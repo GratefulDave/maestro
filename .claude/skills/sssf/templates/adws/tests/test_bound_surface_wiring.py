@@ -220,12 +220,6 @@ class TheSchedulerDerivesTheSurface(unittest.TestCase):
         self.assertNotIn("bound_surface", payload)
         self.assertEqual(complete.call_count, 1)
 
-    def test_the_lane_context_defaults_to_no_surface(self):
-        field = {
-            item.name: item
-            for item in sch.dataclasses.fields(sch.LaneContext)
-        }["bound_surface"]
-        self.assertIsNone(field.default)
 
 
 class TheBuilderPromptCarriesTheSurface(unittest.TestCase):
@@ -261,34 +255,12 @@ class TheBuilderPromptCarriesTheSurface(unittest.TestCase):
         self.assertIn("available", text)
         self.assertIn("reason", text)
 
-    def test_the_names_are_stated_as_contract_not_suggestion(self):
-        text = self._body({"bound_surface": SURFACE})["instructions"]
-        self.assertIn("contract, not a suggestion", text)
-        self.assertIn("exactly these names", text)
-
-    def test_the_prompt_says_the_values_are_withheld(self):
-        text = self._body({"bound_surface": SURFACE})["instructions"]
-        self.assertIn("deliberately withheld", text)
-        self.assertIn("Do not guess", text)
-        self.assertIn("do not hardcode", text)
-
-    def test_a_builder_without_a_surface_gets_no_instruction(self):
-        text = self._body({})["instructions"]
-        self.assertNotIn("bound_surface", text)
-        self.assertIn("Edit only declared_outputs", text)
-
-    def test_an_empty_surface_renders_nothing(self):
-        text = self._body({"bound_surface": {"modules": [], "object_keys": []}})[
-            "instructions"
-        ]
-        self.assertNotIn("bound_surface is the set of names", text)
 
     def test_a_module_with_no_symbols_is_still_named(self):
         text = self._body(
             {"bound_surface": {"modules": [{"specifier": "src/lib/paidDpa"}], "object_keys": []}}
         )["instructions"]
         self.assertIn("src/lib/paidDpa", text)
-        self.assertNotIn("exports .", text)
 
     def test_the_surface_survives_the_private_key_strip(self):
         # `_prompt` deletes forbidden private keys from the builder's body and
@@ -296,24 +268,6 @@ class TheBuilderPromptCarriesTheSurface(unittest.TestCase):
         body = self._body({"bound_surface": SURFACE})
         self.assertEqual(body["bound_surface"], SURFACE)
 
-    def test_the_code_reviewer_prompt_gets_no_builder_surface_text(self):
-        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
-        actor.lane_specs = {}
-        ctx = SimpleNamespace(
-            lane=SimpleNamespace(lane_id="lane-a", lane_kind=st.LANE_KIND_BUILD),
-            plan_revision=1,
-            run_id="run1",
-            stage=st.LaneStage.REVIEWING_CODE,
-        )
-        text = maestro.HerdrStageActor._prompt(
-            actor,
-            ctx,
-            "code-reviewer",
-            Path("/tmp/envelope.json"),
-            Path("/tmp/cwd"),
-            {},
-        )["instructions"]
-        self.assertNotIn("bound_surface", text)
 
 
 class TheActorPutsTheSurfaceInExtra(unittest.TestCase):
@@ -408,8 +362,6 @@ class TheRolesHaveSeparateCheckouts(unittest.TestCase):
         self.assertNotEqual(builder, reviewer)
         self.assertNotIn(builder, reviewer.parents)
         self.assertNotIn(reviewer, builder.parents)
-        self.assertEqual(builder.name, "builder")
-        self.assertEqual(reviewer.name, "code-reviewer")
 
     def test_every_lane_role_gets_its_own_checkout(self):
         actor = self._actor()

@@ -752,6 +752,8 @@ class PollResult:
 
 class LauncherAdapter(Protocol):
     def launch(self, spec: LaunchSpec) -> LaunchHandle: ...
+    def invoking_repository(self, environment: Mapping[str, str]) -> Path | None: ...
+    def restore_layout(self, spec: LaunchSpec) -> str: ...
     def poll(self, handle: LaunchHandle) -> PollResult: ...
     def cancel(self, handle: LaunchHandle, deadline: float) -> None: ...
     def classify(self, exc: BaseException) -> ErrorClass: ...
@@ -2510,6 +2512,7 @@ class HerdrLauncher:
         provision_argv: Sequence[str] = (),
         provision_timeout_s: float = PROVISION_TIMEOUT_S,
         workspace_label: str = "",
+        parent_workspace_id: str = "",
     ) -> None:
         if not isinstance(admitted_routes, AdmittedRouteSet):
             raise TypeError("VERIFIED_ADMITTED_ROUTES_REQUIRED")
@@ -2528,6 +2531,7 @@ class HerdrLauncher:
         #: keeps its label). Empty keeps the non-run path: panes split from
         #: the caller's once-resolved pane, with no workspaces.
         self.workspace_label = str(workspace_label or "")
+        self._invocation_workspace_id = str(parent_workspace_id or "")
         self.agent_start_busy_window_s = AGENT_START_BUSY_WINDOW_S
         self.quiescence_confirm_s = AGENT_QUIESCENCE_CONFIRM_S
         self._handles_lock = threading.RLock()
@@ -2949,7 +2953,18 @@ class HerdrLauncher:
                     "NO_WORKSPACE_LABEL",
                     pane_created=False,
                 )
-            adopted = self._adopt_existing_workspace(environment)
+            adopted = self._invocation_workspace_id
+            if adopted:
+                try:
+                    self._workspace_record(adopted, environment)
+                except _WorkspaceGone as exc:
+                    raise LaunchRefused(
+                        LaunchRefusal.WORKSPACE_UNRESOLVED,
+                        "INVOKING_WORKSPACE_GONE:{}".format(adopted),
+                        pane_created=False,
+                    ) from exc
+            else:
+                adopted = self._adopt_existing_workspace(environment)
             if not adopted:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_UNRESOLVED,
@@ -2959,6 +2974,26 @@ class HerdrLauncher:
             self._parent_workspace_id = adopted
             self._workspace_id = adopted
             return adopted
+
+    def invoking_repository(self, environment: Mapping[str, str]) -> Path | None:
+        """Git UI owner, independent of the role execution repository."""
+        if not self._invocation_workspace_id:
+            return None
+        parent = self._run_workspace(environment)
+        listing = self._worktree_listing(environment, workspace_id=parent)
+        cwd = self._listing_source(listing, "repo_root") if listing is not None else ""
+        if not cwd:
+            raise LaunchRefused(
+                LaunchRefusal.WORKSPACE_UNRESOLVED,
+                "INVALID_INVOKING_SOURCE:{}".format(parent), pane_created=False,
+            )
+        root = Path(cwd)
+        defect = self._binding_defect_in(listing, parent, root)
+        if defect:
+            raise LaunchRefused(
+                LaunchRefusal.WORKSPACE_UNRESOLVED, defect, pane_created=False,
+            )
+        return root
 
     def _adopt_existing_workspace(self, environment: Mapping[str, str]) -> str:
         """Adopt the Space Herdr names as the repository's source checkout.
@@ -3494,6 +3529,42 @@ class HerdrLauncher:
             pane_created=False,
         ) from exc
 
+    def restore_layout(self, spec: LaunchSpec) -> str:
+        """Restore one owned role shell without executing an agent turn."""
+        self._bind_run_identity(spec)
+        environment = spec.environment
+        role = str(spec.pane_role or "")
+        lane = str(spec.lane_label or spec.lane_key or "")
+        panes = _herdr_list(self._herdr("pane", "list", env=environment), "panes")
+        owned = []
+        for pane in panes:
+            tokens = _herdr_tokens(pane)
+            expected = self._pane_identity_tokens(
+                lane, role, tokens.get(METADATA_TOKEN_PARENT, "")
+            )
+            expected.pop(METADATA_TOKEN_SCRATCH, None)
+            if _tokens_match(tokens, expected):
+                owned.append(pane)
+        if len(owned) > 1:
+            self._refuse_live_pane("AMBIGUOUS_ROLE_PANES:{}".format(role))
+        if owned:
+            pane = self._prove_live_pane(spec, owned[0], environment)
+            pane_id = str(pane["pane_id"])
+            self._register_adopted_role_layout(
+                spec, pane_id, str(pane["tab_id"]),
+                str(pane["workspace_id"]), environment,
+            )
+            name = _agent_name(spec.correlation_token)
+            agent = self._fetch_agent(name, environment)
+            if agent is not None:
+                if str(agent.get("pane_id") or "") != pane_id:
+                    self._refuse_live_pane("RESTORED_AGENT_PANE_MISMATCH")
+                self._handle_from_live_agent(spec, name, agent, pane, environment)
+        else:
+            pane_id, _, _ = self._acquire_pane(spec, spec.worktree, environment)
+            self._label_pane(pane_id, spec, environment)
+        return pane_id
+
     def _prove_live_pane(
         self,
         spec: LaunchSpec,
@@ -3510,6 +3581,9 @@ class HerdrLauncher:
         pane = _extract(pane_payload, "pane")
         if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
             self._refuse_live_pane(pane_id)
+        role = str(spec.pane_role or "")
+        if role and _herdr_label(pane) not in (role, pane_label_for(role)):
+            self._refuse_live_pane("NO_PANE_LABEL" if not _herdr_label(pane) else "PANE_LABEL_MISMATCH")
         cwd = pane.get("cwd")
         if not cwd:
             self._refuse_live_pane("NO_CWD")
@@ -3519,6 +3593,53 @@ class HerdrLauncher:
             actual.relative_to(scope)
         except ValueError:
             self._refuse_live_pane("{}!={}".format(actual, scope))
+        source_id = str(pane.get("workspace_id") or "") or workspace_of(str(pane.get("tab_id") or "")) or workspace_of(pane_id)
+        source = self._workspace_record(source_id, environment)
+        source_tokens = _herdr_tokens(source)
+        if source_tokens:
+            expected_lane = self._lane_identity_tokens(
+                str(spec.lane_label or spec.lane_key or ""),
+                source_tokens.get(METADATA_TOKEN_PARENT, ""),
+            )
+            if source_tokens.get(METADATA_TOKEN_KIND) == METADATA_KIND_LANE and not _tokens_match(source_tokens, expected_lane):
+                self._refuse_live_pane("LANE_TOKEN_MISMATCH:{}".format(source_id))
+        layout = self._tab_for(
+            spec, actual, pane_env_flags_for_role(actual, environment), environment
+        )
+        if str(pane.get("workspace_id") or "") != layout.child_workspace_id:
+            role = str(spec.pane_role or "")
+            lane = str(spec.lane_label or spec.lane_key or "")
+            tokens = _herdr_tokens(pane)
+            expected = self._pane_identity_tokens(lane, role, tokens.get(METADATA_TOKEN_PARENT, ""))
+            expected.pop(METADATA_TOKEN_SCRATCH, None)
+            if not role or _herdr_label(pane) not in (role, pane_label_for(role)) or not _tokens_match(tokens, expected):
+                self._refuse_live_pane("FOREIGN_ROLE_PANE:{}".format(pane_id))
+            parent_id = layout.parent_workspace_id
+            seed = layout.nearest_live(0)
+            if seed is None:
+                self._refuse_live_pane("NO_DESTINATION_PANE")
+            moved_payload = self._herdr(
+                "pane", "move", pane_id, "--tab", layout.tab_id,
+                "--target-pane", seed, "--split", "right", "--no-focus",
+                env=environment,
+            )
+            moved_pane = _extract(moved_payload, "pane")
+            moved_id = str(moved_pane.get("pane_id") or "") if isinstance(moved_pane, dict) else ""
+            moved = _extract(self._herdr("pane", "get", moved_id, env=environment), "pane")
+            if not isinstance(moved, dict) or str(moved.get("workspace_id") or "") != layout.child_workspace_id or str(moved.get("tab_id") or "") != layout.tab_id or not _same_resolved_path(moved.get("cwd"), actual):
+                self._refuse_live_pane("MOVED_ROLE_BINDING_MISMATCH")
+            self._tag_pane(
+                moved_id, {METADATA_TOKEN_PARENT: parent_id}, environment
+            )
+            moved["tokens"] = dict(tokens, **{METADATA_TOKEN_PARENT: parent_id})
+            pane = moved
+            if layout.claimed == 0 and self._pane_cwd_within(seed, Path(spec.child_anchor or spec.worktree), environment):
+                self._herdr("pane", "close", seed, env=environment)
+                layout.forget(seed)
+        else:
+            # Lane adoption may have repinned a surviving child whose parent
+            # was closed. Placement proof must see those refreshed tokens.
+            pane = _extract(self._herdr("pane", "get", pane_id, env=environment), "pane")
         self._prove_live_placement(spec, pane, environment)
         return pane
 
@@ -3787,6 +3908,14 @@ class HerdrLauncher:
             self._refuse_live_pane(
                 "AGENT_STATUS_UNOBSERVABLE:{}".format(status or "<missing>")
             )
+        existing_pane = _extract(
+            self._herdr("pane", "get", str(agent.get("pane_id") or ""), env=environment),
+            "pane",
+        )
+        if isinstance(existing_pane, dict) and existing_pane.get("cwd"):
+            actual = Path(str(existing_pane["cwd"])).resolve()
+            if actual != spec.worktree.resolve():
+                self._refuse_live_pane("{}!={}".format(actual, spec.worktree.resolve()))
         pane = self._prove_live_pane(spec, agent, environment)
         if (
             self.workspace_label
@@ -3794,9 +3923,6 @@ class HerdrLauncher:
             != METADATA_SCRATCH_REDIRECT
         ):
             return None
-        actual = Path(str(pane.get("cwd"))).resolve()
-        if actual != spec.worktree.resolve():
-            self._refuse_live_pane("{}!={}".format(actual, spec.worktree.resolve()))
         return self._handle_from_live_agent(spec, stable_name, agent, pane, environment)
 
     def _parse_worktree_opened(self, payload: Mapping[str, object]) -> dict:
@@ -3917,6 +4043,7 @@ class HerdrLauncher:
                 return
         self._invalidate_lane_layout(workspace_id)
 
+
     def _tab_for(
         self,
         spec: LaunchSpec,
@@ -3925,7 +4052,6 @@ class HerdrLauncher:
         environment: Mapping[str, str],
     ) -> _TabLayout:
         """The linked lane child this role's panes live in, created lazily."""
-        del env_flags
         self._bind_run_identity(spec)
         # `worktree` is the launching role's own cwd, and a private-tree role's
         # cwd is materialized out of the vault with no `.git`, because the
@@ -4248,7 +4374,10 @@ class HerdrLauncher:
                             # split in flight in another process and is that
                             # role's to reap; a pane at a foreign or missing
                             # cwd is not Maestro's at all and is left alone.
-                            if self._pane_cwd_within(str(stray), scope, environment):
+                            if self._pane_cwd_within(str(stray), scope, environment) or (
+                                stray == replace_pane and spec.child_anchor is not None
+                                and self._pane_cwd_within(str(stray), spec.child_anchor, environment)
+                            ):
                                 unconfigured.append(str(stray))
                     if (
                         replace_pane
@@ -4502,18 +4631,6 @@ class HerdrLauncher:
                 "{0}!={1}".format(landed, placement_workspace_id),
                 pane_created=not closed,
             )
-        if (
-            parent_workspace_id
-            and placement_workspace_id
-            and placement_workspace_id == parent_workspace_id
-            and self.workspace_label
-        ):
-            closed = self._reap_pane(pane_id, environment)
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_DRIFT,
-                "pane landed in parent run workspace {}".format(parent_workspace_id),
-                pane_created=not closed,
-            )
 
         self._label_pane(pane_id, spec, environment)
         name = _agent_name(spec.correlation_token)
@@ -4669,6 +4786,8 @@ class HerdrLauncher:
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
         self._register_role_handle(spec, handle)
+        # Present the verified live role once, not on readiness or poll retries.
+        self._herdr("agent", "focus", name, env=environment)
         try:
             # Every coding route receives the complete node instruction only
             # after its composer is ready. Startup delivery can race agent
@@ -4858,6 +4977,7 @@ class HerdrLauncher:
         if envelope_path is not None:
             object.__setattr__(handle, "envelope_path", Path(envelope_path))
         self._verified_handle_binding(handle)
+        self._herdr("agent", "focus", handle.agent_name, env=handle.environment)
         try:
             wait_for_interactive_agent(
                 lambda *args, **kwargs: self._herdr(
@@ -5371,7 +5491,7 @@ class HerdrLauncher:
         """
         ordered: List[LaunchHandle] = []
         seen: set[str] = set()
-        for handle in handles:
+        for handle in (*handles, *self._handles.values()):
             token = handle.correlation_token
             if token in seen:
                 continue
@@ -5415,6 +5535,29 @@ class HerdrLauncher:
                 environments[child] = handle.environment
             self._forget_pane(handle.pane_id)
             self._cleaned_absent.add(handle.pane_id)
+        for layout in self._tabs.values():
+            child = layout.child_workspace_id
+            if child and child != self._parent_workspace_id and child not in children:
+                children.append(child)
+        # Restored shells may never dispatch (the native gate can decide the
+        # outcome first). They belong to the same whole-run cleanup boundary.
+        for child in children:
+            if child == self._parent_workspace_id:
+                continue
+            try:
+                listed = self._herdr("pane", "list", "--workspace", child)
+            except HerdrCallError as exc:
+                if exc.code == WORKSPACE_NOT_FOUND:
+                    continue
+                raise
+            for pane in _herdr_list(listed, "panes"):
+                tokens = _herdr_tokens(pane)
+                if tokens.get(METADATA_TOKEN_RUN) != self._run_id:
+                    raise LaunchRefused(
+                        LaunchRefusal.BINDING_MISMATCH,
+                        "FOREIGN_PANE_IN_LANE:{}".format(pane.get("pane_id")),
+                        pane_created=True,
+                    )
         for child in children:
             if child == self._parent_workspace_id:
                 # A handle without a child id names the parent by fallback;
@@ -5445,6 +5588,13 @@ class FakeLauncher:
         self.completed: List[Tuple[str, ...]] = []
         self.closed_runs: List[str] = []
         self._runs: Dict[str, str] = {}
+
+    def invoking_repository(self, environment: Mapping[str, str]) -> Path | None:
+        return None
+
+    def restore_layout(self, spec: LaunchSpec) -> str:
+        handle = self._handles.get(spec.correlation_token)
+        return handle.pane_id if handle is not None else ""
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         handle = LaunchHandle(

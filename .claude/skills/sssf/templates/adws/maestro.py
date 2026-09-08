@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import stat
 import subprocess
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
@@ -41,10 +44,10 @@ from adw_modules.lifecycle import (
     LedgerSchemaUnsupported,
     RunAlreadyExists,
 )
-from adw_modules.reporting_registry import register_installation
+from adw_modules.reporting_registry import read_run, registered_run, register_installation
 from adw_modules.dashboard_autoload import maybe_autoload_dashboard
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
-from adw_modules.runtime_state import RuntimeStateRefused, RuntimeStateRoot
+from adw_modules.runtime_state import LEDGER_FILENAME, RuntimeStateRefused, RuntimeStateRoot
 from adw_modules.scheduler import (
     FactoryRefused,
     FactoryScheduler,
@@ -67,6 +70,7 @@ from adw_modules.plan_model import PlanCompileError
 
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
 _MAESTRO_SCHEMA = "maestro-config.v1"
+_INVOCATION_WORKSPACE: ContextVar[str] = ContextVar("invocation_workspace", default="")
 
 
 class _MaestroConfigurationError(ValueError):
@@ -587,13 +591,17 @@ class HerdrStageActor:
     def _new_attempt_dir(self, ctx: LaneContext) -> Path:
         return self._role_dir(ctx, "tester")
 
-    def _add_worktree(self, dest: Path, sha: str) -> None:
+    def _add_worktree(
+        self, dest: Path, sha: str, *, repo: Path | None = None,
+        no_checkout: bool = False,
+    ) -> None:
         dest = Path(dest)
         precreated = _clear_precreated_role_cwd(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        repo = Path(self.target.target_repository_root)
+        repo = repo or Path(self.target.target_repository_root)
+        flags = ["--no-checkout"] if no_checkout else []
         subprocess.check_call(
-            ["git", "-C", str(repo), "worktree", "add", "--detach", str(dest), sha],
+            ["git", "-C", str(repo), "worktree", "add", "--detach", *flags, str(dest), sha],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -739,6 +747,20 @@ class HerdrStageActor:
         "import greps exactly like one that loads."
     )
 
+    _PUBLIC_INTERFACE_RULE = (
+        "Use the public lane spec, public_acceptance and public_contract as "
+        "the authority for module/import paths, export or callable names, "
+        "argument and return shapes, and observable errors. A module path "
+        "alone does not declare a callable. Tests must consume that public "
+        "interface, not invent an unstated binding or require an alias chosen "
+        "only inside a private test. Test reviewers must report such a binding "
+        "or an ambiguous public interface through existing actionable REVISE "
+        "findings about contract adequacy, not prescribe product implementation "
+        "or pass a guessed binding. Builders implement the public interface; "
+        "do not guess unspecified exports from sealed-test observations or "
+        "spray aliases to satisfy an unknown name."
+    )
+
     def _materialize_role_instructions(
         self, cwd: Path, role: str, route: str, lane_kind: str | None = None
     ) -> Path:
@@ -840,6 +862,8 @@ class HerdrStageActor:
             role_rule = role_rules[role]
         except KeyError as exc:
             raise FactoryRefused("UNKNOWN_ROLE:{}".format(role)) from exc
+        if role in ("tester", "test-reviewer", "builder"):
+            role_rule += "\n" + self._PUBLIC_INTERFACE_RULE
         content = (
             "# Maestro {0} role contract\n\n"
             "- Work only in the assigned checkout: the process CWD.\n"
@@ -904,16 +928,7 @@ class HerdrStageActor:
 
     @staticmethod
     def _bound_surface_instruction(surface: Mapping[str, Any]) -> str:
-        """Render the sealed suite's bound names as a builder instruction.
-
-        The builder cannot see the sealed tests, and until this existed it was
-        also not told the names they resolve against -- so it invented a module
-        path, invented an export, invented a result key, and failed on all
-        three at once. Names are contract; values are secrets. This renders the
-        names and says, in the same breath, that the values are withheld on
-        purpose so that a builder does not read the list as an invitation to
-        reverse-engineer the assertions.
-        """
+        """Render observed names without making them a second public contract."""
         modules = []
         for entry in surface.get("modules") or ():
             if not isinstance(entry, Mapping):
@@ -931,13 +946,12 @@ class HerdrStageActor:
         if not modules and not keys:
             return ""
         text = (
-            " bound_surface is the set of names the sealed acceptance tests "
-            "bind to. It is the contract, not a suggestion: the implementation "
-            "must provide exactly these names, spelled exactly this way, "
-            "reachable from exactly these module specifiers. A name that is "
-            "absent or spelled differently fails every case that touches it, "
-            "and no amount of correct behavior behind a different name will "
-            "pass."
+            " bound_surface records names observed in the sealed suite; it "
+            "does not define or override the public interface. Implement the "
+            "names declared by the public lane spec and public_contract. "
+            "An empty symbols list declares no callable, and an observed name "
+            "cannot fill a missing public signature. Do not invent exports "
+            "or aliases from this observation."
         )
         if modules:
             text += " Modules and the symbols imported from them: {0}.".format(
@@ -1065,6 +1079,8 @@ class HerdrStageActor:
                 )
         elif role == "integration-reviewer":
             instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
+        if role in ("tester", "test-reviewer", "builder"):
+            instructions += " " + self._PUBLIC_INTERFACE_RULE
         if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
             instructions += " PASS requires findings=[]. REVISE requires at least one actionable finding."
         if role == "integration-reviewer":
@@ -1396,21 +1412,54 @@ class HerdrStageActor:
         return path
 
     def _lane_child_anchor(self, ctx: LaneContext, cwd: Path) -> Path | None:
-        """A git-backed path for this lane's Herdr child, or None to use `cwd`.
+        return self._child_anchor(ctx.run_id, ctx.lane.lane_id, cwd)
 
-        A private-tree role runs in a tree materialized out of the vault with
-        no `.git`, and `herdr worktree open` resolves a registered git worktree
-        and refuses anything else. The lane's child is a container, not the
-        role's cwd, so it may be anchored on a sibling role's checkout. It must
-        never be the repository root: that path is the run's parent Space, and
-        opening a child there hands back the parent and relabels it.
-        """
-        if (cwd / ".git").exists():
-            return None
-        for candidate in self._role_cwds(ctx).values():
-            if (candidate / ".git").exists():
-                return candidate
-        return None
+    def _child_anchor(self, run_id: str, lane_id: str, cwd: Path) -> Path | None:
+        invoking = self.launcher.invoking_repository(os.environ)
+        if invoking is None:
+            # Without an invoking Space, retain the target repository's
+            # source-workspace lookup, but never anchor a private role tree.
+            invoking = Path(self.target.target_repository_root)
+        git = gitpub.BoundGit(invoking)
+        owner = hashlib.sha256(str(git.git_common_dir()).encode()).hexdigest()[:16]
+        anchor = self.state_root / "ui-worktrees" / run_id / owner / lane_id
+        if (anchor / ".git").exists():
+            if gitpub.BoundGit(anchor).git_common_dir() != git.git_common_dir():
+                raise FactoryRefused("UI_ANCHOR_GIT_BINDING_MISMATCH")
+        else:
+            self._add_worktree(anchor, "HEAD", repo=invoking, no_checkout=True)
+        return anchor
+
+    def restore_layout(self, run_id: str, lanes: Sequence[st.LaneProjection]) -> None:
+        """Reopen role shells before native gates, never replay role work."""
+        try:
+            for lane in lanes:
+                lane_root = self.worktrees / run_id / lane.lane_id
+                role_cwds = {
+                    role: lane_root / role / "checkout" for role in lch.LANE_PANE_ROLES
+                }
+                # Future roles remain lazy; only existing execution locations
+                # participated in this run and need their shell restored.
+                for role, cwd in role_cwds.items():
+                    if not cwd.is_dir():
+                        continue
+                    route = self.role_routes[role]
+                    self.launcher.restore_layout(lch.LaunchSpec(
+                        correlation_token=lch.role_session_token(run_id, lane.lane_id, role),
+                        worktree=cwd, prompt_path=cwd, envelope_path=cwd,
+                        route=route["route"], model=route["model"], effort=route["effort"],
+                        profile=route["profile"], session_dir=lane_root / role,
+                        environment=self._launch_environment(cwd),
+                        lane_key=lane.lane_id, lane_label=lane.lane_id, pane_role=role,
+                        run_id=run_id,
+                        repository_fingerprint=self.target.target_repository_fingerprint,
+                        repository_root=Path(self.target.target_repository_root),
+                        workspace_label=str(getattr(self.launcher, "workspace_label", "") or lch.workspace_label_for(self.project_identity, run_id)),
+                        pane_group_size=len(lch.LANE_PANE_ROLES), role_cwds=role_cwds,
+                        child_anchor=self._child_anchor(run_id, lane.lane_id, cwd),
+                    ))
+        except lch.LaunchRefused as exc:
+            raise self._launch_failed(exc) from exc
 
     def _role_cwds(self, ctx: LaneContext) -> dict[str, Path]:
         return {
@@ -1659,33 +1708,6 @@ class HerdrStageActor:
 
         lane_id = ctx.lane.lane_id
         token = lch.role_session_token(ctx.run_id, lane_id, role)
-        if stored is not None and stored.handle is not None:
-            self._materialize_role_instructions(
-                cwd, role, route["route"], ctx.lane.lane_kind
-            )
-            write_prompt(cwd)
-            try:
-                handle = self.launcher.resubmit(
-                    stored.handle,
-                    prompt,
-                    route=route["route"],
-                    expected_token=token,
-                    envelope_path=envelope,
-                )
-            except lch.LaunchRefused as extra_exc:
-                raise self._launch_failed(extra_exc) from extra_exc
-            cwd_used = Path(getattr(handle, "launched_cwd", cwd))
-            self._say(
-                lane_id, "resubmitted to {0}".format(role), "turn {0}".format(turn)
-            )
-            payload = self._await_envelope(handle, envelope, role, lane_id)
-            self._say(lane_id, "{0} replied".format(role), "turn {0}".format(turn))
-            stored.handle = handle
-            stored.cwd = cwd_used
-            stored.turns = turn
-            stored.run_id = ctx.run_id
-            self._retain_completed(handle, key)
-            return payload, handle, cwd_used
 
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
@@ -2110,22 +2132,29 @@ class HerdrStageActor:
                 raise CleanupRefused("COMPLETE_RUN_UNAVAILABLE")
             return
         refused: BaseException | None = None
-        if handles:
-            try:
-                complete(
-                    handles,
-                    project_identity=self.project_identity,
-                )
-            except lch.LaunchRefused as exc:
-                refused = exc
-            except BaseException as exc:
-                refused = exc
+        try:
+            complete(
+                handles,
+                project_identity=self.project_identity,
+            )
+        except lch.LaunchRefused as exc:
+            refused = exc
+        except BaseException as exc:
+            refused = exc
         success = refused is None
         for key, stored in sessions:
             if success or self._handle_space_absent(stored.handle):
                 self._roles.pop(key, None)
                 self._safe_remove_attempt(stored.attempt, stored.checkout)
         if refused is None:
+            anchors = self.state_root / "ui-worktrees" / run_id
+            if anchors.is_dir():
+                for anchor in anchors.glob("*/*"):
+                    if (anchor / ".git").is_file():
+                        subprocess.check_call(
+                            ["git", "-C", str(anchor), "worktree", "remove", "--force", str(anchor)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
             return
         if isinstance(refused, lch.LaunchRefused):
             raise CleanupRefused(
@@ -2192,6 +2221,7 @@ def _actor_for(
         provision_timeout_s=layout.get("provision_timeout_s")
         or lch.PROVISION_TIMEOUT_S,
         workspace_label=lch.workspace_label_for(_project_identity(target), run_id),
+        parent_workspace_id=_INVOCATION_WORKSPACE.get(),
     )
     plan = json.loads(compiled.plan_bytes)
     lane_specs = {
@@ -2412,12 +2442,8 @@ def _run_plan(args: argparse.Namespace) -> int:
 
 def _run_start(args: argparse.Namespace) -> int:
     maestro_file = _executing_maestro_file()
-    repo = Path(args.repo).resolve()
-    main_ref = args.main_ref
-    if not main_ref:
-        return _RunRefused(
-            "RUN_CONFIGURATION_REQUIRED", "--main-ref is required"
-        ).emit()
+    repo = Path(args.repo).resolve() if args.repo else _repository_from_cwd()
+    main_ref = args.main_ref or _main_ref_from_head(repo)
     layout = _load_deployment_config(maestro_file)
     require_deployment(maestro_file, repo)
     runtime = _open_runtime(layout, repo)
@@ -2532,6 +2558,54 @@ def _pin_plan_artifact(source: Path, pinned: Path) -> None:
     scratch.replace(pinned)
 
 
+def _existing_run_deployment(run_id: str) -> tuple[Path, dict[str, Any]]:
+    """Prefer a known local run, otherwise recover its deployment from Git."""
+    executing = _executing_maestro_file()
+    local_config = _deployment_product_root(executing) / _MAESTRO_CONFIG_FILE
+    try:
+        if local_config.is_file():
+            layout = _load_deployment_config(executing)
+            database = layout["runtime_state_root"] / LEDGER_FILENAME
+            if read_run(database, run_id) is not None:
+                return executing, layout
+        found = registered_run(run_id)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise _RunRefused("RUN_DISCOVERY_REFUSED", str(exc)) from exc
+    if found is None:
+        raise _RunRefused("RUN_NOT_FOUND", run_id)
+    database, row = found
+    state_root = Path(row["runtime_state_root"]).resolve()
+    if database != state_root / LEDGER_FILENAME:
+        raise _RunRefused("RUN_DISCOVERY_REFUSED", "ledger differs from stored runtime root")
+    target_root = Path(row["target_repository_root"])
+    common_dir = Path(row["target_git_common_dir"]).resolve()
+    git = gitpub.BoundGit(target_root)
+    if Path(git.text("rev-parse", "--path-format=absolute", "--git-common-dir")).resolve() != common_dir:
+        raise RunRepositoryMismatch("target Git common directory changed")
+    candidates = []
+    for field in git.text("worktree", "list", "--porcelain", "-z").split("\0"):
+        if not field.startswith("worktree "):
+            continue
+        candidate = Path(field[len("worktree "):]) / "adws" / "maestro.py"
+        config = candidate.parent / "maestro.config.yaml"
+        if not candidate.is_file() or not config.is_file():
+            continue
+        try:
+            layout = _load_deployment_config(candidate)
+        except _MaestroConfigurationError:
+            continue
+        if layout["runtime_state_root"].resolve() != state_root:
+            continue
+        require_deployment(candidate, target_root)
+        candidates.append((candidate, layout))
+    if len(candidates) != 1:
+        raise _RunRefused(
+            "RUN_DEPLOYMENT_UNRESOLVED",
+            "run {0}: expected one matching deployment, found {1}".format(run_id, len(candidates)),
+        )
+    return candidates[0]
+
+
 def _bind_existing_run(
     run_id: str,
 ) -> tuple[
@@ -2542,14 +2616,14 @@ def _bind_existing_run(
     gitpub.TargetBinding,
     st.CompiledPlan,
 ]:
-    maestro_file = _executing_maestro_file()
-    layout = _load_deployment_config(maestro_file)
-    require_deployment(maestro_file, layout["repo"])
+    maestro_file, layout = _existing_run_deployment(run_id)
     runtime = _open_runtime(layout, layout["repo"])
     runtime.ensure_layout()
     store = _open_store(runtime)
     try:
         row = run_row(store, run_id)
+        if runtime.path.resolve() != Path(row["runtime_state_root"]).resolve():
+            raise FactoryRefused("RUNTIME_STATE_MISMATCH")
         require_deployment(maestro_file, Path(row["target_repository_root"]))
         runtime.revalidate(row["runtime_state_fingerprint"])
         target = target_from_binding(binding_from_run(row))
@@ -2599,10 +2673,12 @@ def _run_resume(args: argparse.Namespace) -> int:
                 row["target_main_ref"],
                 (lane.lane_id for lane in store.active_projection(run_id)),
             )
+            actor = _actor_for(runtime, layout, target, run_id, compiled)
+            actor.restore_layout(run_id, store.active_projection(run_id))
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id, compiled),
+                actor,
                 runtime,
                 target,
                 stage_started=console.stage_started,
@@ -2742,8 +2818,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = run_sub.add_parser("start")
     start.add_argument("plan")
-    start.add_argument("--repo", required=True)
-    start.add_argument("--main-ref", required=True)
+    start.add_argument("--repo")
+    start.add_argument("--main-ref")
     start.add_argument("--run-id")
     start.set_defaults(handler=_run_start)
 
@@ -2796,6 +2872,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if plan_name is not None:
             parser.error("--plan is the whole invocation; it takes no verb")
         handler = args.handler
+    invocation = _INVOCATION_WORKSPACE.set(os.environ.get("HERDR_WORKSPACE_ID", ""))
     try:
         return int(handler(args))
     except _RunRefused as exc:
@@ -2841,6 +2918,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if detail is None:
             raise
         return _RunRefused(cr.SEALED_ENVIRONMENT_OUTCOME, detail).emit()
+    finally:
+        _INVOCATION_WORKSPACE.reset(invocation)
 
 
 if __name__ == "__main__":

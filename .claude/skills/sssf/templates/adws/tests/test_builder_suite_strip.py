@@ -448,8 +448,8 @@ class AmendedBuilderCheckoutTest(unittest.TestCase):
         # amended lane opens green and its reviewer agrees. `build_lanes`
         # makes the candidate "ready"; `code_rounds` skips `HandoffActor`'s
         # scripted opening REVISE, which since #208 a green suite no longer
-        # rewrites to PASS and which would otherwise be the third round that
-        # sets no new low and parks the lane NO_PROGRESS.
+        # rewrites to PASS. This test concerns checkout isolation, not the
+        # separate content-based NO_PROGRESS contract.
         resume.build_lanes.append("lane-build")
         resume.code_rounds["lane-build"] = 1
         scheduler = sch.FactoryScheduler(

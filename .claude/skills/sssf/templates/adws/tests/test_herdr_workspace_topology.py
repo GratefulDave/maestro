@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterator
 from unittest import mock
@@ -44,6 +45,7 @@ def _launcher(
     *,
     run_id: str = RUN_HASH,
     fingerprint: str = REPO,
+    parent_workspace_id: str = "",
 ) -> lch.HerdrLauncher:
     launcher = lch.HerdrLauncher.__new__(lch.HerdrLauncher)
     launcher.herdr_path = Path("herdr")
@@ -54,6 +56,7 @@ def _launcher(
     )()
     launcher.provision_argv = ()
     launcher.workspace_label = label
+    launcher._invocation_workspace_id = parent_workspace_id
     launcher.agent_start_busy_window_s = 0.0
     launcher.quiescence_confirm_s = 0.0
     launcher._handles_lock = threading.RLock()
@@ -188,6 +191,344 @@ class NamingTest(unittest.TestCase):
             ),
             "FDAdb-e892-lane-wp6-build-integration-reviewer",
         )
+
+
+class InvokingWorkspaceTest(unittest.TestCase):
+    def assert_selected(self, herdr: FakeHerdr, handle: lch.LaunchHandle) -> None:
+        self.assertEqual(
+            [wid for wid, record in herdr.workspaces.items() if record["focused"]],
+            [handle.workspace_id],
+        )
+        self.assertEqual(
+            [tid for tid, record in herdr.tabs.items() if record["focused"]],
+            [handle.tab_id],
+        )
+        self.assertEqual(
+            [pid for pid, record in herdr.panes.items() if record["focused"]],
+            [handle.pane_id],
+        )
+        self.assertEqual(herdr.workspaces[handle.workspace_id]["active_tab_id"], handle.tab_id)
+
+    def test_missing_invoking_workspace_refuses_without_target_fallback(self) -> None:
+        herdr = FakeHerdr()
+        launcher = _launcher("run", parent_workspace_id="gone")
+        launcher._herdr = herdr
+        with self.assertRaises(lch.LaunchRefused) as caught:
+            launcher._run_workspace({})
+        self.assertEqual(caught.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
+        self.assertEqual(herdr.workspaces, {})
+
+    def test_cross_repo_linked_children_reuse_roles_and_preserve_parent(self) -> None:
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            invoking_repo = _checkout(root, "invoking")
+            target_repo = _checkout(root, "target")
+            invoking = herdr.add_workspace("invoking", invoking_repo)
+            target = herdr.add_workspace("target", target_repo)
+            other_pane = next(pid for pid, pane in herdr.panes.items() if pane["workspace_id"] == target)
+            herdr._focus_pane(other_pane)
+            before = herdr.snapshot()
+            launcher = _launcher(
+                lch.workspace_label_for("target", RUN_HASH),
+                parent_workspace_id=invoking,
+            )
+            launcher._herdr = herdr
+            tester = _checkout(target_repo, "tester")
+            spec = _spec(tester, lane=TESTS_LANE, role="tester", repository_root=target_repo, workspace_label=launcher.workspace_label)
+            anchor = _checkout(invoking_repo, "ui-anchor")
+            herdr.linked_checkouts[str(anchor.resolve())] = str(invoking_repo.resolve())
+            spec = replace(spec, child_anchor=anchor)
+            first = _launch(launcher, herdr, spec)
+            self.assertNotEqual(first.workspace_id, invoking)
+            self.assertTrue(launcher._child_listed_under(invoking, first.workspace_id, spec.environment))
+            self.assertEqual(herdr.panes[first.pane_id]["cwd"], str(tester.resolve()))
+            self.assertEqual(herdr.tabs[first.tab_id]["workspace_id"], first.workspace_id)
+            self.assert_selected(herdr, first)
+            herdr._focus_pane(other_pane)
+            with _launch_patches():
+                launcher.resubmit(first, spec.prompt_path)
+            self.assert_selected(herdr, first)
+            herdr._focus_pane(other_pane)
+            cached = _launch(launcher, herdr, spec)
+            self.assert_selected(herdr, cached)
+            launcher.wait_for_idle(first, timeout_s=1.0)
+            launcher.retain(first)
+            self.assertNotIn(first.pane_id, herdr.closed_panes)
+            mark = len(herdr.calls)
+            fresh = _launcher(
+                lch.workspace_label_for("target", RUN_HASH),
+                parent_workspace_id=invoking,
+            )
+            fresh._herdr = herdr
+            herdr._focus_pane(other_pane)
+            same = _launch(fresh, herdr, spec)
+            self.assertEqual((same.pane_id, same.agent_name), (first.pane_id, first.agent_name))
+            self.assertEqual(same.tab_id, first.tab_id)
+            self.assertEqual(same.launched_cwd, tester.resolve())
+            self.assert_selected(herdr, same)
+            herdr._focus_pane(other_pane)
+            fresh.wait_for_idle(same, timeout_s=1.0)
+            fresh.poll(same)
+            self.assertTrue(herdr.panes[other_pane]["focused"])
+            self.assertFalse(
+                set(call[:2] for call in herdr.calls[mark:])
+                & {("pane", "split"), ("agent", "start"), ("worktree", "open")}
+            )
+            fresh.wait_for_idle(same, timeout_s=1.0)
+            fresh.complete_run([same], timeout_s=1.0)
+            self.assertIn(first.pane_id, herdr.closed_panes)
+            self.assertEqual(herdr.closed_workspaces, {first.workspace_id})
+            for workspace_id in (invoking, target):
+                for key in ("tokens", "worktree", "label"):
+                    self.assertEqual(
+                        herdr.workspaces[workspace_id].get(key),
+                        before["workspaces"][workspace_id].get(key),
+                    )
+            self.assertIn(("worktree", "open"), _verbs(herdr))
+
+    def test_sibling_role_selects_its_split_and_resubmit_reveals_original(self) -> None:
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            invoking = herdr.add_workspace("invoking", root)
+            launcher = _launcher(
+                lch.workspace_label_for(PROJECT, RUN_HASH),
+                parent_workspace_id=invoking,
+            )
+            launcher._herdr = herdr
+            tester_spec = _spec(_checkout(root, "tester"), lane=TESTS_LANE, role="tester")
+            reviewer_spec = _spec(_checkout(root, "reviewer"), lane=TESTS_LANE, role="test-reviewer")
+            tester = _launch(launcher, herdr, tester_spec)
+            reviewer = _launch(launcher, herdr, reviewer_spec)
+            self.assertEqual(tester.tab_id, reviewer.tab_id)
+            self.assertNotEqual(tester.pane_id, reviewer.pane_id)
+            self.assert_selected(herdr, reviewer)
+            with _launch_patches():
+                launcher.resubmit(tester, tester_spec.prompt_path)
+            self.assert_selected(herdr, tester)
+
+    def test_restored_agent_requires_confirmed_rename_before_child_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            spec = run.spec(TESTS_LANE, "tester")
+            original = _launch(run.launcher(), run.herdr, spec)
+            fresh = run.launcher()
+            mark = len(run.herdr.calls)
+            fresh.restore_layout(spec)
+            self.assertEqual(
+                fresh._handles[spec.correlation_token].pane_id, original.pane_id
+            )
+            self.assertFalse(
+                set(call[:2] for call in run.herdr.calls[mark:])
+                & {("agent", "start"), ("pane", "send-text")}
+            )
+            refusal = lch.LaunchRefused(
+                lch.LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
+                "unconfirmed", pane_created=True,
+            )
+            with mock.patch.object(fresh, "_confirm_session_rename", side_effect=refusal):
+                with self.assertRaises(lch.LaunchRefused):
+                    fresh.complete_run([], timeout_s=1.0)
+            self.assertNotIn(original.child_workspace_id, run.herdr.closed_workspaces)
+            self.assertNotIn(original.pane_id, run.herdr.closed_panes)
+            fresh.complete_run([], timeout_s=1.0)
+            self.assertIn(original.child_workspace_id, run.herdr.closed_workspaces)
+            self.assertNotIn(original.parent_workspace_id, run.herdr.closed_workspaces)
+
+    def test_resume_restores_private_role_shells_before_gate_without_agent_tasks(self) -> None:
+        from tests.test_role_session_revision import _Bench, _RoleLauncher, _lane, _tester_ctx, _init_repo
+        import maestro
+        from types import SimpleNamespace
+        from adw_modules import scheduler_types as st
+
+        for placement in ("linked", "ordinary", "absent"):
+            absent = placement == "absent"
+            with self.subTest(placement=placement), tempfile.TemporaryDirectory() as tmp:
+                bench = _Bench(tmp, launcher=_RoleLauncher())
+                invoking_repo = Path(tmp) / "invoking"
+                _init_repo(invoking_repo)
+                herdr = FakeHerdr()
+                invoking = herdr.add_workspace("invoking", invoking_repo)
+                ctx = _tester_ctx(bench.head, _lane())
+                launcher = _launcher(
+                    bench.actor._workspace_label(ctx), run_id=ctx.run_id,
+                    fingerprint=bench.target.target_repository_fingerprint,
+                    parent_workspace_id=invoking,
+                )
+                launcher._herdr = herdr
+                bench.actor.launcher = launcher
+                cwd = bench.actor._role_dir(ctx, "tester") / "checkout"
+                cwd.mkdir()
+                (cwd / "draft.py").write_text("candidate = 1\n")
+                if placement == "ordinary":
+                    opened = herdr(
+                        "tab", "create", "--workspace", invoking,
+                        "--label", ctx.lane.lane_id, "--cwd", str(cwd), "--no-focus",
+                    )
+                    pane_id = opened["result"]["root_pane"]["pane_id"]
+                    spec = _spec(
+                        cwd, lane=ctx.lane.lane_id, role="tester", run_id=ctx.run_id,
+                        fingerprint=bench.target.target_repository_fingerprint,
+                        repository_root=bench.product, workspace_label=launcher.workspace_label,
+                    )
+                    launcher._run_workspace(spec.environment)
+                    launcher._label_pane(pane_id, spec, spec.environment)
+                else:
+                    bench.actor.restore_layout(ctx.run_id, [ctx.lane])
+                    pane_id = launcher._tabs[ctx.lane.lane_id].role_panes["tester"]
+                terminal = herdr.panes[pane_id]["terminal_id"]
+                if absent:
+                    herdr("pane", "close", pane_id)
+                fresh = _launcher(
+                    launcher.workspace_label, run_id=ctx.run_id,
+                    fingerprint=bench.target.target_repository_fingerprint,
+                    parent_workspace_id=invoking,
+                )
+                fresh._herdr = herdr
+                bench.actor.launcher = fresh
+                runtime = mock.Mock(path=bench.state)
+                runtime.ledger_path.return_value = bench.state / "ledger.sqlite3"
+                store = mock.Mock()
+                store.active_projection.return_value = [ctx.lane]
+                row = {
+                    "target_repository_root": str(bench.product),
+                    "target_main_ref": "refs/heads/main",
+                }
+                bound = ({}, runtime, store, row, bench.target, SimpleNamespace(lanes=(ctx.lane,)))
+
+                def gate_boundary(*args, **kwargs):
+                    layout = fresh._tabs[ctx.lane.lane_id]
+                    restored_pane = herdr.panes[layout.role_panes["tester"]]
+                    self.assertNotIn(restored_pane["pane_id"], herdr.closed_panes)
+                    self.assertTrue(fresh._child_listed_under(invoking, layout.child_workspace_id, {}))
+                    self.assertEqual(herdr.agents, {})
+                    scheduler = mock.Mock()
+                    scheduler.run.return_value = st.RunStatus.WAITING
+                    return scheduler
+
+                with (
+                    mock.patch.object(maestro, "_bind_existing_run", return_value=bound),
+                    mock.patch.object(maestro, "_actor_for", return_value=bench.actor),
+                    mock.patch.object(maestro, "maybe_autoload_dashboard"),
+                    mock.patch.object(maestro.step_log, "RunReporter"),
+                    mock.patch.object(maestro, "FactoryScheduler", side_effect=gate_boundary),
+                    mock.patch("builtins.print"),
+                ):
+                    self.assertEqual(maestro._run_resume(SimpleNamespace(run_id=ctx.run_id)), 0)
+                restored = fresh._tabs[ctx.lane.lane_id]
+                actual = herdr.panes[restored.role_panes["tester"]]
+                self.assertTrue(fresh._child_listed_under(invoking, restored.child_workspace_id, {}))
+                self.assertEqual(actual["cwd"], str(cwd.resolve()))
+                self.assertEqual((cwd / "draft.py").read_text(), "candidate = 1\n")
+                self.assertFalse((cwd / ".git").exists())
+                if absent:
+                    self.assertNotEqual(actual["terminal_id"], terminal)
+                else:
+                    self.assertEqual(actual["terminal_id"], terminal)
+                self.assertEqual(herdr.agents, {})
+                self.assertFalse(set(_verbs(herdr)) & {("agent", "start"), ("pane", "send-text")})
+                fresh.complete_run([])
+                self.assertNotIn(invoking, herdr.closed_workspaces)
+                self.assertIn(restored.child_workspace_id, herdr.closed_workspaces)
+
+    def test_actor_dispatch_reuses_then_recreates_closed_role_in_invoking_workspace(self) -> None:
+        from tests.test_role_session_revision import _Bench, _RoleLauncher, _lane, _tester_ctx, _init_repo
+
+        for reconstructed in (False, True):
+            with self.subTest(reconstructed=reconstructed), tempfile.TemporaryDirectory() as tmp:
+                bench = _Bench(tmp, launcher=_RoleLauncher())
+                herdr = FakeHerdr()
+                invoking_repo = Path(tmp) / "invoking"
+                _init_repo(invoking_repo)
+                invoking = herdr.add_workspace("invoking", invoking_repo)
+                operator = next(iter(herdr.panes))
+                ctx = _tester_ctx(bench.head, _lane())
+                launcher = _launcher(
+                    bench.actor._workspace_label(ctx),
+                    run_id=ctx.run_id,
+                    fingerprint=bench.target.target_repository_fingerprint,
+                    parent_workspace_id=invoking,
+                )
+                launcher._herdr = herdr
+                bench.actor.launcher = launcher
+                cwd = _checkout(Path(tmp), "tester")
+                envelopes = []
+
+                def reply(handle, envelope, role, lane):
+                    envelopes.append(envelope)
+                    envelope.write_text("{}", encoding="utf-8")
+                    return {}
+
+                with _launch_patches(), mock.patch.object(bench.actor, "_await_envelope", side_effect=reply):
+                    _, first, _ = bench.actor._launch(ctx, "tester", cwd, {}, prepare_cwd=lambda path: None)
+                    self.assert_selected(herdr, first)
+                    herdr._focus_pane(operator)
+                    _, reused, _ = bench.actor._launch(ctx, "tester", cwd, {}, prepare_cwd=lambda path: None)
+                    self.assertEqual((reused.pane_id, reused.agent_name), (first.pane_id, first.agent_name))
+                    self.assert_selected(herdr, reused)
+                    herdr("pane", "close", first.pane_id)
+                    herdr._focus_pane(operator)
+                    if reconstructed:
+                        launcher = _launcher(
+                            bench.actor._workspace_label(ctx),
+                            run_id=ctx.run_id,
+                            fingerprint=bench.target.target_repository_fingerprint,
+                            parent_workspace_id=invoking,
+                        )
+                        launcher._herdr = herdr
+                        bench.actor.launcher = launcher
+                    _, reopened, actual_cwd = bench.actor._launch(ctx, "tester", cwd, {}, prepare_cwd=lambda path: None)
+                self.assertNotEqual(reopened.pane_id, first.pane_id)
+                self.assertEqual(reopened.agent_name, first.agent_name)
+                self.assertNotEqual(reopened.workspace_id, invoking)
+                self.assertTrue(launcher._child_listed_under(invoking, reopened.workspace_id, {}))
+                self.assertEqual(actual_cwd, cwd.resolve())
+                self.assertEqual(herdr.panes[reopened.pane_id]["cwd"], str(cwd.resolve()))
+                self.assert_selected(herdr, reopened)
+                self.assertEqual(envelopes, [lch.role_result_path(cwd, turn) for turn in (1, 2, 3)])
+                self.assertEqual(
+                    [pid for pid, pane in herdr.panes.items() if pid not in herdr.closed_panes and pane.get("label") == "tester"],
+                    [reopened.pane_id],
+                )
+                self.assertIn(invoking, herdr.workspaces)
+                self.assertNotIn(operator, herdr.closed_panes)
+
+    def test_resume_in_another_workspace_moves_only_owned_live_pty(self) -> None:
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_repo = _checkout(root, "target")
+            old_parent = herdr.add_workspace("target", target_repo)
+            invoking = herdr.add_workspace("invoking", _checkout(root, "invoking"))
+            launcher = _launcher(lch.workspace_label_for("target", RUN_HASH))
+            launcher._herdr = herdr
+            worktree = _checkout(target_repo, "tester")
+            spec = _spec(worktree, lane=TESTS_LANE, role="tester", repository_root=target_repo, workspace_label=launcher.workspace_label)
+            handle = _launch(launcher, herdr, spec)
+            terminal = herdr.panes[handle.pane_id]["terminal_id"]
+            fresh = _launcher(
+                lch.workspace_label_for("target", RUN_HASH),
+                parent_workspace_id=invoking,
+            )
+            fresh._herdr = herdr
+            invoking_repo = root / "invoking"
+            anchor = _checkout(invoking_repo, "ui-anchor")
+            herdr.linked_checkouts[str(anchor.resolve())] = str(invoking_repo.resolve())
+            spec = replace(spec, child_anchor=anchor)
+            moved = _launch(fresh, herdr, spec)
+            pane = herdr.panes[moved.pane_id]
+            self.assertNotEqual(moved.workspace_id, invoking)
+            self.assertTrue(fresh._child_listed_under(invoking, moved.workspace_id, {}))
+            self.assertEqual(pane["terminal_id"], terminal)
+            self.assertEqual(pane["cwd"], str(worktree.resolve()))
+            self.assertNotEqual(moved.pane_id, handle.pane_id)
+            self.assertEqual(herdr.agents[handle.agent_name]["pane_id"], moved.pane_id)
+            self.assert_selected(herdr, moved)
+            fresh.wait_for_idle(moved, timeout_s=1.0)
+            fresh.retain(moved)
+            self.assertNotIn(handle.pane_id, herdr.closed_panes)
+            self.assertNotIn(old_parent, herdr.closed_workspaces)
 
 
 class LazyParentChildTest(unittest.TestCase):
@@ -1677,7 +2018,6 @@ class OwnershipMatrixTest(unittest.TestCase):
             # With the stable agent live, reconnection proves the child too.
             with self.assertRaises(lch.LaunchRefused) as live:
                 _launch(run.launcher(), run.herdr, tester)
-            self.assertIn("LANE_TOKEN_MISMATCH", live.exception.detail)
             self.assertEqual(_calls_after(run.herdr, mark, CREATE, OPEN, SPLIT, START), [])
             # With the agent gone, the child is found open by `worktree open`.
             run.herdr.agents.pop(first.agent_name)

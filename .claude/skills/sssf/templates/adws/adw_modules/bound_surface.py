@@ -541,21 +541,36 @@ _SIMPLE_ESCAPES = {
 }
 
 
-def _tokenize_javascript(source: str) -> list[_Token]:
+def _tokenize_javascript(source: str, *, comparison: bool = False) -> list[_Token]:
     tokens: list[_Token] = []
     index = 0
     length = len(source)
+    compared: list[_Token] = []
+    previous_end = 0
+
+    def emit(token: _Token) -> None:
+        nonlocal previous_end
+        tokens.append(token)
+        if comparison:
+            if compared and any(char in source[previous_end:start] for char in "\r\n\u2028\u2029"):
+                compared.append(_Token("linebreak", ""))
+            compared.append(_Token(token.kind, source[start:index]))
+            previous_end = index
 
     while index < length:
         char = source[index]
 
-        if char in " \t\r\n\f\v ﻿":
+        if char in " \t\r\n\f\v ﻿\u2028\u2029":
             index += 1
             continue
 
         if source.startswith("//", index):
-            end = source.find("\n", index)
-            index = length if end == -1 else end + 1
+            end = min(
+                (position for terminator in "\r\n\u2028\u2029"
+                 if (position := source.find(terminator, index)) != -1),
+                default=length,
+            )
+            index = min(end + 1, length)
             continue
 
         if source.startswith("/*", index):
@@ -563,19 +578,20 @@ def _tokenize_javascript(source: str) -> list[_Token]:
             index = length if end == -1 else end + 2
             continue
 
+        start = index
         if char in "'\"":
             value, index = _read_js_string(source, index)
-            tokens.append(_Token("str", value))
+            emit(_Token("str", value))
             continue
 
         if char == "`":
             index = _skip_js_template(source, index)
-            tokens.append(_Token("template", ""))
+            emit(_Token("template", ""))
             continue
 
         if char == "/" and _regex_allowed(tokens):
             index = _skip_js_regex(source, index)
-            tokens.append(_Token("regex", ""))
+            emit(_Token("regex", ""))
             continue
 
         if char.isdigit() or (
@@ -586,26 +602,26 @@ def _tokenize_javascript(source: str) -> list[_Token]:
                 source[index].isalnum() or source[index] in "._"
             ):
                 index += 1
-            tokens.append(_Token("num", source[start:index]))
+            emit(_Token("num", source[start:index]))
             continue
 
         if char.isalpha() or char in "_$":
             start = index
             while index < length and (source[index].isalnum() or source[index] in "_$"):
                 index += 1
-            tokens.append(_Token("name", source[start:index]))
+            emit(_Token("name", source[start:index]))
             continue
 
         for punctuator in _JS_PUNCTUATORS:
             if source.startswith(punctuator, index):
-                tokens.append(_Token("punct", punctuator))
                 index += len(punctuator)
+                emit(_Token("punct", punctuator))
                 break
         else:
-            tokens.append(_Token("punct", char))
             index += 1
+            emit(_Token("punct", char))
 
-    return tokens
+    return compared if comparison else tokens
 
 
 def _regex_allowed(tokens: list[_Token]) -> bool:

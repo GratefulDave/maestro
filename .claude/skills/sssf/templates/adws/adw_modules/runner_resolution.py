@@ -293,7 +293,15 @@ class ResolvedRunner:
 
     def collect_argv(self, gate: Any) -> Tuple[str, ...]:
         """The enumeration invocation for one gate. Never executes cases."""
-        return self.argv_prefix + COLLECT_ARGS[self.runner] + tuple(gate.argv)
+        tail = tuple(gate.argv)
+        if self.runner == "pytest":
+            # pytest's quiet/verbose actions accumulate, including -qq, -xq
+            # and long aliases. Its final store action overrides all of them
+            # without mistaking an option value or a selector for an option.
+            # Keep literal selectors after -- literal.
+            end = tail.index("--") if "--" in tail else len(tail)
+            tail = tail[:end] + ("--verbosity=-1", "-o", "addopts=") + tail[end:]
+        return self.argv_prefix + COLLECT_ARGS[self.runner] + tail
 
     def execute_argv(self, argv: Sequence[str]) -> Tuple[str, ...]:
         """The execution invocation. `argv` is the gate's own argv tail: the
@@ -940,7 +948,19 @@ def collect_cases(
                 hide=hide,
             ),
         )
-    return collected_identifiers(output)
+    ids = collected_identifiers(output)
+    # vitest list exits zero with an empty stdout for a genuine empty
+    # selection. pytest instead has the distinct capable exit 5.
+    native_empty = resolved.runner == "vitest" and not _ANSI.sub("", result.stdout or "").strip()
+    if not ids and result.returncode == 0 and not native_empty:
+        raise CollectFailed(
+            resolved.runner,
+            returncode=result.returncode,
+            detail="collection exited successfully but reported no native case "
+            "identifiers; its output cannot be measured: "
+            + bounded_collect_output(result.stdout or "", result.stderr or "", hide=hide),
+        )
+    return tuple(dict.fromkeys(ids))
 
 
 EXECUTE_TIMEOUT_S = 120.0

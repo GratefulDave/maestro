@@ -369,12 +369,8 @@ class SealedReleaseTests(unittest.TestCase):
         resume = _RecordingActor(self.repo, self.runtime.path / "worktrees")
         # The amended build's first candidate is green and its reviewer agrees.
         # `build_lanes` makes the candidate "ready" so the suite is green.
-        # `_sealed_error_history` used to count CODE_REVIEW rounds across plan
-        # revisions, so this lane inherited the pre-amendment argument's rounds
-        # and `HandoffActor`'s scripted opening REVISE landed as a stalling
-        # third one; a `code_rounds` seed skipped it. The window is scoped to
-        # the run's plan revision now, so the amended lane starts at round one
-        # and the seed is gone.
+        # Superseded review rounds do not belong to this revision's progress
+        # window; the amended lane receives a fresh content history.
         resume.build_lanes.append("lane-build")
         scheduler = self._scheduler(amended, resume, "run-amend")
         # The re-seal proves absence against a repository that holds the

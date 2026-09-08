@@ -452,6 +452,14 @@ class FakeHerdr:
             return self._worktree_list(
                 flag(args, "--workspace") or "", flag(args, "--cwd") or ""
             )
+        if verb == ("tab", "create"):
+            workspace_id = flag(args, "--workspace") or ""
+            self._require_workspace(workspace_id)
+            tab = self._new_tab(workspace_id, flag(args, "--label") or "")
+            pane = self._new_pane(workspace_id, tab["tab_id"], flag(args, "--cwd") or "")
+            if "--no-focus" not in args:
+                self._focus_pane(pane["pane_id"])
+            return {"result": {"type": "tab_created", "tab": dict(tab), "root_pane": dict(pane)}}
         if verb == ("tab", "list"):
             workspace_id = flag(args, "--workspace") or ""
             self._require_workspace(workspace_id)
@@ -468,6 +476,22 @@ class FakeHerdr:
         if verb == ("tab", "close"):
             self.tabs.pop(args[2], None)
             return {"result": {"type": "ok"}}
+        if verb == ("pane", "move"):
+            old_id = args[2]
+            self._require_pane(old_id)
+            tab_id = flag(args, "--tab") or ""
+            tab = self.tabs[tab_id]
+            old = self.panes.pop(old_id)
+            if old["workspace_id"] == tab["workspace_id"]:
+                pane_id = old_id
+            else:
+                pane_id = "{}:{}".format(tab["workspace_id"], self._next("p"))
+            moved = dict(old, pane_id=pane_id, workspace_id=tab["workspace_id"], tab_id=tab_id)
+            self.panes[pane_id] = moved
+            for agent in self.agents.values():
+                if agent["pane_id"] == old_id:
+                    agent["pane_id"] = pane_id
+            return {"result": {"type": "pane_move", "changed": True, "pane": dict(moved)}}
         if verb == ("pane", "split"):
             return self._pane_split(args)
         if verb == ("pane", "rename"):
@@ -480,14 +504,15 @@ class FakeHerdr:
             return {"result": {"type": "pane_info", "pane": dict(self.panes[args[2]])}}
         if verb == ("pane", "list"):
             workspace_id = flag(args, "--workspace") or ""
-            self._require_workspace(workspace_id)
+            if workspace_id:
+                self._require_workspace(workspace_id)
             return {
                 "result": {
                     "type": "pane_list",
                     "panes": [
                         dict(pane)
                         for pane in self.panes.values()
-                        if pane.get("workspace_id") == workspace_id
+                        if (not workspace_id or pane.get("workspace_id") == workspace_id)
                         and pane["pane_id"] not in self.closed_panes
                     ],
                 }
@@ -563,6 +588,10 @@ class FakeHerdr:
             }
         if verb == ("agent", "start"):
             return self._agent_start(args)
+        if verb == ("agent", "focus"):
+            agent = self._agent_info(args[2])
+            self._focus_pane(agent["pane_id"])
+            return {"result": {"type": "agent_info", "agent": self._agent_info(args[2])}}
         if verb in (("agent", "get"), ("agent", "wait")):
             return {
                 "result": {
@@ -573,6 +602,18 @@ class FakeHerdr:
         raise AssertionError(args)
 
     # ---- records -----------------------------------------------------------
+
+    def _focus_pane(self, pane_id: str) -> None:
+        self._require_pane(pane_id)
+        pane = self.panes[pane_id]
+        workspace_id, tab_id = pane["workspace_id"], pane["tab_id"]
+        for workspace in self.workspaces.values():
+            workspace["focused"] = workspace["workspace_id"] == workspace_id
+        self.workspaces[workspace_id]["active_tab_id"] = tab_id
+        for tab in self.tabs.values():
+            tab["focused"] = tab["tab_id"] == tab_id
+        for candidate in self.panes.values():
+            candidate["focused"] = candidate["pane_id"] == pane_id
 
     def _require_workspace(self, workspace_id: str) -> None:
         if workspace_id not in self.workspaces or workspace_id in self.closed_workspaces:
@@ -620,7 +661,7 @@ class FakeHerdr:
             "workspace_id": pane["workspace_id"],
             "tab_id": pane["tab_id"],
             "terminal_id": pane["terminal_id"],
-            "focused": False,
+            "focused": pane["focused"],
             "revision": int(pane.get("revision") or 0),
             "interactive_ready": agent["agent_status"] in ("idle", "done"),
             "launch_pending": False,
@@ -672,6 +713,8 @@ class FakeHerdr:
         root = next(
             pane for pane in self.panes.values() if pane["workspace_id"] == workspace_id
         )
+        if "--no-focus" not in args:
+            self._focus_pane(root["pane_id"])
         return {
             "result": {
                 "type": "workspace_created",
@@ -682,6 +725,11 @@ class FakeHerdr:
         }
 
     def _repo_root_of(self, workspace_id: str, path: str) -> str:
+        resolved = _resolved(path)
+        if (Path(resolved) / ".git").exists():
+            return str(lch.git_primary_workdir(Path(resolved)))
+        if resolved in self.linked_checkouts:
+            return self.linked_checkouts[resolved]
         binding = self.workspaces[workspace_id].get("worktree")
         if isinstance(binding, dict) and binding.get("repo_root"):
             return str(binding["repo_root"])
@@ -778,6 +826,8 @@ class FakeHerdr:
             ),
             {"path": resolved, "is_linked_worktree": True, "label": label},
         )
+        if "--no-focus" not in args:
+            self._focus_pane(root["pane_id"])
         return {
             "result": {
                 "type": "worktree_opened",
@@ -865,6 +915,8 @@ class FakeHerdr:
         pane = self._new_pane(
             str(parent["workspace_id"]), str(parent["tab_id"]), flag(args, "--cwd") or ""
         )
+        if "--no-focus" not in args:
+            self._focus_pane(pane["pane_id"])
         return {"result": {"type": "pane_info", "pane": dict(pane)}}
 
     def _agent_start(self, args: tuple[str, ...]) -> dict:

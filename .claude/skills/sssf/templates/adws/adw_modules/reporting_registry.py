@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -29,6 +30,50 @@ def _warn(detail: str) -> None:
     path = registry_path()
     sys.stderr.write("reporting registry {0}: {1}\n".format(path, detail))
 
+
+
+def read_run(database: Path, run_id: str) -> dict[str, Any] | None:
+    """Read discovery evidence without creating or migrating a ledger."""
+    if not database.is_file():
+        return None
+    conn = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def registered_run(run_id: str) -> tuple[Path, dict[str, Any]] | None:
+    """Registry paths locate ledgers; only persisted rows identify runs.
+
+    Missing installations are stale discovery entries. Malformed registries
+    and unreadable ledgers must not silently select a different installation.
+    """
+    payload = _read_unlocked(registry_path())
+    installations = payload.get("installations", [])
+    if not isinstance(installations, list):
+        raise ValueError("registry installations is not a list")
+    seen: set[Path] = set()
+    matches = []
+    for item in installations:
+        if not isinstance(item, Mapping) or not isinstance(item.get("database"), str):
+            raise ValueError("registry installation has no database path")
+        if not item["database"]:
+            raise ValueError("registry installation has empty database path")
+        database = Path(item["database"]).expanduser().resolve()
+        if database in seen:
+            continue
+        seen.add(database)
+        row = read_run(database, run_id)
+        if row is not None:
+            matches.append((database, row))
+    if len(matches) > 1:
+        raise ValueError("ambiguous registered run {0}".format(run_id))
+    return matches[0] if matches else None
 
 def register_installation(
     *,

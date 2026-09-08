@@ -33,7 +33,7 @@ if str(_RUNTIME_ROOT) not in sys.path:
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules.code_review import _COLLECTION_REVISE, _RUNNER_REVISE  # noqa: E402
 from adw_modules.reporting_registry import registry_path  # noqa: E402
-from adw_modules.scheduler import _sealed_error_history, _stalled  # noqa: E402
+from adw_modules.scheduler import _review_content_history, _stalled  # noqa: E402
 
 sys.path.insert(0, str(_TOOLS_DIR))
 import runtime_sync  # noqa: E402
@@ -312,8 +312,10 @@ def lane_table(
             )
         )
 
-    history = _sealed_error_history(SimpleNamespace(conn=conn), run_id, lane_id)
-    rows.append(("sealed_error_history", json.dumps(history)))
+    history = _review_content_history(
+        SimpleNamespace(conn=conn), run_id, lane_id, st.ArtifactKind.CODE_REVIEW
+    )
+    rows.append(("reviewed_attempts", str(len(history))))
     rows.append(("stalled", str(_stalled(history))))
 
     builder = latest_artifact(

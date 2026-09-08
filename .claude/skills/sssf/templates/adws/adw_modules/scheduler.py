@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import fcntl
 import json
@@ -231,25 +232,51 @@ def _base_invalidation_priors(
     )
 
 
-def _sealed_error_history(
-    store: ArtifactStore, run_id: str, lane_id: str
-) -> list[int]:
-    """Sealed failure counts for this lane's review rounds since the last block.
+def _substantive_blob(repo: Path, path: str, oid: str) -> str:
+    """Conservative syntax equality; unknown or invalid files stay exact."""
+    suffix = Path(path).suffix
+    if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"} or oid == "NO_BLOB":
+        return oid
+    raw = hv.cat_blob(repo, oid)
+    if suffix != ".py":
+        try:
+            tokens = bsf._tokenize_javascript(raw.decode("utf-8"), comparison=True)
+            # The surface scanner is not a JSX parser and its slash heuristic
+            # cannot distinguish every regex from division. Stay exact rather
+            # than erase executable JSX whitespace or regex-body spaces.
+            if suffix in {".jsx", ".tsx"} or any(
+                token.kind == "punct" and token.value in {"/", "/="}
+                for token in tokens
+            ):
+                return oid
+        except UnicodeError:
+            return oid
+        return st.digest_canonical(tokens)
+    try:
+        tree = ast.parse(raw)
+    except (SyntaxError, ValueError, UnicodeError):
+        return oid
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                del body[0]
+    return st.digest_bytes(ast.dump(tree, include_attributes=False).encode())
 
-    Counted as failed + errored rather than as passes. The two read the same
-    while `executed` holds still, but a round that collects a different number
-    of cases makes a pass count incomparable to the one before it, and a lane
-    whose suite shrinks would look like it was regressing. Errors are the
-    number that stays honest, and lower is better.
 
-    The window is the rounds of the argument the lane is having now, so two
-    records reset it and neither is a counter stored anywhere. The USER_WAIT
-    record is the later boundary: only rounds recorded after the most recent
-    one count, which is what makes an operator resume grant a fresh window.
-    The run's plan revision is the other: an amendment replaces the contract,
-    the sealed suite, and the findings the builder is answering, so rounds
-    recorded under a superseded revision are rounds of a finished argument.
-    Counting them parks a lane on its first post-amendment REVISE.
+def _review_content_history(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    review_kind: st.ArtifactKind,
+    vault: Optional[Path] = None,
+) -> list[tuple[str, int | None]]:
+    """Content of the exact reviewed artifacts in the current argument.
+
+    USER_WAIT and plan revision reset the window. A changed applicable base,
+    spec, projection or sealed suite starts a new argument, not a cycle.
+    Private identities stay here: neither the ledger nor operator output gets
+    the draft's paths, blobs, or content digest.
     """
     marker = 0
     for row in store.conn.execute(
@@ -258,74 +285,89 @@ def _sealed_error_history(
         (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
     ):
         marker = int(row["sequence"])
-    history: list[int] = []
+    producer_kind = (
+        st.ArtifactKind.TEST_DRAFT
+        if review_kind is st.ArtifactKind.TEST_REVIEW
+        else st.ArtifactKind.BUILDER_OUTPUT
+    )
+    history: list[tuple[str, int | None]] = []
+    applicability = None
     for row in store.conn.execute(
-        "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
-        "AND lane_id=? AND artifact_kind=? AND sequence>? "
+        "SELECT payload_json, spec_digest, lane_projection_digest "
+        "FROM lane_artifacts WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+        "AND sequence>? "
         "AND plan_revision=(SELECT plan_revision FROM runs WHERE run_id=?) "
         "ORDER BY sequence ASC",
-        (run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, marker, run_id),
+        (run_id, lane_id, review_kind.value, marker, run_id),
     ):
-        summary = _loads(row["payload_json"]).get("public_result_summary") or {}
-        failed = summary.get("failed")
-        errored = summary.get("errored")
-        if isinstance(failed, int) and isinstance(errored, int):
-            history.append(failed + errored)
+        review = _loads(row["payload_json"])
+        producers = [
+            artifact
+            for artifact_id in review.get("input_artifact_ids", ())
+            if (artifact := _lane_artifact_by_id(
+                store, run_id, lane_id, artifact_id
+            )) is not None and artifact.kind is producer_kind
+        ]
+        if len(producers) != 1:
+            raise FactoryRefused("review must name exactly one reviewed artifact")
+        payload = producers[0].payload
+        if producer_kind is st.ArtifactKind.TEST_DRAFT:
+            if vault is None:
+                raise FactoryRefused("test content history requires the private vault")
+            commit = hv.rev_parse(vault, payload["private_draft_ref"])
+            content = sorted(
+                (path, _substantive_blob(vault, path, oid))
+                for path, oid in tc._select_private_blobs(vault, commit, payload)
+            )
+            current = (
+                row["spec_digest"],
+                row["lane_projection_digest"],
+                hv.rev_parse(vault, commit + "^"),
+                st.digest_canonical(payload["public_contract"]),
+            )
+        else:
+            current = (
+                payload["spec_digest"],
+                payload["projection_digest"],
+                payload["builder_base_sha"],
+                payload["sealed_test_digest"],
+            )
+            # The admitted fixed-base delta names old/new paths, modes and
+            # blobs. Commit metadata and attempt ids are deliberately absent.
+            repo = Path(store.conn.execute(
+                "SELECT target_repository_root FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()["target_repository_root"])
+            content = []
+            for entry in payload["tree_delta"]:
+                item = dict(entry)
+                for side in ("old", "new"):
+                    item[side + "_oid"] = _substantive_blob(
+                        repo, item[side + "_path"], item[side + "_oid"]
+                    )
+                content.append(item)
+            content.sort(key=st.canonical_bytes)
+        if current != applicability:
+            history.clear()
+            applicability = current
+        summary = review.get("public_result_summary") or {}
+        outcome = summary.get("collected" if producer_kind is st.ArtifactKind.TEST_DRAFT else "passed")
+        history.append((st.digest_canonical(content), outcome))
     return history
 
 
-def _test_review_error_history(
-    store: ArtifactStore, run_id: str, lane_id: str
-) -> list[int]:
-    """Finding counts for this lane's test-review rounds since the last block.
-
-    The tests-lane counterpart of `_sealed_error_history`, read by the same
-    `_stalled` and reset by the same USER_WAIT marker. A tests lane has no
-    sealed suite to count errors from -- its draft has not been accepted yet --
-    so the number that stands in for errors is how many findings the round
-    still had to raise. Lower is better, and a PASS scores zero, exactly as a
-    green sealed suite does.
-
-    Every TEST_REVIEW round of the current argument counts, not only the ones
-    the harness measured. A reviewer that keeps saying REVISE without the
-    finding count coming down is the unbounded loop A9 names, and it is the
-    same shape as a build lane whose sealed errors stop falling. Three rounds
-    of slack, then the operator. Rounds recorded under a superseded plan
-    revision are excluded for the reason given there.
-    """
-    marker = 0
-    for row in store.conn.execute(
-        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
-        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
-        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
-    ):
-        marker = int(row["sequence"])
-    history: list[int] = []
-    for row in store.conn.execute(
-        "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
-        "AND lane_id=? AND artifact_kind=? AND sequence>? "
-        "AND plan_revision=(SELECT plan_revision FROM runs WHERE run_id=?) "
-        "ORDER BY sequence ASC",
-        (run_id, lane_id, st.ArtifactKind.TEST_REVIEW.value, marker, run_id),
-    ):
-        findings = _loads(row["payload_json"]).get("findings")
-        if isinstance(findings, list):
-            history.append(len(findings))
-    return history
-
-
-def _stalled(history: Sequence[int]) -> bool:
-    """True when the lane has had its slack and is no longer clearing errors.
-
-    History is error counts, so lower is better. Under the grace window a lane
-    may oscillate freely. At or past it, a round that fails to set a strict new
-    low is the end of the line: 8,8,8 stops on the third round, and 9,8,10,9
-    stops on the fourth because 9 never beats the 8 already reached. A lane
-    that keeps driving errors down never stops.
-    """
-    if len(history) < st.NO_PROGRESS_GRACE_ROUNDS:
+def _stalled(history: Sequence[tuple[str, int | None]]) -> bool:
+    """REVISE stops on regression, three flat outcomes, or repeated syntax."""
+    if not history:
         return False
-    return history[-1] >= min(history[:-1])
+    latest = history[-1][1]
+    prior = [count for _, count in history[:-1] if count is not None]
+    if latest is not None and prior and latest < max(prior):
+        return True
+    window = history[-st.NO_PROGRESS_GRACE_ROUNDS:]
+    if len(window) < st.NO_PROGRESS_GRACE_ROUNDS:
+        return False
+    plateau = latest is not None and all(count == latest for _, count in window)
+    return plateau or history[-1][0] in [content for content, _ in history[:-1]]
 
 
 def _writing_tests_predecessors(
@@ -1163,38 +1205,6 @@ def _collect_gate(
         min_cases=gate.min_cases,
         required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
     )
-
-
-def _collect_resolution_root(
-    gate: SimpleNamespace, tree: Path, run_repo: Path, *, provisioned: bool
-) -> Path:
-    """Where the draft's runner is resolved from. The rule `tests_chain` states.
-
-    `prepare_collect_tree` symlinks the runtime root's `node_modules` into the
-    tree, so a vitest resolved against the runtime root is the same
-    installation the tree imports from. Nothing bridges a Python environment,
-    so a pytest resolved against the runtime root is the *real* repository's
-    interpreter pointed at the tree's source.
-
-    `tests_chain._sealed_suite` has drawn that distinction since it was
-    written; this call site did not, and resolved everything against the
-    runtime root. FDAdb has no `.venv`, so rank 1 was empty, resolution fell
-    through to `uv run pytest`, uv discovered a *different* repository's
-    environment, and every pytest draft was refused
-    `no usable pytest was found for .` before a single case was collected --
-    measured 2026-09-03 on `lane-wp7-gw-dpa-tests`, seven seconds after the
-    tester's first draft, with the declared output present in the envelope.
-
-    `provisioned` is what keeps this from being a stricter rule than the
-    deployment can satisfy. A deployment that declares no `provision_argv`
-    has no environment in the tree to prefer, and preferring it anyway would
-    refuse every pytest draft in a deployment that collected fine before.
-    Where there is nothing to provision, the runtime root is the only
-    environment there is.
-    """
-    if gate.runner == "pytest" and provisioned:
-        return Path(tree)
-    return Path(run_repo)
 
 
 def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
@@ -2121,10 +2131,10 @@ class FactoryScheduler:
 
     def _measure_draft_gate(
         self, ctx: LaneContext, draft: st.LaneArtifact
-    ) -> tuple[Mapping[str, str], ...] | None:
-        """What the gate measures about this draft, as findings, or None.
+    ) -> tuple[tuple[Mapping[str, str], ...] | None, int | None]:
+        """Return gate findings and its native count (None when unmeasured).
 
-        None means the draft satisfies the gate and the test reviewer is the
+        No findings means the draft satisfies the gate and the test reviewer is the
         next reader. Findings mean it does not, and they are recorded as this
         round's REVISE without a reviewer being asked -- there is nothing for a
         reviewer to judge in a suite whose cases cannot be listed, and a
@@ -2142,12 +2152,12 @@ class FactoryScheduler:
         """
         gate = _lane_gate(self.actor, ctx.lane.lane_id)
         if gate is None:
-            return None
+            return None, None
         files = self._draft_private_files(draft)
         try:
             collected = self._collect_private_draft(ctx, gate, files)
         except DraftCollectionRefused as refused:
-            return _draft_collection_findings(str(refused))
+            return _draft_collection_findings(str(refused)), None
         # Names before count: a suite missing a required case is wrong in a way
         # the tester can act on, and saying "write 4 more cases" instead of
         # naming them is what let run a33d5e9b re-emit the same eleven.
@@ -2155,10 +2165,10 @@ class FactoryScheduler:
             collected, tuple(getattr(gate, "required_cases", ()) or ())
         )
         if missing:
-            return _draft_required_cases_findings(missing)
+            return _draft_required_cases_findings(missing), len(collected)
         if len(collected) < gate.min_cases:
-            return _draft_min_cases_findings(len(collected), gate.min_cases)
-        return None
+            return _draft_min_cases_findings(len(collected), gate.min_cases), len(collected)
+        return None, len(collected)
 
     def _assert_runners_usable(self) -> None:
         """Every runner the plan names must run, before any agent is dispatched.
@@ -2202,13 +2212,9 @@ class FactoryScheduler:
                     dest, self._provision_argv, self._provision_timeout_s
                 )
                 rr.prepare_collect_tree(run_repo, dest)
-                probe_gate = SimpleNamespace(runner=runner, cwd=cwd)
                 rr.resolve(
                     runner,
-                    _collect_resolution_root(
-                        probe_gate, dest, run_repo,
-                        provisioned=bool(self._provision_argv),
-                    ),
+                    dest,
                     cwd,
                     # Empty on purpose, and now stated rather than defaulted:
                     # this preflight runs before any candidate exists, so the
@@ -2267,11 +2273,10 @@ class FactoryScheduler:
         hv.checkout_vault_worktree(vault, base, dest)
         keep = False
         try:
-            # Before any private byte is written, exactly as the review tree
-            # provisions: nothing this runs, reads, or reports in an error can
-            # carry draft test bytes. It is also what puts an interpreter in
-            # the tree for `_collect_resolution_root` to find.
+            # Provision and bridge dependencies before probing, without exposing
+            # any private draft bytes to the environment measurement.
             cr.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
+            rr.prepare_collect_tree(run_repo, dest)
             # Resolve BEFORE the draft is written, because `resolve`'s probe is
             # a whole-tree `--collect-only` and would otherwise be measuring the
             # draft it is supposed to be measuring the environment for. FDAdb
@@ -2288,9 +2293,7 @@ class FactoryScheduler:
             # interpreter from a draft that will not collect.
             resolved = rr.resolve(
                 gate.runner,
-                _collect_resolution_root(
-                    gate, dest, run_repo, provisioned=bool(self._provision_argv)
-                ),
+                dest,
                 gate.cwd,
                 # Empty on purpose. This probe deliberately runs BEFORE
                 # `write_files`, so the draft's paths do not exist yet and
@@ -2374,7 +2377,7 @@ class FactoryScheduler:
             public_contract=draft.payload.get("public_contract"),
         )
         draft_artifact = _record_as_lane_artifact(draft, lane)
-        measured = self._measure_draft_gate(ctx, draft_artifact)
+        measured, collected = self._measure_draft_gate(ctx, draft_artifact)
         if measured is not None:
             verdict: st.ReviewerVerdict = st.ReviewerVerdict.REVISE
             findings: Sequence[Mapping[str, str]] = measured
@@ -2403,13 +2406,18 @@ class FactoryScheduler:
             test_draft=draft_artifact,
             private_tokens=tokens,
         )
+        if collected is not None:
+            payload = dict(artifact.payload, public_result_summary={"collected": collected})
+            artifact = dataclasses.replace(
+                artifact, payload=payload, output_digest=st.digest_canonical(payload)
+            )
         _complete(
             self.store,
             ctx,
             _with_input_artifact_ids(artifact, [plan.artifact_id, draft.artifact_id]),
         )
         # The lane is back at WRITING_TESTS and will redraft. A tests lane that
-        # keeps redrafting without the finding count coming down gets the same
+        # keeps redrafting without measured or substantive progress gets the same
         # answer a build lane does: park for the operator rather than opening
         # another tester turn. Only this lane stops; the run keeps advancing
         # every lane that does not need it.
@@ -2878,16 +2886,13 @@ class FactoryScheduler:
         # belongs in the guard. Keying on the reviewer's raw `verdict` -- what
         # this read before ad186ba -- would skip exactly that case.
         #
-        # A reviewer that says REVISE over a green suite now reaches here,
-        # which is the point. Those rounds score zero errors, so three of them
-        # satisfy `_stalled` and park the lane at WAITING_FOR_USER for the
-        # operator. That is the recoverable end of a reviewer that will not be
-        # satisfied; merging its candidate anyway was not.
+        # REVISE remains blocking even over a green suite. Repeated candidate
+        # content, measured plateau or regression parks only this lane.
         if settled is st.ReviewerVerdict.REVISE:
             self._block_if_stalled(lane_id)
 
     def _block_if_stalled(self, lane_id: str) -> None:
-        """Stop a lane that has stopped climbing.
+        """Pause a lane on measured stagnation or substantive repetition.
 
         Called once the REVISE has been recorded, so the lane already sits at
         the stage that will redo the work: BUILDING after a code review,
@@ -2895,18 +2900,19 @@ class FactoryScheduler:
         reviewing stage means a resume redoes the work against the findings
         instead of re-judging an artifact that was already judged.
 
-        Which history is read follows from that stage, because the two measure
-        different rounds of different work -- a tests lane has no sealed suite
-        to count errors from, and a build lane's test reviews belong to an
-        earlier, finished argument.
+        The stage selects collected cases or sealed passed outcomes, plus
+        substantive content. Findings never measure progress or grant approval.
         """
         stage = self.store.lane_stage(self.run_id, lane_id)
-        if stage is st.LaneStage.WRITING_TESTS:
-            history = _test_review_error_history(self.store, self.run_id, lane_id)
-            label = "test review findings"
-        else:
-            history = _sealed_error_history(self.store, self.run_id, lane_id)
-            label = "sealed errors"
+        review_kind = (
+            st.ArtifactKind.TEST_REVIEW
+            if stage is st.LaneStage.WRITING_TESTS
+            else st.ArtifactKind.CODE_REVIEW
+        )
+        history = _review_content_history(
+            self.store, self.run_id, lane_id, review_kind,
+            hv.vault_path(self.runtime.path, self.run_id),
+        )
         if not _stalled(history):
             return
         if stage not in st.PAUSEABLE_STAGES:
@@ -2923,9 +2929,7 @@ class FactoryScheduler:
         self._say(
             lane_id,
             "no progress, blocking for the operator",
-            "{0} {1} over {2} round(s); resume grants another {3}".format(
-                label,
-                ", ".join(str(count) for count in history),
+            "reviewed outcomes or substantive content stalled after {0} round(s); resume grants another {1}".format(
                 len(history),
                 st.NO_PROGRESS_GRACE_ROUNDS,
             ),

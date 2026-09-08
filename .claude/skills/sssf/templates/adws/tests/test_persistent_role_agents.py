@@ -47,6 +47,7 @@ def _bare_launcher(
     launcher._proven_absent = {}
     launcher._split_parent_id = None
     launcher._parent_workspace_id = ""
+    launcher._invocation_workspace_id = ""
     launcher._workspace_id = ""
     launcher._run_id = run_id
     launcher._repository_fingerprint = fingerprint
@@ -1090,7 +1091,7 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] == ("agent", "get"):
+                if args[:2] in (("agent", "get"), ("agent", "focus")):
                     return {
                         "result": {
                             "agent": {
@@ -1218,7 +1219,7 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get")):
+                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
                     return agent_record()
                 raise AssertionError(args)
 
@@ -1817,7 +1818,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get")):
+                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
                     return {
                         "result": {
                             "agent": {
@@ -1895,7 +1896,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
 
             def fake_herdr(*args: str, **kwargs: object) -> dict:
                 del kwargs
-                if args[:2] == ("agent", "get"):
+                if args[:2] in (("agent", "get"), ("agent", "focus")):
                     return {
                         "result": {
                             "agent": {
@@ -1918,6 +1919,10 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             }
                         }
                     }
+                if args[:2] == ("pane", "list"):
+                    return {"result": {"panes": [
+                        fake_herdr("pane", "get", "w9:p4")["result"]["pane"]
+                    ]}}
                 placed = _topology_reply(args)
                 if placed is not None:
                     return placed
@@ -1991,7 +1996,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get")):
+                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
                     agent: dict[str, object] = {
                         "pane_id": "w9:p4",
                         "agent_status": "idle",

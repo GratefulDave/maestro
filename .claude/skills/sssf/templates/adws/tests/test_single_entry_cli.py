@@ -664,6 +664,112 @@ class RunSelectionTest(SingleEntryBase):
         self.assertEqual(self.run_ids(), (created,))
 
 
+class RegisteredRunRoutingTest(SingleEntryBase):
+    def foreign_invocation(self) -> tuple[str, Path]:
+        self.invoke(["--plan", self.plan_name])
+        run_id = self.starts[0].run_id
+        maestro.register_installation(
+            database=self.state / "lifecycle.sqlite3",
+            plans_dir=self.plan_path.parent,
+            repository=self.repo,
+            state=self.state,
+        )
+        foreign = self.root / "foreign"
+        _init_repo(foreign)
+        self.maestro_file = install_deployment(foreign, self.root / "foreign-state")
+        return run_id, foreign
+
+    def test_repository_local_run_verbs_recover_registered_target(self) -> None:
+        run_id, foreign = self.foreign_invocation()
+        actor = ScriptedActor(self.repo, self.root / "worktrees")
+        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+            code, payload = self.invoke(
+                ["run", "status", run_id], cwd=foreign, record=False
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["status"], "executing")
+            code, payload = self.invoke(
+                ["run", "resume", run_id], cwd=foreign, record=False
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["status"], "complete")
+        self.assertTrue((self.repo / "a.txt").is_file())
+        self.assertFalse((foreign / "a.txt").exists())
+        self.assertFalse((self.root / "foreign-state").exists())
+        self.assertEqual(self.run_row(run_id)["target_repository_root"], str(self.repo))
+
+    def test_amend_from_foreign_deployment_uses_stored_target(self) -> None:
+        run_id, foreign = self.foreign_invocation()
+        amended = self.root / "amended-plan.v1"
+        amended.write_bytes(plan_bytes(goal="emit b.txt", output="b.txt"))
+        actor = ScriptedActor(self.repo, self.root / "worktrees")
+        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+            code, payload = self.invoke(
+                ["run", "amend", str(amended), "--run", run_id], cwd=foreign, record=False
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(self.run_row(run_id)["plan_revision"], 2)
+        self.assertTrue((self.repo / "b.txt").is_file())
+        self.assertFalse((self.root / "foreign-state").exists())
+
+    def test_multiple_matching_worktree_configs_refuse_before_binding(self) -> None:
+        run_id, foreign = self.foreign_invocation()
+        duplicate = self.root / "duplicate"
+        _git(self.repo, "worktree", "add", "--detach", str(duplicate))
+        code, payload = self.invoke(
+            ["run", "status", run_id], cwd=foreign, record=False
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["outcome"], "RUN_DEPLOYMENT_UNRESOLVED")
+
+    def test_only_wrong_runtime_config_refuses_without_using_foreign_config(self) -> None:
+        run_id, foreign = self.foreign_invocation()
+        install_deployment(self.repo, self.root / "wrong-state")
+        code, payload = self.invoke(
+            ["run", "status", run_id], cwd=foreign, record=False
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["outcome"], "RUN_DEPLOYMENT_UNRESOLVED")
+        self.assertFalse((self.root / "wrong-state").exists())
+        self.assertFalse((self.root / "foreign-state").exists())
+
+    def test_duplicate_registered_identity_refuses_but_local_run_wins(self) -> None:
+        run_id, foreign = self.foreign_invocation()
+        import shutil
+
+        duplicate = self.root / "duplicate-state"
+        shutil.copytree(self.state, duplicate)
+        maestro.register_installation(
+            database=duplicate / "lifecycle.sqlite3",
+            plans_dir=self.plan_path.parent,
+            repository=self.repo,
+            state=duplicate,
+        )
+        code, payload = self.invoke(
+            ["run", "status", run_id], cwd=foreign, record=False
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["outcome"], "RUN_DISCOVERY_REFUSED")
+        self.maestro_file = self.repo / "adws" / "maestro.py"
+        with mock.patch.object(maestro, "_actor_for", return_value=object()):
+            code, payload = self.invoke(["run", "status", run_id], record=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["run_id"], run_id)
+
+    def test_explicit_start_infers_cwd_repo_and_head(self) -> None:
+        actor = ScriptedActor(self.repo, self.root / "worktrees")
+        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+            code, payload = self.invoke(
+                ["run", "start", str(self.plan_path)], record=False
+            )
+        self.assertEqual(code, 0)
+        row = self.run_row(str(payload["run_id"]))
+        self.assertEqual(row["target_repository_root"], str(self.repo))
+        self.assertEqual(row["target_main_ref"], "refs/heads/main")
+        self.assertTrue((self.repo / "a.txt").is_file())
+
+
 class ConcurrentFirstInvocationTest(SingleEntryBase):
     def test_two_simultaneous_first_invocations_create_exactly_one_run(self) -> None:
         barrier = threading.Barrier(2)

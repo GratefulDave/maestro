@@ -834,51 +834,23 @@ def run_private_suite(
     files = tuple(paths)
     bound = _suite_gate(gate, files)
     root = Path(runtime_root or tree)
-    # Where the runner is resolved FROM is not the same question for the two
-    # runners, because only one of them has its environment bridged into the
-    # tree. `rr.COLLECT_RUNTIME_DIRS` is `("node_modules",)`: before executing,
-    # `prepare_collect_tree` symlinks the runtime root's `node_modules` into
-    # the tree, so a vitest resolved against the runtime root and the modules
-    # it imports are the same installation, and resolving vitest there is
-    # correct.
-    #
-    # Nothing bridges a Python environment. A pytest resolved against the
-    # runtime root is the REAL repository's interpreter, while
-    # `rr.execute_cases` runs it with cwd inside the review tree. Two ways that
-    # goes wrong, both silent: the repository's environment lacks what the
-    # candidate needs and the suite reports zero executed cases, or — worse —
-    # that environment has the project installed editable, `import app.x`
-    # resolves to the REAL repository's source, and the sealed suite greenly
-    # certifies code that is not the candidate's.
-    #
-    # It currently works only because the repository happens to have no
-    # `.venv`, so `_rank_candidates` falls through to `uv run pytest`, and uv
-    # discovers its environment from cwd — which is the tree. Creating a
-    # `.venv` in the repository would silently take resolution away from the
-    # tree. So pytest resolves against the tree it will execute in. If the tree
-    # has no usable environment, `rr.resolve` refuses, and an explicit
-    # `SEALED_SUITE_RUNNER_UNUSABLE:pytest` is the right answer — better than
-    # running the wrong interpreter against the wrong source.
-    resolution_root = Path(tree) if bound.runner == "pytest" else root
+    # Probe the tree that will execute the selectors. Only node dependencies
+    # are bridged; Python environments and editable imports stay tree-local.
+    rr.prepare_collect_tree(root, tree)
     try:
-        # Both runners resolve through `rr.resolve`. pytest used to be pinned
-        # to `sys.executable -m pytest`, the interpreter the *scheduler* runs
-        # under — a 3.9 scheduler could never import a
-        # `requires-python = ">=3.12"` project, so the sealed suite failed on
-        # import forever. `rr.resolve` probes a project-local environment first
-        # and refuses rather than guessing.
+        # Resolve the runner against the materialized execution environment.
         # Only the path operands. `_suite_selectors` returns a whole
         # invocation -- `--rootdir . -vv --tb=line …` -- and those flags are
         # this suite's reporting shape, not the probe's question.
         _argv, selectors = pr.substituted_gate_argv(bound.argv, files, Path(tree))
         resolved = rr.resolve(
-            bound.runner, resolution_root, bound.cwd, paths=selectors
+            bound.runner, Path(tree), bound.cwd, paths=selectors
         )
     except rr.RunnerUnusable as extra:
         raise pr.SealedEnvironmentError(
             "SEALED_SUITE_RUNNER_UNUSABLE:{0}".format(bound.runner)
         ) from extra
-    _assert_declared_python(resolved, resolution_root, Path(tree), bound.cwd, files)
+    _assert_declared_python(resolved, Path(tree), Path(tree), bound.cwd, files)
     exec_gate = SimpleNamespace(
         runner=bound.runner,
         argv=_suite_selectors(bound, files, Path(tree)),
