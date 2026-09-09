@@ -7,6 +7,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **A gating obligation names its observation seam or does not ship.** A claim a
+  tests lane must discharge carries an `observation_seam` in the Plan IR — the
+  public export, module boundary, injectable observer, recorded effect, or
+  output a case can assert on from the public contract. Ingress projects a tests
+  lane's claims as gating acceptance criteria carrying that field, and the
+  objective compiler refuses a gating criterion without one
+  (`OBLIGATION_UNOBSERVABLE`, `adw_modules/plan_validate.py`), so an obligation
+  no test can observe is refused when the plan is authored rather than after
+  three review rounds. Gating is declared, never read out of the prose: a plain
+  string criterion, and one declaring `gating: false`, is advisory and needs no
+  seam. The seam reaches the tester, builder, and reviewer appended to the
+  criterion it belongs to. `docs/plan-authoring.md` gains the authoring rule with
+  the FDAdb obligation before and after.
 - **The tester is told where a test double belongs, and how to report a subject
   it cannot reach.** `maestro.TEST_DOUBLE_BOUNDARY` is appended to both tester
   rules: substitute only at a boundary the lane does not own, never a

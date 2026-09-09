@@ -399,5 +399,152 @@ class ObjectiveCompilerTests(unittest.TestCase):
 
 
 
+class ObservationSeamTests(unittest.TestCase):
+    """A gating obligation names its observation seam or does not ship.
+
+    FDAdb run d246ae95's `lane-faq-producer-tests` carried "serving never calls
+    the FAQ producer" with nothing said about how a case observes it. A
+    same-module call whose result is discarded is unobservable from the public
+    contract, so the tester could not discharge it, the reviewer correctly
+    refused three rounds, and the lane parked. The defect was in the plan and
+    it is decidable at ship time.
+    """
+
+    _SEAM = (
+        "src/faq/producer.py is the producer's public module; serving's import "
+        "of it is the observable"
+    )
+
+    def _gating(self, **overrides) -> dict:
+        criterion = {
+            "criterion": "serving never calls the FAQ producer",
+            "gating": True,
+        }
+        criterion.update(overrides)
+        return criterion
+
+    def test_gating_obligation_without_a_seam_is_refused(self):
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(
+                _dump(_plan(_lane("lane-a", acceptance=[self._gating()])))
+            )
+        self.assertIn(pv.OBLIGATION_UNOBSERVABLE, _codes(caught.exception))
+        self.assertEqual(
+            caught.exception.refusals[0].pointer, "/lanes/0/acceptance/0"
+        )
+
+    def test_an_empty_seam_is_not_a_seam(self):
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(
+                _dump(
+                    _plan(
+                        _lane(
+                            "lane-a",
+                            acceptance=[self._gating(observation_seam="   ")],
+                        )
+                    )
+                )
+            )
+        self.assertIn(pv.ACCEPTANCE_MISSING, _codes(caught.exception))
+
+    def test_the_same_obligation_ships_once_it_names_its_seam(self):
+        compiled = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-a",
+                        lane_kind="tests",
+                        acceptance=[self._gating(observation_seam=self._SEAM)],
+                    )
+                )
+            )
+        )
+        self.assertEqual(
+            (
+                "serving never calls the FAQ producer [observable: {0}]".format(
+                    self._SEAM
+                ),
+            ),
+            _lane_of(compiled, "lane-a").public_acceptance,
+        )
+
+    def test_a_declared_seam_is_part_of_the_plan_identity(self):
+        """The seam is authored data, not a rendering of the criterion text."""
+        one = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-a",
+                        acceptance=[self._gating(observation_seam=self._SEAM)],
+                    )
+                )
+            )
+        )
+        other = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-a",
+                        acceptance=[
+                            self._gating(observation_seam="a different seam")
+                        ],
+                    )
+                )
+            )
+        )
+        self.assertNotEqual(one.plan_digest, other.plan_digest)
+
+    def test_an_advisory_obligation_needs_no_seam(self):
+        for acceptance in (
+            ["serving is fast enough"],
+            [{"criterion": "serving is fast enough"}],
+            [{"criterion": "serving is fast enough", "gating": False}],
+        ):
+            with self.subTest(acceptance=acceptance):
+                compiled = compile_plan(
+                    _dump(
+                        _plan(
+                            _lane(
+                                "lane-a", lane_kind="tests", acceptance=acceptance
+                            )
+                        )
+                    )
+                )
+                self.assertEqual(
+                    ("serving is fast enough",),
+                    _lane_of(compiled, "lane-a").public_acceptance,
+                )
+
+    def test_gating_is_declared_and_never_read_out_of_the_prose(self):
+        """"must" / "never" / "always" in the text does not make a criterion gate."""
+        compiled = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-a",
+                        lane_kind="tests",
+                        acceptance=["serving must never call the FAQ producer"],
+                    )
+                )
+            )
+        )
+        self.assertEqual(
+            ("serving must never call the FAQ producer",),
+            _lane_of(compiled, "lane-a").public_acceptance,
+        )
+
+    def test_an_unknown_acceptance_key_is_refused(self):
+        for item in (
+            {"criterion": "x", "gating": True, "seam": self._SEAM},
+            {"criterion": "x", "gating": "yes", "observation_seam": self._SEAM},
+            {"gating": True, "observation_seam": self._SEAM},
+            {"criterion": "  ", "gating": True, "observation_seam": self._SEAM},
+        ):
+            with self.subTest(item=item):
+                with self.assertRaises(PlanCompileError) as caught:
+                    compile_plan(_dump(_plan(_lane("lane-a", acceptance=[item]))))
+                self.assertIn(pv.ACCEPTANCE_MISSING, _codes(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

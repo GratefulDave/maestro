@@ -333,6 +333,7 @@ _CLAIM_FIELDS = (
     "kind",
     "mutation_kinds",
     "object",
+    "observation_seam",
     "owner",
     "polarity",
     "postconditions",
@@ -374,7 +375,10 @@ _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
     }
 }
 _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
-    name: "spec.obligations.claims" for name in _CLAIM_FIELDS
+    **{name: "spec.obligations.claims" for name in _CLAIM_FIELDS},
+    # A tests lane's claim is a gating obligation, so its declared seam is
+    # carried onto the acceptance criterion the compiler refuses without.
+    "observation_seam": "acceptance, spec.obligations.claims",
 }
 _CLAIM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
@@ -614,15 +618,43 @@ def _claim_sentence(claim: Mapping[str, Any]) -> str:
     return sentence
 
 
-def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]) -> list:
+def _observation_seam(claim: Mapping[str, Any]) -> Optional[str]:
+    seam = claim.get("observation_seam")
+    if isinstance(seam, str) and seam.strip():
+        return seam
+    return None
+
+
+def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]],
+                gating: bool) -> list:
+    """The lane's public acceptance: the verifier oracle, then one per claim.
+
+    On a tests lane every claim is an obligation the sealed suite must
+    discharge, so it is projected as a gating criterion carrying the claim's
+    declared `observation_seam`. A claim that declares none projects a gating
+    criterion with no seam, and the objective compiler refuses the plan
+    (`OBLIGATION_UNOBSERVABLE`) rather than shipping an obligation no case can
+    observe. Nothing here reads the claim's prose.
+    """
     verifier_id = _require_text(
         verifier.get("verifier_id"), "UNMAPPABLE_VERIFIERS", "verifier_id")
     oracle = _require_text(
         verifier.get("oracle"), "UNMAPPABLE_VERIFIERS",
         "{}.oracle".format(verifier_id))
-    return ["{}: {}".format(verifier_id, oracle)] + [
-        _claim_sentence(claim) for claim in claims
-    ]
+    head = ["{}: {}".format(verifier_id, oracle)]
+    if not gating:
+        return head + [_claim_sentence(claim) for claim in claims]
+    projected = []
+    for claim in claims:
+        criterion: dict = {
+            "criterion": _claim_sentence(claim),
+            "gating": True,
+        }
+        seam = _observation_seam(claim)
+        if seam is not None:
+            criterion["observation_seam"] = seam
+        projected.append(criterion)
+    return head + projected
 
 
 def _seam_prose(seams: Sequence[Mapping[str, Any]]) -> str:
@@ -926,6 +958,16 @@ def _assert_ingress_projection_is_total(
         "{}.claim_ids".format(lane_id))
     if len(acceptance) != 1 + len(claim_ids):
         _fail("len(acceptance)", 1 + len(claim_ids), len(acceptance))
+    if kind == "tests":
+        for offset, claim in enumerate(
+                _bound_records(ir, lane, "claim_ids", "claims", "claim_id")):
+            declared = _observation_seam(claim)
+            item = acceptance[offset + 1]
+            carried = item.get("observation_seam") if isinstance(item, dict) else None
+            if declared != carried:
+                _fail(
+                    "acceptance[{0}].observation_seam".format(offset + 1),
+                    declared, carried)
     branch = maestro.get("integration_branch")
     if spec.get("integration", {}).get("integration_branch") != branch:
         _fail("spec.integration.integration_branch", branch,
@@ -1098,7 +1140,8 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             "outputs": list(outputs),
             "lane_kind": lane_kind,
             "spec": spec,
-            "acceptance": _acceptance(verifier, claims),
+            "acceptance": _acceptance(
+                verifier, claims, lane_kind == "tests"),
         }
         strength = verifier.get("test_strength")
         if lane_kind == "tests":
