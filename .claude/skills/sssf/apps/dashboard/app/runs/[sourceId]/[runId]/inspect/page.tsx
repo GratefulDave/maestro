@@ -1,3 +1,4 @@
+import { ArtifactList } from "@/components/ArtifactList";
 import { EmptyState } from "@/components/EmptyState";
 import { RunChrome, loadRunOrBanner } from "@/components/RunFrame";
 import { StatusPill } from "@/components/StatusPill";
@@ -145,6 +146,20 @@ export default async function RunInspectPage({
             </table>
           </div>
         )}
+      </section>
+      <section className="panel section-panel">
+        <div className="section-heading">
+          <div>
+            <h2>Artifacts</h2>
+            <p>
+              Every artifact this run recorded, in ledger order. Open one to read the body
+              the factory stored. Bodies are published through the API&apos;s per-kind key
+              allowlist, so a sealed test draft shows its public contract and its digests
+              and never its source.
+            </p>
+          </div>
+        </div>
+        <ArtifactList results={run.results} />
       </section>
     </RunChrome>
   );

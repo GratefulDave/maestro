@@ -1254,3 +1254,199 @@ code,
     grid-template-columns: 1fr;
   }
 }
+
+/* artifact list — the run inspect page's expandable artifact bodies */
+.artifact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.artifact-entry {
+  border: 1px solid var(--color-border-soft);
+  border-radius: 8px;
+  background: var(--color-elev);
+}
+
+.artifact-entry[open] {
+  border-color: var(--color-border);
+}
+
+.artifact-entry > summary {
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  grid-template-columns: 46px 200px minmax(120px, 1fr) 140px 96px minmax(0, 2fr);
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 0.81rem;
+  list-style: none;
+}
+
+.artifact-entry > summary::-webkit-details-marker {
+  display: none;
+}
+
+.artifact-entry > summary:hover {
+  background: rgb(255 255 255 / 3%);
+}
+
+.artifact-seq {
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.artifact-kind {
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.artifact-lane {
+  color: var(--color-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-when {
+  color: var(--color-faint);
+  font-size: 0.74rem;
+}
+
+.artifact-ref {
+  color: var(--color-faint);
+  direction: rtl;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-body {
+  border-top: 1px solid var(--color-border-soft);
+  padding: 12px 14px 14px;
+}
+
+/* json tree */
+.json-tree {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.55;
+}
+
+.json-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.json-copy {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-panel-2);
+  color: var(--color-muted);
+  font-family: var(--font-sans);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  text-transform: uppercase;
+}
+
+.json-copy:hover {
+  border-color: var(--color-accent);
+  color: var(--color-ink);
+}
+
+.json-branch > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  list-style: none;
+  padding: 1px 0;
+}
+
+.json-branch > summary::-webkit-details-marker {
+  display: none;
+}
+
+.json-branch > summary::before {
+  color: var(--color-faint);
+  content: "▸";
+  font-size: 0.66rem;
+  width: 9px;
+}
+
+.json-branch[open] > summary::before {
+  content: "▾";
+}
+
+.json-branch > summary:hover .json-key {
+  color: var(--color-accent);
+}
+
+.json-leaf {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 1px 0 1px 16px;
+}
+
+.json-key {
+  color: var(--color-muted);
+  flex: none;
+}
+
+.json-key::after {
+  color: var(--color-faint);
+  content: ":";
+}
+
+.json-brace,
+.json-count {
+  color: var(--color-faint);
+  font-size: 0.71rem;
+}
+
+.json-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.json-string {
+  color: var(--color-ok);
+}
+.json-number {
+  color: var(--color-accent);
+}
+.json-boolean {
+  color: var(--color-warn);
+}
+.json-null,
+.json-other {
+  color: var(--color-faint);
+}
+
+@media (max-width: 1100px) {
+  .artifact-entry > summary {
+    grid-template-columns: 44px minmax(0, 1fr);
+    grid-template-areas:
+      "seq kind"
+      "lane lane";
+    row-gap: 4px;
+  }
+  .artifact-when,
+  .artifact-ref {
+    display: none;
+  }
+}

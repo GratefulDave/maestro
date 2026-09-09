@@ -46,6 +46,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   key a draft's private payload uses. A draft carrying `source`,
   `private_files`, `selectors` or `expected` still publishes none of them, and
   `server/artifactFactoryDb.test.ts` pins that from a hostile fixture.
+- **The run inspect page shows every artifact, openable to its body.** A new
+  Artifacts section lists each `lane_artifacts` / `run_artifacts` row in ledger
+  order — sequence, kind, lane, verdict, when, and the ref its bytes are pinned
+  under — and expands to the body as a collapsible tree with a copy button
+  (`dashboard/components/ArtifactList.tsx`, `ArtifactPayload.tsx`,
+  `lib/jsonTree.ts`). Collapsed by default; the first finding of a review opens
+  with the row, because a review artifact's findings are the reason to open it.
+  Expansion is a native `<details>`, so the list works before hydration.
+  Nothing was removed: the existing Results / adjudications table stays.
 - **The tester is told where a test double belongs, and how to report a subject
   it cannot reach.** `maestro.TEST_DOUBLE_BOUNDARY` is appended to both tester
   rules: substitute only at a boundary the lane does not own, never a
