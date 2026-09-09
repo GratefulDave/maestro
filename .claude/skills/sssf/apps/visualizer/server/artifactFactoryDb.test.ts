@@ -342,7 +342,9 @@ describe("run/lane/stage/artifact mapping", () => {
         kind: "TEST_REVIEW",
         payload: {
           verdict: "REVISE",
-          findings: [{ message: `${PRIVATE_TOKEN} failed at line 3` }],
+          // As the factory writes it: `private_review.actionable_findings`
+          // has already replaced every private token with `[redacted]`.
+          findings: [{ observed_behavior: "[redacted] failed at line 3" }],
         },
       });
       insertLaneArtifact(db, {
@@ -399,7 +401,19 @@ describe("run/lane/stage/artifact mapping", () => {
         actor: null,
       }),
     ]);
-    expect(JSON.stringify(detail.results)).not.toContain("TEST_DRAFT");
+    // A draft is now listed, because its public contract and digests are
+    // worth reading. Its body is not: the per-kind allowlist names no key
+    // that a draft's private payload uses.
+    const draft = detail.results.find(
+      (r) => (r.payload as { artifact_id: string }).artifact_id === "art-draft",
+    )!;
+    expect(draft.artifact_kind).toBe("TEST_DRAFT");
+    expect(draft.sequence).toBe(1);
+    expect(draft.payload).not.toHaveProperty("source");
+    expect(draft.payload).not.toHaveProperty("private_files");
+    expect(draft.payload).not.toHaveProperty("selectors");
+    expect(draft.payload).not.toHaveProperty("expected");
+    expect(draft.payload).not.toHaveProperty("vault");
     const code = detail.results.find((r) => (r.payload as { artifact_id: string }).artifact_id === "art-code-review")!;
     expect(code.adjudication).toBe("REVISE");
     expect(code.payload).toEqual(
@@ -416,7 +430,17 @@ describe("run/lane/stage/artifact mapping", () => {
     const testReview = detail.results.find(
       (r) => (r.payload as { artifact_id: string }).artifact_id === "art-test-review",
     )!;
-    expect(testReview.payload).not.toHaveProperty("findings");
+    // Published, because the factory redacts a test review's findings before
+    // it writes them (`tests_chain.review_test_draft` →
+    // `private_review.actionable_findings`, then `refuse_private_leak` over
+    // the artifact's canonical bytes). The ledger holds redacted text.
+    expect(testReview.payload).toEqual(
+      expect.objectContaining({
+        findings: [
+          expect.objectContaining({ observed_behavior: "[redacted] failed at line 3" }),
+        ],
+      }),
+    );
     expect(testReview.adjudication).toBe("REVISE");
     db.close();
   });
@@ -566,7 +590,7 @@ describe("run/lane/stage/artifact mapping", () => {
         sequence: 2,
         stage: "REVIEWING_TESTS",
         kind: "TEST_REVIEW",
-        payload: { verdict: "REVISE", findings: [{ message: PRIVATE_TOKEN }] },
+        payload: { verdict: "REVISE", findings: [{ observed_behavior: "[redacted]" }] },
       });
     });
     const db = new ArtifactFactoryDb(path);
@@ -576,7 +600,6 @@ describe("run/lane/stage/artifact mapping", () => {
     expect(dumped).not.toContain("private_files");
     expect(dumped).not.toContain("selectors");
     expect(dumped).not.toContain(PRIVATE_SOURCE);
-    expect(dumped).not.toContain("TEST_DRAFT");
     db.close();
   });
 
@@ -592,6 +615,83 @@ describe("run/lane/stage/artifact mapping", () => {
 });
 
 describe("payload allowlist", () => {
+  test("publishes only the keys named for the kind", () => {
+    // Every key a real FDAdb LANE_PLAN carries, plus one the table does not
+    // name. The unnamed key is what must not survive.
+    const body = publicArtifactBody(
+      "LANE_PLAN",
+      JSON.stringify({
+        declared_outputs: ["src/lib/seo/faq.test.ts"],
+        input_artifact_ids: [],
+        input_digest: "3678ee",
+        lane_kind: "tests",
+        needs: [],
+        plan_artifact_ref: "/repo/specs/fdadb-wp6.maestro-plan.json",
+        private_files: { "tests/test_secret.py": PRIVATE_TOKEN },
+      }),
+    );
+    expect(body).toEqual({
+      declared_outputs: ["src/lib/seo/faq.test.ts"],
+      input_artifact_ids: [],
+      input_digest: "3678ee",
+      lane_kind: "tests",
+      needs: [],
+      plan_artifact_ref: "/repo/specs/fdadb-wp6.maestro-plan.json",
+      role: "planner",
+    });
+  });
+
+  test("keeps a draft's contract and digests and drops its body", () => {
+    const body = publicArtifactBody(
+      "TEST_DRAFT",
+      JSON.stringify({
+        public_contract: { acceptance_criteria: ["verify-lane-a: …"] },
+        private_draft_digest: "f57fbd",
+        private_manifest_schema: "private-manifest.v1",
+        source: PRIVATE_SOURCE,
+        selectors: ["test_secret"],
+        expected: PRIVATE_TOKEN,
+      }),
+    );
+    expect(body).toEqual({
+      public_contract: { acceptance_criteria: ["verify-lane-a: …"] },
+      private_draft_digest: "f57fbd",
+      private_manifest_schema: "private-manifest.v1",
+      role: "tester",
+    });
+  });
+
+  test("carries a code review's advisory findings, which cause no transition", () => {
+    const body = publicArtifactBody(
+      "CODE_REVIEW",
+      JSON.stringify({
+        verdict: "PASS",
+        findings: [],
+        advisory_findings: [
+          { implementation_area: "spl_bytes", observed_behavior: "no containment check" },
+        ],
+        public_result_summary: { executed: 11, passed: 11 },
+      }),
+    );
+    expect(body).toEqual(
+      expect.objectContaining({
+        verdict: "PASS",
+        advisory_findings: [
+          expect.objectContaining({ implementation_area: "spl_bytes" }),
+        ],
+        public_result_summary: { executed: 11, passed: 11 },
+      }),
+    );
+  });
+
+  test("refuses a verdict that is not a real one", () => {
+    const body = publicArtifactBody(
+      "TEST_REVIEW",
+      JSON.stringify({ verdict: "APPROVED_BY_ME", findings: [] }),
+    );
+    expect(body).not.toHaveProperty("verdict");
+  });
+
   test("strips non-public keys even when called directly", () => {
     const body = publicArtifactBody("TEST_DRAFT", JSON.stringify({
       source: PRIVATE_SOURCE,

@@ -602,6 +602,20 @@ export interface MaestroResult {
   subject_sha: string | null;
   adjudication: string | null;
   created_at: string | null;
+  /**
+   * Ledger sequence of the artifact this row reports, so a reader can order
+   * lane and run artifacts together as the factory recorded them. Null for a
+   * legacy-lifecycle ledger, which has no artifact table.
+   */
+  sequence: number | null;
+  /** `lane_artifacts.artifact_kind` — LANE_PLAN, TEST_REVIEW, CODE_REVIEW, … */
+  artifact_kind: string | null;
+  /** Where the artifact's bytes are pinned: a git ref, a vault ref, a path. */
+  artifact_ref: string | null;
+  /**
+   * The artifact body an operator may read: the per-kind key allowlist in
+   * `artifactFactoryDb.publicArtifactBody`, never `payload_json` wholesale.
+   */
   payload: unknown;
 }
 
