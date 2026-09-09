@@ -102,6 +102,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A lane's Space is counted once, however many worktrees it has open.**
+  `HerdrLauncher._adopt_existing_lane` iterated `worktree list` rows and
+  appended a match once per row. Herdr lists one Space on more than one row
+  when that Space has more than one linked worktree open: observed on FDAdb
+  run `d246ae9592be478396ad5146a89f00ae`, Space `w1HH` appeared for both
+  `.../ui-worktrees/<run>/<hash>/lane-faq-producer-tests` and
+  `.../worktrees/<run>/lane-faq-producer-tests/tester/checkout`. Two rows,
+  one Space, and the resume refused `BINDING_MISMATCH:DUPLICATE_LANE_WORKSPACE`
+  although exactly one Space was tagged for the lane. Rows are now grouped by
+  `open_workspace_id` and each distinct child is classified once, using the
+  union of its rows for any row-level fact (path match, row label); two
+  genuinely different Spaces still refuse as `DUPLICATE_LANE_WORKSPACE`.
 - **A tree is provisioned after its final materialization, never before one.**
   The first fix for FDAdb run `d246ae9592be478396ad5146a89f00ae` put actor
   provisioning in `HerdrLauncher.launch`, which runs *before* the launcher's
