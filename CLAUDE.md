@@ -542,6 +542,19 @@ identically, for three rounds. Fix: the bridge is deleted; all three sites call 
 `RUNNER_PREFLIGHT_REFUSED` at round 1 instead of failing silently under the wrong actor's
 name for three.
 
+**And the first fix for that was in the wrong place.** It provisioned the actor's tree from
+`HerdrLauncher.launch` — which runs before the launcher's own `spec.prepare_adopted_cwd`
+callback, and that callback is a materialization: it re-runs `prepare_cwd`, and for a
+private tree `hv.refresh_materialized_commit` unlinks every child. So on the two paths that
+reach a pane which already exists, a reused role pane and an adopted agent, the tree was
+provisioned and then wiped, and the agent started in it anyway. The test reviewer reported
+`vitest/config` `ERR_MODULE_NOT_FOUND` for ten rounds and was right every time. The
+invariant is an ordering, not a gate: **provision a tree after its final materialization,
+never before one.** `HerdrStageActor._prepared_cwd` owns both paths;
+`HerdrLauncher.provision` is deleted. Anywhere a tree is prepared in more than one step,
+ask which step runs last — a destructive step after an installing one destroys it silently,
+and the actor it dispatches gets the blame.
+
 One idea, not two: a fix applied to one of several sibling paths converts a loud round-1
 refusal into a quiet multi-round failure blamed on the wrong actor. Deployment
 consequence: FDAdb's `provision_argv` needs `npm ci --prefer-offline --no-audit --no-fund`

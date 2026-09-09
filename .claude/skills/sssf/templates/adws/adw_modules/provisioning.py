@@ -10,7 +10,8 @@ if the runner cannot load. The refusal is only true of the actor trees if they
 are provisioned by the same function with the same argv.
 
 Until 2026-09-09 they were not. `HerdrLauncher.provision` carried its own copy
-of "run `provision_argv`, raise on non-zero", and the harness's collect trees
+of "run `provision_argv`, raise on non-zero" -- since deleted -- and the
+harness's collect trees
 additionally symlinked the product repository's `node_modules` into the
 checkout (`runner_resolution.prepare_collect_tree`). The bridge made the
 preflight and the draft collect succeed in a deployment whose `provision_argv`
@@ -76,11 +77,20 @@ def provision_tree(
     copied in, so nothing provisioning writes, reads, or reports back in an
     error can carry private test bytes.
 
-    It also runs once per materialization by construction.
+    The invariant every caller owes this function: **provision a tree after its
+    final materialization, never before one.** Materializing is destructive --
     `hv.refresh_materialized_commit` unlinks every child of the tree, which is
-    every installed dependency and any marker a previous run could have left, so
-    there is no "already provisioned" state inside the tree to detect. The
-    durable cache is the package manager's own, outside the tree.
+    every installed dependency and any marker a previous run could have left,
+    and a git checkout resets it -- so there is no "already provisioned" state
+    inside the tree to detect, and nothing this function installs survives a
+    later materialization. The durable cache is the package manager's own,
+    outside the tree.
+
+    `LaunchSpec.prepare_adopted_cwd` is a materialization. Until 2026-09-09 the
+    actor path provisioned from `HerdrLauncher.launch`, which runs before that
+    callback, so every reused role pane and every adopted agent started in a
+    tree whose dependencies had just been unlinked. `HerdrStageActor.
+    _prepared_cwd` now owns both, and the launcher provisions nothing.
     """
     argv = tuple(str(item) for item in provision_argv if str(item))
     if not argv:

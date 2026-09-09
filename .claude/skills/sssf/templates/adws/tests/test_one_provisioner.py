@@ -10,7 +10,7 @@ tester, reviewer and builder trees, which had no bridge, could not resolve
 Two properties restore the invariant, and both are asserted here rather than
 grepped for:
 
-* the scheduler's preflight and draft-collect trees, the launcher's actor
+* the scheduler's preflight and draft-collect trees, the actor's role
   worktree, and the code-review tree all call `provisioning.provision_tree`,
   so a patch of that one function observes every site; and
 * with nothing bridged in, a provisioned tree whose runner cannot load is
@@ -29,6 +29,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import sys
+
+ADWS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ADWS))
+
+import maestro
 from adw_modules import code_review as cr
 from adw_modules import launcher as lch
 from adw_modules import provisioning
@@ -150,10 +156,17 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
         self.assertFalse((self.tree / "node_modules").exists())
 
     def test_the_actor_worktree(self) -> None:
-        launcher = lch.HerdrLauncher.__new__(lch.HerdrLauncher)
-        launcher.provision_argv = ("provisioner", "--install")
-        launcher.provision_timeout_s = 7.0
-        launcher.provision(self.tree)
+        # Moved out of `HerdrLauncher.provision`, which is deleted: the actor
+        # provisions the tree after its final materialization, because the
+        # launcher's own callbacks materialize it again after `launch` begins.
+        # See `test_provision_after_materialize.py` for the ordering itself.
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor.launcher = SimpleNamespace(
+            provision_argv=("provisioner", "--install"), provision_timeout_s=7.0
+        )
+        materialized: list[Path] = []
+        actor._prepared_cwd(self.tree, materialized.append)
+        self.assertEqual(materialized, [self.tree])
         self.assertEqual(
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7.0)]
         )
@@ -176,14 +189,16 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
             self.assertNotIn("runtime_root", inspect.signature(fn).parameters, fn.__name__)
 
 
-class TheLauncherRefusesTyped(unittest.TestCase):
+class TheActorRefusesTyped(unittest.TestCase):
     def test_a_failing_provisioner_is_a_launch_refusal_not_a_bare_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            launcher = lch.HerdrLauncher.__new__(lch.HerdrLauncher)
-            launcher.provision_argv = ("sh", "-c", "echo 'lockfile is stale' >&2; exit 3")
-            launcher.provision_timeout_s = 30.0
+            actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+            actor.launcher = SimpleNamespace(
+                provision_argv=("sh", "-c", "echo 'lockfile is stale' >&2; exit 3"),
+                provision_timeout_s=30.0,
+            )
             with self.assertRaises(lch.LaunchRefused) as caught:
-                launcher.provision(Path(tmp))
+                actor._prepared_cwd(Path(tmp), lambda _: None)
         exc = caught.exception
         self.assertIs(exc.refusal, lch.LaunchRefusal.PROVISION_FAILED)
         self.assertTrue(str(exc).startswith("LAUNCH_REFUSED:PROVISION_FAILED:"))
