@@ -216,7 +216,17 @@ def ledger(tmp_path: Path) -> dict:
                     "projection_digest": DIGEST,
                     "builder_base_sha": head,
                     "sealed_test_digest": DIGEST,
-                    "tree_delta": [{"path": "file.txt", "blob": _digest("candidate")}],
+                    # The admitted delta's real shape: old/new path and oid
+                    # per entry. A fixture that invents keys measures nothing --
+                    # `_review_content_history` reads `old_path` and stops.
+                    "tree_delta": [
+                        {
+                            "old_path": "file.txt",
+                            "new_path": "file.txt",
+                            "old_oid": _digest("base"),
+                            "new_oid": _digest("candidate"),
+                        }
+                    ],
                     "candidate_sha": head,
                 }
             ),
@@ -317,39 +327,70 @@ def test_reports_stage_and_wait_and_rounds(ledger, capsys):
     assert "candidate_matches_head  True" in out
 
 
-def test_new_content_is_progress_despite_unchanged_failure_counts(ledger, capsys):
-    _code, out = _run(ledger, capsys, "--lane", "lane-build")
-    rows = dict(
-        line.split(None, 1) for line in out.splitlines()
-        if line.startswith(("reviewed_attempts", "stalled"))
-    )
-    assert rows["reviewed_attempts"] == "3"
-    assert rows["stalled"] == "True"
-    assert st.digest_canonical(
-        [{"path": "file.txt", "blob": _digest("candidate")}]
-    ) not in out
+def _rewrite(ledger, sequence: int, mutate) -> None:
+    """Edit one artifact payload in the fixture ledger."""
     conn = sqlite3.connect(ledger["database"])
     try:
-        for sequence in (1, 3, 5):
-            payload = json.loads(conn.execute(
-                "SELECT payload_json FROM lane_artifacts WHERE run_id=? "
-                "AND lane_id=? AND sequence=?",
-                (RUN_ID, "lane-build", sequence),
-            ).fetchone()[0])
-            payload["tree_delta"][0]["blob"] = _digest("changed:{0}".format(sequence))
-            conn.execute(
-                "UPDATE lane_artifacts SET payload_json=? WHERE run_id=? "
-                "AND lane_id=? AND sequence=?",
-                (json.dumps(payload), RUN_ID, "lane-build", sequence),
-            )
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM lane_artifacts WHERE run_id=? "
+            "AND lane_id=? AND sequence=?",
+            (RUN_ID, "lane-build", sequence),
+        ).fetchone()[0])
+        mutate(payload)
+        conn.execute(
+            "UPDATE lane_artifacts SET payload_json=? WHERE run_id=? "
+            "AND lane_id=? AND sequence=?",
+            (json.dumps(payload), RUN_ID, "lane-build", sequence),
+        )
         conn.commit()
     finally:
         conn.close()
+
+
+def _stall_rows(ledger, capsys) -> tuple[dict, str]:
     _code, out = _run(ledger, capsys, "--lane", "lane-build")
     rows = dict(
         line.split(None, 1) for line in out.splitlines()
-        if line.startswith(("reviewed_attempts", "stalled"))
+        if line.startswith(("reviewed_attempts", "stalled", "review_kind"))
     )
+    return rows, out
+
+
+def test_new_content_and_a_rising_count_is_progress(ledger, capsys):
+    # Three rounds of the same candidate content at the same passed count:
+    # repeated content and a plateau, and the tool says so.
+    rows, out = _stall_rows(ledger, capsys)
+    assert rows["review_kind"] == st.ArtifactKind.CODE_REVIEW.value
+    assert rows["reviewed_attempts"] == "3"
+    assert rows["stalled"] == "True"
+    assert st.digest_canonical(
+        [
+            {
+                "old_path": "file.txt",
+                "new_path": "file.txt",
+                "old_oid": _digest("base"),
+                "new_oid": _digest("candidate"),
+            }
+        ]
+    ) not in out
+
+    # New content each round and a passed count that climbs: not a stall.
+    for index, sequence in enumerate((1, 3, 5)):
+        _rewrite(
+            ledger,
+            sequence,
+            lambda payload, sequence=sequence: payload["tree_delta"][0].update(
+                new_oid=_digest("changed:{0}".format(sequence))
+            ),
+        )
+        _rewrite(
+            ledger,
+            sequence + 1,
+            lambda payload, index=index: payload["public_result_summary"].update(
+                passed=9 + index
+            ),
+        )
+    rows, _out = _stall_rows(ledger, capsys)
     assert rows["reviewed_attempts"] == "3"
     assert rows["stalled"] == "False"
 

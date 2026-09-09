@@ -828,15 +828,14 @@ def run_private_suite(
     paths: Sequence[str],
     *,
     gate: Any = None,
-    runtime_root: Path | None = None,
     timeout_s: float = 120.0,
 ) -> dict:
     files = tuple(paths)
     bound = _suite_gate(gate, files)
-    root = Path(runtime_root or tree)
-    # Probe the tree that will execute the selectors. Only node dependencies
-    # are bridged; Python environments and editable imports stay tree-local.
-    rr.prepare_collect_tree(root, tree)
+    # The tree runs with what provisioning installed in it and nothing else.
+    # Nothing is bridged in from the product checkout: a dependency that is
+    # missing here is missing for every actor tree too, and belongs to the
+    # round-1 runner preflight, not to this measurement.
     try:
         # Resolve the runner against the materialized execution environment.
         # Only the path operands. `_suite_selectors` returns a whole
@@ -862,7 +861,6 @@ def run_private_suite(
         exec_gate,
         tree,
         timeout_s=timeout_s,
-        runtime_root=root if Path(root).resolve() != Path(tree).resolve() else None,
     )
     output = str(raw.get("output") or "")
     returncode = int(raw.get("returncode") or 0)

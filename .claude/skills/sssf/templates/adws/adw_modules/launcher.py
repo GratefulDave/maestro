@@ -175,6 +175,15 @@ class LaunchRefusal(Enum):
     #: open; publication is not rolled back. Non-deterministic: a retry may
     #: observe the confirmation that this attempt did not.
     SESSION_RENAME_UNCONFIRMED = ("SESSION_RENAME_UNCONFIRMED", True, False)
+    #: The deployment's `provision_argv` failed in the worktree an actor was
+    #: about to be dispatched into. Raised before any herdr call, so no pane
+    #: exists. Deterministic: the command and the tree it runs in are the
+    #: same on every attempt, and dispatching an agent into an unprovisioned
+    #: tree is what the round-1 runner preflight exists to refuse. It is the
+    #: same `ReviewProvisioningError` the review and collect trees raise,
+    #: restated as a launch refusal rather than escaping as a bare
+    #: `RuntimeError` no operator-facing clause mapped.
+    PROVISION_FAILED = ("PROVISION_FAILED", False, True)
 
 
     def __init__(
@@ -5569,13 +5578,21 @@ class HerdrLauncher:
         return classify_error(exc)
 
     def provision(self, worktree: Path) -> None:
+        # The one provisioner every factory tree crosses. `provisioning`
+        # imports this module for `run_harness_process`, so it is bound here
+        # at call time rather than at import.
+        from . import provisioning as prov
+
         if not self.provision_argv:
             return
-        result = run_harness_process(
-            self.provision_argv, cwd=worktree, timeout=self.provision_timeout_s
-        )
-        if result.returncode != 0:
-            raise RuntimeError("PROVISION_FAILED:{}".format(result.stderr[-400:]))
+        try:
+            prov.provision_tree(
+                worktree, self.provision_argv, self.provision_timeout_s
+            )
+        except prov.ReviewProvisioningError as exc:
+            raise LaunchRefused(
+                LaunchRefusal.PROVISION_FAILED, exc.detail or str(exc), pane_created=False
+            ) from exc
 
 
 

@@ -123,6 +123,38 @@ RESUMABLE_WAIT_REASONS: Tuple[WaitReason, ...] = (
 NO_PROGRESS_GRACE_ROUNDS = 3
 
 
+def stall_regression_on_findings(config: Any) -> bool:
+    """`stall.regression_on_findings` off a loaded config. Absent means False.
+
+    A tests round is measured by its findings count, not by its collected case
+    count: a tester fixing assertions inside the same cases cannot move the
+    case count, and a lane that answered a shrinking list of findings was
+    parked for making no progress. Findings are still not approval and still
+    grant nothing -- they are only what a tests round can change.
+
+    The plateau and repeated-content rules apply at every setting. This key
+    decides one thing: whether a single worse tests round is itself a stall.
+    Default False, because a reviewer that finds one more thing after the
+    tester fixed three is describing the same work getting better.
+
+    Read by the config loader and by `tools/lane_gates.py`, so the tool and the
+    scheduler cannot disagree about where the key lives or what absent means.
+    """
+    if config is None:
+        return False
+    if not isinstance(config, Mapping):
+        raise ValueError("config root must be a mapping")
+    stall = config.get("stall")
+    if stall is None:
+        return False
+    if not isinstance(stall, Mapping):
+        raise ValueError("stall must be a mapping")
+    value = stall.get("regression_on_findings", False)
+    if not isinstance(value, bool):
+        raise ValueError("stall.regression_on_findings must be a boolean")
+    return value
+
+
 class BuildingEntryKind(str, Enum):
     INITIAL = "INITIAL"
     CODE_REVISE = "CODE_REVISE"

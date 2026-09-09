@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
-from typing import Any, Sequence, cast
+from typing import Any, Optional, Sequence, cast
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -155,8 +155,13 @@ class DraftActor:
         selector: str = PRIVATE,
         required_cases: Sequence[str] = (),
         review_verdict: st.ReviewerVerdict = st.ReviewerVerdict.PASS,
+        review_findings: Optional[Sequence[int]] = None,
     ) -> None:
         self.selector = selector
+        #: One findings count per reviewed round. A tests round's outcome is
+        #: this number, so a suite that shrinks its reviewer's list is making
+        #: progress even when it collects the same cases every time.
+        self.review_findings = list(review_findings or ())
         self.bodies = list(bodies)
         self.write_contexts: list[sch.LaneContext] = []
         self.review_contexts: list[sch.LaneContext] = []
@@ -189,16 +194,23 @@ class DraftActor:
 
     def review_tests(self, ctx: sch.LaneContext) -> Any:
         self.review_contexts.append(ctx)
+        if self.review_findings:
+            count = self.review_findings.pop(0)
+            return st.ReviewerVerdict.REVISE, tuple(
+                self._finding(index) for index in range(count)
+            )
         if self.review_verdict is st.ReviewerVerdict.PASS:
             return st.ReviewerVerdict.PASS, ()
-        return st.ReviewerVerdict.REVISE, (
-            {
-                "implementation_area": "private tests",
-                "observed_behavior": "the suite asserts nothing about refusal",
-                "required_behavior": "assert the refusal path too",
-                "violated_requirement": "acceptance",
-            },
-        )
+        return st.ReviewerVerdict.REVISE, (self._finding(0),)
+
+    @staticmethod
+    def _finding(index: int) -> dict:
+        return {
+            "implementation_area": "private tests",
+            "observed_behavior": "case {0} asserts nothing about refusal".format(index),
+            "required_behavior": "assert the refusal path too",
+            "violated_requirement": "acceptance",
+        }
 
     def build(self, ctx: sch.LaneContext) -> dict:
         del ctx
@@ -288,7 +300,12 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def _start(
-        self, actor: DraftActor, *, runner: str = "pytest", dependency: bool = False
+        self,
+        actor: DraftActor,
+        *,
+        runner: str = "pytest",
+        dependency: bool = False,
+        regression_on_findings: bool = False,
     ) -> sch.FactoryScheduler:
         plan = _plan_bytes(runner=runner, selector=actor.selector)
         if dependency:
@@ -307,7 +324,12 @@ class DraftGateVerdictTests(unittest.TestCase):
             target=target,
         )
         scheduler = sch.FactoryScheduler(
-            self.store, RUN_ID, actor, self.runtime, target
+            self.store,
+            RUN_ID,
+            actor,
+            self.runtime,
+            target,
+            regression_on_findings=regression_on_findings,
         )
         scheduler._planned(LANE_ID)
         return scheduler
@@ -453,16 +475,79 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.assertEqual(self._stage(), st.LaneStage.WAITING_FOR_USER)
         self.assertEqual(actor.review_calls, 3)
 
-    def test_increasing_collected_outcomes_continue(self) -> None:
-        actor = DraftActor([_cases(4), _cases(5), _cases(6), _cases(7)])
+    def test_shrinking_findings_over_a_flat_case_count_continue(self) -> None:
+        # FDAdb run d246ae95, `lane-faq-producer-tests`: twelve cases every
+        # round, findings 7, 5, 4, and the lane was parked for making no
+        # progress. What a tests round moves is its reviewer's list.
+        actor = DraftActor(
+            [_cases(12).replace("assert True", "assert " + str(n)) for n in (1, 2, 3, 4)],
+            review_findings=[7, 5, 4, 3],
+        )
         scheduler = self._start(actor)
         for _ in range(4):
             self._round(scheduler)
             self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
         self.assertEqual(self._artifacts(st.ArtifactKind.USER_WAIT), [])
+        self.assertEqual(
+            [r["public_result_summary"]["collected"] for r in self._reviews()],
+            [12, 12, 12, 12],
+        )
+        self.assertEqual(actor.review_calls, 4)
+
+    def test_flat_findings_park_at_the_grace_window(self) -> None:
+        actor = DraftActor(
+            [_cases(12).replace("assert True", "assert " + str(n)) for n in (1, 2, 3)],
+            review_findings=[4, 4, 4],
+        )
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WAITING_FOR_USER)
+        waits = self._artifacts(st.ArtifactKind.USER_WAIT)
+        self.assertEqual(waits[0]["wait_reason"], st.WaitReason.NO_PROGRESS.value)
+
+    def _one_worse_round(self, opted_in: bool) -> st.LaneStage:
+        actor = DraftActor(
+            [_cases(12).replace("assert True", "assert " + str(n)) for n in (1, 2)],
+            review_findings=[4, 6],
+        )
+        scheduler = self._start(actor, regression_on_findings=opted_in)
+        self.assertIs(scheduler.regression_on_findings, opted_in)
+        self._round(scheduler)
+        self._round(scheduler)
+        return self._stage()
+
+    def test_one_worse_round_continues_by_default(self) -> None:
+        self.assertEqual(self._one_worse_round(False), st.LaneStage.WRITING_TESTS)
+
+    def test_one_worse_round_parks_where_the_deployment_opted_in(self) -> None:
+        self.assertEqual(
+            self._one_worse_round(True), st.LaneStage.WAITING_FOR_USER
+        )
+
+    def test_a_rising_case_count_under_repeated_refusals_continues(self) -> None:
+        # A draft the harness itself refuses carries one substituted finding
+        # every round, so findings alone would read a draft climbing toward
+        # min_cases as flat. The case count is the half that moved.
+        actor = DraftActor([_cases(4), _cases(6), _cases(8)])
+        scheduler = self._start(actor)
+        for _ in range(3):
+            self._round(scheduler)
+            self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self.assertEqual(self._artifacts(st.ArtifactKind.USER_WAIT), [])
+        self.assertEqual(actor.review_calls, 0)
+        self.assertEqual(
+            [r["public_result_summary"]["collected"] for r in self._reviews()],
+            [4, 6, 8],
+        )
 
     def test_test_history_uses_named_draft_not_newest_unreviewed_draft(self) -> None:
-        actor = DraftActor([_cases(4), _cases(5), _cases(6), _cases(4)])
+        actor = DraftActor(
+            [_cases(12).replace("assert True", "assert " + str(n)) for n in (1, 2, 3, 1)],
+            review_findings=[7, 5, 4, 3],
+        )
         scheduler = self._start(actor)
         for _ in range(3):
             self._round(scheduler)
@@ -470,7 +555,7 @@ class DraftGateVerdictTests(unittest.TestCase):
         history = sch._review_content_history(
             self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW, self._vault()
         )
-        self.assertFalse(sch._stalled(history))
+        self.assertFalse(sch._stalled(history, st.ArtifactKind.TEST_REVIEW))
 
     def test_changed_draft_base_resets_grace(self) -> None:
         actor = DraftActor([_cases(8)] * 5)
@@ -511,9 +596,12 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.assertEqual(self._stage(), st.LaneStage.WAITING_FOR_USER)
         self.assertEqual([r["public_result_summary"]["collected"] for r in self._reviews()], [8, 8, 8])
 
-    def test_collected_regression_after_improvement_pauses(self) -> None:
-        actor = DraftActor([_cases(n) for n in (4, 6, 8, 6)])
-        scheduler = self._start(actor)
+    def test_findings_regression_after_improvement_pauses_when_opted_in(self) -> None:
+        actor = DraftActor(
+            [_cases(12).replace("assert True", "assert " + str(n)) for n in (1, 2, 3, 4)],
+            review_findings=[8, 6, 4, 6],
+        )
+        scheduler = self._start(actor, regression_on_findings=True)
         for _ in range(3):
             self._round(scheduler)
             self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
@@ -576,12 +664,26 @@ class DraftGateVerdictTests(unittest.TestCase):
 
     # -- the finding still carries the runner, never the draft --------------
 
+    def _provisioned_fake_vitest(self) -> tuple[str, ...]:
+        """A `provision_argv` that installs the fake vitest into the tree it runs in.
+
+        The fake lives outside the product checkout. Nothing is bridged in from
+        `self.repo`: the collect tree holds exactly what provisioning put there,
+        which is what the tester's own tree will hold.
+        """
+        fake = _install_fake_vitest(self.root / "fake-runtime")
+        return (
+            "/bin/sh",
+            "-c",
+            "mkdir -p node_modules/.bin && cp {0} node_modules/.bin/vitest".format(fake),
+        )
+
     def test_vitest_collect_refused_forwards_stderr_not_private_source(self) -> None:
-        _install_fake_vitest(self.repo)
         secret = "SECRET_ORACLE_LITERAL"
         body = _vitest_cases(1).replace("case 0", secret)
         actor = DraftActor([body], selector=VITEST_PRIVATE)
         scheduler = self._start(actor, runner="vitest")
+        scheduler._provision_argv = self._provisioned_fake_vitest()
         failed = rr.CollectFailed(
             "vitest",
             returncode=1,
@@ -602,15 +704,16 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
         self.assertEqual(actor.review_calls, 0)
 
-    def test_vitest_draft_collects_via_product_node_modules_link(self) -> None:
-        _install_fake_vitest(self.repo)
+    def test_vitest_draft_collects_in_the_provisioned_tree(self) -> None:
         actor = DraftActor([_vitest_cases(9)], selector=VITEST_PRIVATE)
         scheduler = self._start(actor, runner="vitest")
+        scheduler._provision_argv = self._provisioned_fake_vitest()
         self._round(scheduler)
         self.assertEqual(self._stage(), st.LaneStage.TESTS_SEALED)
         self.assertEqual(len(self._drafts()), 1)
         self.assertEqual(actor.review_calls, 1)
         self.assertFalse((self.repo / VITEST_PRIVATE).exists())
+        self.assertFalse((self.repo / "node_modules").exists())
         leftover = list((self.runtime.path / "worktrees").glob("draft-collect-*"))
         self.assertEqual(leftover, [])
 
@@ -650,7 +753,8 @@ class CollectIdentifierTests(unittest.TestCase):
             ids = rr.collect_cases(resolved, gate, tree)
             self.assertEqual(len(ids), 2)
 
-    def test_vitest_collect_without_runtime_root_keeps_module_error(self) -> None:
+    def test_vitest_collect_in_unprovisioned_tree_keeps_module_error(self) -> None:
+        # No bridge repairs the tree: what the runner printed is the refusal.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             product = root / "product"
@@ -671,26 +775,6 @@ class CollectIdentifierTests(unittest.TestCase):
             self.assertNotIn("must not run", detail)
             self.assertNotIn(str(vault), detail)
             self.assertIn("$tree", detail)
-
-    def test_vitest_collect_links_product_node_modules(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            product = root / "product"
-            vault = root / "vault"
-            fake = _install_fake_vitest(product)
-            target = vault / VITEST_PRIVATE
-            target.parent.mkdir(parents=True)
-            target.write_text(_vitest_cases(2), encoding="utf-8")
-            resolved = rr.ResolvedRunner(runner="vitest", executable=str(fake))
-            gate = SimpleNamespace(runner="vitest", argv=(VITEST_PRIVATE,), cwd=".")
-            ids = rr.collect_cases(resolved, gate, vault, runtime_root=product)
-            self.assertEqual(len(ids), 2)
-            self.assertTrue((vault / "node_modules").is_symlink())
-            self.assertEqual(
-                (vault / "node_modules").resolve(),
-                (product / "node_modules").resolve(),
-            )
-            self.assertFalse((product / VITEST_PRIVATE).exists())
 
     def test_bounded_collect_output_strips_ansi_and_caps(self) -> None:
         stderr = (

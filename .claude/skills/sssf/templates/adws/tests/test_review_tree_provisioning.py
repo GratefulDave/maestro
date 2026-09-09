@@ -38,6 +38,7 @@ from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import hidden_vault as hv  # noqa: E402
 from adw_modules import launcher as lch  # noqa: E402
 from adw_modules import private_review as pr  # noqa: E402
+from adw_modules import provisioning  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
@@ -315,7 +316,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         base = _git(self.repo, "rev-parse", "HEAD")
         sha, ref = self._head()
 
-        with mock.patch.object(cr, "run_harness_process") as harness:
+        with mock.patch.object(provisioning, "run_harness_process") as harness:
             artifact = cr.review_builder_output(
                 request=_request(
                     run_id=self.run_id,
@@ -341,7 +342,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PLAIN_TEST_SOURCE, "blank")
         head = _git(self.repo, "rev-parse", "HEAD")
 
-        with mock.patch.object(cr, "run_harness_process") as harness:
+        with mock.patch.object(provisioning, "run_harness_process") as harness:
             result = cr.run_integration_gate(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
@@ -811,7 +812,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PLAIN_TEST_SOURCE, "timeout")
         head = _git(self.repo, "rev-parse", "HEAD")
 
-        with mock.patch.object(cr, "run_harness_process") as harness:
+        with mock.patch.object(provisioning, "run_harness_process") as harness:
             harness.return_value = subprocess.CompletedProcess([], 0, "", "")
             cr.run_integration_gate(
                 run_id=self.run_id,
@@ -832,7 +833,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PLAIN_TEST_SOURCE, "deftimeout")
         head = _git(self.repo, "rev-parse", "HEAD")
 
-        with mock.patch.object(cr, "run_harness_process") as harness:
+        with mock.patch.object(provisioning, "run_harness_process") as harness:
             harness.return_value = subprocess.CompletedProcess([], 0, "", "")
             cr.run_integration_gate(
                 run_id=self.run_id,
@@ -926,7 +927,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PLAIN_TEST_SOURCE, "collide")
         sha, _ref = self._head()
 
-        with mock.patch.object(cr, "run_harness_process") as harness:
+        with mock.patch.object(provisioning, "run_harness_process") as harness:
             cr.detect_candidate_private_collisions(
                 request=_request(
                     run_id=self.run_id,

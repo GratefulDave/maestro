@@ -301,6 +301,14 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["concurrency"] = _config_concurrency(
         loaded.get("concurrency"), "concurrency"
     )
+    # One key, read where the tool reads it, so a deployment cannot be told two
+    # different things about when a tests lane stops.
+    try:
+        loaded["stall_regression_on_findings"] = st.stall_regression_on_findings(
+            loaded
+        )
+    except ValueError as exc:
+        raise _MaestroConfigurationError(str(exc)) from exc
     loaded["repo"] = repo.resolve()
     return loaded
 
@@ -2587,6 +2595,9 @@ def _run_start(args: argparse.Namespace) -> int:
                 step=console.step,
                 compiled=compiled,
                 concurrency=layout.get("concurrency") or 1,
+                regression_on_findings=bool(
+                    layout.get("stall_regression_on_findings")
+                ),
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -2773,6 +2784,9 @@ def _run_resume(args: argparse.Namespace) -> int:
                 step=console.step,
                 compiled=compiled,
                 concurrency=layout.get("concurrency") or 1,
+                regression_on_findings=bool(
+                    layout.get("stall_regression_on_findings")
+                ),
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -2839,6 +2853,9 @@ def _run_amend(args: argparse.Namespace) -> int:
                 step=console.step,
                 compiled=compiled,
                 concurrency=layout.get("concurrency") or 1,
+                regression_on_findings=bool(
+                    layout.get("stall_regression_on_findings")
+                ),
             )
             status = scheduler.run()
             console.finished(run_id, status)
