@@ -176,13 +176,17 @@ class LaunchRefusal(Enum):
     #: observe the confirmation that this attempt did not.
     SESSION_RENAME_UNCONFIRMED = ("SESSION_RENAME_UNCONFIRMED", True, False)
     #: The deployment's `provision_argv` failed in the worktree an actor was
-    #: about to be dispatched into. Raised before any herdr call, so no pane
-    #: exists. Deterministic: the command and the tree it runs in are the
-    #: same on every attempt, and dispatching an agent into an unprovisioned
-    #: tree is what the round-1 runner preflight exists to refuse. It is the
-    #: same `ReviewProvisioningError` the review and collect trees raise,
-    #: restated as a launch refusal rather than escaping as a bare
-    #: `RuntimeError` no operator-facing clause mapped.
+    #: about to be dispatched into. Raised by `HerdrStageActor._prepared_cwd`,
+    #: which provisions the tree after its final materialization: on a first
+    #: launch that is before any herdr call, and on the reused and adopted
+    #: paths it is inside `prepare_adopted_cwd`, whose pane this launch did not
+    #: create. Either way no pane is left behind by the refusal, so
+    #: `pane_created` is False at both raise sites. Deterministic: the command
+    #: and the tree it runs in are the same on every attempt, and dispatching
+    #: an agent into an unprovisioned tree is what the round-1 runner preflight
+    #: exists to refuse. It is the same `ReviewProvisioningError` the review
+    #: and collect trees raise, restated as a launch refusal rather than
+    #: escaping as a bare `RuntimeError` no operator-facing clause mapped.
     PROVISION_FAILED = ("PROVISION_FAILED", False, True)
 
 
@@ -766,7 +770,6 @@ class LauncherAdapter(Protocol):
     def poll(self, handle: LaunchHandle) -> PollResult: ...
     def cancel(self, handle: LaunchHandle, deadline: float) -> None: ...
     def classify(self, exc: BaseException) -> ErrorClass: ...
-    def provision(self, worktree: Path) -> None: ...
     def resubmit(
         self,
         handle: LaunchHandle,
@@ -4570,7 +4573,10 @@ class HerdrLauncher:
         else:
             raise LaunchRefused(LaunchRefusal.UNSUPPORTED_ROUTE, spec.route)
         worktree = spec.worktree.resolve()
-        self.provision(worktree)
+        # The launcher does not provision. `HerdrStageActor._prepared_cwd`
+        # does, after the tree's final materialization -- which on the reused
+        # and adopted paths is `spec.prepare_adopted_cwd`, called from inside
+        # this method, after this point. Provisioning here wiped itself.
         environment = MappingProxyType(dict(spec.environment))
         # The pane shell is forked by the herdr server, not by the CLI process
         # below, so `env=` alone leaves the bracket's redirection outside the
@@ -5577,24 +5583,6 @@ class HerdrLauncher:
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)
 
-    def provision(self, worktree: Path) -> None:
-        # The one provisioner every factory tree crosses. `provisioning`
-        # imports this module for `run_harness_process`, so it is bound here
-        # at call time rather than at import.
-        from . import provisioning as prov
-
-        if not self.provision_argv:
-            return
-        try:
-            prov.provision_tree(
-                worktree, self.provision_argv, self.provision_timeout_s
-            )
-        except prov.ReviewProvisioningError as exc:
-            raise LaunchRefused(
-                LaunchRefusal.PROVISION_FAILED, exc.detail or str(exc), pane_created=False
-            ) from exc
-
-
 
 class FakeLauncher:
     def __init__(self) -> None:
@@ -5734,9 +5722,6 @@ class FakeLauncher:
 
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)
-
-    def provision(self, worktree: Path) -> None:
-        return None
 
 
 

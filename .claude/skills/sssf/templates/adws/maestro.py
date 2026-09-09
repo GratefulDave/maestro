@@ -36,6 +36,7 @@ from adw_modules import code_review as cr
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import private_review as prv
+from adw_modules import provisioning
 from adw_modules import review_standards as rvs
 from adw_modules import scheduler_types as st
 from adw_modules import step_log
@@ -66,6 +67,15 @@ from adw_modules.scheduler import (
     run_row,
     runs_for_target,
     target_from_binding,
+)
+# Private on purpose: the actor provisions a role tree with the binding this
+# run was admitted with, read off the launcher by the same two helpers the
+# scheduler uses for its own trees. Re-reading `maestro.config.yaml` here
+# would let a role tree be provisioned with a command the run was not
+# admitted with.
+from adw_modules.scheduler import (  # noqa: F401
+    _resolved_provision_argv,
+    _resolved_provision_timeout,
 )
 from adw_modules.plan_model import PlanCompileError
 
@@ -1735,6 +1745,46 @@ class HerdrStageActor:
             )
         return bool(stale)
 
+    def _prepared_cwd(self, cwd: Path, prepare_cwd: Callable[[Path], None]) -> None:
+        """Materialize the tree, then install its dependencies. In that order.
+
+        A tree is provisioned after its *final* materialization, never before
+        one. Materializing is destructive by construction --
+        `hv.refresh_materialized_commit` unlinks every child of the tree, and a
+        git checkout resets it -- so anything installed before a later
+        materialization is gone by the time the agent reads the tree.
+
+        That is not hypothetical. Provisioning first lived in
+        `HerdrLauncher.launch`, which runs after this dispatch's `prepare_cwd`
+        and *before* `prepare_adopted_cwd`, and `prepare_adopted_cwd` is a
+        materialization: it is called on the two paths that reach a pane which
+        already exists -- a reused role pane and an adopted agent. On FDAdb run
+        d246ae9592be478396ad5146a89f00ae the test reviewer was therefore
+        dispatched into a tree whose `node_modules` had just been unlinked, and
+        reported `ERR_MODULE_NOT_FOUND` for `vitest/config` over ten rounds. It
+        was right every time.
+
+        Both paths call this, so provisioning is always the last thing done to
+        the tree before the agent is asked to read it. A failure is the same
+        typed refusal the launcher raised, because it is the same failure: the
+        deployment's command, in the tree an actor was about to be dispatched
+        into, before any agent is asked to fix it.
+        """
+        prepare_cwd(cwd)
+        argv = _resolved_provision_argv(self, None)
+        if not argv:
+            return
+        try:
+            provisioning.provision_tree(
+                cwd, argv, _resolved_provision_timeout(self)
+            )
+        except provisioning.ReviewProvisioningError as exc:
+            raise lch.LaunchRefused(
+                lch.LaunchRefusal.PROVISION_FAILED,
+                exc.detail or str(exc),
+                pane_created=False,
+            ) from exc
+
     def _launch(
         self,
         ctx: LaneContext,
@@ -1781,7 +1831,10 @@ class HerdrStageActor:
         # private tree carries no sha, and the ledger records the input
         # artifact id rather than the bytes the reader was given, so
         # `input_digest` moved every round while the file did not.
-        prepare_cwd(cwd)
+        try:
+            self._prepared_cwd(cwd, prepare_cwd)
+        except lch.LaunchRefused as refused:
+            raise self._launch_failed(refused) from refused
         envelope = lch.role_result_path(cwd, turn)
         envelope.parent.mkdir(parents=True, exist_ok=True)
         prompt = lch.role_prompt_path(cwd, turn)
@@ -1794,7 +1847,7 @@ class HerdrStageActor:
 
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
-            prepare_cwd(adopted)
+            self._prepared_cwd(adopted, prepare_cwd)
             self._materialize_role_instructions(
                 adopted, role, route["route"], ctx.lane.lane_kind
             )
