@@ -3321,25 +3321,38 @@ class HerdrLauncher:
                     "{}!={}".format(source_id, parent_id),
                     pane_created=False,
                 )
-        matches: List[str] = []
-        untagged_ours: List[str] = []
-        pinned_elsewhere: List[str] = []
-        label_only = 0
+        # Herdr lists one Space on more than one row when that Space has
+        # more than one linked worktree open (e.g. a ui-worktree row beside
+        # the role checkout row). Group by `open_workspace_id` first and
+        # classify each distinct child once, using the union of its rows for
+        # any row-level fact (path match, row label) -- otherwise a single
+        # Space is double-counted into DUPLICATE_LANE_WORKSPACE.
+        rows_by_child: Dict[str, List[Mapping[str, object]]] = {}
         for item in _herdr_list(payload, "worktrees"):
             child_id = str(item.get("open_workspace_id") or "")
             if not child_id:
                 continue
             if item.get("is_linked_worktree") is not True:
                 continue
+            rows_by_child.setdefault(child_id, []).append(item)
+        matches: List[str] = []
+        untagged_ours: List[str] = []
+        pinned_elsewhere: List[str] = []
+        label_only = 0
+        for child_id, rows in rows_by_child.items():
             try:
                 live = self._workspace_record(child_id, environment)
             except _WorkspaceGone:
                 continue
             tokens = _herdr_tokens(live)
             if not tokens:
-                if _same_resolved_path(item.get("path"), worktree):
+                if any(
+                    _same_resolved_path(row.get("path"), worktree) for row in rows
+                ):
                     untagged_ours.append(child_id)
-                elif _herdr_label(live) == label or _herdr_label(item) == label:
+                elif _herdr_label(live) == label or any(
+                    _herdr_label(row) == label for row in rows
+                ):
                     label_only += 1
                 continue
             if _tokens_match(tokens, expected):
