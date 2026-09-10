@@ -11,6 +11,7 @@ from .plan_model import (
     PlanRefusal,
     normalize_declared_output,
     outputs_conflict,
+    parse_acceptance_item,
 )
 
 SCHEMA_INVALID = "SCHEMA_INVALID"
@@ -21,6 +22,7 @@ OUTPUT_OWNERSHIP_CONFLICT = "OUTPUT_OWNERSHIP_CONFLICT"
 ACCEPTANCE_MISSING = "ACCEPTANCE_MISSING"
 REVIEW_NODE_FORBIDDEN = "REVIEW_NODE_FORBIDDEN"
 BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
+OBLIGATION_UNOBSERVABLE = "OBLIGATION_UNOBSERVABLE"
 
 
 def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
@@ -214,12 +216,26 @@ def _validate_acceptance(
         )
         return
     for index, item in enumerate(acceptance):
-        if not isinstance(item, str) or not item.strip():
+        item_pointer = pointer + "/acceptance/{0}".format(index)
+        parsed = parse_acceptance_item(item)
+        if parsed is None:
             refusals.append(
                 PlanRefusal(
                     ACCEPTANCE_MISSING,
-                    pointer + "/acceptance/{0}".format(index),
-                    "each public acceptance criterion must be a nonempty string",
+                    item_pointer,
+                    "each public acceptance criterion must be a nonempty string "
+                    "or an object with a nonempty criterion",
+                )
+            )
+            continue
+        if parsed.gating and not parsed.observation_seam:
+            refusals.append(
+                PlanRefusal(
+                    OBLIGATION_UNOBSERVABLE,
+                    item_pointer,
+                    "a gating obligation must declare the observation_seam a "
+                    "case can assert on from the public contract; an obligation "
+                    "no test can observe is advisory, not gating",
                 )
             )
 

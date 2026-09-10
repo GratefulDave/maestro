@@ -592,3 +592,15 @@ function hands off to "downstream machinery", name the reader and check it is
 still there** — the handoff in the docstring outlived the branch that received
 it, and the two changes were made months apart in different files, each correct
 on its own.
+
+## Historical — 2026-09-09 run d246ae95 (an obligation no case can observe)
+
+`lane-faq-producer-tests` carried the mandatory obligation "serving never calls the FAQ
+producer", and the plan said nothing about how a test observes it. It is a same-module call
+whose result is discarded, so no public export, recorded effect, or output changes whether
+it happens. A capable tester spent its last three rounds on it and finally said so; the
+reviewer correctly refused each round, and the lane parked with no candidate. Run `a33d5e9b`
+is the same shape read from the other side — a suite that could not tell required from
+accepted. The defect was in the plan and it was decidable when the plan was authored: a
+gating obligation now declares an `observation_seam` in the IR, and the objective compiler
+refuses one that does not (`OBLIGATION_UNOBSERVABLE`), before any run starts.

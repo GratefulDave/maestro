@@ -210,8 +210,9 @@ class IngressProjectionTests(unittest.TestCase):
 
 
 class PlanAuthorCliTests(unittest.TestCase):
-    def _author(self, root: Path, out: Path) -> subprocess.CompletedProcess[str]:
-        ir = _ir()
+    def _author(self, root: Path, out: Path,
+                ir: dict = None) -> subprocess.CompletedProcess[str]:
+        ir = _ir() if ir is None else ir
         ir_path = root / "ir.json"
         ir_bytes = _write_json(ir_path, ir)
         receipt_path = root / "receipt.json"
@@ -275,6 +276,59 @@ class PlanAuthorCliTests(unittest.TestCase):
             payload = json.loads(second.stdout)
             self.assertEqual(payload["outcome"], "AuthoringError")
             self.assertIn("PLAN_EXISTS", payload["detail"])
+
+
+    def test_cli_refuses_a_tests_claim_with_no_observation_seam(self) -> None:
+        """The ship verb is where an unobservable obligation is caught.
+
+        FDAdb run d246ae95 spent its last three rounds on an obligation no case
+        could observe from the public contract. The claim is projected onto a
+        gating acceptance criterion, and the objective compiler the CLI runs
+        refuses a gating criterion that names no seam.
+        """
+        ir = _ir()
+        seams = [
+            claim.pop("observation_seam")
+            for claim in ir["claims"]
+            if claim["claim_id"] == "claim-t"
+        ]
+        self.assertEqual(1, len(seams))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out, ir)
+            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["outcome"], "AuthoringError")
+            self.assertIn("OBLIGATION_UNOBSERVABLE", payload["detail"])
+            self.assertFalse(out.exists())
+
+    def test_cli_carries_the_declared_seam_onto_the_acceptance(self) -> None:
+        from adw_modules.plan_compiler import compile_plan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            lanes = {
+                lane.lane_id: lane for lane in compile_plan(out.read_bytes()).lanes
+            }
+            self.assertTrue(
+                any(
+                    "[observable: src/b.py is imported by its public module path"
+                    in item
+                    for item in lanes["lane-t"].public_acceptance
+                ),
+                lanes["lane-t"].public_acceptance,
+            )
+            self.assertFalse(
+                any("[observable:" in item
+                    for item in lanes["lane-b"].public_acceptance),
+                lanes["lane-b"].public_acceptance,
+            )
 
 
 if __name__ == "__main__":

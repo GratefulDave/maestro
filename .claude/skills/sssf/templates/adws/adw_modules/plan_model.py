@@ -12,6 +12,63 @@ NO_PLAN_ARTIFACT_REF = "NO_PLAN_ARTIFACT_REF"
 
 PLAN_KEYS = frozenset({"schema_version", "lanes"})
 LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance", "lane_kind"})
+ACCEPTANCE_KEYS = frozenset({"criterion", "gating", "observation_seam"})
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    """One public acceptance criterion, with its declared observation seam.
+
+    A criterion authored as a plain string is advisory: nothing gates on it and
+    no seam is required. A criterion authored as an object may declare
+    ``gating: true``, which makes it an obligation a tests lane must discharge,
+    and a gating obligation must name the ``observation_seam`` a case can assert
+    on from the public contract. Gating is declared, never read out of the prose.
+    """
+
+    criterion: str
+    gating: bool = False
+    observation_seam: Optional[str] = None
+
+    @property
+    def public_text(self) -> str:
+        """What reaches the tester, builder, and reviewer as acceptance."""
+        if not self.observation_seam:
+            return self.criterion
+        return "{0} [observable: {1}]".format(self.criterion, self.observation_seam)
+
+    def canonical(self) -> Any:
+        """The authored form, normalized: a plain string stays a plain string."""
+        if not self.gating and self.observation_seam is None:
+            return self.criterion
+        payload: dict = {"criterion": self.criterion, "gating": self.gating}
+        if self.observation_seam is not None:
+            payload["observation_seam"] = self.observation_seam
+        return payload
+
+
+def parse_acceptance_item(raw: Any) -> Optional[AcceptanceCriterion]:
+    """One acceptance criterion, or None if the authored item is inadmissible.
+
+    Accepts the historical plain-string form and the object form carrying the
+    declared ``gating`` flag and ``observation_seam``. No prose is inspected.
+    """
+    if isinstance(raw, str):
+        return AcceptanceCriterion(raw) if raw.strip() else None
+    if not isinstance(raw, dict):
+        return None
+    if set(raw) - ACCEPTANCE_KEYS:
+        return None
+    criterion = raw.get("criterion")
+    if not isinstance(criterion, str) or not criterion.strip():
+        return None
+    gating = raw.get("gating", False)
+    if not isinstance(gating, bool):
+        return None
+    seam = raw.get("observation_seam")
+    if seam is not None and (not isinstance(seam, str) or not seam.strip()):
+        return None
+    return AcceptanceCriterion(criterion, gating, seam)
 
 
 class PlanParseError(ValueError):

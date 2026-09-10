@@ -48,6 +48,7 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - Paths have no absolute, empty, `.`, or `..` components.
 - No duplicate, equal, ancestor, or descendant ownership conflicts exist across lanes.
 - Each lane declares public acceptance criteria.
+- Every gating acceptance criterion declares an `observation_seam`.
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -362,6 +363,49 @@ The fix is the same pair offered above — give the lane the wiring, or split so
 files its lane may write — applied to the test path rather than the production path. When authoring a
 tests lane, trace one acceptance case from its entry point to its subject and name every file it
 passes through. Any of them the lane does not own is the seam this section is about.
+
+## A gating obligation names its observation seam
+
+An obligation is **gating** when a tests lane must discharge it and a reviewer may refuse a suite
+that does not. Every gating obligation states the **observation seam**: the public export, module
+boundary, injectable observer, recorded effect, or output a case can assert on from the public
+contract. It is a field on the claim (`observation_seam`), not a sentence a reader infers from the
+prose, and the compiler refuses a plan whose gating obligation has none
+(`OBLIGATION_UNOBSERVABLE`). An obligation that names no seam is advisory: nothing gates on it, no
+suite can discharge it, and no reviewer can refuse for it.
+
+Bad — the obligation a tester cannot write a case for:
+
+```
+claim-serving-isolation: serving never calls the FAQ producer
+```
+
+Nothing here is observable. The call the sentence forbids is same-module and its result is
+discarded, so no public export, no recorded effect and no output changes whether it happens. A
+capable tester spent three rounds on it and finally said so; the reviewer was right to refuse all
+three, and the lane parked with no candidate.
+
+Good — the same obligation, with the seam that makes it decidable:
+
+```
+claim-serving-isolation: serving never imports the FAQ producer module
+  observation_seam: |
+    src/faq/producer.py is the producer's public module. Serving's import graph is the
+    observable: a case imports src/serving/app.py, reads its module dependencies, and
+    asserts src.faq.producer is absent. The refusal case is the mirror: with the import
+    restored, that same assertion fails.
+```
+
+It names where the boundary is, what a case reads, and the refusal case that proves the assertion
+can fail. Two rules for writing one:
+
+- **The seam is public.** It is delivered to the builder along with the criterion, so it names
+  exports, module paths, and observable effects, never fixtures, selectors, or expected literals.
+- **If you cannot name it, the obligation is not gating.** Do not phrase an aspiration as a
+  requirement and leave the tester to discover it is undecidable. Either move the boundary so the
+  behaviour is observable — that is usually a lane-shape change, see the section above — or write
+  the obligation as advisory and gate on something a case can see.
+
 ## What a review rejection costs
 
 A rejection is not a fresh start and it is not a retry budget. `TEST_REVIEW(REVISE)` returns the

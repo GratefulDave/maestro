@@ -6,11 +6,13 @@ from typing import Any, List, Mapping, Sequence, Tuple
 
 from .plan_model import (
     NO_PLAN_ARTIFACT_REF,
+    AcceptanceCriterion,
     SCHEMA_VERSION,
     PlanCompileError,
     PlanParseError,
     PlanRefusal,
     normalize_declared_output,
+    parse_acceptance_item,
     parse_stored_mapping,
 )
 from .plan_validate import SCHEMA_INVALID, validate_objective_plan
@@ -78,11 +80,20 @@ def _lane_projections(
                 lane_projection_digest=lane_projection_digest(
                     spec_digest, needs, outputs, lane_kind=lane_kind
                 ),
-                public_acceptance=tuple(str(item) for item in raw["acceptance"]),
+                public_acceptance=tuple(
+                    _criterion(item).public_text for item in raw["acceptance"]
+                ),
                 lane_kind=lane_kind,
             )
         )
     return tuple(sorted(compiled, key=lambda lane: lane.lane_id))
+
+
+def _criterion(raw: Any) -> AcceptanceCriterion:
+    parsed = parse_acceptance_item(raw)
+    if parsed is None:
+        raise RuntimeError("validate_objective_plan admitted an invalid criterion")
+    return parsed
 
 
 def _required_output(raw: Any) -> str:
@@ -97,6 +108,13 @@ def _canonical_document(
     raw_lanes: Sequence[Mapping[str, Any]],
 ) -> dict:
     specs = {raw["id"]: raw["spec"] for raw in raw_lanes}
+    # The authored acceptance, not its projection: an observation seam a lane
+    # declares is part of the plan's identity, so a plan that gains one is a
+    # different plan. `public_acceptance` is the flattened text the actors read.
+    authored = {
+        raw["id"]: [_criterion(item).canonical() for item in raw["acceptance"]]
+        for raw in raw_lanes
+    }
     return {
         "lanes": [
             {
@@ -105,7 +123,7 @@ def _canonical_document(
                     if lane.lane_kind is not None
                     else {}
                 ),
-                "acceptance": list(lane.public_acceptance),
+                "acceptance": authored[lane.lane_id],
                 "id": lane.lane_id,
                 "needs": list(lane.needs),
                 "outputs": list(lane.declared_outputs),

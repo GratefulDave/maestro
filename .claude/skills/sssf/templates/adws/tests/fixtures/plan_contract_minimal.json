@@ -40,6 +40,7 @@
       "subject": "tests/test_t.py",
       "predicate": "covers",
       "object": "the public contract",
+      "observation_seam": "src/b.py is imported by its public module path; the contract it exports is what a case asserts on.",
       "polarity": "positive",
       "source_requirement_ids": ["req-t"],
       "source_ids": ["src-a"],
