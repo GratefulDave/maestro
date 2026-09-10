@@ -6,6 +6,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **An operator interrupt ends every in-flight wait, and the process exits.**
+  On FDAdb run `d246ae95` the operator pressed Ctrl-C on `run resume` while
+  `lane-faq-release-tests` was waiting on its test reviewer. The scheduler did
+  its half correctly -- `USER_WAIT` with `wait_reason` PAUSE and `resume_stage`
+  REVIEWING_TESTS, then `run finished waiting` on the console -- and the
+  process then printed `waiting on test-reviewer <N>s elapsed` every thirty
+  seconds for twenty more minutes. Closing the reviewer's Herdr pane, so the
+  envelope could never be written by anyone, changed nothing; `pkill -TERM`
+  changed nothing; SIGKILL ended it.
+
+  `signal` delivers SIGINT to the **main** thread, so above `concurrency` 1 the
+  `KeyboardInterrupt` unwound the scheduler thread and left the worker inside
+  `HerdrStageActor._await_envelope`, a loop that by design ends on the envelope
+  and on nothing else. `ThreadPoolExecutor` workers are not daemon threads, and
+  `concurrent.futures.thread._python_exit` joins them at interpreter shutdown,
+  so one polling worker held the whole process open however cleanly the
+  scheduler returned. `pool.shutdown(wait=False, cancel_futures=True)` cannot
+  reach a worker that is already running.
+
+  `adw_modules/interrupt` is the missing half: one process-wide flag, set by
+  the SIGINT handler after it has snapshotted what was executing, and polled by
+  the envelope wait, which restates it as the typed
+  `interrupt.AgentWaitInterrupted`. `FactoryScheduler.run` reads that refusal as
+  the operator stop it is and returns `WAITING` with the pause already recorded,
+  never as a lane failure, and `_advance` refuses to dispatch a fresh stage into
+  a run the operator has just stopped.
+
+  **This is not a transport signal and does not reopen what four incidents
+  closed beside `_await_envelope`.** A closed pane, an absent herdr record and a
+  quiet composer still end no wait. Nothing about what PAUSE means or how
+  `run resume` restores a lane changes, no wall clock is added, and a wait that
+  is already holding a declared envelope returns it rather than discarding it.
+
 ### Added
 - **`run attend` authors the amendment a `NO_PROGRESS` park needs.** FDAdb run
   `d246ae95` parked `lane-faq-producer` twice. Both times a human read the gate

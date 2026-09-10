@@ -24,6 +24,7 @@ from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
 from . import hidden_vault as hv
+from . import interrupt
 from . import private_review as prv
 from . import provisioning as prov
 from . import runner_resolution as rr
@@ -1507,10 +1508,21 @@ class FactoryScheduler:
         #: whose stage is executing right now, on any thread.
         self._inflight: dict[str, tuple[str, st.LaneStage, str, Mapping[str, Any]]] = {}
         self._inflight_lock = threading.Lock()
+        #: What was executing at the instant SIGINT was handled, snapshotted
+        #: by the handler itself. `None` until then. The pause reads this
+        #: rather than `_inflight`, because setting the interrupt flag frees
+        #: every worker at once and each one empties its own entry on the way
+        #: out -- so by the time the main thread reaches `_pause_on_interrupt`
+        #: the lanes it must pause may already have left the live map.
+        self._interrupted: Optional[
+            list[tuple[str, st.LaneStage, str, Mapping[str, Any]]]
+        ] = None
         self._pool: Optional[ThreadPoolExecutor] = None
 
     def run(self) -> st.RunStatus:
         previous = signal.getsignal(signal.SIGINT)
+        interrupt.clear_stop()
+        self._interrupted = None
         signal.signal(signal.SIGINT, self._handle_sigint)
         try:
             self._assert_runners_usable()
@@ -1551,6 +1563,15 @@ class FactoryScheduler:
         except KeyboardInterrupt:
             self._pause_on_interrupt()
             return st.RunStatus.WAITING
+        except interrupt.AgentWaitInterrupted:
+            # The inline path: with `concurrency` 1 the wait is on this
+            # thread, so the `KeyboardInterrupt` above already ended it and
+            # this is unreachable. Above 1 a worker's interrupted wait is a
+            # stored future exception the drain re-raises, and it is the same
+            # operator stop, not a lane failure -- the pause is already
+            # recorded, so there is nothing here but to agree with it.
+            self._pause_on_interrupt()
+            return st.RunStatus.WAITING
         finally:
             pool, self._pool = self._pool, None
             if pool is not None:
@@ -1559,6 +1580,14 @@ class FactoryScheduler:
                 # its late completion is refused by the ledger (the lane is
                 # already WAITING_FOR_USER). Waiting on it would hold the
                 # operator's Ctrl-C until that turn ends.
+                #
+                # `cancel_futures` reaches only what was never started. What
+                # ends a *running* worker is the interrupt flag its wait
+                # polls: these threads are not daemons and
+                # `concurrent.futures.thread._python_exit` joins them at
+                # interpreter shutdown, so a worker that ignored the stop
+                # would keep the process alive after this method returned
+                # WAITING -- which is precisely FDAdb run d246ae95.
                 pool.shutdown(wait=False, cancel_futures=True)
             signal.signal(signal.SIGINT, previous)
 
@@ -1688,11 +1717,36 @@ class FactoryScheduler:
         return ensure_run_integration_ref(self.target, self.store, self.run_id)
 
     def _handle_sigint(self, _signum: int, _frame: object) -> None:
+        # Three things, in this order, and the order is the whole of it.
+        #
+        # Snapshot what is executing *before* anything is freed, so the pause
+        # below names the lanes the operator actually interrupted. Then set
+        # the flag, which ends every in-flight wait on every worker thread.
+        # Then unwind this thread into `_pause_on_interrupt`.
+        #
+        # Raising alone stopped only this thread. A run with `concurrency`
+        # above 1 keeps its waits on workers, and those went on polling for an
+        # envelope long after the ledger said the lane was paused and the
+        # console said the run had finished waiting.
+        #
+        # The snapshot is taken without blocking: this handler runs on the
+        # thread that may itself be holding the lock (`concurrency` 1 keeps
+        # every stage inline), and waiting for it here would deadlock the
+        # interrupt. Losing the race just falls back to reading the live map.
+        if self._inflight_lock.acquire(blocking=False):
+            try:
+                self._interrupted = list(self._inflight.values())
+            finally:
+                self._inflight_lock.release()
+        interrupt.request_stop()
         raise KeyboardInterrupt
 
     def _pause_on_interrupt(self) -> None:
-        with self._inflight_lock:
-            targets = list(self._inflight.values())
+        targets = self._interrupted
+        if targets is None:
+            with self._inflight_lock:
+                targets = list(self._inflight.values())
+        targets = list(targets)
         if not targets:
             for lane in self.store.active_projection(self.run_id):
                 stage = self.store.lane_stage(self.run_id, lane.lane_id)
@@ -1931,6 +1985,10 @@ class FactoryScheduler:
             pass
 
     def _advance(self, lane_id: str) -> None:
+        # A worker freed by the interrupt must not be refilled with a fresh
+        # stage: dispatching one would put an agent in front of an operator
+        # who has just stopped the run.
+        interrupt.raise_if_stopped("dispatch:{0}".format(lane_id))
         stage = self.store.lane_stage(self.run_id, lane_id)
         if stage is st.LaneStage.WRITING_TESTS:
             self._maybe_correct_legacy_integration_base()
