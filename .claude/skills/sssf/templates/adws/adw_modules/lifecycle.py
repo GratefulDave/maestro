@@ -16,6 +16,28 @@ from .utils import now_iso
 LANE_STAGE_CHECK = ", ".join(f"'{stage.value}'" for stage in st.LaneStage)
 LANE_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.LANE_ARTIFACT_KINDS)
 RUN_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.RUN_ARTIFACT_KINDS)
+# The v2 run-artifact kinds, kept verbatim rather than derived, so that adding
+# a kind to `st.RUN_ARTIFACT_KINDS` cannot silently redefine what a v2 ledger
+# was. v3 added ATTEND_SESSION and AMENDMENT_RATIONALE.
+V2_RUN_ARTIFACT_KINDS = (
+    "FINAL_INTEGRATION_REVIEW",
+    "MAIN_PUBLICATION",
+    "PLAN_AMENDMENT",
+)
+V2_RUN_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V2_RUN_ARTIFACT_KINDS)
+RUN_ARTIFACT_COLUMNS = (
+    "artifact_id",
+    "run_id",
+    "sequence",
+    "artifact_kind",
+    "plan_revision",
+    "input_digest",
+    "output_digest",
+    "artifact_ref",
+    "payload_json",
+    "created_at",
+)
+_RUN_ARTIFACTS_V2_BACKUP = "run_artifacts__v2_backup"
 V1_LANE_ARTIFACT_KINDS = (
     "LANE_PLAN",
     "TEST_DRAFT",
@@ -71,7 +93,27 @@ def _lane_artifacts_ddl(kind_check: str) -> str:
 )"""
 
 
-def _schema_script(lane_kind_check: str) -> str:
+def _run_artifacts_ddl(kind_check: str) -> str:
+    return f"""CREATE TABLE run_artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ({kind_check})),
+  plan_revision INTEGER NOT NULL,
+  input_digest TEXT NOT NULL,
+  output_digest TEXT NOT NULL,
+  artifact_ref TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (run_id, sequence),
+  UNIQUE (run_id, artifact_kind, input_digest),
+  UNIQUE (run_id, artifact_id),
+  FOREIGN KEY (run_id, plan_revision)
+    REFERENCES plan_revisions(run_id, plan_revision) DEFERRABLE INITIALLY DEFERRED
+)"""
+
+
+def _schema_script(lane_kind_check: str, run_kind_check: str) -> str:
     return f"""
 CREATE TABLE ledger_meta (
   schema_version TEXT PRIMARY KEY
@@ -138,23 +180,7 @@ CREATE TABLE lane_state (
   FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
 {_lane_artifacts_ddl(lane_kind_check)};
-CREATE TABLE run_artifacts (
-  artifact_id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  sequence INTEGER NOT NULL,
-  artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ({RUN_KIND_CHECK})),
-  plan_revision INTEGER NOT NULL,
-  input_digest TEXT NOT NULL,
-  output_digest TEXT NOT NULL,
-  artifact_ref TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE (run_id, sequence),
-  UNIQUE (run_id, artifact_kind, input_digest),
-  UNIQUE (run_id, artifact_id),
-  FOREIGN KEY (run_id, plan_revision)
-    REFERENCES plan_revisions(run_id, plan_revision) DEFERRABLE INITIALLY DEFERRED
-);
+{_run_artifacts_ddl(run_kind_check)};
 CREATE TABLE transitions (
   id INTEGER PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -170,8 +196,10 @@ CREATE TABLE transitions (
 
 LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(LANE_KIND_CHECK)
 V1_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V1_LANE_KIND_CHECK)
-SCHEMA = _schema_script(LANE_KIND_CHECK)
-V1_SCHEMA = _schema_script(V1_LANE_KIND_CHECK)
+RUN_ARTIFACTS_SQL = _run_artifacts_ddl(RUN_KIND_CHECK)
+V2_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V2_RUN_KIND_CHECK)
+SCHEMA = _schema_script(LANE_KIND_CHECK, RUN_KIND_CHECK)
+V1_SCHEMA = _schema_script(V1_LANE_KIND_CHECK, V2_RUN_KIND_CHECK)
 
 
 class ArtifactStoreError(st.KernelError):
@@ -308,8 +336,14 @@ class ArtifactStore:
         version = versions[0]
         if version == st.LEDGER_SCHEMA_VERSION:
             return
+        # Chained, not branched: a v1 ledger reaches v3 through v2 rather than
+        # through a second one-off script, so there is one definition of what
+        # each version's tables are and no path that skips a rebuild.
         if version == st.LEDGER_SCHEMA_VERSION_V1:
             self._migrate_v1_to_v2()
+            version = st.LEDGER_SCHEMA_VERSION_V2
+        if version == st.LEDGER_SCHEMA_VERSION_V2:
+            self._migrate_v2_to_v3()
             return
         self._refuse_schema()
 
@@ -375,7 +409,7 @@ class ArtifactStore:
         )
         self.conn.execute(f"DROP TABLE {_LANE_ARTIFACTS_V1_BACKUP}")
 
-    def _require_post_migration_integrity(self) -> None:
+    def _require_post_migration_integrity(self, expected: str) -> None:
         fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
         if fk_violations:
             raise ArtifactStoreError("foreign_key_check")
@@ -385,10 +419,16 @@ class ArtifactStore:
         sql = _table_create_sql(self.conn, "lane_artifacts")
         if sql is None or _normalize_sql(sql) != _normalize_sql(LANE_ARTIFACTS_SQL):
             raise ArtifactStoreError("lane_artifacts ddl")
+        if expected is st.LEDGER_SCHEMA_VERSION:
+            run_sql = _table_create_sql(self.conn, "run_artifacts")
+            if run_sql is None or _normalize_sql(run_sql) != _normalize_sql(
+                RUN_ARTIFACTS_SQL
+            ):
+                raise ArtifactStoreError("run_artifacts ddl")
         version = self.conn.execute(
             "SELECT schema_version FROM ledger_meta"
         ).fetchone()
-        if version is None or version[0] != st.LEDGER_SCHEMA_VERSION:
+        if version is None or version[0] != expected:
             raise ArtifactStoreError("schema_version")
 
     def _migrate_v1_to_v2(self) -> None:
@@ -398,11 +438,94 @@ class ArtifactStore:
             self._rebuild_lane_artifacts_current_check()
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V1),
+                (st.LEDGER_SCHEMA_VERSION_V2, st.LEDGER_SCHEMA_VERSION_V1),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
-            self._require_post_migration_integrity()
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V2)
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _run_artifacts_need_rebuild(self) -> bool:
+        """True when run_artifacts still carries the v2 kind check.
+
+        False when it already carries the current one, which happens two ways:
+        a crash between the table rebuild and the version stamp, and a ledger
+        whose lane_artifacts were rolled back to v1 while its run_artifacts
+        were created by current code. Both leave a correct table under a stale
+        stamp, and refusing them would strand a ledger that needs nothing done
+        to it.
+        """
+        names = _tables(self.conn)
+        if "run_artifacts" not in names or _RUN_ARTIFACTS_V2_BACKUP in names:
+            self._refuse_schema()
+        sql = _table_create_sql(self.conn, "run_artifacts")
+        if sql is not None and _normalize_sql(sql) == _normalize_sql(
+            RUN_ARTIFACTS_SQL
+        ):
+            return False
+        if sql is None or _normalize_sql(sql) != _normalize_sql(V2_RUN_ARTIFACTS_SQL):
+            self._refuse_schema()
+        return True
+
+    def _require_supported_v2_run_artifacts(self) -> None:
+        cols = tuple(
+            row[1] for row in self.conn.execute("PRAGMA table_info(run_artifacts)")
+        )
+        if cols != RUN_ARTIFACT_COLUMNS:
+            self._refuse_schema()
+        extra_indexes = list(
+            self.conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='run_artifacts' AND sql IS NOT NULL"
+            )
+        )
+        if extra_indexes:
+            self._refuse_schema()
+
+    def _rebuild_run_artifacts_current_check(self) -> None:
+        cols = ", ".join(RUN_ARTIFACT_COLUMNS)
+        self.conn.execute(
+            f"ALTER TABLE run_artifacts RENAME TO {_RUN_ARTIFACTS_V2_BACKUP}"
+        )
+        self.conn.execute(RUN_ARTIFACTS_SQL)
+        self.conn.execute(
+            f"INSERT INTO run_artifacts ({cols}) "
+            f"SELECT {cols} FROM {_RUN_ARTIFACTS_V2_BACKUP}"
+        )
+        self.conn.execute(f"DROP TABLE {_RUN_ARTIFACTS_V2_BACKUP}")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Widen the run-artifact kind check for the attend records.
+
+        A CHECK constraint is baked into the table at creation, so a ledger
+        created before `ATTEND_SESSION` and `AMENDMENT_RATIONALE` existed
+        refuses them at INSERT no matter what the enum says. Adding a kind is
+        therefore a schema version, exactly as it was when v1 gained
+        `TEST_INVALIDATION` -- not a constant edit.
+        """
+        rebuild = self._run_artifacts_need_rebuild()
+        self._require_supported_v2_run_artifacts()
+        self._begin()
+        try:
+            if rebuild:
+                self._rebuild_run_artifacts_current_check()
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V2),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION)
             self.conn.execute("COMMIT")
         except Exception:
             try:
@@ -2221,6 +2344,149 @@ class ArtifactStore:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+    def _record_run_note(
+        self,
+        run_id: str,
+        kind: st.ArtifactKind,
+        input_digest: str,
+        artifact_ref: str,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        """Append a run artifact that records something and decides nothing.
+
+        Neither `ATTEND_SESSION` nor `AMENDMENT_RATIONALE` appears in
+        `COMPLETE_STAGE_EDGES`, touches `lane_state`, or is read by any
+        predicate. They are durable because prose in a log is not evidence, and
+        they are inert because a record of why a human-shaped decision was made
+        must not become a second way of making one.
+        """
+        body = dict(st.json_ready(payload))
+        body["input_digest"] = input_digest
+        artifact = st.RunArtifact(
+            kind=kind,
+            plan_revision=int(self._run(run_id)["plan_revision"]),
+            input_digest=input_digest,
+            output_digest=st.digest_canonical(body),
+            artifact_ref=artifact_ref,
+            payload=body,
+        )
+        now = now_iso()
+        self._begin()
+        try:
+            record = self._insert_run_artifact(run_id, artifact, now)
+            self._touch_run(run_id, now)
+            self.conn.execute("COMMIT")
+            return record
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def record_attend_session(
+        self,
+        run_id: str,
+        *,
+        session_id: str,
+        phase: str,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        """One end of one `run attend` session."""
+        digest = st.attend_session_input_digest(
+            run_id=run_id, session_id=session_id, phase=phase
+        )
+        body = dict(payload)
+        body["session_id"] = session_id
+        body["phase"] = phase
+        return self._record_run_note(
+            run_id,
+            st.ArtifactKind.ATTEND_SESSION,
+            digest,
+            "attend/{0}/{1}".format(session_id, phase.lower()),
+            body,
+        )
+
+    @serialized
+    def record_amendment_rationale(
+        self,
+        run_id: str,
+        *,
+        lane_id: str,
+        amendment_artifact_id: str,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        """Why an attended amendment was authored, bound to that amendment."""
+        run = self._run(run_id)
+        digest = st.amendment_rationale_input_digest(
+            run_id=run_id,
+            lane_id=lane_id,
+            plan_revision=int(run["plan_revision"]),
+            amendment_artifact_id=amendment_artifact_id,
+        )
+        body = dict(payload)
+        body["lane_id"] = lane_id
+        body["amendment_artifact_id"] = amendment_artifact_id
+        return self._record_run_note(
+            run_id,
+            st.ArtifactKind.AMENDMENT_RATIONALE,
+            digest,
+            "amendment-rationale/{0}/{1}".format(
+                int(run["plan_revision"]), lane_id
+            ),
+            body,
+        )
+
+    def sealed_bundle_artifact_id(self, run_id: str, lane_id: str) -> Optional[str]:
+        """The sealed bundle this lane is graded against, at the live revision.
+
+        `_sealed_bundle` already resolves a build lane to its tests
+        predecessor's bundle, which is what makes this the same bundle the
+        builder and the code reviewer were measured against rather than a
+        second answer to the same question.
+        """
+        row = self._sealed_bundle(run_id, lane_id)
+        return None if row is None else str(row["artifact_id"])
+
+    def run_artifacts_of_kind(
+        self, run_id: str, kind: st.ArtifactKind
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Every run artifact of one kind, oldest first. Read-only."""
+        rows = self.conn.execute(
+            "SELECT sequence, artifact_id, payload_json, created_at "
+            "FROM run_artifacts WHERE run_id=? AND artifact_kind=? "
+            "ORDER BY sequence",
+            (run_id, kind.value),
+        ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "artifact_id": row["artifact_id"],
+                "created_at": row["created_at"],
+                "payload": _loads(row["payload_json"]),
+            }
+            for row in rows
+        )
+
+    def latest_lane_artifact_payload(
+        self, run_id: str, lane_id: str, kind: st.ArtifactKind
+    ) -> Optional[Mapping[str, Any]]:
+        """The newest lane artifact of one kind, as a payload. Read-only."""
+        row = self._latest_lane_artifact(run_id, lane_id, kind)
+        if row is None:
+            return None
+        return _loads(row["payload_json"])
+
+    def lane_artifact_payloads(
+        self, run_id: str, lane_id: str, kind: st.ArtifactKind, limit: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        """The newest `limit` payloads of one kind, oldest first. Read-only."""
+        rows = self.conn.execute(
+            "SELECT payload_json FROM lane_artifacts "
+            "WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+            "ORDER BY sequence DESC LIMIT ?",
+            (run_id, lane_id, kind.value, max(0, int(limit))),
+        ).fetchall()
+        return tuple(_loads(row["payload_json"]) for row in reversed(rows))
 
     def ready_lane_ids(self, run_id: str) -> tuple[str, ...]:
         run = self._run(run_id)

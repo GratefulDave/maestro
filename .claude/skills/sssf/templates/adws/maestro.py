@@ -26,6 +26,7 @@ if __name__ == "__main__":
 
 import yaml
 
+from adw_modules import attend as att
 from adw_modules import git_publication as gitpub
 from adw_modules import hidden_vault as hv
 from adw_modules.handoff_budget import (
@@ -35,6 +36,8 @@ from adw_modules.handoff_budget import (
 from adw_modules import code_review as cr
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
+from adw_modules import plan_contract_ingress as ingress
+from adw_modules import route_admission as admission
 from adw_modules import private_review as prv
 from adw_modules import provisioning
 from adw_modules import review_standards as rvs
@@ -50,6 +53,7 @@ from adw_modules.reporting_registry import read_run, registered_run, register_in
 from adw_modules.dashboard_autoload import maybe_autoload_dashboard
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
 from adw_modules.runtime_state import LEDGER_FILENAME, RuntimeStateRefused, RuntimeStateRoot
+from adw_modules.utils import now_iso
 from adw_modules.scheduler import (
     FactoryRefused,
     FactoryScheduler,
@@ -74,6 +78,7 @@ from adw_modules.scheduler import (
 # would let a role tree be provisioned with a command the run was not
 # admitted with.
 from adw_modules.scheduler import (  # noqa: F401
+    _record_as_lane_artifact,
     _resolved_provision_argv,
     _resolved_provision_timeout,
 )
@@ -113,6 +118,18 @@ class CleanupRefused(RuntimeError):
 
 _ROLE_ROUTE_FIELDS = frozenset(("route", "model", "effort", "profile"))
 _DASHBOARD_FIELDS = frozenset(("enabled", "launcher", "api_port", "ui_port", "open"))
+_ATTEND_FIELDS = frozenset(
+    (
+        "max_amendments_per_lane",
+        "max_amendments_per_run",
+        "route",
+        "planctl",
+        "plan_ir",
+        "validate_argv",
+        "reviewer_id",
+        "reviewer_vendor",
+    )
+)
 
 
 
@@ -186,53 +203,127 @@ def _canonical_role_routes(
         )
     canonical: dict[str, Mapping[str, str]] = {}
     for role in lch.LANE_PANE_ROLES:
-        binding = value[role]
-        if not isinstance(binding, Mapping):
-            raise _MaestroConfigurationError(
-                "role_routes.{} must be a mapping".format(role)
-            )
-        extras = frozenset(binding) - _ROLE_ROUTE_FIELDS
-        if extras:
-            raise _MaestroConfigurationError(
-                "role_routes.{} has unsupported fields: {}".format(
-                    role, ", ".join(sorted(extras))
-                )
-            )
-        route = _config_string(
-            binding.get("route"), "role_routes.{}.route".format(role)
-        )
-        model = _optional_config_string(
-            binding.get("model"), "role_routes.{}.model".format(role)
-        )
-        effort = _optional_config_string(
-            binding.get("effort"), "role_routes.{}.effort".format(role)
-        )
-        profile = _optional_config_string(
-            binding.get("profile"), "role_routes.{}.profile".format(role)
-        )
-        if route == "omp":
-            if not profile or model or effort:
-                raise _MaestroConfigurationError(
-                    "role_routes.{} must use only an omp profile".format(role)
-                )
-        elif route == "claude":
-            if not model or not effort or profile:
-                raise _MaestroConfigurationError(
-                    "role_routes.{} must use Claude model and effort only".format(role)
-                )
-        else:
-            raise _MaestroConfigurationError(
-                "role_routes.{}.route must be omp or claude".format(role)
-            )
-        canonical[role] = MappingProxyType(
-            {
-                "route": route,
-                "model": model,
-                "effort": effort,
-                "profile": profile,
-            }
+        canonical[role] = _canonical_role_route(
+            value[role], "role_routes.{}".format(role)
         )
     return MappingProxyType(canonical)
+
+
+def _canonical_role_route(value: object, label: str) -> Mapping[str, str]:
+    """One route binding. Absent is an empty mapping, which binds nothing.
+
+    Factored out of `_canonical_role_routes` so `attend.route` is validated by
+    the same rules as the five lane roles rather than by a second copy that
+    could drift -- an attend route that names a model on an omp profile has to
+    refuse here, not at dispatch in front of an operator waiting on a run.
+    """
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise _MaestroConfigurationError("{} must be a mapping".format(label))
+    extras = frozenset(value) - _ROLE_ROUTE_FIELDS
+    if extras:
+        raise _MaestroConfigurationError(
+            "{} has unsupported fields: {}".format(label, ", ".join(sorted(extras)))
+        )
+    route = _config_string(value.get("route"), "{}.route".format(label))
+    model = _optional_config_string(value.get("model"), "{}.model".format(label))
+    effort = _optional_config_string(value.get("effort"), "{}.effort".format(label))
+    profile = _optional_config_string(value.get("profile"), "{}.profile".format(label))
+    if route == "omp":
+        if not profile or model or effort:
+            raise _MaestroConfigurationError(
+                "{} must use only an omp profile".format(label)
+            )
+    elif route == "claude":
+        if not model or not effort or profile:
+            raise _MaestroConfigurationError(
+                "{} must use Claude model and effort only".format(label)
+            )
+    else:
+        raise _MaestroConfigurationError(
+            "{}.route must be omp or claude".format(label)
+        )
+    return MappingProxyType(
+        {"route": route, "model": model, "effort": effort, "profile": profile}
+    )
+
+def _config_bound(value: object, label: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _MaestroConfigurationError(label + " must be an integer >= 0")
+    return int(value)
+
+
+def _canonical_attend(value: object) -> Mapping[str, Any]:
+    """`attend.*` off a loaded config. Absent means the verb is disabled.
+
+    `max_amendments_per_lane` defaults to 0, and 0 is what `run attend` refuses
+    on. That default is the whole opt-in: an upgraded deployment keeps parking
+    for its operator until someone sets the key in *that* deployment's config,
+    the same way `concurrency` stays 1 until someone raises it. The route is
+    validated here rather than in `attend.py`, which must not name a route.
+    """
+    if value is None:
+        return MappingProxyType(
+            {
+                "max_amendments_per_lane": 0,
+                "max_amendments_per_run": 10,
+                "route": MappingProxyType({}),
+                "planctl": None,
+                "validate_argv": (),
+                "reviewer_id": "maestro-attend",
+                "reviewer_vendor": "maestro",
+            }
+        )
+    if not isinstance(value, Mapping):
+        raise _MaestroConfigurationError("attend must be a mapping")
+    extras = frozenset(value) - _ATTEND_FIELDS
+    if extras:
+        raise _MaestroConfigurationError(
+            "attend has unsupported fields: " + ", ".join(sorted(extras))
+        )
+    per_lane = _config_bound(
+        value.get("max_amendments_per_lane"), "attend.max_amendments_per_lane", 0
+    )
+    per_run = _config_bound(
+        value.get("max_amendments_per_run"), "attend.max_amendments_per_run", 10
+    )
+    route = _canonical_role_route(value.get("route"), "attend.route")
+    if per_lane > 0 and not route:
+        raise _MaestroConfigurationError(
+            "attend.route is required once attend.max_amendments_per_lane is set"
+        )
+    planctl = _optional_config_string(value.get("planctl"), "attend.planctl")
+    if planctl and not Path(planctl).is_absolute():
+        raise _MaestroConfigurationError("attend.planctl must be absolute")
+    plan_ir = _optional_config_string(value.get("plan_ir"), "attend.plan_ir")
+    if plan_ir and not Path(plan_ir).is_absolute():
+        raise _MaestroConfigurationError("attend.plan_ir must be absolute")
+    return MappingProxyType(
+        {
+            "max_amendments_per_lane": per_lane,
+            "max_amendments_per_run": per_run,
+            "route": route,
+            "planctl": Path(planctl) if planctl else None,
+            "plan_ir": Path(plan_ir) if plan_ir else None,
+            "validate_argv": _config_argv(
+                value.get("validate_argv"), "attend.validate_argv"
+            )
+            if value.get("validate_argv") is not None
+            else (),
+            "reviewer_id": _optional_config_string(
+                value.get("reviewer_id"), "attend.reviewer_id"
+            )
+            or "maestro-attend",
+            "reviewer_vendor": _optional_config_string(
+                value.get("reviewer_vendor"), "attend.reviewer_vendor"
+            )
+            or "maestro",
+        }
+    )
+
 
 def _config_port(value: object, label: str, default: int) -> int:
     if value is None:
@@ -308,6 +399,7 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
         loaded.get("provision_timeout_s"), "provision_timeout_s"
     )
     loaded["dashboard"] = _canonical_dashboard(loaded.get("dashboard"))
+    loaded["attend"] = _canonical_attend(loaded.get("attend"))
     loaded["concurrency"] = _config_concurrency(
         loaded.get("concurrency"), "concurrency"
     )
@@ -378,6 +470,22 @@ def _precreated_role_cwd(dest: Path) -> bool:
         return {child.name for child in dest.iterdir()} <= {lch.ROLE_AGENT_DIR}
     except OSError:
         return False
+
+
+def _resolved_under(root: Path, relative: str) -> Path:
+    """A repository-relative path resolved inside `root`, or a refusal.
+
+    The sealed paths written into an operator tree come out of the vault, and
+    a `..` component in one of them would write outside the tree the role
+    contract confines this agent to.
+    """
+    base = Path(root).resolve()
+    candidate = (base / relative).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise FactoryRefused("OPERATOR_TREE_PATH_ESCAPE:{}".format(relative)) from exc
+    return candidate
 
 
 def _relative_under(root: Path, path: Path) -> str:
@@ -588,12 +696,21 @@ class HerdrStageActor:
         target: gitpub.TargetBinding,
         role_routes: Mapping[str, Mapping[str, str]],
         lane_specs: Mapping[str, Mapping[str, Any]] | None = None,
+        operator_route: Mapping[str, str] | None = None,
     ) -> None:
         self.launcher = launcher
         self.state_root = Path(state_root)
         self.worktrees = self.state_root / "worktrees"
         self.target = target
-        self.role_routes = _canonical_role_routes(role_routes)
+        # The operator route is bound beside the five lane routes rather
+        # than inside them: `role_routes` must name exactly the lane roles, and
+        # a deployment that never opted into `run attend` binds no operator at
+        # all. A dispatch without one is a KeyError at the launch, which is
+        # where the missing configuration actually bites.
+        routes = dict(_canonical_role_routes(role_routes))
+        if operator_route:
+            routes["operator"] = MappingProxyType(dict(operator_route))
+        self.role_routes = MappingProxyType(routes)
         self.lane_specs = MappingProxyType(
             {
                 str(lane_id): MappingProxyType(dict(spec))
@@ -773,6 +890,11 @@ class HerdrStageActor:
             }
         if role == "test-reviewer":
             return {"verdict": "PASS|REVISE", "findings": findings}
+        if role == "operator":
+            return {
+                "revision_path": "<revision_out_path, exactly as given>",
+                "rationale": {key: "<{0}>".format(key) for key in att.RATIONALE_KEYS},
+            }
         return {
             "verdict": "PASS|REVISE",
             "findings": findings,
@@ -938,6 +1060,33 @@ class HerdrStageActor:
                 + rvs.standards_section(
                     rvs.discover_standards_files(self.target.target_repository_root)
                 )
+            ),
+            "operator": (
+                "## Operator obligations\n"
+                "You are authoring a plan revision, not implementing a lane. "
+                "A lane has parked because its reviewed rounds stopped moving "
+                "against the contract it was given; your job is to name the "
+                "gap between what the sealed suite asserts and what the "
+                "contract says, and to close it with the smallest edit that "
+                "reaches this lane's projection -- normally one seam contract "
+                "on the lane's own carrier.\n"
+                "You may read the sealed acceptance suite. It is in this "
+                "checkout under `sealed/`, and reading it is the privilege "
+                "this role exists to exercise: the builder and every reviewer "
+                "still cannot, and nothing you write may hand it to them as "
+                "test source. Stating an expectation the suite asserts, as a "
+                "contract clause in your own words, is exactly what you are "
+                "here to do; pasting the test file into the contract is not.\n"
+                "Write the revision IR at the path the per-turn JSON names, "
+                "and nowhere else. Do not edit the current IR in place. Do not "
+                "run any `maestro` verb, any git command, or `planctl` -- the "
+                "harness validates, mints the receipt, projects, and applies. "
+                "Do not add, remove, or rewire a lane: an edit that reaches "
+                "any lane outside allowed_lane_ids is refused whole, and the "
+                "lane you were called for gets nothing.\n"
+                "Return the rationale in the envelope. `contract_gap` must "
+                "name the clause that was missing or wrong, not restate that "
+                "the lane failed."
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
@@ -1184,6 +1333,14 @@ class HerdrStageActor:
                 )
         elif role == "integration-reviewer":
             instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
+        elif role == "operator":
+            instructions += (
+                " Read current_ir_path, the sealed suite under sealed/, the "
+                "lane gate table, and the reviews. Write the revised IR at "
+                "revision_out_path and return that exact path plus the "
+                "rationale. Change only lanes in allowed_lane_ids. Run no "
+                "maestro verb, no git command, and no planctl."
+            )
         if role in ("tester", "test-reviewer", "builder"):
             instructions += " " + self._PUBLIC_INTERFACE_RULE
         if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
@@ -1601,6 +1758,11 @@ class HerdrStageActor:
                 st.ReviewerVerdict.PASS.value,
                 st.ReviewerVerdict.REVISE.value,
             )
+        if role == "operator":
+            # Asked again here rather than refused later: an envelope with no
+            # revision_path is a turn the agent has not finished, and the
+            # attend loop's refusal would end the whole verb over it.
+            return bool(str(payload.get("revision_path") or "").strip())
         return True
 
     #: Set by FactoryScheduler when an operator console is attached. Reporting
@@ -2207,6 +2369,95 @@ class HerdrStageActor:
         verdict, findings = self._review_payload(payload)
         return verdict, findings, tuple(payload.get("affected_lanes") or ())
 
+    #: Files the operator agent's tree carries, relative to its CWD.
+    _OPERATOR_INPUTS = "inputs"
+    _OPERATOR_SEALED = "sealed"
+    _OPERATOR_OUT = "revisions"
+
+    def _write_operator_tree(
+        self, cwd: Path, request: att.OperatorRequest
+    ) -> None:
+        """Materialize everything the operator agent reads, on every dispatch.
+
+        On disk rather than in the prompt: the sealed suite and four rounds of
+        findings are the bulk of this handoff, and B13's size check is made
+        against the route's window at launch. A prompt that carries them is a
+        prompt that can overflow, and an overflowing agent answers about a
+        different lane.
+        """
+        inputs = cwd / self._OPERATOR_INPUTS
+        sealed = cwd / self._OPERATOR_SEALED
+        for directory in (inputs, sealed, cwd / self._OPERATOR_OUT):
+            if directory.exists():
+                shutil.rmtree(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+        (inputs / "current.ir.json").write_bytes(Path(request.ir_path).read_bytes())
+        (inputs / "lane_gates.txt").write_text(request.lane_gates, encoding="utf-8")
+        (inputs / "amendment_rules.md").write_text(
+            request.amendment_rules, encoding="utf-8"
+        )
+        (inputs / "reviews.json").write_text(
+            json.dumps(
+                {
+                    "public_contract": st.json_ready(request.public_contract),
+                    "redacted_failures": list(request.redacted_failures),
+                    "reviews": [st.json_ready(row) for row in request.reviews],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        for relative, text in sorted(request.sealed_files.items()):
+            destination = _resolved_under(sealed, relative)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text, encoding="utf-8")
+        lch.scratch_environment(cwd)
+
+    def attend_operator(
+        self, ctx: LaneContext, request: att.OperatorRequest
+    ) -> Mapping[str, Any]:
+        """Dispatch the operator agent that authors an attended amendment.
+
+        Its tree is not a git checkout. That is deliberate: this role authors a
+        plan, never a candidate, and giving it a worktree would give it a HEAD
+        to commit against and the product repo to wander into. It gets its
+        inputs as files and one path to write.
+        """
+        attempt = self._role_dir(ctx, "operator")
+        cwd = attempt / "checkout"
+        cwd.mkdir(parents=True, exist_ok=True)
+        extra = {
+            "allowed_lane_ids": list(request.allowed_lane_ids),
+            "amendment_rules_path": str(
+                (cwd / self._OPERATOR_INPUTS / "amendment_rules.md").resolve()
+            ),
+            "current_ir_path": str(
+                (cwd / self._OPERATOR_INPUTS / "current.ir.json").resolve()
+            ),
+            "lane_gates_path": str(
+                (cwd / self._OPERATOR_INPUTS / "lane_gates.txt").resolve()
+            ),
+            "next_plan_revision": request.next_plan_revision,
+            "parked_stage": request.stage,
+            "reviews_path": str(
+                (cwd / self._OPERATOR_INPUTS / "reviews.json").resolve()
+            ),
+            "revision_out_path": request.revision_out_path,
+            "round": request.round_number,
+            "sealed_suite_dir": str((cwd / self._OPERATOR_SEALED).resolve()),
+            "sealed_suite_files": sorted(request.sealed_files),
+        }
+        payload, _handle, cwd_used = self._launch(
+            ctx,
+            "operator",
+            cwd,
+            extra,
+            prepare_cwd=lambda path: self._write_operator_tree(path, request),
+        )
+        del cwd_used
+        return payload
+
     def publish(
         self,
         ctx: LaneContext,
@@ -2369,7 +2620,13 @@ def _actor_for(
         {str(name): Path(path) for name, path in receipts.items()},
         verify_keys=keys,
     )
-    configured_routes = {binding["route"] for binding in role_routes.values()}
+    attend_route = (layout.get("attend") or {}).get("route") or {}
+    # The operator agent is dispatched through the same launcher as every
+    # other role, so its route is admitted by the same executed receipt. A
+    # deployment cannot opt into `run attend` on a route it never captured.
+    configured_routes = {binding["route"] for binding in role_routes.values()} | {
+        binding for binding in (attend_route.get("route"),) if binding
+    }
     if not all(admitted.admits(route) for route in configured_routes):
         raise FactoryRefused("ROUTE_RECEIPTS_REQUIRED")
     launcher = lch.HerdrLauncher(
@@ -2388,7 +2645,12 @@ def _actor_for(
         str(lane["id"]): st.json_ready(lane["spec"]) for lane in plan["lanes"]
     }
     return HerdrStageActor(
-        launcher, runtime.path, target, role_routes, lane_specs=lane_specs
+        launcher,
+        runtime.path,
+        target,
+        role_routes,
+        lane_specs=lane_specs,
+        operator_route=attend_route or None,
     )
 
 
@@ -2937,6 +3199,548 @@ def _run_amend(args: argparse.Namespace) -> int:
     return 0
 
 
+ATTEND_AMENDMENT_RULES = """# Amendment rules (from docs/plan-authoring.md)
+
+- Edit the IR, never the projected plan. The plan is a projection; a hand-edit
+  of it is discarded by the next projection and is refused at run start.
+- Do not add, remove, or rewire a lane. Topology is fixed for the life of a
+  run: removing a lane is refused at any stage, and a dependency change to a
+  merged lane is refused.
+- Change the smallest carrier that reaches the parked lane's projection. A
+  seam contract on the lane's own carrier is normally that carrier.
+- A lane whose canonical spec, ordered `needs`, ordered declared outputs, or
+  authored `lane_kind` moves is a changed lane: it restarts at PLANNED and
+  every former input of that lane is invalidated. A lane you did not intend to
+  change is finished work you are about to discard.
+- A claim binding copied into every tests lane re-digests every tests lane.
+  Bind the edit to the claims the parked lane discharges.
+- Weakening a check, a verdict, or an error path is a contract change, not a
+  fix for a blocked lane. If the contract is wrong, say so in the rationale;
+  do not delete the obligation the suite is asserting.
+"""
+
+
+def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
+    raw = layout.get("attend") or {}
+    return att.AttendPolicy(
+        max_amendments_per_lane=int(raw.get("max_amendments_per_lane") or 0),
+        max_amendments_per_run=int(raw.get("max_amendments_per_run") or 0),
+        route=raw.get("route") or {},
+        planctl=raw.get("planctl"),
+        plan_ir=raw.get("plan_ir"),
+        validate_argv=tuple(raw.get("validate_argv") or ()),
+        reviewer_id=str(raw.get("reviewer_id") or "maestro-attend"),
+        reviewer_vendor=str(raw.get("reviewer_vendor") or "maestro"),
+    )
+
+
+def _reviewer_hmac_key(runtime: RuntimeStateRoot) -> str:
+    """The plan-contract reviewer key, from where the runtime already keeps it.
+
+    `route_admission.provision_keys` mints it once under the state root's keys
+    directory and never regenerates it, because a new key silently invalidates
+    every approval receipt already signed with the old one. Resolved here
+    rather than hardcoded so a deployment that moved its state root moves its
+    key with it.
+    """
+    path = runtime.path / "keys" / admission.REVIEWER_HMAC_KEY_FILE
+    try:
+        material = path.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise att.AttendRefused(
+            att.KEY_UNRESOLVED, "{0}: {1}".format(path, exc)
+        ) from exc
+    if not material:
+        raise att.AttendRefused(att.KEY_UNRESOLVED, "{0} is empty".format(path))
+    return material
+
+
+def _planctl_binary(policy: att.AttendPolicy) -> Path:
+    if policy.planctl is None:
+        raise att.AttendRefused(
+            att.PLANCTL_UNRESOLVED, "attend.planctl is not configured"
+        )
+    if not policy.planctl.is_file():
+        raise att.AttendRefused(
+            att.PLANCTL_UNRESOLVED, "{0} is not a file".format(policy.planctl)
+        )
+    return policy.planctl
+
+
+def _run_planctl(
+    binary: Path, argv: Sequence[str], *, key: Optional[str] = None
+) -> None:
+    """One planctl subcommand, refused by exit status and nothing else.
+
+    The refusal carries planctl's own output because a receipt or validation
+    refusal names the IR field that is wrong, and that sentence is the whole
+    value of running it. It is never parsed: the decision is the exit code.
+    """
+    environment = dict(os.environ)
+    environment.pop(admission.REVIEWER_HMAC_KEY_ENV, None)
+    if key is not None:
+        environment[admission.REVIEWER_HMAC_KEY_ENV] = key
+    result = subprocess.run(
+        [sys.executable, str(binary), *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    if result.returncode == 0:
+        return
+    detail = (result.stdout or "") + (result.stderr or "")
+    raise att.AttendRefused(
+        att.REVISION_REFUSED,
+        "planctl {0} exited {1}: {2}".format(
+            argv[0], result.returncode, detail.strip()[:2000]
+        ),
+    )
+
+
+def _attend_lane_gates(
+    runtime: RuntimeStateRoot, run_id: str, lane_id: str, regression: bool
+) -> str:
+    """The gate table an operator reads, rendered by the tool that owns it.
+
+    Imported here rather than at module scope: `tools/` is a sibling of the
+    package and a deployment that trimmed it must still be able to run every
+    other verb. A missing tool costs the operator agent one input, not the run.
+    """
+    try:
+        from tools import lane_gates
+    except ImportError as exc:  # pragma: no cover - trimmed deployment
+        return "lane gate table unavailable: {0}".format(exc)
+    conn = lane_gates.open_readonly(runtime.ledger_path())
+    try:
+        rows = [
+            row
+            for row in lane_gates.lane_rows(conn, run_id)
+            if str(row["lane_id"]) == lane_id
+        ]
+        if not rows:
+            return "no lane row for {0}".format(lane_id)
+        table = lane_gates.lane_table(
+            conn,
+            run_id,
+            rows[0],
+            str(runtime.path),
+            "runtime_sync not read by attend",
+            regression_on_findings=regression,
+        )
+        return lane_gates.render(run_id, lane_id, table)
+    finally:
+        conn.close()
+
+
+def _attend_sealed_files(
+    store: ArtifactStore,
+    runtime: RuntimeStateRoot,
+    run_id: str,
+    lane: st.LaneProjection,
+) -> dict[str, str]:
+    """The sealed suite, read out of the vault for the operator agent alone.
+
+    This is the one place outside code review that decrypts the private-test
+    boundary, and it is a deliberate trade the operator opted into by setting
+    `attend.max_amendments_per_lane`. Nothing downstream of here hands these
+    bytes to a builder or a reviewer: they are written into the operator's own
+    tree, which is not a git checkout and is never merged.
+    """
+    artifact_id = store.sealed_bundle_artifact_id(run_id, lane.lane_id)
+    if artifact_id is None:
+        return {}
+    record = store.get_lane_artifact(artifact_id)
+    vault = hv.ensure_vault(runtime.path, run_id)
+    blobs = tchain.sealed_private_files(
+        vault, _record_as_lane_artifact(record, lane)
+    )
+    return {
+        path: hv.cat_blob(vault, blob).decode("utf-8", errors="replace")
+        for path, blob in blobs.items()
+    }
+
+
+def _attend_plan_ir(
+    policy: att.AttendPolicy, plans_dir: Path, run_id: str, revision: int
+) -> Path:
+    """The Plan IR the live revision was projected from.
+
+    Two places, in order: the copy `run attend` itself wrote for a revision it
+    applied, and the deployment's configured `attend.plan_ir` for the revision
+    a human authored. Neither present is a refusal rather than a fallback --
+    the pinned plan artifact is a *projection* of an IR, and handing it to an
+    agent asked to edit an IR would produce a revision the ingress cannot read
+    and a refusal three steps later that names none of this.
+    """
+    written = plans_dir / "{0}.r{1}.ir.json".format(run_id, revision)
+    if written.is_file():
+        return written
+    if policy.plan_ir is not None and policy.plan_ir.is_file():
+        return policy.plan_ir
+    raise att.AttendRefused(
+        att.PLAN_IR_UNRESOLVED,
+        "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
+        "({2})".format(revision, written, policy.plan_ir or "unset"),
+    )
+
+
+def _attend_request(
+    store: ArtifactStore,
+    runtime: RuntimeStateRoot,
+    layout: Mapping[str, Any],
+    run_id: str,
+    lane_id: str,
+    compiled: st.CompiledPlan,
+    ir_path: Path,
+    operator_cwd: Path,
+) -> att.OperatorRequest:
+    """Everything the operator agent reads, assembled from the ledger."""
+    lane = next(item for item in compiled.lanes if item.lane_id == lane_id)
+    stage = store.lane_stage(run_id, lane_id)
+    reviews: list[Mapping[str, Any]] = []
+    for kind in (st.ArtifactKind.TEST_REVIEW, st.ArtifactKind.CODE_REVIEW):
+        for payload in store.lane_artifact_payloads(run_id, lane_id, kind, 4):
+            reviews.append({"kind": kind.value, **dict(payload)})
+    plan = store.latest_lane_artifact_payload(
+        run_id, lane_id, st.ArtifactKind.LANE_PLAN
+    )
+    contract = {}
+    if isinstance(plan, Mapping):
+        contract = dict(plan.get("public_contract") or {})
+    failures: tuple[str, ...] = ()
+    builder = store.latest_lane_artifact_payload(
+        run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
+    )
+    if isinstance(builder, Mapping):
+        raw = builder.get("redacted_failures")
+        if isinstance(raw, Sequence) and not isinstance(raw, str):
+            failures = tuple(str(item) for item in raw)
+    next_revision = compiled.plan_revision + 1
+    return att.OperatorRequest(
+        run_id=run_id,
+        lane_id=lane_id,
+        stage=stage.value,
+        round_number=len(reviews),
+        plan_revision=compiled.plan_revision,
+        next_plan_revision=next_revision,
+        public_contract=contract,
+        reviews=tuple(reviews),
+        redacted_failures=failures,
+        lane_gates=_attend_lane_gates(
+            runtime,
+            run_id,
+            lane_id,
+            bool(layout.get("stall_regression_on_findings")),
+        ),
+        ir_path=str(ir_path),
+        revision_out_path=str(
+            operator_cwd
+            / HerdrStageActor._OPERATOR_OUT
+            / "r{0}.ir.json".format(next_revision)
+        ),
+        sealed_files=_attend_sealed_files(store, runtime, run_id, lane),
+        amendment_rules=ATTEND_AMENDMENT_RULES,
+        allowed_lane_ids=att.paired_lane_ids(compiled.lanes, lane_id),
+    )
+
+
+def _attend_project(
+    policy: att.AttendPolicy,
+    runtime: RuntimeStateRoot,
+    repo: Path,
+    plans_dir: Path,
+    run_id: str,
+    revision_ir: Path,
+    revision: int,
+) -> tuple[st.CompiledPlan, Path]:
+    """Validate, approve, project and compile one authored revision.
+
+    The same four steps the human ran by hand on FDAdb `d246ae95`, in the same
+    order and against the same binary. The IR is copied under the repository
+    first because `planctl --repo-root` refuses an IR outside the root it is
+    told to resolve sources against, and because a revision that is applied
+    has to survive the operator agent's scratch tree.
+    """
+    binary = _planctl_binary(policy)
+    key = _reviewer_hmac_key(runtime)
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    stem = "{0}.r{1}".format(run_id, revision)
+    ir = plans_dir / (stem + ".ir.json")
+    rendered = plans_dir / (stem + ".html")
+    receipt = plans_dir / (stem + ".receipt.json")
+    plan_out = plans_dir / (stem + ".plan.json")
+    for stale in (rendered, receipt, plan_out):
+        if stale.exists():
+            stale.unlink()
+    shutil.copyfile(revision_ir, ir)
+    root = ["--repo-root", str(repo)]
+    _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
+    _run_planctl(
+        binary,
+        [
+            "review",
+            str(ir),
+            "--rendered",
+            str(rendered),
+            "--receipt-out",
+            str(receipt),
+            "--reviewer",
+            policy.reviewer_id,
+            "--reviewer-vendor",
+            policy.reviewer_vendor,
+            *root,
+        ],
+        key=key,
+    )
+    _run_planctl(
+        binary,
+        [
+            "validate",
+            str(ir),
+            "--rendered",
+            str(rendered),
+            "--receipt",
+            str(receipt),
+            "--require-approved",
+            *root,
+            *policy.validate_argv,
+        ],
+    )
+    try:
+        ingress.author_from_plan_contract(ir, receipt, plan_out, repo, rendered)
+    except Exception as exc:
+        raise att.AttendRefused(
+            att.REVISION_REFUSED, "{0}: {1}".format(type(exc).__name__, exc)
+        ) from exc
+    try:
+        compiled = _compile_plan(plan_out, revision=revision, ref=str(plan_out))
+    except PlanCompileError as exc:
+        raise att.AttendRefused(att.REVISION_REFUSED, str(exc)) from exc
+    return compiled, plan_out
+
+
+def _run_attend(args: argparse.Namespace) -> int:
+    """Run the factory and author the amendment a NO_PROGRESS park needs.
+
+    Everything about a lane's lifecycle is unchanged. This verb runs the same
+    scheduler `run resume` runs, and when that scheduler parks a lane for
+    making no progress it does what the operator would have done by hand
+    instead of returning to a prompt: dispatches one agent to author a plan
+    revision, validates and projects it exactly as `run amend` requires, and
+    applies it through `apply_factory_amendment`. Any other wait reason, and
+    any lane past its bound, parks as it does today.
+    """
+    run_id = args.run_id
+    layout, runtime, store, row, target, compiled = _bind_existing_run(run_id)
+    policy = _attend_policy(layout)
+    if not policy.enabled:
+        store.close()
+        runtime.close()
+        return _RunRefused(
+            att.DISABLED,
+            "set attend.max_amendments_per_lane in this deployment's "
+            "maestro.config.yaml to enable run attend",
+        ).emit()
+    maybe_autoload_dashboard(
+        layout,
+        repository=Path(row["target_repository_root"]),
+        ledger=runtime.ledger_path(),
+    )
+    session_id = uuid.uuid4().hex
+    repo = Path(row["target_repository_root"])
+    plans_dir = Path(plan_artifact_ref_for(store, run_id, row["plan_revision"]))
+    plans_dir = plans_dir.resolve().parent
+    console = step_log.RunReporter(run_id, runtime.path)
+    state: dict[str, Any] = {"passes": 0}
+
+    def build_scheduler(plan: st.CompiledPlan) -> tuple[Any, Any]:
+        actor = _actor_for(runtime, layout, target, run_id, plan)
+        if state["passes"]:
+            close_panes = getattr(actor, "close_run_panes", None)
+            if close_panes is not None:
+                close_panes(run_id)
+        scheduler = FactoryScheduler(
+            store,
+            run_id,
+            actor,
+            runtime,
+            target,
+            stage_started=console.stage_started,
+            stage_completed=console.stage_completed,
+            step=console.step,
+            compiled=plan,
+            concurrency=layout.get("concurrency") or 1,
+            regression_on_findings=bool(layout.get("stall_regression_on_findings")),
+        )
+        return actor, scheduler
+
+    def run_scheduler(plan: st.CompiledPlan) -> st.RunStatus:
+        actor, scheduler = build_scheduler(plan)
+        state["actor"] = actor
+        actor.restore_layout(run_id, store.active_projection(run_id))
+        scheduler.resume_waiting()
+        status = scheduler.run()
+        state["passes"] = state["passes"] + 1
+        return status
+
+    def operator_cwd_for(lane_id: str) -> Path:
+        return runtime.path / "worktrees" / run_id / lane_id / "operator" / "checkout"
+
+    def request_for(lane_id: str, plan: st.CompiledPlan) -> att.OperatorRequest:
+        return _attend_request(
+            store,
+            runtime,
+            layout,
+            run_id,
+            lane_id,
+            plan,
+            _attend_plan_ir(policy, plans_dir, run_id, plan.plan_revision),
+            operator_cwd_for(lane_id),
+        )
+
+    def dispatch(request: att.OperatorRequest) -> Mapping[str, Any]:
+        actor = state.get("actor")
+        propose = getattr(actor, "attend_operator", None)
+        if propose is None:
+            raise att.AttendRefused(
+                att.OPERATOR_FAILED, "actor cannot dispatch an operator agent"
+            )
+        lane = next(
+            item
+            for item in store.active_projection(run_id)
+            if item.lane_id == request.lane_id
+        )
+        ctx = LaneContext(
+            run_id=run_id,
+            lane=lane,
+            plan_revision=request.plan_revision,
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=plan_artifact_ref_for(
+                store, run_id, request.plan_revision
+            ),
+            input_digest=st.digest_canonical(
+                {
+                    "attend_session_id": session_id,
+                    "lane_id": request.lane_id,
+                    "plan_revision": request.plan_revision,
+                    "schema_version": st.CANONICAL_SCHEMA_VERSION,
+                }
+            ),
+            stage=st.LaneStage(request.stage),
+            artifacts={},
+        )
+        return propose(ctx, request)
+
+    def project(revision_ir: Path, revision: int) -> st.CompiledPlan:
+        plan, plan_out = _attend_project(
+            policy, runtime, repo, plans_dir, run_id, revision_ir, revision
+        )
+        state["plan_path"] = plan_out
+        return plan
+
+    def apply(plan: st.CompiledPlan) -> Any:
+        record = apply_factory_amendment(
+            store, run_id, plan, runtime=runtime, target=target
+        )
+        _pin_plan_artifact(
+            Path(state["plan_path"]),
+            _pinned_plan_artifact(runtime, run_id, plan.plan_revision),
+        )
+        return record
+
+    started = now_iso()
+    store.record_attend_session(
+        run_id,
+        session_id=session_id,
+        phase=st.ATTEND_PHASE_START,
+        payload={
+            "started_at": started,
+            "max_amendments_per_lane": policy.max_amendments_per_lane,
+            "max_amendments_per_run": policy.max_amendments_per_run,
+            "plan_revision": compiled.plan_revision,
+        },
+    )
+    outcome: att.AttendOutcome | None = None
+    stop_reason = ""
+    status = st.RunStatus.WAITING
+    try:
+        try:
+            console.opened(
+                "attend",
+                run_id,
+                row["target_repository_root"],
+                row["target_main_ref"],
+                (lane.lane_id for lane in store.active_projection(run_id)),
+            )
+            try:
+                outcome = att.attend_run(
+                    store=store,
+                    run_id=run_id,
+                    policy=policy,
+                    compiled=compiled,
+                    session_id=session_id,
+                    run_scheduler=run_scheduler,
+                    request_for=request_for,
+                    dispatch=dispatch,
+                    project=project,
+                    apply_amendment=apply,
+                    say=console.step,
+                )
+                status = outcome.status
+                stop_reason = outcome.stop_reason
+                applied = outcome.applied
+            except att.AttendRefused as refused:
+                stop_reason = refused.code
+                applied = ()
+                raise
+            finally:
+                store.record_attend_session(
+                    run_id,
+                    session_id=session_id,
+                    phase=st.ATTEND_PHASE_STOP,
+                    payload={
+                        "started_at": started,
+                        "stopped_at": now_iso(),
+                        "stop_reason": stop_reason or "UNRECORDED",
+                        "revisions_applied": len(applied),
+                        "lanes_amended": sorted(
+                            {item.lane_id for item in applied}
+                        ),
+                        "amendments": [
+                            {
+                                "lane_id": item.lane_id,
+                                "plan_revision": item.plan_revision,
+                                "amendment_artifact_id": item.amendment_artifact_id,
+                                "rationale_artifact_id": item.rationale_artifact_id,
+                            }
+                            for item in applied
+                        ],
+                    },
+                )
+            console.finished(run_id, status)
+        finally:
+            store.close()
+    except att.AttendRefused as refused:
+        return _RunRefused(refused.code, refused.detail).emit()
+    finally:
+        runtime.close()
+    print(
+        json.dumps(
+            {
+                "outcome": "ATTENDED",
+                "run_id": run_id,
+                "status": status.value,
+                "stop_reason": stop_reason,
+                "session_id": session_id,
+                "revisions_applied": len(outcome.applied) if outcome else 0,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _run_status(args: argparse.Namespace) -> int:
     run_id = args.run_id
     layout, runtime, store, _row, target, compiled = _bind_existing_run(run_id)
@@ -2956,6 +3760,12 @@ def _run_status(args: argparse.Namespace) -> int:
                 lane.lane_id: store.lane_stage(run_id, lane.lane_id).value
                 for lane in store.active_projection(run_id)
             }
+            attend_rows = [
+                dict(row["payload"])
+                for row in store.run_artifacts_of_kind(
+                    run_id, st.ArtifactKind.ATTEND_SESSION
+                )
+            ]
         finally:
             store.close()
     finally:
@@ -2967,6 +3777,7 @@ def _run_status(args: argparse.Namespace) -> int:
                 "run_id": run_id,
                 "status": status.value,
                 "lanes": stages,
+                **({"attend": attend_rows} if attend_rows else {}),
             },
             sort_keys=True,
         )
@@ -3000,6 +3811,10 @@ def build_parser() -> argparse.ArgumentParser:
     amend.add_argument("plan")
     amend.add_argument("--run", dest="run_id", required=True)
     amend.set_defaults(handler=_run_amend)
+
+    attend = run_sub.add_parser("attend")
+    attend.add_argument("--run", dest="run_id", required=True)
+    attend.set_defaults(handler=_run_attend)
 
     status = run_sub.add_parser("status")
     status.add_argument("run_id")

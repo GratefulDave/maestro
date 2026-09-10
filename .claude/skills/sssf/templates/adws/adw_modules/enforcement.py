@@ -68,6 +68,10 @@ REQUIRED_VERBS = (
     "run start",
     "run resume",
     "run amend",
+    # Always on the parser; opting out is a config value, not a missing verb,
+    # so an operator who reads §13 and types it gets ATTEND_DISABLED rather
+    # than an argparse error that says nothing about why.
+    "run attend",
     "run status",
 )
 

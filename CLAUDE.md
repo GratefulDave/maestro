@@ -9,8 +9,12 @@ receipts, copied plans, and ephemeral worktrees live only under the deployment's
 absolute `runtime_state_root` (mode `0700`, outside the target repository). Every
 `run start`, `run resume`, `run amend`, and `run status` revalidates
 `runtime_state_fingerprint`. Operator execution is only
-`uv run adws/maestro.py run start|resume|amend|status` from the stamped `adws/`
-copy against a bound `--repo` publication worktree. Template-source run creation
+`uv run adws/maestro.py run start|resume|amend|attend|status` from the stamped
+`adws/` copy against a bound `--repo` publication worktree. `run attend` is the
+opted-in loop that authors a plan amendment for a `NO_PROGRESS` park instead of
+stopping for a human; it is off unless that deployment's own
+`maestro.config.yaml` sets `attend.max_amendments_per_lane`, and it still moves
+a lane only through a `PLAN_AMENDMENT`. Template-source run creation
 refuses `RUN_REPOSITORY_MISMATCH`. Herdr and OMP are transport for agent dispatch;
 pane text, process liveness, and session directories are not workflow authority.
 There is no retry, skip, abandon, attempt-salvage, or coordinator/workspace verb.

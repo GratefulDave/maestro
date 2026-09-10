@@ -148,6 +148,23 @@ A final-review `REVISE` appends `USER_WAIT` with `wait_reason=AMENDMENT_REQUIRED
 
 `run amend` is a separate explicit verb. Ordinary stage-boundary continuation is `run resume <run-id>`.
 
+### Attended amendment
+
+A lane parked with `wait_reason=NO_PROGRESS` is resumable by definition (§5, `RESUMABLE_WAIT_REASONS`), and resuming it grants another window against the same contract. That is the right answer when the lane stalled on something a further round can fix and the wrong one when it stalled because its contract does not say what the sealed suite asserts — the second case parks again in the same place.
+
+`run attend --run <run-id>` is the opted-in loop that answers the second case. It runs the same scheduler `run resume` runs; when that scheduler parks a lane for `NO_PROGRESS`, it dispatches one operator agent to author a plan revision, validates and approves that revision through `planctl`, projects it through the plan-contract ingress, and applies it through the same `apply_amendment` path `run amend` uses. Every rule above still holds: the transition is caused by the `PLAN_AMENDMENT` artifact and by changed `lane_projection_digest` values, never by the agent's prose, and a changed lane restarts at `PLANNED` with every former input invalidated.
+
+Three bounds, all in the deployment's own `maestro.config.yaml` and therefore never carried by a runtime mirror:
+
+- `attend.max_amendments_per_lane` — absent or `0` refuses the verb with `ATTEND_DISABLED`. This is the whole opt-in.
+- `attend.max_amendments_per_run` — default `10`.
+- `attend.route` — required once the lane bound is set, validated like a lane role route and admitted by the same executed route receipt.
+- `attend.planctl` and `attend.plan_ir` — absolute paths to the plan-contract validator and to the Plan IR the run's current revision was projected from. Absent refuses `ATTEND_PLANCTL_UNRESOLVED` / `ATTEND_PLAN_IR_UNRESOLVED` rather than approving an unvalidated revision or handing an agent a projected plan to edit as an IR. After the first attended amendment the IR is the copy that amendment wrote under the plans directory.
+
+A revision that changes any lane other than the parked lane and the tests/build lane it is paired with is refused `ATTEND_AMENDMENT_TOO_WIDE`, and so is one that changes no lane projection at all. A wait for any other reason, a lane or run at its bound, an operator agent that refuses or crashes, and a revision that fails validation all park exactly as they do today and end the verb on the same `waiting` status `run resume` would have returned.
+
+One privilege is deliberate and is stated in the operator agent's own prompt: **it reads the sealed suite.** The builder and every reviewer still do not, and nothing else in §11 relaxes. The operator agent is a plan author; the trade a deployment accepts by setting the lane bound is that an amendment it writes may state, as a contract clause, an expectation the suite was asserting privately.
+
 ### Changed versus unchanged lanes
 
 A changed lane is one whose canonical spec, ordered `needs`, ordered declared outputs, or authored `lane_kind` differ, and therefore whose `lane_projection_digest` changes. A lane's canonical spec carries only the bindings of the claims that lane discharges, plus the paired build lanes' claims its spec already embeds. A plan-wide binding list copied into every tests lane makes one claim edit re-digest every tests lane, and `apply_amendment` then correctly resets lanes the amendment never named: on FDAdb run d246ae95 an amendment editing one FAQ claim un-merged both finished geo lanes. Absent `lane_kind` keeps the legacy digest identity. It restarts at `PLANNED`, invalidates every former input, and creates a new `LANE_PLAN` before the typed or untyped next stage. No input from a changed projection may be retained. Changed-projection reset to `PLANNED` takes precedence over pause preservation.
@@ -288,7 +305,9 @@ Every fingerprint is SHA-256 over UTF-8 canonical JSON with schema version `1`, 
 
 ### 8.7 `run_artifacts`
 
-Append-only run-level records. Kinds: `FINAL_INTEGRATION_REVIEW`, `MAIN_PUBLICATION`, `PLAN_AMENDMENT`. Completion key `(run_id, artifact_kind, input_digest)` unique.
+Append-only run-level records. Kinds: `FINAL_INTEGRATION_REVIEW`, `MAIN_PUBLICATION`, `PLAN_AMENDMENT`, `ATTEND_SESSION`, `AMENDMENT_RATIONALE`. Completion key `(run_id, artifact_kind, input_digest)` unique.
+
+`ATTEND_SESSION` and `AMENDMENT_RATIONALE` are records, not authority. Neither appears in the §3 transition table, neither touches `lane_state`, and no predicate reads either. They exist because an attended amendment's reason must survive as evidence rather than as console text. Adding them is a ledger schema version (`artifact-factory.v3`): the run-artifact kind check is baked into the table at creation, so a ledger created before them refuses the insert whatever the enum says.
 
 ### 8.8 `transitions`
 
@@ -394,6 +413,7 @@ Untyped private tester files are independent hidden meta-tests. They must not co
 - Code reviewer receives the candidate commit and controlled vault access, runs the predecessor sealed suite in scratch, and emits only verdict, public result summary, and redacted findings.
 - What the observability surface publishes from an artifact body is a per-kind key allowlist, never one list applied to every kind, and a key no kind names never leaves. `TEST_REVIEW` publishes its redacted actionable findings, which the runtime redacts where they are written. `TEST_DRAFT` publishes its public contract and digests only, so a draft carrying private source, private file paths, selectors, expected literals, or a vault reference publishes none of them. The surface is read-only and is never workflow authority.
 - On an untyped lane, a candidate collision raises typed `PRIVATE_PATH_COLLISION`. `REVIEWING_CODE` durably emits `TEST_INVALIDATION`, atomically resets the lane to `WRITING_TESTS`, passes the redacted actionable reason to the persistent tester, and leaves prior artifacts as immutable history. Other `IsolationError` failures fail closed. Typed build review overlays the predecessor suite even when those paths exist in the candidate.
+- The operator agent dispatched by `run attend` reads the sealed suite, in a tree that is not a git checkout and is never merged. It is the only reader outside code review that does, it is opted into per deployment, and it authors plans rather than candidates. Nothing it produces hands those bytes to a builder or a reviewer.
 - Private objects must be absent from the builder worktree, refs, rev-list, and fetch paths, and from the run repo until an authored build lane's `INTEGRATION_MERGE` releases its predecessor tests lane's accepted suite (§12). That release follows the lane's own code review, so no builder could have shaped a candidate to bytes it was judged against first.
 - A build lane's own acceptance suite is absent from its checkout unconditionally, whatever its base carries. `LaneContext.sealed_private_paths` names the pair `_sealed_for` already resolves, and the launch removes those paths from the working tree on every turn: after an amendment the lane's new base is an integration head carrying the very suite it is graded against, and the merge cannot un-release it. The removal never reaches the candidate — it stays out of the index, and the same paths are subtracted from the commit pathspec. That subtraction is load-bearing. Neither `plan_compiler` nor `validate_objective_plan` forbids a plan from declaring an output that covers a sealed path; without the subtraction `_commit_declared` would stage the removal as a deletion, `validate_declared_ownership` would admit that deletion as owned, and the next merge would delete a released suite from the integration ref.
 
@@ -419,19 +439,21 @@ A crash after Git mutation but before ledger commit is idempotently reconciled f
 
 ## 13. Operator commands
 
-Frozen operator surface:
+Operator surface. It is closed — a verb outside this table is refused by `enforcement.assert_verbs` and by `test_single_entry_cli` — and it grew once, deliberately, when `run attend` was added:
 
 ```text
 uv run adws/maestro.py run start <approved-plan> [--repo <target-worktree-root>] [--main-ref <ref>]
 uv run adws/maestro.py run resume <run-id>
 uv run adws/maestro.py run amend <approved-plan> --run <run-id>
+uv run adws/maestro.py run attend --run <run-id>
 uv run adws/maestro.py run status <run-id>
 
 ```
 
 - `run start` creates the run, initial plan revision, complete DAG projection, and initial `PLANNED` lane states in one transaction after pinning `integration_initial_sha` from the plan's declared integration branch, then creates the integration ref from zero to that SHA.
 - `run resume` continues the next incomplete stage from the last accepted immutable artifact. After an explicit `PAUSE`, it restores the recorded stage/input. After `AMENDMENT_REQUIRED`, it leaves the lane waiting.
-- `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`.
+- `run amend <approved-plan> --run <run-id>` applies an operator-authored `PLAN_AMENDMENT`.
+- `run attend --run <run-id>` runs the scheduler like `run resume` and, on a `NO_PROGRESS` park, authors and applies the amendment itself. Opt-in per deployment; refuses `ATTEND_DISABLED` otherwise. It writes an `ATTEND_SESSION` at start and stop and an `AMENDMENT_RATIONALE` beside every amendment it applies. See §5, *Attended amendment*.
 - `run status` derives §6 from durable rows after revalidating `runtime_state_fingerprint`.
 
 `run start` after ledger registration and `run resume` after binding detach the configured Next.js dashboard launcher. The scheduler is never blocked. `run amend` and `run status` do not launch.

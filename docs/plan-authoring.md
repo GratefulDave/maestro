@@ -425,6 +425,43 @@ does not adopt a live session.
 integration-review-pending / publishable from durable rows. Pane text and scheduler liveness are
 not authority.
 
+## Attended amendments
+
+A lane that parks `NO_PROGRESS` has stopped moving against the contract it was given. Sometimes
+that is a lane problem and another round fixes it; `run resume` grants that round. Sometimes it is
+an authoring problem — the suite asserts something the contract never required, so every candidate
+is judged against an obligation no reader of the contract could have satisfied. On FDAdb run
+`d246ae95` that happened twice on one lane, and both times the fix was one edit to one
+`seams[i].contract` on the parked lane's own carrier, after which the lane converged in a single
+round.
+
+`run attend --run <run-id>` automates that authoring loop where a deployment opts into it
+(`attend.max_amendments_per_lane` in that deployment's `maestro.config.yaml`; absent means off, and
+a runtime mirror never carries the key). It dispatches one operator agent, which reads the lane's
+public contract, its recent reviews, its gate table, the current Plan IR **and the sealed suite**,
+and writes one revision IR. Maestro then validates and approves that revision with `planctl`,
+projects it, and applies it exactly as `run amend` would.
+
+Three authoring consequences.
+
+- **The revision is an IR edit, not a plan edit.** Everything under *The compiler boundary* still
+  holds: the executable plan is a projection, and a hand-edit of it is discarded by the next one.
+- **Scope is the parked lane and its pair.** A revision that moves any other lane's
+  `lane_projection_digest` is refused whole with `ATTEND_AMENDMENT_TOO_WIDE`, because a lane whose
+  digest moves restarts at `PLANNED` and loses every input it had. This is the failure §5 records
+  from `d246ae95`: an amendment editing one FAQ claim un-merged both finished geo lanes, because a
+  plan-wide binding list copied into every tests lane re-digests every tests lane. Bind a claim to
+  the lanes that discharge it and an attended amendment can reach the lane it was called for.
+- **A weakened obligation is still a contract change.** The operator agent is told not to delete
+  what the suite asserts, and an amendment that narrows a check should land on its own, labeled as
+  such — not inside an amendment whose stated purpose was to unblock a lane.
+
+The privilege is worth stating plainly, because it is the one boundary this verb moves: the
+operator agent reads the sealed suite. Builders and reviewers still do not. A deployment that turns
+`run attend` on is accepting that an amendment may put into a public contract an expectation the
+suite had been asserting privately — which is usually the correct repair, and is always a
+disclosure.
+
 ## Several repositories
 
 There is no multi-repository Plan IR in the proven two-lane slice. Each repository is one run

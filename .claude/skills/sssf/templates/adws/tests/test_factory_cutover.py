@@ -437,7 +437,11 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(resumed.run(), st.RunStatus.COMPLETE)
         self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.MERGED)
 
-    def test_cli_surface_is_frozen_verbs_only(self) -> None:
+    def test_cli_surface_is_the_documented_verbs_only(self) -> None:
+        # Equality, not containment: the surface is closed, and the one time
+        # it grew -- `run attend`, MAESTRO_architecture.md §13 -- it grew here
+        # first. No retry, skip, abandon, salvage, coordinator or workspace
+        # verb has ever passed this assertion.
         verbs = maestro.parser_verbs(maestro.build_parser())
         self.assertEqual(
             verbs,
@@ -445,6 +449,7 @@ class FactoryCutoverTests(unittest.TestCase):
                 "run start",
                 "run resume",
                 "run amend",
+                "run attend",
                 "run status",
             ),
         )
