@@ -6,6 +6,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **A handle is bound to its terminal, not to its pane id.** On 2026-09-10 an
+  operator ran `herdr pane move w1HY:p2 --tab w1FA:t1 --split right` on a lane
+  pane whose tester was already dispatched. Herdr gave the pane a new id under
+  the same `terminal_id`, `_verified_handle_binding` compared the pane record's
+  id against the handle's and raised `LaunchRefused(BINDING_MISMATCH, w1HY:p2)`
+  on the next `wait_for_idle`, and that refusal propagated out of
+  `_await_envelope` — which was holding a valid envelope — through
+  `_advance_ready` and ended the entire `run amend` process, taking every other
+  lane with it. Two defects, one arrangement: a display coordinate used as a
+  durable key, and one lane's transport refusal given run-wide blast radius.
+  `LaunchHandle` now records `terminal_id` at launch and the verified binding
+  keys on it (`adw_modules/launcher.py`): a pane whose id changed but whose
+  terminal did not is re-resolved onto its new pane, tab, and workspace ids and
+  the wait continues, reported as `PANE_RELOCATED old->new`. The lane child
+  Space the launcher owns and must close is deliberately not rewritten, so a
+  pane dragged into the operator's own Space does not make that Space Maestro's
+  to reap. Nothing is weakened: `BINDING_MISMATCH` still refuses a vanished
+  terminal, a pane found under a different terminal, a handle carrying no
+  recorded terminal, and a relocated pane whose named agent is no longer the one
+  in it. Real-binary observation, not a fake: herdr 0.9.0 reports
+  `previous_pane_id`/`previous_tab_id`/`previous_workspace_id` on the move,
+  keeps `terminal_id`, and resolves `pane get <stale-id>` to the moved pane.
+
+  The blast-radius half is **not** fixed here and is recorded as it stands:
+  there is no lane-level path for a `LaunchRefused` raised mid-wait. Every one
+  of them becomes `LaunchFailed` (`maestro.py:1688`), and `LaunchFailed` has
+  exactly one handler in the runtime, the top-level CLI dispatch
+  (`maestro.py:3061`); `_advance` (`adw_modules/scheduler.py:1933`) catches no
+  per-lane exception and `_advance_ready` re-raises the first. Giving a
+  transport refusal a lane-level home is a change to how a run terminates and
+  belongs on its own commit, not bundled with this one.
+
 ### Added
 - **A gating obligation names its observation seam or does not ship.** A claim a
   tests lane must discharge carries an `observation_seam` in the Plan IR — the

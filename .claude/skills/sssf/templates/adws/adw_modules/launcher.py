@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -707,6 +708,13 @@ class LaunchHandle:
     pane_id: str
     agent_name: str
     launched_cwd: Path
+    #: The pane's terminal, which is the handle's durable identity. A
+    #: `herdr pane move` across tabs or Spaces mints a new `pane_id` and keeps
+    #: `terminal_id`, so a binding keyed on the pane id refuses a pane an
+    #: operator merely rearranged. Empty only for handles built without a pane
+    #: record (`FakeLauncher`, the throwaway handle `cancel` is handed on a
+    #: cwd mismatch), and an empty value keeps the old strict pane-id equality.
+    terminal_id: str = ""
     transcript_path: Optional[Path] = None
     envelope_path: Optional[Path] = None
     #: Honestly unreachable rather than mistakenly unwired, and the difference
@@ -4039,6 +4047,7 @@ class HerdrLauncher:
             pane_id,
             name,
             launched,
+            terminal_id=str(pane.get("terminal_id") or ""),
             transcript_path=transcript,
             envelope_path=spec.envelope_path,
             environment=environment,
@@ -4962,6 +4971,9 @@ class HerdrLauncher:
             pane_id,
             name,
             bound_cwd,
+            terminal_id=(
+                str(bound.get("terminal_id") or "") if isinstance(bound, dict) else ""
+            ),
             transcript_path=transcript,
             envelope_path=spec.envelope_path,
             environment=environment,
@@ -5066,13 +5078,76 @@ class HerdrLauncher:
                 pane_created=False,
             ) from exc
 
+    def _pane_bound_to_terminal(
+        self, handle: LaunchHandle
+    ) -> Optional[dict]:
+        """The pane now carrying this handle's terminal, wherever it moved to.
+
+        Read off herdr 0.9.0 rather than off a fake: a pane split from
+        `w1AT:t1` and moved with `herdr pane move --tab w1J3:t1 --split right`
+        came back as `previous_pane_id` `w1AT:p2R`, `pane_id` `w1J3:p2`,
+        `tab_id` and `workspace_id` both changed, and `terminal_id`
+        `term_65b1a58627363b8` unchanged. The terminal is the durable key; the
+        pane id is a display coordinate an operator may rearrange at will.
+        """
+        terminal = str(handle.terminal_id or "")
+        if not terminal:
+            return None
+        try:
+            listed = self._herdr("pane", "list", env=handle.environment)
+        except HerdrCallError:
+            return None
+        for pane in _herdr_list(listed, "panes"):
+            if str(pane.get("terminal_id") or "") == terminal:
+                return pane
+        return None
+
+    def _rebind_relocated_pane(self, handle: LaunchHandle, pane: dict) -> None:
+        """Move the handle's display coordinates onto the pane's new home.
+
+        `child_workspace_id` and `parent_workspace_id` are deliberately left
+        alone. They are cleanup ownership -- the Space Maestro created for this
+        lane and must close, and the Space it must never close. A pane dragged
+        into the operator's own Space must not make that Space Maestro's to
+        reap.
+        """
+        old = handle.pane_id
+        resolved = str(pane.get("pane_id") or "")
+        object.__setattr__(handle, "pane_id", resolved)
+        tab = str(pane.get("tab_id") or "")
+        if tab:
+            object.__setattr__(handle, "tab_id", tab)
+        landed = (
+            str(pane.get("workspace_id") or "")
+            or workspace_of(tab)
+            or workspace_of(resolved)
+        )
+        if landed:
+            object.__setattr__(handle, "workspace_id", landed)
+        sys.stderr.write(
+            "PANE_RELOCATED {0}->{1} terminal={2}\n".format(
+                old, resolved, handle.terminal_id
+            )
+        )
+
     def _verified_handle_binding(self, handle: LaunchHandle) -> None:
-        """Prove a registered handle still names its pane, actor, and cwd.
+        """Prove a registered handle still names its terminal, actor, and cwd.
 
         A resubmission must never follow a label or an in-memory convenience
         map alone.  Herdr ids plus the pane cwd are the ownership proof; a
         mismatch means a replacement session may have reused display text and
         must not receive this lane's repair prompt.
+
+        The identity checked is the **terminal**, not the pane id. On
+        2026-09-10 an operator ran `herdr pane move w1HY:p2 --tab w1FA:t1
+        --split right` on a lane pane whose tester had already been dispatched;
+        herdr gave the pane a new id under the same terminal, this method
+        refused `BINDING_MISMATCH:w1HY:p2` on the next `wait_for_idle`, and the
+        refusal propagated out of `_await_envelope` -- which was holding a
+        valid envelope -- through `_advance_ready` and ended the whole run.
+        Rearranging a pane is not a change of session, so a relocated pane is
+        re-resolved and recorded. A terminal that is gone, or one whose agent
+        session is no longer this handle's, still refuses.
         """
         token = str(handle.correlation_token or "")
         if not token or handle.agent_name != _agent_name(token):
@@ -5080,21 +5155,38 @@ class HerdrLauncher:
         with self._handles_lock:
             if self._handles.get(token) is not handle:
                 raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, token)
+        pane: Optional[dict] = None
         try:
             pane_payload = self._herdr(
                 "pane", "get", handle.pane_id, env=handle.environment
             )
         except HerdrCallError as exc:
             if exc.code in (AGENT_NOT_FOUND, PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
-                raise LaunchRefused(
-                    LaunchRefusal.BINDING_MISMATCH, handle.pane_id
-                ) from exc
-            raise
-        pane = _extract(pane_payload, "pane")
-        if (
-            not isinstance(pane, dict)
-            or str(pane.get("pane_id") or "") != handle.pane_id
-        ):
+                pane = self._pane_bound_to_terminal(handle)
+                if pane is None:
+                    raise LaunchRefused(
+                        LaunchRefusal.BINDING_MISMATCH, handle.pane_id
+                    ) from exc
+            else:
+                raise
+        if pane is None:
+            extracted = _extract(pane_payload, "pane")
+            if not isinstance(extracted, dict):
+                raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.pane_id)
+            pane = extracted
+        resolved = str(pane.get("pane_id") or "")
+        bound_terminal = str(handle.terminal_id or "")
+        seen_terminal = str(pane.get("terminal_id") or "")
+        if bound_terminal and seen_terminal != bound_terminal:
+            # Whatever this pane is, it is not the terminal this handle owns.
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{}!={}".format(seen_terminal, bound_terminal),
+            )
+        relocated = resolved != handle.pane_id
+        if relocated and not bound_terminal:
+            # A handle with no recorded terminal keeps the old strict rule:
+            # there is nothing to prove the new pane is the same session.
             raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.pane_id)
         cwd = pane.get("cwd")
         actual = Path(str(cwd)).resolve() if cwd else None
@@ -5106,14 +5198,19 @@ class HerdrLauncher:
         landed = (
             str(pane.get("workspace_id") or "")
             or workspace_of(str(pane.get("tab_id") or ""))
-            or workspace_of(handle.pane_id)
+            or workspace_of(resolved)
         )
-        if handle.child_workspace_id and landed and landed != handle.child_workspace_id:
+        if (
+            not relocated
+            and handle.child_workspace_id
+            and landed
+            and landed != handle.child_workspace_id
+        ):
             raise LaunchRefused(
                 LaunchRefusal.WORKSPACE_DRIFT,
                 "{}!={}".format(landed, handle.child_workspace_id),
             )
-        if handle.tab_id:
+        if handle.tab_id and not relocated:
             bound_tab = str(pane.get("tab_id") or "")
             if bound_tab and bound_tab != handle.tab_id:
                 raise LaunchRefused(
@@ -5135,11 +5232,15 @@ class HerdrLauncher:
         if not isinstance(agent, dict) or not _agent_named(agent, handle.agent_name):
             raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.agent_name)
         agent_pane = agent.get("pane_id")
-        if agent_pane is not None and str(agent_pane) != handle.pane_id:
+        # This is the session guard a relocation must still pass: the named
+        # agent has to be sitting in the pane the terminal resolved to.
+        if agent_pane is not None and str(agent_pane) != resolved:
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
-                "{}!={}".format(agent_pane, handle.pane_id),
+                "{}!={}".format(agent_pane, resolved),
             )
+        if relocated:
+            self._rebind_relocated_pane(handle, pane)
 
     def resubmit(
         self,
