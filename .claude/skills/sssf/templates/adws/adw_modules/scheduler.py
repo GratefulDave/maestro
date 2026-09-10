@@ -25,6 +25,7 @@ from . import code_review as cr
 from . import git_publication as gitpub
 from . import hidden_vault as hv
 from . import private_review as prv
+from . import provisioning as prov
 from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
@@ -350,23 +351,67 @@ def _review_content_history(
             history.clear()
             applicability = current
         summary = review.get("public_result_summary") or {}
-        outcome = summary.get("collected" if producer_kind is st.ArtifactKind.TEST_DRAFT else "passed")
+        outcome: Any
+        if producer_kind is st.ArtifactKind.TEST_DRAFT:
+            # Both quantities a tests round can move, together. Cases alone
+            # read a tester rewriting assertions inside the same twelve as a
+            # plateau; findings alone read a draft climbing toward min_cases
+            # under one substituted refusal the same way. Findings are negated
+            # so higher stays better in both halves.
+            outcome = (summary.get("collected"), -len(review.get("findings") or ()))
+        else:
+            outcome = summary.get("passed")
         history.append((st.digest_canonical(content), outcome))
     return history
 
 
-def _stalled(history: Sequence[tuple[str, int | None]]) -> bool:
-    """REVISE stops on regression, three flat outcomes, or repeated syntax."""
+def _regressed(latest: Optional[int], prior: Sequence[Optional[int]]) -> bool:
+    """One measured quantity below the best an earlier round in this argument reached."""
+    best = [value for value in prior if value is not None]
+    return latest is not None and bool(best) and latest < max(best)
+
+
+def _stalled(
+    history: Sequence[tuple[str, Any]],
+    review_kind: st.ArtifactKind,
+    *,
+    regression_on_findings: bool = False,
+) -> bool:
+    """REVISE stops on regression, three flat outcomes, or repeated syntax.
+
+    A build round is measured by the sealed suite's passed count, and one
+    round below the applicable best is a regression at any setting.
+
+    A tests round is measured by both quantities it can move, as the pair
+    (collected, -findings). A plateau needs the whole pair flat across the
+    grace window, so a draft adding cases under a repeated harness refusal
+    keeps going, and so does a suite that rewrites assertions inside the same
+    cases while its reviewer's list shrinks. Collected falling below the
+    applicable best is a regression at any setting -- that measurement has
+    always stopped a lane. Findings rising is a regression only where the
+    deployment's `stall.regression_on_findings` says so, because a reviewer
+    naming one more thing after the tester fixed three is describing the same
+    work getting better.
+    """
     if not history:
         return False
     latest = history[-1][1]
-    prior = [count for _, count in history[:-1] if count is not None]
-    if latest is not None and prior and latest < max(prior):
-        return True
+    prior = [outcome for _, outcome in history[:-1] if outcome is not None]
+    if latest is not None and prior:
+        if review_kind is st.ArtifactKind.TEST_REVIEW:
+            collected, findings = latest
+            if _regressed(collected, [outcome[0] for outcome in prior]):
+                return True
+            if regression_on_findings and _regressed(
+                findings, [outcome[1] for outcome in prior]
+            ):
+                return True
+        elif _regressed(latest, prior):
+            return True
     window = history[-st.NO_PROGRESS_GRACE_ROUNDS:]
     if len(window) < st.NO_PROGRESS_GRACE_ROUNDS:
         return False
-    plateau = latest is not None and all(count == latest for _, count in window)
+    plateau = latest is not None and all(outcome == latest for _, outcome in window)
     return plateau or history[-1][0] in [content for content, _ in history[:-1]]
 
 
@@ -1351,6 +1396,11 @@ def _resolved_provision_timeout(actor: object) -> float | None:
 class FactoryScheduler:
     """Advance every ready lane one frozen stage at a time."""
 
+    #: Class default so a scheduler assembled without `__init__` (several
+    #: tests build one that way) reads the same value an absent config key
+    #: gives: plateau only.
+    regression_on_findings: bool = False
+
     def __init__(
         self,
         store: ArtifactStore,
@@ -1367,9 +1417,14 @@ class FactoryScheduler:
         compiled: Optional[st.CompiledPlan] = None,
         provision_argv: Optional[Sequence[str]] = None,
         concurrency: int = 1,
+        regression_on_findings: bool = False,
     ) -> None:
         if isinstance(concurrency, bool) or int(concurrency) < 1:
             raise ValueError("concurrency is >= 1")
+        #: Whether one worse tests round -- more findings than an earlier round
+        #: in the same argument -- is itself a stall. `stall.regression_on_
+        #: findings` in the deployment's config; absent is False.
+        self.regression_on_findings = bool(regression_on_findings)
         #: Independent ready lanes advance author/review/build stages on this
         #: many worker threads; merges stay on the calling thread and are
         #: serialized. 1 keeps every stage inline on the calling thread.
@@ -2208,10 +2263,13 @@ class FactoryScheduler:
             keep = False
             try:
                 self._say("", "checking {0} is usable in {1}".format(runner, cwd))
-                cr.provision_tree(
+                # The one provisioner every actor and measurement tree crosses,
+                # with nothing bridged in afterwards: this probe speaks for the
+                # tester, reviewer and builder trees only if it runs in exactly
+                # what `provision_argv` installs.
+                prov.provision_tree(
                     dest, self._provision_argv, self._provision_timeout_s
                 )
-                rr.prepare_collect_tree(run_repo, dest)
                 rr.resolve(
                     runner,
                     dest,
@@ -2221,7 +2279,7 @@ class FactoryScheduler:
                     # whole tree genuinely is its question.
                     (),
                 )
-            except (rr.RunnerUnusable, cr.ReviewProvisioningError) as extra:
+            except (rr.RunnerUnusable, prov.ReviewProvisioningError) as extra:
                 # Provisioning belongs to this refusal, not above it. The
                 # preflight's own sentence is "the environment every lane will
                 # run in is usable", and a `provision_argv` that fails is that
@@ -2273,10 +2331,12 @@ class FactoryScheduler:
         hv.checkout_vault_worktree(vault, base, dest)
         keep = False
         try:
-            # Provision and bridge dependencies before probing, without exposing
-            # any private draft bytes to the environment measurement.
-            cr.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
-            rr.prepare_collect_tree(run_repo, dest)
+            # Provision before probing, without exposing any private draft
+            # bytes to the environment measurement -- and with nothing bridged
+            # in from the product checkout, so a dependency the deployment's
+            # `provision_argv` does not install is missing here exactly as it
+            # is missing in the tester's tree.
+            prov.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
             # Resolve BEFORE the draft is written, because `resolve`'s probe is
             # a whole-tree `--collect-only` and would otherwise be measuring the
             # draft it is supposed to be measuring the environment for. FDAdb
@@ -2308,7 +2368,6 @@ class FactoryScheduler:
                 resolved,
                 _collect_gate(gate, files, Path(dest)),
                 dest,
-                runtime_root=run_repo,
             )
             return tuple(ids)
         except (rr.CollectFailed, rr.RunnerUnusable) as extra:
@@ -2789,7 +2848,6 @@ class FactoryScheduler:
                 scratch_root=self.runtime.path / "worktrees",
                 allow_candidate_paths=typed_build,
                 gate=self._sealed_suite_gate(lane),
-                runtime_root=Path(self.target.target_repository_root),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
             )
@@ -2849,7 +2907,6 @@ class FactoryScheduler:
                 allow_candidate_paths=typed_build,
                 public_contract=product_contract,
                 gate=self._sealed_suite_gate(lane),
-                runtime_root=Path(self.target.target_repository_root),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
                 measurement=measurement,
@@ -2900,8 +2957,11 @@ class FactoryScheduler:
         reviewing stage means a resume redoes the work against the findings
         instead of re-judging an artifact that was already judged.
 
-        The stage selects collected cases or sealed passed outcomes, plus
-        substantive content. Findings never measure progress or grant approval.
+        The stage selects the outcome a round can move -- the review's findings
+        count on a tests round, the sealed suite's passed count on a build
+        round -- plus substantive content. A findings count measures whether
+        the same argument is shrinking; it still grants nothing and still
+        causes no transition.
         """
         stage = self.store.lane_stage(self.run_id, lane_id)
         review_kind = (
@@ -2913,7 +2973,11 @@ class FactoryScheduler:
             self.store, self.run_id, lane_id, review_kind,
             hv.vault_path(self.runtime.path, self.run_id),
         )
-        if not _stalled(history):
+        if not _stalled(
+            history,
+            review_kind,
+            regression_on_findings=self.regression_on_findings,
+        ):
             return
         if stage not in st.PAUSEABLE_STAGES:
             return
@@ -3182,7 +3246,6 @@ class FactoryScheduler:
                 sealed_bundle=_record_as_lane_artifact(sealed, lane),
                 scratch_root=self.runtime.path / "worktrees",
                 gate=self._sealed_suite_gate(lane),
-                runtime_root=Path(self.target.target_repository_root),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
             )

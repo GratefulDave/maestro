@@ -516,3 +516,33 @@ integration head before running it, and it had already passed — a gate failure
 produces exactly one fixed finding, `_INTEGRATION_GATE_REVISE`, which this verdict did
 not carry. **A located finding from a reviewer is a claim, not a measurement.** Check it
 against the factory's own row before acting on it.
+
+## Historical — 2026-09-09 run d246ae95 (a stall metric must be a quantity the round can move)
+
+Two defects on `lane-faq-producer-tests`, both fixed on this branch.
+
+**Stall measured on a count the round could not change.** `_review_history` recorded a
+`TEST_DRAFT` round's outcome as `public_result_summary["collected"]`, the case count. A
+tester revising assertions inside the same twelve cases read 12, 12, 12 while the
+reviewer's findings went 7, 5, 4; `_stalled`'s plateau rule parked the lane
+`WAITING_FOR_USER` as `NO_PROGRESS`. `tools/lane_gates.py` printed `stalled False` for the
+same lane — tool and scheduler disagreed on a lane that was actually converging. Fix:
+tests rounds now record the review's findings count, negated; regression parks a tests
+lane only when `stall.regression_on_findings: true` (default `false`), because a findings
+count is a reviewer's editorial judgment, not a measurement. Builder rounds are unchanged.
+
+**The harness repaired its own tree and no other.** Three sites materialize a candidate to
+run it — the harness draft-collect tree, actor worktrees, and code-review trees. Only the
+first carried a `node_modules` symlink bridge so `vitest list` could resolve
+`vitest.config.ts`; the other two got `provision_argv` alone, which installs nothing for
+JS here. The harness counted 12 cases and round 1's preflight passed, while the test
+reviewer's checkout could not resolve `vitest/config` and reported it against the tester,
+identically, for three rounds. Fix: the bridge is deleted; all three sites call one
+`provision_tree`, so a deployment missing JS provisioning now refuses
+`RUNNER_PREFLIGHT_REFUSED` at round 1 instead of failing silently under the wrong actor's
+name for three.
+
+One idea, not two: a fix applied to one of several sibling paths converts a loud round-1
+refusal into a quiet multi-round failure blamed on the wrong actor. Deployment
+consequence: FDAdb's `provision_argv` needs `npm ci --prefer-offline --no-audit --no-fund`
+added (deployment-owned config, held out of template mirrors).

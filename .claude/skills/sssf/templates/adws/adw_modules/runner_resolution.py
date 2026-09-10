@@ -638,15 +638,6 @@ def write_record(path: Path, resolved: Iterable[ResolvedRunner]) -> None:
 #: bodies; this bound is only against a hung importer.
 COLLECT_TIMEOUT_S = 120.0
 
-#: Draft collect runs in a vault worktree: a git checkout of integration.
-#: Gitignored runtime deps are absent there. Resolving vitest from the
-#: product repo and listing in the vault is not enough — measured 2026-08-30
-#: against FDAdb integration (Vitest 3.2.7, bun.lock, alias `@` → `./src`):
-#: product cwd lists cases; vault cwd without `node_modules` exits 1 with
-#: `ERR_MODULE_NOT_FOUND: Cannot find package 'vitest'` while loading
-#: `vitest.config.ts`. Linking the product's `node_modules` into the collect
-#: tree is the repair. Private files stay in the vault.
-COLLECT_RUNTIME_DIRS: Tuple[str, ...] = ("node_modules",)
 COLLECT_DETAIL_CHARS = 1800
 COLLECT_DETAIL_LINES = 20
 COLLECT_DETAIL_LINE_CHARS = 220
@@ -733,21 +724,17 @@ class CollectFailed(RuntimeError):
         super().__init__(self.detail)
 
 
-def prepare_collect_tree(runtime_root: Path, tree: Path) -> Tuple[Path, ...]:
-    """Expose `runtime_root`'s collect deps inside `tree`. Never copies tests."""
-    runtime_root = Path(runtime_root).resolve()
-    tree = Path(tree).resolve()
-    if runtime_root == tree:
-        return ()
-    linked: List[Path] = []
-    for name in COLLECT_RUNTIME_DIRS:
-        src = runtime_root / name
-        dest = tree / name
-        if not src.is_dir() or dest.exists() or dest.is_symlink():
-            continue
-        dest.symlink_to(src.resolve(), target_is_directory=True)
-        linked.append(dest)
-    return tuple(linked)
+# There is deliberately no `node_modules` bridge here any more. Until 2026-09-09
+# `prepare_collect_tree` symlinked the product repository's `node_modules` into
+# every harness collect/execute tree (`runtime_root=`), which made the runner
+# preflight and the draft collect pass in a deployment whose `provision_argv`
+# installed no JS dependencies -- while the tester, reviewer and builder trees,
+# which had no bridge, could not resolve `vitest/config`. The bridge hid a
+# provisioning gap from the one check meant to name it and never reached the
+# trees agents actually work in (FDAdb run d246ae9592be478396ad5146a89f00ae,
+# lane-faq-producer-tests, three rounds of a harness fault filed against the
+# tester). Every tree is now provisioned by `provisioning.provision_tree` and
+# measured with exactly what that installed.
 
 
 def bounded_collect_output(
@@ -883,7 +870,6 @@ def collect_cases(
     *,
     timeout_s: float = COLLECT_TIMEOUT_S,
     env: Optional[Mapping[str, str]] = None,
-    runtime_root: Optional[Path] = None,
 ) -> Tuple[str, ...]:
     """Enumerate gate selectors on `tree`. Never executes case bodies."""
     cwd = Path(tree) / str(getattr(gate, "cwd", None) or ".")
@@ -892,16 +878,6 @@ def collect_cases(
             resolved.runner,
             detail="the gate's working directory does not exist: {0}".format(cwd),
         )
-    if runtime_root is not None:
-        try:
-            prepare_collect_tree(runtime_root, tree)
-        except OSError as extra:
-            raise CollectFailed(
-                resolved.runner,
-                detail="{0} could not link collect runtime from {1}".format(
-                    resolved.runner, runtime_root
-                ),
-            ) from extra
     argv = resolved.collect_argv(gate)
     merged = dict(os.environ)
     if env is not None:
@@ -973,7 +949,6 @@ def execute_cases(
     *,
     timeout_s: float = EXECUTE_TIMEOUT_S,
     env: Optional[Mapping[str, str]] = None,
-    runtime_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run gate selectors on `tree`. Broker-owned; never guesses the binary."""
     cwd = Path(tree) / str(getattr(gate, "cwd", None) or ".")
@@ -982,16 +957,6 @@ def execute_cases(
             "output": "the gate's working directory does not exist: {0}".format(cwd),
             "returncode": -1,
         }
-    if runtime_root is not None:
-        try:
-            prepare_collect_tree(runtime_root, tree)
-        except OSError as extra:
-            return {
-                "output": "{0} could not link execute runtime from {1}".format(
-                    resolved.runner, runtime_root
-                ),
-                "returncode": -1,
-            }
     argv = resolved.execute_argv(tuple(getattr(gate, "argv", ()) or ()))
     merged = dict(os.environ)
     if env is not None:

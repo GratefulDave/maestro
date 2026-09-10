@@ -245,6 +245,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `sealed_ref` and `private_results_ref` are keyed on three different digests
   but all refused a malformed one as `input_digest`, which is not a field any
   of them takes. Each now names its own.
+- **A tests-round stall metric now measures something the round can move.**
+  `_review_history` in `scheduler.py` recorded a `TEST_DRAFT` round's outcome
+  as `public_result_summary["collected"]`, the case count. On FDAdb run
+  `d246ae9592be478396ad5146a89f00ae`, `lane-faq-producer-tests` revised
+  assertions inside the same twelve cases across three rounds — the count read
+  12, 12, 12 while the reviewer's findings went 7, 5, 4 — and `_stalled`'s
+  plateau rule parked the lane `WAITING_FOR_USER` as `NO_PROGRESS` on real
+  per-round improvement; sibling `lane-geo-subset-tests` sat at 7, 7, 7 with
+  findings 3, 1, 0 and escaped only because round 3 happened to PASS.
+  `tools/lane_gates.py` printed `stalled False` for the parked lane the whole
+  time, disagreeing with the scheduler that parked it. Tests rounds now
+  record the review's findings count, negated, as the outcome; the plateau and
+  content-repeat rules are unchanged. The regression rule (an increase parks
+  the lane) applies to tests rounds only when `stall.regression_on_findings:
+  true` is set in `maestro.config.yaml` — default `false` — because a
+  findings count is a reviewer's editorial reading, not a measurement, and
+  model prose must never decide a transition by itself. Builder rounds are
+  unchanged (still measured by `passed`). `lane_gates.py` now calls the same
+  function with the same inputs, so it cannot disagree with the scheduler
+  again.
+- **The harness no longer repairs only its own tree.** Three sites materialize
+  a copy of a candidate to run it: the harness's private draft-collect tree
+  (`_collect_private_draft`), actor worktrees
+  (`launcher.HerdrLauncher.provision`), and code-review trees
+  (`code_review._review_tree`). The draft-collect tree alone carried
+  `runner_resolution.prepare_collect_tree`, a symlink bridge of the product's
+  `node_modules` so `vitest list` could resolve `vitest.config.ts`; the other
+  two sites received only the deployment's `provision_argv`, which in FDAdb
+  installs the Python venv and nothing for JS. On the same run, the harness
+  counted 12 cases and round 1's runner preflight passed, while the test
+  reviewer's checkout could not resolve `vitest/config` and reported it as a
+  finding against the tester, in all three rounds, against an environment the
+  tester is not allowed to install into. The bridge is deleted — a deletion of
+  a harness self-repair, not a weakened check — and all three sites now call
+  one `code_review.provision_tree`. A deployment missing JS provisioning now
+  refuses `RUNNER_PREFLIGHT_REFUSED`, naming the environment, at round 1
+  instead of failing silently against the wrong actor for three rounds.
+  Deployment consequence: FDAdb's `provision_argv` needs `npm ci
+  --prefer-offline --no-audit --no-fund` added (deployment-owned config, held
+  out of template mirrors).
 
 ### Changed
 - **Maestro now runs one nine-stage artifact factory instead of overlapping

@@ -30,6 +30,9 @@ _RUNTIME_ROOT = _TOOLS_DIR.parent
 if str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 
+import yaml  # noqa: E402
+
+from adw_modules import hidden_vault as hv  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules.code_review import _COLLECTION_REVISE, _RUNNER_REVISE  # noqa: E402
 from adw_modules.reporting_registry import registry_path  # noqa: E402
@@ -153,17 +156,64 @@ def latest_artifact(
 
 
 def review_rounds(
-    conn: sqlite3.Connection, run_id: str, lane_id: str, limit: int = 5
+    conn: sqlite3.Connection,
+    run_id: str,
+    lane_id: str,
+    review_kind: st.ArtifactKind = st.ArtifactKind.CODE_REVIEW,
+    limit: int = 5,
 ) -> list[sqlite3.Row]:
-    """The last `limit` CODE_REVIEW records, oldest first."""
+    """The last `limit` review records of this lane's kind, oldest first."""
     rows = list(
         conn.execute(
             "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? "
             "AND artifact_kind=? ORDER BY sequence DESC LIMIT ?",
-            (run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, limit),
+            (run_id, lane_id, review_kind.value, limit),
         )
     )
     return list(reversed(rows))
+
+
+#: The stages whose argument is about the tests, so whose reviews are
+#: TEST_REVIEW. A parked lane's stage is WAITING_FOR_USER, which says nothing
+#: about which half of the lane stopped -- the wait artifact's `resume_stage`
+#: does, and reading the stage alone is what made this tool print `stalled
+#: False` about a tests lane the scheduler had just parked.
+_TESTS_STAGES = frozenset(
+    {
+        st.LaneStage.PLANNED.value,
+        st.LaneStage.WRITING_TESTS.value,
+        st.LaneStage.REVIEWING_TESTS.value,
+    }
+)
+
+
+def review_kind_for(stage: str, wait_payload: Mapping[str, Any]) -> st.ArtifactKind:
+    """Whether this lane's open argument is about its tests or its code."""
+    effective = stage
+    if stage == st.LaneStage.WAITING_FOR_USER.value:
+        effective = str(wait_payload.get("resume_stage") or stage)
+    return (
+        st.ArtifactKind.TEST_REVIEW
+        if effective in _TESTS_STAGES
+        else st.ArtifactKind.CODE_REVIEW
+    )
+
+
+def stall_regression_on_findings(repository: str) -> bool:
+    """The bound deployment's `stall.regression_on_findings`, as it is run.
+
+    Read off the same config the scheduler loads, through the same function,
+    so the row below cannot report a different rule than the one that parked
+    the lane. An unreadable or invalid config reads as the default rather than
+    raising: this tool reports, it never refuses.
+    """
+    try:
+        loaded = yaml.safe_load(
+            (Path(repository) / "maestro.config.yaml").read_text(encoding="utf-8")
+        )
+        return st.stall_regression_on_findings(loaded)
+    except (OSError, ValueError, yaml.YAMLError):
+        return False
 
 
 def reviewer_verdict(payload: Mapping[str, Any]) -> str:
@@ -259,6 +309,7 @@ def lane_table(
     lane_row: sqlite3.Row,
     runtime_state_root: str,
     sync_line: str,
+    regression_on_findings: bool = False,
 ) -> list[tuple[str, str]]:
     lane_id = str(lane_row["lane_id"])
     rows: list[tuple[str, str]] = [
@@ -267,10 +318,11 @@ def lane_table(
     ]
 
     wait = latest_artifact(conn, run_id, lane_id, st.ArtifactKind.USER_WAIT.value)
+    wait_payload: Mapping[str, Any] = {}
     if wait is None:
         rows.append(("user_wait", _ABSENT))
     else:
-        payload = _loads(wait["payload_json"])
+        payload = wait_payload = _loads(wait["payload_json"])
         rows.append(
             (
                 "user_wait",
@@ -285,7 +337,9 @@ def lane_table(
             )
         )
 
-    rounds = review_rounds(conn, run_id, lane_id)
+    review_kind = review_kind_for(str(lane_row["stage"]), wait_payload)
+    rows.append(("review_kind", review_kind.value))
+    rounds = review_rounds(conn, run_id, lane_id, review_kind)
     if not rounds:
         rows.append(("review", _ABSENT))
     for index, record in enumerate(rounds):
@@ -312,11 +366,34 @@ def lane_table(
             )
         )
 
-    history = _review_content_history(
-        SimpleNamespace(conn=conn), run_id, lane_id, st.ArtifactKind.CODE_REVIEW
-    )
-    rows.append(("reviewed_attempts", str(len(history))))
-    rows.append(("stalled", str(_stalled(history))))
+    # The scheduler's own function, over the scheduler's own inputs: the kind
+    # of review this lane's argument is made of, the vault a tests history is
+    # read from, and the deployment's stall rule. Recomputing any of those
+    # here is how the tool came to print `stalled False` about a lane the
+    # scheduler had already parked.
+    try:
+        history = _review_content_history(
+            SimpleNamespace(conn=conn),
+            run_id,
+            lane_id,
+            review_kind,
+            hv.vault_path(Path(runtime_state_root), run_id),
+        )
+        stalled = str(
+            _stalled(
+                history,
+                review_kind,
+                regression_on_findings=regression_on_findings,
+            )
+        )
+        attempts = str(len(history))
+    except Exception as exc:  # noqa: BLE001 - a report never raises
+        # The type only: an exception message here can quote a vault path
+        # or a draft path, and this tool prints for an operator.
+        attempts = stalled = "UNREADABLE:{0}".format(type(exc).__name__)
+    rows.append(("reviewed_attempts", attempts))
+    rows.append(("stalled", stalled))
+    rows.append(("regression_on_findings", str(regression_on_findings)))
 
     builder = latest_artifact(
         conn, run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT.value
@@ -528,6 +605,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         runtime_state_root = str(run_row["runtime_state_root"])
         repository = str(run_row["target_repository_root"])
         sync_line, level = runtime_sync_line(repository)
+        regression_on_findings = stall_regression_on_findings(repository)
         lanes = lane_rows(conn, args.run)
         if args.lane is not None:
             lanes = [row for row in lanes if str(row["lane_id"]) == args.lane]
@@ -541,7 +619,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.run,
                     str(lane_row["lane_id"]),
                     lane_table(
-                        conn, args.run, lane_row, runtime_state_root, sync_line
+                        conn,
+                        args.run,
+                        lane_row,
+                        runtime_state_root,
+                        sync_line,
+                        regression_on_findings,
                     ),
                 )
             )

@@ -19,7 +19,7 @@ from . import private_review as pr
 from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
-from .launcher import PROVISION_TIMEOUT_S, run_harness_process
+from . import provisioning as prov
 
 _RUNNER_REVISE = {
     "implementation_area": "declared product outputs",
@@ -62,7 +62,6 @@ def run_integration_gate(
     sealed_bundle: st.LaneArtifact,
     scratch_root: Path,
     gate: Mapping[str, object] | object | None = None,
-    runtime_root: Path | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
 ) -> Mapping[str, object]:
@@ -85,12 +84,7 @@ def run_integration_gate(
         integration_repo, integration_sha, dest, provision_argv, provision_timeout_s
     )
     hv.copy_blobs_to_tree(vault, dest, files)
-    run = tc.run_private_suite(
-        dest,
-        tuple(files),
-        gate=gate,
-        runtime_root=runtime_root or integration_repo,
-    )
+    run = tc.run_private_suite(dest, tuple(files), gate=gate)
     min_cases = int(run.get("min_cases") or 1)
     counts = run["counts"]
     failed = bool(
@@ -180,68 +174,12 @@ def _collected_no_case(run: Mapping[str, object]) -> bool:
     )
 
 
-class ReviewProvisioningError(SealedEnvironmentError):
-    """The review tree could not be provisioned, so no verdict is derivable.
-
-    Typed and fail-closed on purpose. A provisioning failure is a failure of the
-    review harness, never of the candidate: an unprovisioned tree collects zero
-    cases, and `_RUNNER_REVISE` would then report that as "sealed private tests
-    failed" and send the builder to fix tests that never ran. Raising instead of
-    returning a verdict makes that mislabelling impossible -- no CODE_REVIEW
-    artifact is built on this path at all.
-    """
-
-    code = "REVIEW_TREE_PROVISION_FAILED"
-
-    def __init__(
-        self,
-        argv: Sequence[str],
-        returncode: int | None,
-        detail: str = "",
-    ) -> None:
-        self.argv = tuple(str(item) for item in argv)
-        self.returncode = returncode
-        self.detail = detail
-        super().__init__(
-            "{0}:{1}:{2}:{3}".format(
-                self.code, " ".join(self.argv), returncode, detail
-            )
-        )
-
-
-def provision_tree(
-    dest: Path,
-    provision_argv: Sequence[str],
-    timeout_s: float | None = None,
-) -> None:
-    """Install the candidate's declared dependencies into the review tree.
-
-    Ordering is a containment property, not a convenience: this runs after the
-    commit is materialized and before any sealed blob is copied in, so nothing
-    provisioning writes, reads, or reports back in an error can carry private
-    test bytes.
-
-    It also runs once per materialization by construction.
-    `hv.refresh_materialized_commit` unlinks every child of the tree, which is
-    every installed dependency and any marker a previous run could have left, so
-    there is no "already provisioned" state inside the tree to detect. The
-    durable cache is the package manager's own, outside the tree.
-    """
-    argv = tuple(str(item) for item in provision_argv if str(item))
-    if not argv:
-        return
-    bound = PROVISION_TIMEOUT_S if timeout_s is None else float(timeout_s)
-    try:
-        result = run_harness_process(argv, cwd=Path(dest), timeout=bound)
-    except OSError as exc:
-        # TimeoutError is an OSError; a missing provisioning executable is one
-        # too. Both are the harness failing, and both must stay distinguishable
-        # from a candidate that failed its tests.
-        raise ReviewProvisioningError(argv, None, str(exc)) from exc
-    if result.returncode != 0:
-        raise ReviewProvisioningError(
-            argv, result.returncode, (result.stderr or "")[-400:]
-        )
+# `ReviewProvisioningError` and `provision_tree` live in `provisioning`, the one
+# provisioner every factory tree crosses. Re-exported here for existing imports;
+# the call below goes through the module so one patch of `prov.provision_tree`
+# observes every site.
+ReviewProvisioningError = prov.ReviewProvisioningError
+provision_tree = prov.provision_tree
 
 
 def _review_tree(
@@ -256,7 +194,7 @@ def _review_tree(
         tree = hv.refresh_materialized_commit(repo, sha, dest)
     else:
         tree = hv.materialize_commit(repo, sha, dest)
-    provision_tree(tree, provision_argv, provision_timeout_s)
+    prov.provision_tree(tree, provision_argv, provision_timeout_s)
     return tree
 
 
@@ -276,7 +214,6 @@ def _run_sealed_suite(
     files: Mapping[str, str],
     *,
     gate: Mapping[str, object] | object | None,
-    runtime_root: Path,
 ) -> tuple[Mapping[str, object], pr.PrivateReviewError | None]:
     """Run the sealed suite, treating an environment refusal as a measurement.
 
@@ -289,9 +226,7 @@ def _run_sealed_suite(
     propagates untouched.
     """
     try:
-        return tc.run_private_suite(
-            tree, tuple(files), gate=gate, runtime_root=runtime_root
-        ), None
+        return tc.run_private_suite(tree, tuple(files), gate=gate), None
     except pr.PrivateReviewError as exc:
         if sealed_environment_detail(exc) is None:
             raise
@@ -311,7 +246,6 @@ def _collect_at_base(
     lane_id: str,
     input_digest: str,
     gate: Mapping[str, object] | object | None,
-    runtime_root: Path,
     provision_argv: Sequence[str],
     provision_timeout_s: float | None,
 ) -> bool:
@@ -334,9 +268,7 @@ def _collect_at_base(
             provision_timeout_s,
         )
         hv.copy_blobs_to_tree(vault, base_dest, files)
-        run, refusal = _run_sealed_suite(
-            base_dest, files, gate=gate, runtime_root=runtime_root
-        )
+        run, refusal = _run_sealed_suite(base_dest, files, gate=gate)
     except (pr.PrivateReviewError, hv.VaultError, OSError):
         return False
     return refusal is None and not _collected_no_case(run)
@@ -746,7 +678,6 @@ def measure_candidate(
     scratch_root: Path,
     allow_candidate_paths: bool = False,
     gate: Mapping[str, object] | object | None = None,
-    runtime_root: Path | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
 ) -> SealedMeasurement:
@@ -778,9 +709,7 @@ def measure_candidate(
     if not allow_candidate_paths:
         _refuse_candidate_private_collisions(dest, files)
     hv.copy_blobs_to_tree(vault, dest, files)
-    run, refusal = _run_sealed_suite(
-        dest, files, gate=gate, runtime_root=runtime_root or candidate_repo
-    )
+    run, refusal = _run_sealed_suite(dest, files, gate=gate)
     collection_broken = False
     if refusal is not None or _collected_no_case(run):
         # "No case outcome" is ambiguous on its own: an undeclared dependency
@@ -798,7 +727,6 @@ def measure_candidate(
             lane_id=request.lane_id,
             input_digest=request.input_digest,
             gate=gate,
-            runtime_root=runtime_root or candidate_repo,
             provision_argv=provision_argv,
             provision_timeout_s=provision_timeout_s,
         ):
@@ -886,7 +814,6 @@ def review_builder_output(
     allow_candidate_paths: bool = False,
     public_contract: Mapping[str, object] | None = None,
     gate: Mapping[str, object] | object | None = None,
-    runtime_root: Path | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
     measurement: SealedMeasurement | None = None,
@@ -911,7 +838,6 @@ def review_builder_output(
             scratch_root=scratch_root,
             allow_candidate_paths=allow_candidate_paths,
             gate=gate,
-            runtime_root=runtime_root,
             provision_argv=provision_argv,
             provision_timeout_s=provision_timeout_s,
         )

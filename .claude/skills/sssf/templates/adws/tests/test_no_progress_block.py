@@ -217,7 +217,7 @@ class ReviewedContentTest(unittest.TestCase):
         self.scheduler._building(self.lane_id)
         history = sch._review_content_history(self.store, self.run_id, self.lane_id,
                                               st.ArtifactKind.CODE_REVIEW)
-        self.assertFalse(sch._stalled(history))
+        self.assertFalse(sch._stalled(history, st.ArtifactKind.CODE_REVIEW))
 
     def test_native_pass_counts_increase_then_regress(self):
         self.start(["4", "6", "8", "6"], numeric=True)

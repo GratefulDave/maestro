@@ -1367,13 +1367,17 @@ def test_producer_artifact_pin():
 
 
     def _install_fake_vitest(self) -> Path:
-        binary = self.repo / "node_modules" / ".bin" / "vitest"
+        # Written outside every tree. It reaches a review tree only through
+        # `provision_argv` (`_provision_fake_vitest`), the way a deployment's
+        # own install command does -- nothing is bridged in from the repo.
+        binary = self.root / "fake-vitest" / "vitest"
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_text(
             "#!{python}\n"
             "import sys\n"
             "from pathlib import Path\n"
-            "stamp = Path(__file__).with_name('vitest.calls')\n"
+            "stamp = Path({stamp!r})\n"
+            "fail_flag = Path({fail!r})\n"
             "prior = stamp.read_text() if stamp.exists() else ''\n"
             "stamp.write_text(prior + ' '.join(sys.argv[1:]) + '\\n')\n"
             "args = sys.argv[1:]\n"
@@ -1384,7 +1388,7 @@ def test_producer_artifact_pin():
             "    print('suite.test.ts > ok')\n"
             "    raise SystemExit(0)\n"
             "if 'run' in args:\n"
-            "    fail = Path(__file__).with_name('vitest.fail').exists()\n"
+            "    fail = fail_flag.exists()\n"
             "    if fail:\n"
             "        print(' Test Files  1 failed (1)')\n"
             "        print('      Tests  1 failed | 0 passed (1)')\n"
@@ -1392,11 +1396,26 @@ def test_producer_artifact_pin():
             "    print(' Test Files  1 passed (1)')\n"
             "    print('      Tests  1 passed (1)')\n"
             "    raise SystemExit(0)\n"
-            "raise SystemExit(1)\n".format(python=sys.executable),
+            "raise SystemExit(1)\n".format(
+                python=sys.executable,
+                stamp=str(binary.with_name("vitest.calls")),
+                fail=str(binary.with_name("vitest.fail")),
+            ),
             encoding="utf-8",
         )
         binary.chmod(0o755)
         return binary
+
+    @staticmethod
+    def _provision_fake_vitest(binary: Path) -> tuple[str, ...]:
+        """A `provision_argv` that installs the fake into the tree it runs in."""
+        return (
+            "sh",
+            "-c",
+            "mkdir -p node_modules/.bin && cp {0} node_modules/.bin/vitest".format(
+                binary
+            ),
+        )
 
     def test_code_review_runs_vitest_gate_not_pytest(self):
         suite_path = "suite.test.ts"
@@ -1446,7 +1465,7 @@ def test_producer_artifact_pin():
             scratch_root=self.root / "scratch-vitest",
             architecture_constraints=CONSTRAINTS,
             gate=gate,
-            runtime_root=self.repo,
+            provision_argv=self._provision_fake_vitest(binary),
         )
         self.assertIs(accepted.verdict, st.ReviewerVerdict.PASS)
         self.assertGreaterEqual(accepted.payload["public_result_summary"]["passed"], 1)
@@ -1472,7 +1491,7 @@ def test_producer_artifact_pin():
             scratch_root=self.root / "scratch-vitest-red",
             architecture_constraints=CONSTRAINTS,
             gate=gate,
-            runtime_root=self.repo,
+            provision_argv=self._provision_fake_vitest(binary),
         )
         self.assertIs(demoted.verdict, st.ReviewerVerdict.REVISE)
         self.assertGreater(demoted.payload["public_result_summary"]["failed"], 0)

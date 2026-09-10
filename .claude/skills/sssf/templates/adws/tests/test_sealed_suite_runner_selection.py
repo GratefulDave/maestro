@@ -1092,11 +1092,11 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
                 "def test_candidate():\n    assert IDENTITY == 'candidate'\n",
                 encoding="utf-8",
             )
-            out = tc.run_private_suite(tree, ("test_identity.py",), runtime_root=repo)
+            out = tc.run_private_suite(tree, ("test_identity.py",))
         self.assertEqual(out["returncode"], 0, out["output"])
         self.assertEqual(out["counts"]["passed"], 1)
 
-    def test_vitest_probes_tree_local_selector_with_bridged_dependencies(self) -> None:
+    def test_vitest_probes_tree_local_selector_with_provisioned_dependencies(self) -> None:
         vitest = _discover_vitest()
         if vitest is None:
             self.skipTest("no vitest binary found; set MAESTRO_TEST_VITEST")
@@ -1114,7 +1114,9 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
         if installation is None:
             self.skipTest("vitest needs an installed node_modules tree")
         with self._pair() as (repo, tree):
-            (repo / "node_modules").symlink_to(installation, target_is_directory=True)
+            # What provisioning would have installed into the tree itself.
+            # Nothing is bridged in from `repo` any more.
+            (tree / "node_modules").symlink_to(installation, target_is_directory=True)
             for checkout in (repo, tree):
                 (checkout / "package.json").write_text(
                     '{"name":"sealed","private":true,"type":"module"}\n',
@@ -1127,9 +1129,7 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
                 'it("candidate", () => { expect(1 + 1).toBe(2); });\n',
                 encoding="utf-8",
             )
-            out = tc.run_private_suite(
-                tree, (selector,), runtime_root=repo, timeout_s=300.0
-            )
+            out = tc.run_private_suite(tree, (selector,), timeout_s=300.0)
         self.assertEqual(out["returncode"], 0, out["output"])
         self.assertEqual(out["counts"]["passed"], 1)
 
@@ -1148,9 +1148,7 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
                 tc, "_interpreter_release", return_value=(3, 9, 6)
             ), mock.patch.object(rr, "execute_cases") as execute:
                 with self.assertRaises(pr.PrivateReviewError) as caught:
-                    tc.run_private_suite(
-                        tree, ("tests/test_a.py",), runtime_root=repo
-                    )
+                    tc.run_private_suite(tree, ("tests/test_a.py",))
                 execute.assert_not_called()
         message = str(caught.exception)
         self.assertIn("SEALED_SUITE_PYTHON_UNSUPPORTED", message)
