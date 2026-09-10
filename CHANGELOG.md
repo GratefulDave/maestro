@@ -102,6 +102,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A copy-detected source path is not a written path.** `admit_candidate`
+  measures a candidate with `git diff-tree -M -C --find-copies-harder`, so a
+  new file that resembles an existing one arrives as a copy `C<score>
+  <source> <new>`. `TreeDeltaEntry.represented_paths` returned both paths, and
+  `validate_declared_ownership` refused the source, which the builder never
+  wrote. FDAdb run d246ae95 refused a clean `lane-faq-producer` candidate with
+  `CANDIDATE_OUTPUT_OWNERSHIP_REFUSED:tests/wp7/vitest.config.ts` because its
+  new `tests/wp6/vitest.config.ts` was a 66% copy of the wp7 config. A copy now
+  represents only its destination; the payload still records the source as
+  provenance, and `publication_touched_paths` no longer names an untouched
+  file. `test_git_publication_contract.py::test_copy_source_is_not_an_owned_path`
+  fails on the parent.
 - **A dispatch prepares a tree once; an adopted cwd it already prepared is not
   prepared again.** `HerdrStageActor._launch` materializes and provisions
   `cwd` up front, then hands the launcher a `prepare_adopted_cwd` callback

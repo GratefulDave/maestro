@@ -79,8 +79,14 @@ class TreeDeltaEntry:
     new_oid: str
 
     def represented_paths(self) -> tuple[str, ...]:
+        """The paths this entry writes, replaces, or deletes.
+
+        A copy (`C`) names its source only as provenance: the source blob is
+        unchanged between the two trees, so it is neither owned by the lane
+        that produced the copy nor touched by the publication that lands it.
+        """
         paths = []
-        if self.old_path:
+        if self.old_path and self.status != "C":
             paths.append(self.old_path)
         if self.new_path and self.new_path != self.old_path:
             paths.append(self.new_path)
