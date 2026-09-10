@@ -224,6 +224,117 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(status, st.RunStatus.COMPLETE)
         return run_id
 
+    def test_published_resume_with_lane_specs_only_cleans_up(self) -> None:
+        target = self._binding_target()
+        run_id = self._start(ScriptedActor(self.repo, self.runtime.path / "worktrees"))
+        compiled = self._compile(revision=1, ref="plan:two-lane")
+        cleaned = []
+
+        class CleanupOnlyActor:
+            lane_specs = gitpub.lane_specs_from_plan(compiled)
+
+            def complete_run_spaces(self, completed_run):
+                cleaned.append(completed_run)
+
+        actor = CleanupOnlyActor()
+        before_binding = dict(sch.run_row(self.store, run_id))
+        before_refs = _git(self.repo, "show-ref")
+        before_ledger = tuple(self.store.conn.iterdump())
+        scheduler = sch.FactoryScheduler(
+            self.store, run_id, actor, self.runtime, target
+        )
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+        self.assertEqual(cleaned, [run_id])
+        self.assertEqual(dict(sch.run_row(self.store, run_id)), before_binding)
+        self.assertEqual(_git(self.repo, "show-ref"), before_refs)
+        self.assertEqual(tuple(self.store.conn.iterdump()), before_ledger)
+        self.assertEqual(scheduler._legacy_correction_action(), "noop")
+
+        publication = self._run_rows(run_id, st.ArtifactKind.MAIN_PUBLICATION)[0][2]
+        receipt_ref = publication["receipt_ref"]
+        receipt_object = publication["receipt_object"]
+        published_sha = publication["published_sha"]
+        seed_sha = publication["expected_before_sha"]
+        forged = subprocess.check_output(
+            ["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"],
+            input=b'{"kind":"MAIN_PUBLICATION_RECEIPT","run_id":"another-run"}',
+        ).decode().strip()
+        for corruption in ("missing-receipt", "forged-receipt", "target-drift"):
+            with self.subTest(corruption=corruption):
+                if corruption == "missing-receipt":
+                    _git(self.repo, "update-ref", "-d", receipt_ref)
+                elif corruption == "forged-receipt":
+                    _git(self.repo, "update-ref", receipt_ref, forged)
+                else:
+                    _git(self.repo, "update-ref", target.target_main_ref, seed_sha)
+                try:
+                    with self.assertRaises(sch.FactoryRefused):
+                        sch.FactoryScheduler(
+                            self.store, run_id, actor, self.runtime, target
+                        ).run()
+                    self.assertEqual(cleaned, [run_id])
+                    self.assertEqual(
+                        dict(sch.run_row(self.store, run_id)), before_binding
+                    )
+                    self.assertEqual(tuple(self.store.conn.iterdump()), before_ledger)
+                    self.assertEqual(
+                        _git(self.repo, "rev-parse", st.integration_ref(run_id)),
+                        published_sha,
+                    )
+                finally:
+                    _git(self.repo, "update-ref", receipt_ref, receipt_object)
+                    _git(self.repo, "update-ref", target.target_main_ref, published_sha)
+
+    def test_published_resume_after_target_advanced_since_review(self) -> None:
+        target = self._binding_target()
+        original_publish = sch.FactoryScheduler._publish
+        advanced_to = []
+
+        def publish_after_target_advance(scheduler):
+            first_merge = self._lane_rows(
+                scheduler.run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-a"
+            )[0][2]["after_sha"]
+            _git(self.repo, "merge", "--ff-only", first_merge)
+            advanced_to.append(first_merge)
+            original_publish(scheduler)
+
+        sch.FactoryScheduler._publish = publish_after_target_advance
+        try:
+            run_id = self._start(
+                ScriptedActor(self.repo, self.runtime.path / "worktrees")
+            )
+        finally:
+            sch.FactoryScheduler._publish = original_publish
+
+        review = self._run_rows(run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW)[0][2]
+        publication = self._run_rows(run_id, st.ArtifactKind.MAIN_PUBLICATION)[0][2]
+        self.assertEqual(publication["expected_before_sha"], advanced_to[0])
+        self.assertNotEqual(
+            publication["expected_before_sha"], review["observed_target_main_sha"]
+        )
+        compiled = self._compile(revision=1, ref="plan:two-lane")
+        cleaned = []
+
+        class CleanupOnlyActor:
+            lane_specs = gitpub.lane_specs_from_plan(compiled)
+
+            def complete_run_spaces(self, completed_run):
+                cleaned.append(completed_run)
+
+        before_binding = dict(sch.run_row(self.store, run_id))
+        before_refs = _git(self.repo, "show-ref")
+        before_ledger = tuple(self.store.conn.iterdump())
+        self.assertEqual(
+            sch.FactoryScheduler(
+                self.store, run_id, CleanupOnlyActor(), self.runtime, target
+            ).run(),
+            st.RunStatus.COMPLETE,
+        )
+        self.assertEqual(cleaned, [run_id])
+        self.assertEqual(dict(sch.run_row(self.store, run_id)), before_binding)
+        self.assertEqual(_git(self.repo, "show-ref"), before_refs)
+        self.assertEqual(tuple(self.store.conn.iterdump()), before_ledger)
+
     def test_two_dependent_lanes_seal_revise_merge_and_publish(self) -> None:
         actor = ScriptedActor(self.repo, self.runtime.path / "worktrees")
         run_id = self._start(actor)
@@ -823,6 +934,17 @@ class FactoryCutoverTests(unittest.TestCase):
         assert review is not None
         self.assertEqual(review.payload.get("verdict"), st.ReviewerVerdict.PASS.value)
         self.assertFalse(sch._has_publication(self.store, run_id))
+        before_binding = dict(sch.run_row(self.store, run_id))
+        before_refs = _git(self.repo, "show-ref")
+        with self.assertRaises(sch.FactoryRefused):
+            sch.correct_legacy_integration_base(
+                store=self.store,
+                target=target,
+                run_id=run_id,
+                declared_sha=sch.durable_integration_tip(self.store, run_id),
+            )
+        self.assertEqual(dict(sch.run_row(self.store, run_id)), before_binding)
+        self.assertEqual(_git(self.repo, "show-ref"), before_refs)
         record = sch.apply_factory_amendment(
             self.store,
             run_id,

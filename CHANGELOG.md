@@ -115,6 +115,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **Published runs can resume completion cleanup without rebasing their initial
+  integration baseline.** Resume authenticates the immutable publication receipt
+  against the bound target and reviewed integration tip before treating the run
+  as complete, including publication after the target advanced since review.
+  Missing or mismatched receipts, changed targets, and unsafe unpublished
+  baseline corrections remain refused; cleanup does not rerun lane work or
+  rewrite run bindings and refs.
 - **A copy-detected source path is not a written path.** `admit_candidate`
   measures a candidate with `git diff-tree -M -C --find-copies-harder`, so a
   new file that resembles an existing one arrives as a copy `C<score>

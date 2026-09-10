@@ -691,6 +691,8 @@ def correct_legacy_integration_base(
         return recover_legacy_retarget_journal(
             store=store, target=target, run_id=run_id
         )
+    if _completed_publication_matches(store, target, run_id, declared):
+        return target
     action = legacy_integration_correction_decision(
         stored_sha=stored,
         declared_sha=declared,
@@ -962,6 +964,54 @@ def _has_publication(store: ArtifactStore, run_id: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _completed_publication_matches(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    declared_sha: str,
+) -> bool:
+    """A committed publication needs cleanup, not a new integration baseline."""
+    publication = _latest_run_artifact(store, run_id, st.ArtifactKind.MAIN_PUBLICATION)
+    if publication is None:
+        return False
+    tip = durable_integration_tip(store, run_id)
+    fingerprint = store.active_final_review_fingerprint(run_id, tip)
+    review = _latest_run_artifact(
+        store, run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW
+    )
+    if review is None or review.input_digest != fingerprint:
+        raise FactoryRefused("PUBLICATION_RECEIPT_MISMATCH")
+    gitpub.revalidate_binding(target)
+    ref = gitpub.publication_ref_name(run_id, fingerprint)
+    git = target.git()
+    receipt = git.read_ref(ref)
+    expected_before = str(publication.payload["expected_before_sha"])
+    expected = gitpub.publication_receipt_payload(
+        run_id=run_id,
+        target_repository_fingerprint=target.target_repository_fingerprint,
+        target_main_ref=target.target_main_ref,
+        review_input_fingerprint=fingerprint,
+        final_review_artifact_id=review.artifact_id,
+        expected_before_sha=expected_before,
+        reviewed_integration_sha=tip,
+    )
+    if (
+        declared_sha != tip
+        or git.rev_parse(target.target_main_ref) != tip
+        or receipt is None
+        or publication.payload != gitpub.main_publication_payload(
+            review_input_fingerprint=fingerprint,
+            receipt_ref=ref,
+            receipt_object=receipt,
+            expected_before_sha=expected_before,
+            published_sha=tip,
+        )
+        or git.cat_file("blob", receipt) != st.canonical_bytes(expected)
+    ):
+        raise FactoryRefused("PUBLICATION_RECEIPT_MISMATCH")
+    return True
 
 
 @dataclass(frozen=True)
@@ -2047,6 +2097,10 @@ class FactoryScheduler:
             return "noop"
         ref = gitpub.declared_integration_ref(specs)
         declared = self.target.git().rev_parse(ref)
+        if _completed_publication_matches(
+            self.store, self.target, self.run_id, declared
+        ):
+            return "noop"
         row = run_row(self.store, self.run_id)
         stages = tuple(
             self.store.lane_stage(self.run_id, lane.lane_id)
