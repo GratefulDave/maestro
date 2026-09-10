@@ -5590,6 +5590,18 @@ class HerdrLauncher:
         if session_rename_confirmed(self._pane_text(handle), session_name):
             return
         try:
+            # Idle OMP and Claude bind Ctrl+C to whole-draft clearing, unlike
+            # Ctrl+U (cursor-to-line-start only). Let prior input settle first:
+            # OMP treats a second Ctrl+C within 500ms as an exit request.
+            time.sleep(PASTE_SETTLE_S)
+            self._herdr(
+                "pane",
+                "send-keys",
+                handle.pane_id,
+                "ctrl+c",
+                env=handle.environment,
+            )
+            time.sleep(PASTE_SETTLE_S)
             self._herdr(
                 "pane",
                 "send-text",
@@ -5597,6 +5609,17 @@ class HerdrLauncher:
                 "/rename {}".format(session_name),
                 env=handle.environment,
             )
+            # Match prompt submission's paste/close-popup/submit ordering;
+            # Herdr returning does not mean the composer ingested the paste.
+            time.sleep(PASTE_SETTLE_S)
+            self._herdr(
+                "pane",
+                "send-keys",
+                handle.pane_id,
+                "esc",
+                env=handle.environment,
+            )
+            time.sleep(PASTE_SETTLE_S)
             self._herdr(
                 "pane",
                 "send-keys",

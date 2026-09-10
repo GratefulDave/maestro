@@ -122,6 +122,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Missing or mismatched receipts, changed targets, and unsafe unpublished
   baseline corrections remain refused; cleanup does not rerun lane work or
   rewrite run bindings and refs.
+- **Completion cleanup submits session renames from an empty composer.**
+  An idle session's entire draft is cleared with its supported single Ctrl+C
+  action before `/rename`, with input-ingestion waits and popup dismissal
+  before Enter. Dirty multiline text at any cursor position can no longer
+  turn the command into an ordinary prompt. Confirmation remains mandatory;
+  an already-confirmed rename remains a no-op. This fixes cleanup refusal
+  after successful publication, not publication itself; existing deployments
+  require a separately authorized rollout.
 - **A copy-detected source path is not a written path.** `admit_candidate`
   measures a candidate with `git diff-tree -M -C --find-copies-harder`, so a
   new file that resembles an existing one arrives as a copy `C<score>

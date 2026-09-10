@@ -32,6 +32,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
@@ -205,18 +206,10 @@ class TheRenameIsConfirmedByReadingThePane(unittest.TestCase):
         launcher._confirm_session_rename(
             handle, OBSERVED_SESSION_NAME, timeout_s=1.0
         )
-        sent = [call for call in herdr.calls if call[:2] == ("pane", "send-text")]
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0][3], "/rename " + OBSERVED_SESSION_NAME)
-
-    def test_it_never_asks_herdr_to_match_the_string(self) -> None:
-        # The verb that could not do this job is not called at all any more.
-        herdr, launcher, handle = self._bound()
-        launcher._confirm_session_rename(
-            handle, OBSERVED_SESSION_NAME, timeout_s=1.0
-        )
-        self.assertFalse(
-            any(call[:2] == ("pane", "wait-output") for call in herdr.calls)
+        self.assertTrue(
+            lch.session_rename_confirmed(
+                launcher._pane_text(handle), OBSERVED_SESSION_NAME
+            )
         )
 
     def test_a_composer_that_never_confirms_still_refuses(self) -> None:
@@ -246,6 +239,98 @@ class TheRenameIsConfirmedByReadingThePane(unittest.TestCase):
                 for call in herdr.calls[before:]
             )
         )
+
+
+class DelayedComposer:
+    """Transport boundary: pasted text lands later than key delivery.
+
+    Model the documented idle Ctrl+C whole-draft action, cursor-relative
+    insertion, and the completion popup consuming Enter unless dismissed.
+    Confirmation comes from parsing the submitted buffer, never last_text.
+    """
+
+    def __init__(self, draft: str, cursor: int) -> None:
+        self.draft = draft
+        self.cursor = cursor
+        self.now = 10.0
+        self.last_clear = self.now
+        self.pending = []
+        self.popup = False
+        self.output = ""
+        self.submitted = []
+        self.exited = False
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        while self.pending and self.pending[0][0] <= self.now:
+            _, operation, value = self.pending.pop(0)
+            if operation == "clear":
+                self.draft = ""
+                self.cursor = 0
+                self.popup = False
+            else:
+                self.draft = (
+                    self.draft[:self.cursor] + value + self.draft[self.cursor:]
+                )
+                self.cursor += len(value)
+                self.popup = self.draft.startswith("/")
+
+    def __call__(self, *args: str, **kwargs: object) -> dict:
+        verb = args[:2]
+        if verb == ("pane", "read"):
+            return {"result": {"text": self.output}}
+        if self.exited:
+            raise RuntimeError("composer exited")
+        if verb == ("pane", "send-text"):
+            self.pending.append((self.now + 0.5, "paste", args[3]))
+            self.pending.sort()
+            return {}
+        if verb != ("pane", "send-keys"):
+            raise AssertionError(args)
+        key = args[3]
+        if key == "ctrl+c":
+            if self.now - self.last_clear < 0.5:
+                self.exited = True
+                raise RuntimeError("double Ctrl+C exits")
+            self.last_clear = self.now
+            self.pending.append((self.now + 0.75, "clear", ""))
+        elif key == "esc":
+            self.popup = False
+        elif key == "enter":
+            if self.popup:
+                self.popup = False
+                return {}
+            text = self.draft
+            self.submitted.append(text)
+            self.draft = ""
+            self.cursor = 0
+            if text.startswith("/rename ") and "\n" not in text:
+                self.output = "Session renamed to:\n" + text[len("/rename "):]
+        return {}
+
+
+class StandaloneRenameSubmission(unittest.TestCase):
+    def test_dirty_multiline_composer_is_replaced_before_submit(self) -> None:
+        draft = "first line\nleft e right\nlast line"
+        for cursor in (0, draft.index("e right") + 1, len(draft)):
+            with self.subTest(cursor=cursor):
+                self._rename(draft, cursor)
+
+    def test_empty_composer_is_not_exited(self) -> None:
+        self._rename("", 0)
+
+    def _rename(self, draft: str, cursor: int) -> None:
+        composer = DelayedComposer(draft, cursor)
+        launcher = _launcher()
+        launcher._herdr = composer
+        with patch.object(lch.time, "sleep", composer.sleep), patch.object(
+            lch.time, "monotonic", lambda: composer.now
+        ):
+            launcher._confirm_session_rename(
+                _handle("w1:p1", Path(".")), OBSERVED_SESSION_NAME, timeout_s=1
+            )
+        self.assertEqual(composer.submitted, ["/rename " + OBSERVED_SESSION_NAME])
+        self.assertFalse(composer.exited)
 
 
 if __name__ == "__main__":  # pragma: no cover
