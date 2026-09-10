@@ -2141,3 +2141,254 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComposerHoldsOfferTests(unittest.TestCase):
+    """FDAdb run d246ae95: a composer that keeps the offer has not sent it."""
+
+    PANE = "w9:p1"
+    # Not under /tmp: on macOS that is a symlink, and the launcher
+    # compares the resolved path the composer was actually offered.
+    PROMPT = Path("/maestro/lane-faq-producer-tests/prompt-1.json")
+
+    def _screen(self, holding: bool) -> str:
+        body = [
+            "> read the plan",
+            "L Read /maestro/lane-faq-producer-tests/contract.md (12 lines)",
+            "",
+            "PASS",
+            "",
+            "2026-09-10 00:07:07  30K  7  2.6s",
+            "",
+            "|-- pi > Mac > GPT-6-Astra > 01a088cd --|",
+        ]
+        composer = "@{0}".format(self.PROMPT) if holding else ""
+        body.append("|_ {0} _|".format(composer))
+        return "\n".join(body)
+
+    @staticmethod
+    def _clock():
+        """A clock the test can move; the grace before conviction reads it."""
+        now = [0.0]
+
+        def monotonic() -> float:
+            now[0] += 1.0
+            return now[0]
+
+        return monotonic
+
+    def _herdr(self, screens: list[str], sent: list[tuple[str, ...]]):
+        def herdr(*args: str, **kwargs: object) -> dict:
+            del kwargs
+            sent.append(tuple(args))
+            if args[:2] == ("pane", "get"):
+                return {"result": {"pane": {"pane_id": self.PANE, "revision": 1}}}
+            if args[:2] == ("pane", "read"):
+                return {"result": {"text": screens[-1]}}
+            if args[:2] in (("pane", "send-text"), ("pane", "send-keys")):
+                return {}
+            if args[:2] == ("agent", "send-keys"):
+                return {}
+            if args[:2] == ("agent", "wait"):
+                raise lch.HerdrCallError("wait timeout", code="timeout")
+            raise AssertionError(args)
+
+        return herdr
+
+    def test_reads_the_composer_not_the_transcript_above_it(self) -> None:
+        sent: list[tuple[str, ...]] = []
+        herdr = self._herdr([self._screen(True)], sent)
+        self.assertIs(
+            True,
+            lch.composer_holds_offer(herdr, self.PANE, self.PROMPT),
+        )
+        # The same path printed as an ordinary tool result far above the
+        # composer is transcript, not an unsent offer.
+        scrolled = "\n".join(
+            ["L Read {0} (3 lines)".format(self.PROMPT)]
+            + ["line {0}".format(n) for n in range(12)]
+            + ["|_  _|"]
+        )
+        self.assertIs(
+            False,
+            lch.composer_holds_offer(
+                self._herdr([scrolled], []), self.PANE, self.PROMPT
+            ),
+        )
+
+    def test_unreadable_pane_answers_nothing(self) -> None:
+        def herdr(*args: str, **kwargs: object) -> dict:
+            del kwargs
+            raise lch.HerdrCallError("pane gone", code="pane_not_found")
+
+        self.assertIsNone(
+            lch.composer_holds_offer(herdr, self.PANE, self.PROMPT)
+        )
+
+    def test_enter_frees_the_composer_and_the_mark_lands(self) -> None:
+        """The paste lands, the first Enter is swallowed, a later one takes."""
+        screens = [self._screen(True)]
+        marks = {"count": 0}
+        sent: list[tuple[str, ...]] = []
+        herdr = self._herdr(screens, sent)
+
+        pressed = {"n": 0}
+
+        def recorded() -> bool:
+            return marks["count"] > 0
+
+        def press_counting(*args: str, **kwargs: object) -> dict:
+            if args[:2] in (("agent", "send-keys"), ("pane", "send-keys")) and (
+                args[-1] == "enter"
+            ):
+                pressed["n"] += 1
+                # The composer takes the second Enter, exactly as the one a
+                # human typed on run d246ae95 did.
+                if pressed["n"] >= 2:
+                    marks["count"] = 1
+                    screens.append(self._screen(False))
+            return herdr(*args, **kwargs)
+
+        lch.submit_agent_prompt(
+            press_counting,
+            self.PANE,
+            "@{0} ".format(self.PROMPT),
+            "maestro-reviewer",
+            timeout_s=5.1,
+            attempts=4,
+            sleep=lambda _s: None,
+            monotonic=self._clock(),
+            refuse_unproven=False,
+            submission_recorded=recorded,
+            composer_holds=lambda: lch.composer_holds_offer(
+                herdr, self.PANE, self.PROMPT
+            ),
+        )
+        self.assertGreaterEqual(pressed["n"], 2)
+        self.assertTrue(recorded())
+
+    def test_held_composer_refuses_instead_of_returning_offered(self) -> None:
+        """The observed stall: never submitted, and never said so."""
+        sent: list[tuple[str, ...]] = []
+        herdr = self._herdr([self._screen(True)], sent)
+
+        with self.assertRaises(lch.PromptNotSubmitted) as raised:
+            lch.submit_agent_prompt(
+                herdr,
+                self.PANE,
+                "@{0} ".format(self.PROMPT),
+                "maestro-reviewer",
+                timeout_s=5.1,
+                attempts=2,
+                sleep=lambda _s: None,
+                monotonic=self._clock(),
+                refuse_unproven=False,
+                submission_recorded=lambda: False,
+                composer_holds=lambda: lch.composer_holds_offer(
+                    herdr, self.PANE, self.PROMPT
+                ),
+            )
+        self.assertIn("AGENT_PROMPT_HELD_IN_COMPOSER", str(raised.exception))
+
+    def test_released_composer_still_returns_offered_unproven(self) -> None:
+        """A turn that started but has not written its record is not a refusal."""
+        herdr = self._herdr([self._screen(False)], [])
+        lch.submit_agent_prompt(
+            herdr,
+            self.PANE,
+            "@{0} ".format(self.PROMPT),
+            "maestro-reviewer",
+            timeout_s=5.1,
+            attempts=2,
+            sleep=lambda _s: None,
+            monotonic=self._clock(),
+            refuse_unproven=False,
+            submission_recorded=lambda: False,
+            composer_holds=lambda: lch.composer_holds_offer(
+                herdr, self.PANE, self.PROMPT
+            ),
+        )
+
+    def test_a_repaint_that_still_shows_the_prompt_is_not_a_refusal(self) -> None:
+        """Claude keeps the submitted line right above its composer."""
+        herdr = self._herdr([self._screen(True)], [])
+        marks = {"count": 0}
+
+        def recorded() -> bool:
+            # The record lands while the grace before conviction is running.
+            marks["count"] += 1
+            return marks["count"] > 3
+
+        lch.submit_agent_prompt(
+            herdr,
+            self.PANE,
+            "@{0} ".format(self.PROMPT),
+            "maestro-reviewer",
+            timeout_s=5.1,
+            attempts=1,
+            sleep=lambda _s: None,
+            monotonic=self._clock(),
+            refuse_unproven=False,
+            submission_recorded=recorded,
+            composer_holds=lambda: lch.composer_holds_offer(
+                herdr, self.PANE, self.PROMPT
+            ),
+        )
+
+    def test_resubmit_reports_a_held_composer_as_a_typed_refusal(self) -> None:
+        launcher = _bare_launcher("product run-1")
+        token = lch.role_session_token(RUN_HASH, LANE, "test-reviewer")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt-1.json"
+            prompt.write_text("{}", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            handle = lch.LaunchHandle(
+                token,
+                self.PANE,
+                lch._agent_name(token),
+                root,
+                transcript_path=transcript,
+                environment={},
+                pane_role="test-reviewer",
+                lane_key=LANE,
+            )
+            screen = "|_ @{0} _|".format(prompt.resolve())
+
+            def herdr(*args: str, **kwargs: object) -> dict:
+                del kwargs
+                if args[:2] == ("agent", "focus"):
+                    return {}
+                if args[:2] == ("agent", "get"):
+                    return {"result": {"agent": {"agent_status": "idle"}}}
+                if args[:2] == ("pane", "get"):
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": self.PANE,
+                                "cwd": str(root),
+                                "revision": 1,
+                            }
+                        }
+                    }
+                if args[:2] == ("pane", "read"):
+                    return {"result": {"text": screen}}
+                if args[:2] in (
+                    ("pane", "send-text"),
+                    ("pane", "send-keys"),
+                    ("agent", "send-keys"),
+                ):
+                    return {}
+                if args[:2] == ("agent", "wait"):
+                    raise lch.HerdrCallError("wait timeout", code="timeout")
+                raise AssertionError(args)
+
+            launcher._herdr = herdr  # type: ignore[method-assign]
+            launcher._handles[token] = handle
+            with self.assertRaises(lch.LaunchRefused) as raised:
+                launcher.resubmit(handle, prompt, timeout_s=5.1)
+        self.assertIs(
+            raised.exception.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
+        )
+        self.assertIn("AGENT_PROMPT_HELD_IN_COMPOSER", raised.exception.detail)

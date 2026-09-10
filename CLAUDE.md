@@ -559,3 +559,36 @@ One idea, not two: a fix applied to one of several sibling paths converts a loud
 refusal into a quiet multi-round failure blamed on the wrong actor. Deployment
 consequence: FDAdb's `provision_argv` needs `npm ci --prefer-offline --no-audit --no-fund`
 added (deployment-owned config, held out of template mirrors).
+
+## Historical — 2026-09-09 run d246ae95 (an unproven offer had no reader)
+
+`lane-faq-producer-tests` and `lane-geo-subset-tests` each dispatched a
+test-reviewer (omp, `openai-astra`) after a resume, and each pane then sat with
+`@…/prompt-1.json` visible in its composer, status `idle`, for 38 minutes.
+The lanes logged `waiting on test-reviewer` every 30s and nothing else. A human
+typed one `herdr pane send-keys <pane> Enter` into each; both recorded their
+first user turn within four seconds and answered normally.
+
+The cause is not the offer sequence, which was measured against a live omp pane
+during this diagnosis and submits on the first Enter both on a fresh session and
+on a second prompt into a session that has already run turns; `agent send-keys`
+and `pane send-keys` both deliver. The cause is that nothing read the failure.
+`submit_agent_prompt` on the lane path passes `refuse_unproven=False` and
+returns "offered, unproven", deferring to "the node's liveness and quiescence
+machinery" — and on this path that machinery no longer exists. `_await_envelope`
+was deliberately stripped of every non-envelope terminator, for four good
+reasons each of which had ended a live lane on a transport signal, and the
+envelope is now the only thing that ends the wait. So an offer that was never
+submitted has no adjudicator at all, and the diagnostics the offer built —
+`enters_delivered`, the absorbed `SubmitCallFailure` records — are discarded on
+that silent return, which is why the run cannot say whether a single recovery
+Enter was ever delivered.
+
+The fix does not add a clock. A composer that still *displays* the offered path
+has demonstrably not sent it, however long a turn may run, so
+`composer_holds_offer` reads that observable and the offer refuses
+`AGENT_PROMPT_HELD_IN_COMPOSER` on both paths rather than returning. **When a
+function hands off to "downstream machinery", name the reader and check it is
+still there** — the handoff in the docstring outlived the branch that received
+it, and the two changes were made months apart in different files, each correct
+on its own.
