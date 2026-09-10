@@ -473,7 +473,9 @@ _IR_PROJECTION: Dict[str, Optional[str]] = {
     "lanes": "lanes",
     "verifiers": "spec.gate, acceptance[0]",
     "traceability": None,
-    "rendered_bindings": "spec.obligations.rendered_bindings",
+    "rendered_bindings": (
+        "spec.obligations.rendered_bindings, filtered to the claims the "
+        "lane discharges"),
     "links": None,
     "approval": None,
     "extensions": "_EXTENSIONS_PROJECTION",
@@ -717,6 +719,57 @@ def _bindings(lane: Mapping[str, Any], kind: str) -> dict:
     return bindings
 
 
+def _rendered_bindings_for(ir: Mapping[str, Any],
+                           claim_ids: Sequence[str]) -> list:
+    """The plan's rendered bindings for exactly these claims, in IR order.
+
+    A lane's spec used to embed the whole plan's ``rendered_bindings`` list, so
+    editing any one claim's binding re-digested every lane that carried it and
+    an amendment reset lanes it never named. A binding belongs to the claim it
+    renders; it rides with that claim and with no other lane.
+
+    Ownership is read three ways because the Plan Contract writes it three
+    ways, and a binding a lane needs must never be dropped: the claim's own
+    ``rendered_binding_ids``, the binding's ``claim_id``, and its
+    ``element_id`` when that names a claim.
+    """
+    rendered = ir.get("rendered_bindings")
+    if not isinstance(rendered, list):
+        return []
+    wanted_claims = {item for item in claim_ids if isinstance(item, str) and item}
+    wanted_bindings: set = set()
+    index = _records_by_id(ir, "claims", "claim_id")
+    for claim_id in wanted_claims:
+        claim = index.get(claim_id)
+        if not isinstance(claim, dict):
+            continue
+        for binding_id in claim.get("rendered_binding_ids") or []:
+            if isinstance(binding_id, str) and binding_id:
+                wanted_bindings.add(binding_id)
+    kept = []
+    for binding in rendered:
+        if not isinstance(binding, dict):
+            continue
+        if (binding.get("binding_id") in wanted_bindings
+                or binding.get("claim_id") in wanted_claims
+                or binding.get("element_id") in wanted_claims):
+            kept.append(binding)
+    return kept
+
+
+def _carried_claim_ids(lane: Mapping[str, Any],
+                       paired: Sequence[Mapping[str, Any]]) -> list:
+    """Claim ids this spec embeds: the lane's own, then each paired build's."""
+    ids: list = []
+    seen: set = set()
+    for source in [lane, *paired]:
+        for claim_id in source.get("claim_ids") or []:
+            if isinstance(claim_id, str) and claim_id and claim_id not in seen:
+                seen.add(claim_id)
+                ids.append(claim_id)
+    return ids
+
+
 def _pack_obligations(
         ir: Mapping[str, Any], source_lane: Mapping[str, Any],
         source_verifier: Mapping[str, Any]) -> dict:
@@ -741,6 +794,7 @@ def _obligations(
             lanes_by_id.setdefault(item["lane_id"], item)
     verifiers = ir.get("verifiers") if isinstance(ir.get("verifiers"), list) else []
     paired = []
+    paired_lanes = []
     for projected in projected_build_lanes:
         build_lane = lanes_by_id[projected["id"]]
         build_verifiers = [
@@ -751,15 +805,16 @@ def _obligations(
         packed["lane_id"] = projected["id"]
         packed["acceptance"] = list(projected["acceptance"])
         paired.append(packed)
+        paired_lanes.append(build_lane)
     own = _pack_obligations(ir, lane, verifier)
-    rendered = ir.get("rendered_bindings")
     return {
         "claims": own["claims"],
         "observed_baseline": own["observed_baseline"],
         "seams": own["seams"],
         "verifier": own["verifier"],
         "for_build_lanes": paired,
-        "rendered_bindings": list(rendered) if isinstance(rendered, list) else [],
+        "rendered_bindings": _rendered_bindings_for(
+            ir, _carried_claim_ids(lane, paired_lanes)),
     }
 
 
@@ -995,6 +1050,20 @@ def _assert_ingress_projection_is_total(
         ]
         if actual_paired != paired:
             _fail("obligations.for_build_lanes", paired, actual_paired)
+        lane_index = _records_by_id(ir, "lanes", "lane_id")
+        expected_bindings = _rendered_bindings_for(
+            ir,
+            _carried_claim_ids(
+                lane,
+                [lane_index[item] for item in paired if item in lane_index]))
+        actual_bindings = obligations.get("rendered_bindings")
+        if list(actual_bindings or []) != expected_bindings:
+            _fail(
+                "obligations.rendered_bindings",
+                [item.get("binding_id") for item in expected_bindings],
+                [item.get("binding_id")
+                 for item in actual_bindings or []
+                 if isinstance(item, dict)])
     else:
         if "obligations" in spec:
             raise IngressProjectionIncomplete(
