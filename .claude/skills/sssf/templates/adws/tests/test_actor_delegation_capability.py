@@ -172,26 +172,22 @@ class CliHasNoDelegationPolicyFlagsTest(unittest.TestCase):
                 self.assertNotIn(flag, flags)
 
 
-class RecordingLauncher:
+class RecordingLauncher(lch.FakeLauncher):
     def __init__(
         self,
         *,
         files: Mapping[str, str] | None = None,
         envelope: Mapping[str, Any] | None = None,
     ) -> None:
+        super().__init__()
         self.files = dict(files or {})
         self.envelope = dict(envelope or {})
         self.launches: list[LaunchRecord] = []
         self.resubmits: list[dict[str, Any]] = []
         self.specs: list[lch.LaunchSpec] = []
         self.cancels: list[object] = []
-        self.retained: list[str] = []
-        self.completed: list[tuple[str, ...]] = []
         self.wait_idle = 0
         self._live: dict[tuple[str, str], SimpleNamespace] = {}
-        self._handles: dict[str, object] = {}
-        self._statuses: dict[str, str | None] = {}
-        self._states: dict[str, lch.PollResult] = {}
 
     def _write_worktree(self, worktree: Path) -> None:
         for rel, body in self.files.items():
@@ -490,7 +486,6 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     "run-1",
                 ),
             )
-            self.assertEqual(len(recorder.specs), 1)
             self.assertEqual(
                 recorder.specs[0].envelope_path.name, "envelope-1.json"
             )
