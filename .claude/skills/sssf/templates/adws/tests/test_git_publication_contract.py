@@ -267,6 +267,45 @@ class GitPublicationContract(unittest.TestCase):
         declared = tuple({path for item in delta for path in item.represented_paths()})
         gp.validate_declared_ownership(delta, declared, changed=True)
 
+    def test_copy_source_is_not_an_owned_path(self) -> None:
+        """A file git reports as copied from an unowned sibling is still owned.
+
+        `diff_tree_raw` runs with `-C --find-copies-harder`, so a new file that
+        resembles an existing one arrives as `C<score> <source> <new>`. The
+        lane wrote only the new path; the source is unchanged provenance. On
+        FDAdb run d246ae95 a builder's new `tests/wp6/vitest.config.ts` was
+        reported as a 66% copy of `tests/wp7/vitest.config.ts` and refused
+        `CANDIDATE_OUTPUT_OWNERSHIP_REFUSED:tests/wp7/vitest.config.ts` for a
+        path it never touched.
+        """
+        template = (
+            "import { getViteConfig } from \"astro/config\";\n\n"
+            "export default getViteConfig({\n  test: {\n"
+            "    environment: \"node\",\n"
+            "    include: [\"tests/%s/**/*.test.ts\"],\n  },\n});\n"
+        )
+        base = _commit_paths(self.root, {"tests/wp7/vitest.config.ts": template % "wp7"}, "wp7")
+        cand = _commit_paths(self.root, {"tests/wp6/vitest.config.ts": template % "wp6"}, "wp6")
+        delta = gp.measure_tree_delta(self.binding, base, cand)
+        self.assertEqual([item.status for item in delta], ["C"], delta)
+        self.assertEqual(delta[0].old_path, "tests/wp7/vitest.config.ts")
+        self.assertEqual(delta[0].represented_paths(), ("tests/wp6/vitest.config.ts",))
+        gp.validate_declared_ownership(
+            delta, ("tests/wp6/vitest.config.ts",), changed=True
+        )
+        self.assertEqual(
+            gp.publication_touched_paths(
+                self.binding, expected_before_sha=base, reviewed_integration_sha=cand
+            ),
+            frozenset({"tests/wp6/vitest.config.ts"}),
+        )
+        raw = (
+            b":100644 100644 " + b"5" * 40 + b" " + b"9" * 40
+            + b" C066\0tests/wp7/vitest.config.ts\0tests/wp6/vitest.config.ts\0"
+        )
+        parsed = gp.parse_diff_tree(raw)
+        self.assertEqual(parsed[0].represented_paths(), ("tests/wp6/vitest.config.ts",))
+
     def test_undeclared_path_refuses_before_ref(self) -> None:
         sha = _commit_paths(self.root, {"secret.txt": "no\n"}, "secret")
         with self.assertRaises(gp.GitPublicationRefused) as raised:
