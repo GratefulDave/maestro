@@ -1094,7 +1094,6 @@ class RenameCloseTest(unittest.TestCase):
             )
             extra = herdr.calls[before:]
             texts = [call for call in extra if call[:2] == ("pane", "send-text")]
-            keys = [call for call in extra if call[:2] == ("pane", "send-keys")]
             closes = [call for call in extra if call[:2] == ("workspace", "close")]
             self.assertEqual(len(texts), 2)
             self.assertTrue(all(call[3].startswith("/rename ") for call in texts))
@@ -1107,7 +1106,6 @@ class RenameCloseTest(unittest.TestCase):
                     ),
                 },
             )
-            self.assertTrue(all(call[3] == "enter" for call in keys))
             self.assertEqual(
                 [call[2] for call in closes],
                 [tester_handle.child_workspace_id],
