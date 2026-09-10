@@ -943,10 +943,13 @@ class FrozenSurfaceTest(SingleEntryBase):
         for banned in ("--repo", "--main-ref", "--run-id", "--run"):
             self.assertNotIn(banned, options)
 
-    def test_the_frozen_verb_surface_is_unchanged(self) -> None:
+    def test_the_operator_surface_is_the_five_documented_verbs(self) -> None:
+        # `run attend` is the fifth, added deliberately and documented in
+        # MAESTRO_architecture.md §13. The surface is still closed: this
+        # assertion is equality, so a sixth verb fails here before it ships.
         self.assertEqual(
             maestro.parser_verbs(maestro.build_parser()),
-            ("run start", "run resume", "run amend", "run status"),
+            ("run start", "run resume", "run amend", "run attend", "run status"),
         )
 
     def test_a_plan_selector_and_a_verb_together_are_rejected(self) -> None:

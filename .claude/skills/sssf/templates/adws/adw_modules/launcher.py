@@ -1080,6 +1080,9 @@ PANE_ROLE_LABELS = {
     "builder": "builder",
     "code-reviewer": "code-reviewer",
     "integration-reviewer": "integration-reviewer",
+    # An attended amendment's author. Not persistent: it is dispatched once
+    # per park, answers once, and its pane is closed with the run's others.
+    "operator": "operator",
 }
 
 PANE_LABEL_ROLES = {
@@ -1089,6 +1092,7 @@ PANE_LABEL_ROLES = {
     "builder": "builder",
     "code-reviewer": "code-reviewer",
     "integration-reviewer": "integration-reviewer",
+    "operator": "operator",
 }
 
 #: Herdr 0.8.2 `AgentInfo.agent_status` is `idle | working | blocked | done |

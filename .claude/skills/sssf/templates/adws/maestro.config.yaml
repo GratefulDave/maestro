@@ -8,6 +8,23 @@ concurrency: 1
 # worse round. Absent means false.
 stall:
   regression_on_findings: false
+# `run attend` authors the amendment a NO_PROGRESS park needs instead of
+# stopping for a human. Opt-in: 0 (and absent) refuses the verb with
+# ATTEND_DISABLED, so an upgraded deployment keeps parking for its operator
+# until someone sets this key in *this* file. The operator agent it dispatches
+# reads the sealed suite; builders and reviewers still do not.
+attend:
+  max_amendments_per_lane: 0
+  max_amendments_per_run: 10
+  # Required once max_amendments_per_lane is set. Same shape as a role route,
+  # and admitted by the same executed route receipt.
+  # route:
+  #   route: claude
+  #   model: opus
+  #   effort: high
+  # Absolute path to the plan-contract validator. Absent refuses
+  # ATTEND_PLANCTL_UNRESOLVED rather than approving an unvalidated revision.
+  # planctl: /absolute/path/to/planctl.py
 role_routes:
   tester:
     route: omp

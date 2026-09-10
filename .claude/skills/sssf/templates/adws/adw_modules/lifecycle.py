@@ -2436,6 +2436,17 @@ class ArtifactStore:
             body,
         )
 
+    def sealed_bundle_artifact_id(self, run_id: str, lane_id: str) -> Optional[str]:
+        """The sealed bundle this lane is graded against, at the live revision.
+
+        `_sealed_bundle` already resolves a build lane to its tests
+        predecessor's bundle, which is what makes this the same bundle the
+        builder and the code reviewer were measured against rather than a
+        second answer to the same question.
+        """
+        row = self._sealed_bundle(run_id, lane_id)
+        return None if row is None else str(row["artifact_id"])
+
     def run_artifacts_of_kind(
         self, run_id: str, kind: st.ArtifactKind
     ) -> tuple[Mapping[str, Any], ...]:

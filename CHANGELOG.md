@@ -7,6 +7,59 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **`run attend` authors the amendment a `NO_PROGRESS` park needs.** FDAdb run
+  `d246ae95` parked `lane-faq-producer` twice. Both times a human read the gate
+  table, the latest `CODE_REVIEW` findings and the sealed suite, edited one
+  `seams[i].contract`, validated it with `planctl`, minted the receipt and ran
+  `run amend`; both amendments converged in one round. `run attend --run <id>`
+  is that loop with an agent holding the pen: it runs the same scheduler
+  `run resume` runs, and on a `NO_PROGRESS` park dispatches one operator agent,
+  validates and approves its revision through `planctl`, projects it through the
+  plan-contract ingress, and applies it through the same
+  `apply_factory_amendment` path `run amend` uses.
+
+  **Nothing about how a lane moves changes.** The transition is the
+  `PLAN_AMENDMENT` and the `lane_projection_digest` values that moved, never the
+  agent's prose. Any wait that is not `NO_PROGRESS`, a lane or run at its bound,
+  an operator that refuses or crashes, and a revision that fails validation all
+  park exactly as they do today and end the verb on the `waiting` status
+  `run resume` would have returned. A revision reaching any lane beyond the
+  parked lane and the tests/build lane it is paired with is refused
+  `ATTEND_AMENDMENT_TOO_WIDE`, and so is one that moves no projection at all —
+  because a lane whose digest moves restarts at `PLANNED` and loses every input
+  it had, which is how one FAQ claim edit un-merged two finished geo lanes on
+  that same run.
+
+  **Opt-in, per deployment.** `attend.max_amendments_per_lane` is absent and `0`
+  in the template and `0` refuses the verb with `ATTEND_DISABLED`, so mirroring
+  the runtime into a deployment can never turn it on — `runtime_sync` holds
+  `maestro.config.yaml` back, the same property that keeps `concurrency` at 1.
+  `attend.max_amendments_per_run` defaults to 10; `attend.route` is required
+  once the lane bound is set and is admitted by the same executed route receipt
+  as every lane role.
+
+  **The operator agent reads the sealed suite.** That is a deliberate move of
+  the §11 boundary and is stated in the agent's own prompt: builders and every
+  reviewer still do not, the operator tree is not a git checkout and is never
+  merged, and what a deployment accepts by opting in is that an amendment may
+  state as a contract clause an expectation the suite was asserting privately.
+
+  Two new run-artifact kinds record it. `ATTEND_SESSION` at start and stop
+  (bounds, revisions applied, lanes amended, stop reason), printed by
+  `run status`; `AMENDMENT_RATIONALE` beside each amendment, carrying the
+  agent's `{lane, round, failing_cases_summary, contract_gap, edit_path,
+  edit_text}`. Neither appears in the transition table, touches `lane_state`, or
+  is read by any predicate.
+
+  **Ledger schema `artifact-factory.v3`.** A run-artifact kind check is baked
+  into the table at creation, so the two kinds could not be added to the enum
+  alone: every existing ledger would have refused the insert at runtime while
+  the enum said it was legal. v3 rebuilds the `run_artifacts` kind check the way
+  v2 rebuilt the lane one, and a v1 ledger now reaches it by chaining through v2
+  rather than through a second one-off script. The rebuild is skipped when the
+  table already carries the current check, so a crash between the rebuild and
+  the version stamp reopens instead of stranding the ledger.
+
 - **A gating obligation names its observation seam or does not ship.** A claim a
   tests lane must discharge carries an `observation_seam` in the Plan IR — the
   public export, module boundary, injectable observer, recorded effect, or
