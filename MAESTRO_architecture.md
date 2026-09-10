@@ -199,8 +199,11 @@ The compiler admits a plan if and only if all of the following hold. It does not
 - Declared outputs are exact normalized repository-relative POSIX file paths, never directories or globs.
 - Paths have no absolute, empty, `.`, or `..` components.
 - No duplicate, equal, ancestor, or descendant ownership conflicts exist across lanes.
-- Each lane declares public acceptance criteria.
+- Each lane declares public acceptance criteria. An acceptance item is either a bare criterion string or `{criterion, gating, observation_seam}`.
+- Every gating acceptance criterion names an observation seam — a public export, a module boundary, an injectable observer, or a recorded effect. One with none refuses `OBLIGATION_UNOBSERVABLE`. Gating is declared in the plan IR and never read out of prose, and ingress projects every tests-lane claim as gating with its seam.
 - Integration order is deterministic from the DAG.
+
+The seam reaches the tester, the builder and the reviewer appended to the criterion and is part of the plan digest, so a deployment that mirrors this refuses a plan shipped without one until that plan is re-shipped.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate symlink.
 
