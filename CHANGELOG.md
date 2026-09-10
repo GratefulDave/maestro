@@ -102,6 +102,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A tree is provisioned after its final materialization, never before one.**
+  The first fix for FDAdb run `d246ae9592be478396ad5146a89f00ae` put actor
+  provisioning in `HerdrLauncher.launch`, which runs *before* the launcher's
+  own `spec.prepare_adopted_cwd` callback — and that callback is a
+  materialization: it re-runs `prepare_cwd`, and for a private tree
+  `hv.refresh_materialized_commit` unlinks every child of the tree. So on the
+  two paths that reach a pane which already exists, a reused role pane and an
+  adopted agent, the `node_modules` the launcher had just installed was
+  unlinked and the agent started in an unprovisioned tree. On that run the test
+  reviewer reported `vitest/config` `ERR_MODULE_NOT_FOUND` for ten rounds and
+  was right every time; its checkout had every file stamped after the last
+  dispatch, no `node_modules` and no `.venv`, while the tester's checkout — a
+  git worktree, whose refresh keeps untracked files — had both.
+  `HerdrStageActor._prepared_cwd` now materializes and then provisions, and
+  both the first-launch path and `prepare_adopted_cwd` go through it, so
+  provisioning is the last thing done to a tree before an agent reads it. A
+  failing provisioner is the same typed `LaunchRefusal.PROVISION_FAILED` on
+  both paths. **Deletion:** `HerdrLauncher.provision`, `FakeLauncher.provision`
+  and the `LauncherAdapter.provision` protocol member are removed, along with
+  the `self.provision(worktree)` call in `HerdrLauncher.launch` — the launcher
+  no longer provisions anything. The deployment binding it read
+  (`provision_argv`, `provision_timeout_s`) stays on the launcher, where
+  `scheduler._resolved_provision_argv` already reads it.
+  `tests/test_provision_after_materialize.py` drives `_launch` with a launcher
+  fake that provisions where the launcher used to and then calls
+  `prepare_adopted_cwd`, so it falsifies the ordering rather than the presence
+  of a provisioner; `tests/test_one_provisioner.py`'s actor-worktree and typed
+  refusal assertions moved to the new site unchanged, and
+  `tests/test_persistent_role_agents.py`'s reused-pane ordering case now
+  records `provisioning.provision_tree` itself, so a launcher that provisions
+  again lands in the event list before the callback that wipes it.
 - **Resume restores genuine linked lane children before native gates.**
   Lane UI anchors are deterministic detached, no-checkout worktrees of the
   invoking repository; execution checkouts and publication stay target-bound.

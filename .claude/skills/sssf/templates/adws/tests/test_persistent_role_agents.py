@@ -13,6 +13,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import launcher as lch
+from adw_modules import provisioning
 from tests.herdr_fake import FakeHerdr
 
 
@@ -1120,10 +1121,16 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 mock.patch.object(lch, "pane_env_flags", return_value=()),
                 mock.patch.object(launcher, "_existing_role_handle", return_value=None),
                 mock.patch.object(launcher, "_reconnect_live_agent", return_value=None),
+                # The launcher provisions nothing: `HerdrStageActor.
+                # _prepared_cwd` does, after the tree's final materialization,
+                # which on this path is the `prepare_adopted_cwd` callback
+                # below. Recorded rather than asserted absent by inspection --
+                # if the launcher ever provisions again it lands in `events`
+                # before the callback that wipes it.
                 mock.patch.object(
-                    launcher,
-                    "provision",
-                    side_effect=lambda worktree: events.append("provision"),
+                    provisioning,
+                    "provision_tree",
+                    side_effect=lambda *a, **k: events.append("provision"),
                 ),
                 mock.patch.object(
                     launcher,
@@ -1148,7 +1155,6 @@ class WorkspaceAdoptTest(unittest.TestCase):
             [
                 "route",
                 "preflight",
-                "provision",
                 "prepare:" + str(retained.resolve()),
                 "route",
                 "preflight",
@@ -1249,7 +1255,6 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 mock.patch.object(lch, "pane_env_flags", return_value=()),
                 mock.patch.object(launcher, "_existing_role_handle", return_value=None),
                 mock.patch.object(launcher, "_reconnect_live_agent", return_value=None),
-                mock.patch.object(launcher, "provision"),
                 mock.patch.object(
                     launcher,
                     "_acquire_pane",
@@ -1771,7 +1776,6 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
             mock.patch.object(lch, "pane_env_flags", return_value=()),
             mock.patch.object(launcher, "_existing_role_handle", return_value=None),
             mock.patch.object(launcher, "_reconnect_live_agent", return_value=None),
-            mock.patch.object(launcher, "provision"),
             mock.patch.object(
                 launcher, "_acquire_pane", return_value=("w9:p4", layout, True)
             ),
@@ -1948,7 +1952,6 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                 mock.patch.object(lch, "preflight_launch_prompt"),
                 mock.patch.object(lch, "build_omp_argv", return_value=("omp",)),
                 mock.patch.object(lch, "pane_env_flags", return_value=()),
-                mock.patch.object(launcher, "provision"),
                 mock.patch.object(lch, "wait_for_interactive_agent"),
                 mock.patch.object(lch, "submit_agent_prompt", side_effect=submit),
                 mock.patch.object(
