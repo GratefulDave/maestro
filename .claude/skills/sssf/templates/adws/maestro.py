@@ -3341,7 +3341,9 @@ def _attend_sealed_files(
         return {}
     record = store.get_lane_artifact(artifact_id)
     vault = hv.ensure_vault(runtime.path, run_id)
-    blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(record, lane))
+    blobs = tchain.sealed_private_files(
+        vault, _record_as_lane_artifact(record, lane)
+    )
     return {
         path: hv.cat_blob(vault, blob).decode("utf-8", errors="replace")
         for path, blob in blobs.items()
