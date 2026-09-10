@@ -604,3 +604,19 @@ is the same shape read from the other side — a suite that could not tell requi
 accepted. The defect was in the plan and it was decidable when the plan was authored: a
 gating obligation now declares an `observation_seam` in the IR, and the objective compiler
 refuses one that does not (`OBLIGATION_UNOBSERVABLE`), before any run starts.
+
+## Historical — 2026-09-09 run d246ae95 (a lane's spec carried every claim's binding)
+
+The first amendment on this run un-merged two finished geo lanes it never named. It edited
+one claim's binding on the FAQ lanes; `lane-geo-subset-tests`, whose own requirements were
+byte-identical, went MERGED to PLANNED, and `lane-geo-subset` was un-merged behind it, while
+the amendment artifact recorded `invalidated_inputs: []`. Neither `apply_amendment` nor the
+#232 rule that spares an unnamed merged lane was wrong; the input they read was. Every tests
+lane's `spec.obligations` embedded the plan-wide `rendered_bindings` list — all 28 entries —
+so a change to any claim's binding moved every lane's `spec_digest`, and a reset policy
+keyed on that digest reset lanes the amendment had nothing to do with. A lane now carries
+the bindings of the claims it discharges and of the paired build lanes its spec already
+embeds, and the ingress totality check refuses any other set, because a projection that
+silently drops something has cost this factory runs before. **A digest is only as narrow as
+the thing it digests: before trusting a reset policy that reads one, ask what else rides in
+the payload.**

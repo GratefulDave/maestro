@@ -145,6 +145,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   for 38 minutes while `lane-faq-producer-tests` and `lane-geo-subset-tests`
   logged "waiting on test-reviewer" every 30s and nothing else, until a human
   typed one Enter into each pane and both turns started within seconds.
+- **A lane's spec carries only the bindings of the claims it discharges.**
+  `_obligations` (`adw_modules/plan_contract_ingress.py`) embedded the
+  plan-wide `rendered_bindings` list — every entry, for every claim in the plan
+  — into each tests lane's `spec.obligations`, so editing any one claim's
+  binding re-digested every tests lane that carried the list. `apply_amendment`
+  resets a lane whose `lane_projection_digest` changed, and #232 spares a merged
+  lane the amendment never named, but both read a digest that had moved for a
+  claim the lane does not discharge. A lane now receives
+  `_rendered_bindings_for` its own claims plus the paired build lanes' claims
+  its spec already embeds, and the totality check refuses a projection that
+  carries any other set, so a dropped binding fails at ingress rather than
+  reading as an empty default downstream. On FDAdb run
+  `d246ae9592be478396ad5146a89f00ae` the first amendment, which edited one
+  claim's binding on the FAQ lanes only, took `lane-geo-subset-tests` from
+  MERGED to PLANNED and un-merged `lane-geo-subset` behind it, while the
+  amendment artifact recorded `invalidated_inputs: []`.
 - **A dispatch prepares a tree once; an adopted cwd it already prepared is not
   prepared again.** `HerdrStageActor._launch` materializes and provisions
   `cwd` up front, then hands the launcher a `prepare_adopted_cwd` callback
