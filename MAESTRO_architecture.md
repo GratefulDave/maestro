@@ -204,6 +204,8 @@ The compiler admits a plan if and only if all of the following hold. It does not
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate symlink.
 
+The candidate measurement detects renames and copies. A rename entry represents both of its paths, because the source is gone from the new tree. A copy entry represents only its destination: the source blob is unchanged between the two trees, so it is neither a path the lane owns nor a path the publication touches. A copy's source is recorded on the payload as provenance only, and declared-ownership validation and the publication's touched-path set never name it.
+
 ---
 
 ## 8. Durable data model
