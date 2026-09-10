@@ -150,7 +150,7 @@ A final-review `REVISE` appends `USER_WAIT` with `wait_reason=AMENDMENT_REQUIRED
 
 ### Changed versus unchanged lanes
 
-A changed lane is one whose canonical spec, ordered `needs`, ordered declared outputs, or authored `lane_kind` differ, and therefore whose `lane_projection_digest` changes. Absent `lane_kind` keeps the legacy digest identity. It restarts at `PLANNED`, invalidates every former input, and creates a new `LANE_PLAN` before the typed or untyped next stage. No input from a changed projection may be retained. Changed-projection reset to `PLANNED` takes precedence over pause preservation.
+A changed lane is one whose canonical spec, ordered `needs`, ordered declared outputs, or authored `lane_kind` differ, and therefore whose `lane_projection_digest` changes. A lane's canonical spec carries only the bindings of the claims that lane discharges, plus the paired build lanes' claims its spec already embeds. A plan-wide binding list copied into every tests lane makes one claim edit re-digest every tests lane, and `apply_amendment` then correctly resets lanes the amendment never named: on FDAdb run d246ae95 an amendment editing one FAQ claim un-merged both finished geo lanes. Absent `lane_kind` keeps the legacy digest identity. It restarts at `PLANNED`, invalidates every former input, and creates a new `LANE_PLAN` before the typed or untyped next stage. No input from a changed projection may be retained. Changed-projection reset to `PLANNED` takes precedence over pause preservation.
 
 An unchanged transitive dependent whose implementation has not started (`PLANNED`, `WRITING_TESTS`, `REVIEWING_TESTS`, or `TESTS_SEALED`) keeps its current stage. Its spec/test artifacts remain valid. Its eventual builder reads the new integration HEAD.
 
