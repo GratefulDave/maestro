@@ -114,7 +114,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   provenance, and `publication_touched_paths` no longer names an untouched
   file. `test_git_publication_contract.py::test_copy_source_is_not_an_owned_path`
   fails on the parent.
-
 - **A composer still holding the offered prompt has not submitted it, and that
   is not a claim about the clock.** `submit_agent_prompt` gains a
   `composer_holds` observable, read from `herdr pane read --source
