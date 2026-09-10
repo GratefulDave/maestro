@@ -114,6 +114,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   provenance, and `publication_touched_paths` no longer names an untouched
   file. `test_git_publication_contract.py::test_copy_source_is_not_an_owned_path`
   fails on the parent.
+- **A composer still holding the offered prompt has not submitted it, and that
+  is not a claim about the clock.** `submit_agent_prompt` gains a
+  `composer_holds` observable, read from `herdr pane read --source
+  recent-unwrapped` over the composer's own trailing lines. When the
+  submission proof is absent and the composer still displays the offered
+  `@<path>` after every Enter the recovery had to give, the offer now refuses
+  `AGENT_PROMPT_HELD_IN_COMPOSER` on both the admission and the lane path, and
+  `resubmit` reports it as `PROMPT_SUBMISSION_REFUSED` rather than letting an
+  untyped `RuntimeError` escape. A definite "the composer let it go" stops the
+  remaining rounds instead, so no Enter lands on an empty composer as a stray
+  blank turn; an unreadable pane decides nothing. `refuse_unproven=False`
+  stays right about the transcript -- a turn's length is unbounded -- and was
+  wrong that something downstream would read an unsubmitted prompt:
+  `_await_envelope` ends on the envelope and deliberately on nothing else. On
+  FDAdb run `d246ae95` two test-reviewer composers held their `prompt-1.json`
+  for 38 minutes while `lane-faq-producer-tests` and `lane-geo-subset-tests`
+  logged "waiting on test-reviewer" every 30s and nothing else, until a human
+  typed one Enter into each pane and both turns started within seconds.
 - **A dispatch prepares a tree once; an adopted cwd it already prepared is not
   prepared again.** `HerdrStageActor._launch` materializes and provisions
   `cwd` up front, then hands the launcher a `prepare_adopted_cwd` callback

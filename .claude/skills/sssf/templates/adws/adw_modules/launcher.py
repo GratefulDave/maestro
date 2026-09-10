@@ -1609,6 +1609,58 @@ class PromptSubmissionUnobservable(RuntimeError):
 SUBMIT_ATTEMPTS = 4
 
 
+#: How many trailing non-empty snapshot lines are the composer's own.
+#:
+#: A coding agent's composer is the bottom of its screen -- omp draws it in the
+#: last box, Claude Code on the last input line -- so the offered `@<path>` is
+#: legible there and nowhere else while it sits unsubmitted. The tail is short
+#: on purpose: further up is transcript, where the same path can appear as an
+#: ordinary tool result. It is only ever consulted when the submission proof
+#: is already absent, and a turn that never started writes no tool results, so
+#: the two cannot be confused in the state that reads it.
+COMPOSER_TAIL_LINES = 6
+
+
+def composer_holds_offer(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    prompt_path: Path,
+) -> Optional[bool]:
+    """Whether the pane's composer still displays the offered prompt path.
+
+    `True` is the one negative fact about submission that is NOT a claim about
+    Maestro's clock. The transcript's silence is unbounded -- a turn can run
+    far longer than any window (§7.6) -- but a composer still holding
+    `@<path>` has demonstrably not sent it, however long anyone waits. That
+    distinction is why this may end an offer where a timeout may not.
+
+    `False` means the snapshot was legible and the path is not in it, so the
+    composer let the text go; `None` means the pane could not be read at all,
+    which is a missing observation and never a "no".
+
+    `--source recent-unwrapped` because the composer wraps a long absolute
+    path across terminal columns, and an unwrapped snapshot is the only form
+    in which the path survives as one comparable string.
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        # The caller records the dead probe -- see `read_composer` -- and a
+        # read that raised must answer nothing rather than "not holding".
+        return None
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    if not text:
+        return None
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    marker = str(Path(prompt_path).resolve())
+    return any(marker in line for line in lines[-COMPOSER_TAIL_LINES:])
+
+
 def pane_revision(
     herdr_call: Callable[..., dict],
     pane_id: str,
@@ -1652,6 +1704,7 @@ def submit_agent_prompt(
     monotonic: Callable[[], float] = time.monotonic,
     refuse_unproven: bool = True,
     submission_recorded: Optional[Callable[[], bool]] = None,
+    composer_holds: Optional[Callable[[], Optional[bool]]] = None,
 ) -> None:
     """Offer one prompt to an agent composer and press it until it takes.
 
@@ -1703,6 +1756,22 @@ def submit_agent_prompt(
     already arms only after `working` or `blocked` is observed (B14). Route
     admission keeps the default `True` -- see its call site for why its turn is
     bounded by construction.
+
+    **`composer_holds` is the one negative observation that is not a clock.**
+    `refuse_unproven=False` is right about the transcript and was wrong about
+    everything: it returned "offered, unproven" and handed off to machinery
+    that, on this path, has nothing to read. `_await_envelope` ends on the
+    envelope and deliberately on nothing else, so an offer that was never
+    submitted has no adjudicator at all -- FDAdb run d246ae95, where two
+    test-reviewer composers held their `@prompt-1.json` for 38 minutes under a
+    lane that logged "waiting on test-reviewer" every 30s until a human
+    pressed Enter. A composer still DISPLAYING the offered path has not sent
+    it, and that stays true however long a turn may run, so when the predicate
+    answers a definite `True` after every Enter has been given, this function
+    convicts `AGENT_PROMPT_HELD_IN_COMPOSER` on both paths. A `False` stops the
+    remaining rounds instead: the text is gone from the screen, so another
+    Enter would land on an empty composer as a stray blank turn. An unreadable
+    pane answers `None` and decides nothing.
 
     `AGENT_PROMPT_UNDELIVERED` (herdr accepted no Enter at all, so nothing
     was ever pressed) still raises on both paths: that is not a claim about
@@ -1843,6 +1912,22 @@ def submit_agent_prompt(
             ):
                 return True
         return False
+
+    def read_composer() -> Optional[bool]:
+        """Consult the composer observable, recording a dead read as one.
+
+        Only ever called with the submission proof already absent. A probe
+        that raises answers nothing about the composer, so it must not be
+        allowed to read as "the composer let it go" -- that would turn a
+        broken pane read into permission to declare the prompt offered.
+        """
+        if composer_holds is None:
+            return None
+        try:
+            return composer_holds()
+        except Exception as exc:
+            absorb("composer-read", ("pane", "read", pane_id), exc)
+            return None
 
     def wait_for(budget_s: float) -> bool:
         """Give the composer a budget, then read the meter — always read it.
@@ -2042,8 +2127,61 @@ def submit_agent_prompt(
                     )
         if consumed():
             return
+        # Stop keying a composer that has visibly let the offer go. The text
+        # is gone from the screen, so a further Enter cannot rescue anything
+        # and would land on an empty composer as a stray blank turn. Only a
+        # definite `False` stops the pressing: an unreadable pane is a missing
+        # observation, and the rounds are what it is missing.
+        if read_composer() is False:
+            break
         if round_no + 1 < rounds:
             sleep(0.5)
+
+    def held_refusal() -> Optional["PromptNotSubmitted"]:
+        """The one refusal an unproven lane offer may still carry.
+
+        `refuse_unproven=False` exists because the end of a window over an
+        unbounded turn is a fact about the window. A composer still displaying
+        the offered path is not that fact: it is the pane saying, at whatever
+        moment it is read, that this text has not been sent. So this convicts
+        on both paths, and only on a definite reading -- the observable is
+        consulted here, after every Enter this function had to give, so that a
+        composer which took the prompt on the last key is never convicted by a
+        stale answer.
+
+        On FDAdb run d246ae95 two test-reviewer composers held their offered
+        `prompt-1.json` for 38 minutes while their lanes logged "waiting on
+        test-reviewer" every 30s and nothing else; the lane path had returned
+        offered-unproven, and `_await_envelope` -- which by design ends on the
+        envelope and on nothing else -- had no second thing to read. One Enter
+        typed by hand started both turns at once.
+        """
+        if read_composer() is not True:
+            return None
+        # Read it twice, with the proof channel polled between.
+        #
+        # A composer that has just accepted a prompt still shows the text for
+        # an instant -- Claude Code moves the submitted line into the
+        # transcript directly above the composer, where it is inside the tail
+        # this predicate reads. Convicting on a single sample would turn that
+        # repaint into a refusal of work that had in fact started. The gap is
+        # `TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S`, the same bounded grace the
+        # admission path already spends on a trailing transcript write, and it
+        # is not what decides: the second reading is.
+        grace = monotonic() + TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
+        while monotonic() < grace:
+            if consumed():
+                return None
+            sleep(0.1)
+        if read_composer() is not True:
+            return None
+        return PromptNotSubmitted(
+            "AGENT_PROMPT_HELD_IN_COMPOSER:{0} after {1} submit attempts{2}".format(
+                target, rounds, _swallowed_summary(failures)
+            ),
+            failures,
+        )
+
     summary = _swallowed_summary(failures)
     if submission_recorded is not None:
         # The agent runtime writes the transcript record as the turn starts,
@@ -2076,6 +2214,9 @@ def submit_agent_prompt(
             # here would assert a fact about the composer that only the dead
             # proof channel could have established. Admission fail-closes;
             # the lane path already pressed Enter and hands off.
+            refusal = held_refusal()
+            if refusal is not None:
+                raise refusal
             if not refuse_unproven:
                 return
             raise PromptSubmissionUnobservable(
@@ -2084,6 +2225,9 @@ def submit_agent_prompt(
                 ),
                 failures,
             )
+        refusal = held_refusal()
+        if refusal is not None:
+            raise refusal
         if not refuse_unproven:
             # Offered, unproven — and on this path that is the whole truthful
             # answer. Enters were delivered and the proof channel answered; it
@@ -2121,6 +2265,9 @@ def submit_agent_prompt(
             ),
             failures,
         )
+    refusal = held_refusal()
+    if refusal is not None:
+        raise refusal
     if not refuse_unproven:
         # Same reasoning as the transcript branch above, over a weaker meter:
         # a legible revision that did not move is not proof the composer
@@ -4525,6 +4672,25 @@ class HerdrLauncher:
         with self._handles_lock:
             self._tailers[handle.correlation_token] = TranscriptTailer(path)
 
+    def _composer_holds(
+        self,
+        pane_id: str,
+        prompt_path: Path,
+        environment: Mapping[str, str],
+    ) -> Callable[[], Optional[bool]]:
+        """The composer observable, bound to this pane and this offer."""
+
+        def holds() -> Optional[bool]:
+            return composer_holds_offer(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=environment, **kwargs
+                ),
+                pane_id,
+                prompt_path,
+            )
+
+        return holds
+
     def _runtime_submission_recorded(
         self, handle: LaunchHandle, prompt_path: Path
     ) -> Callable[[], bool]:
@@ -4863,6 +5029,9 @@ class HerdrLauncher:
                 # what adjudicates a lane attempt.
                 refuse_unproven=False,
                 submission_recorded=submission_recorded,
+                composer_holds=self._composer_holds(
+                    pane_id, spec.prompt_path, environment
+                ),
             )
 
             # The pane's foreground group is meaningful only after submission.
@@ -5023,6 +5192,30 @@ class HerdrLauncher:
                 str(exc),
                 pane_created=True,
             ) from exc
+        try:
+            self._submit_resubmission(handle, prompt, timeout_s)
+        except PromptNotSubmitted as exc:
+            # A composer still holding this offer is a fact about the pane,
+            # not about the budget, so it reaches the lane as the typed
+            # refusal this path already declares instead of as a bare
+            # RuntimeError nobody catches.
+            raise LaunchRefused(
+                LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+                str(exc),
+                pane_created=True,
+            ) from exc
+        # A new prompt is a new turn. Any confirmation window still open from
+        # the previous one measures a pane that has since been handed work,
+        # and would convict this turn on the last one's silence -- and the
+        # record count it is judged against has to restart with it, or the
+        # previous turn's output arms the new turn's window before the new
+        # turn has written anything.
+        self._clear_quiescence(handle.correlation_token)
+        return handle
+
+    def _submit_resubmission(
+        self, handle: LaunchHandle, prompt: Path, timeout_s: float
+    ) -> None:
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
@@ -5040,15 +5233,10 @@ class HerdrLauncher:
             submission_recorded=self._runtime_submission_recorded(
                 handle, prompt
             ),
+            composer_holds=self._composer_holds(
+                handle.pane_id, prompt, handle.environment
+            ),
         )
-        # A new prompt is a new turn. Any confirmation window still open from
-        # the previous one measures a pane that has since been handed work,
-        # and would convict this turn on the last one's silence -- and the
-        # record count it is judged against has to restart with it, or the
-        # previous turn's output arms the new turn's window before the new
-        # turn has written anything.
-        self._clear_quiescence(handle.correlation_token)
-        return handle
 
 
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
