@@ -1835,6 +1835,17 @@ class HerdrStageActor:
             self._prepared_cwd(cwd, prepare_cwd)
         except lch.LaunchRefused as refused:
             raise self._launch_failed(refused) from refused
+        # The path this dispatch already materialized and provisioned above.
+        # `prepare_adopted_cwd` below is called on the two paths that reach a
+        # pane which already exists (a reused role pane, an adopted agent);
+        # when the cwd the launcher hands back is this same path, the launcher
+        # has already verified it is bound to the tree this dispatch prepared
+        # (`actual != worktree` is refused before the callback runs), so
+        # materializing and provisioning it again would be a byte-identical
+        # repeat of what just ran a few lines up -- on FDAdb this is ~2
+        # minutes of `npm ci` + `uv venv` wasted on every reused-pane
+        # dispatch, which is the common case for a long-running lane.
+        dispatch_prepared = cwd.resolve()
         envelope = lch.role_result_path(cwd, turn)
         envelope.parent.mkdir(parents=True, exist_ok=True)
         prompt = lch.role_prompt_path(cwd, turn)
@@ -1847,7 +1858,8 @@ class HerdrStageActor:
 
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
-            self._prepared_cwd(adopted, prepare_cwd)
+            if adopted != dispatch_prepared:
+                self._prepared_cwd(adopted, prepare_cwd)
             self._materialize_role_instructions(
                 adopted, role, route["route"], ctx.lane.lane_kind
             )

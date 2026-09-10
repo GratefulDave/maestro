@@ -102,6 +102,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A dispatch prepares a tree once; an adopted cwd it already prepared is not
+  prepared again.** `HerdrStageActor._launch` materializes and provisions
+  `cwd` up front, then hands the launcher a `prepare_adopted_cwd` callback
+  that runs on the reused-role-pane and adopted-agent paths. On the
+  reused-pane path — the common case for a long-running lane — the launcher
+  has already verified the pane is bound to the same tree `_launch` just
+  prepared before it calls back, so the callback re-materialized and
+  re-provisioned a byte-identical path: on FDAdb this is `npm ci` + `uv venv`,
+  roughly two minutes, wasted on every reused-pane dispatch. `_launch` now
+  remembers the resolved path it prepared for the dispatch, and the callback
+  skips materialization and provisioning when the adopted path resolves to
+  that same path; a genuinely different adopted path is still prepared and
+  provisioning remains the last thing done to it.
 - **A lane's Space is counted once, however many worktrees it has open.**
   `HerdrLauncher._adopt_existing_lane` iterated `worktree list` rows and
   appended a match once per row. Herdr lists one Space on more than one row
