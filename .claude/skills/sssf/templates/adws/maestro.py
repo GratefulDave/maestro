@@ -532,6 +532,30 @@ TEST_CRAFT_REVIEWER_QUESTION = (
     "is REVISE.\n"
 )
 
+#: The converse of every question above. Those ask whether a case would fail a
+#: wrong implementation; none of them asks whether it would fail a *right* one.
+#: On FDAdb run d246ae95 the sealed suite for `lane-faq-producer-tests` required,
+#: through a private helper regex, that a "No" answer contain one of "does not
+#: warn", "no warning", "absent from", "not listed", "not mentioned". No public
+#: contract text stated that lexicon. A builder that wrote "does not name X in
+#: its warnings" satisfied the contract and failed the suite for six rounds
+#: across two amendments, and the test reviewer PASSed that suite with zero
+#: findings three times.
+TEST_CONTRACT_ENTAILMENT_QUESTION = (
+    "## Contract entailment\n"
+    "For every assertion, ask whether the public contract entails it. A sealed "
+    "case may only fail an implementation that violates the contract, so an "
+    "assertion that a correct implementation of the contract could fail -- a "
+    "specific phrase, vocabulary, ordering, format, or literal the contract "
+    "does not state -- is a located ERROR finding naming the case id and the "
+    "contract text it lacks, and the verdict is REVISE. Read a private helper "
+    "or shared matcher as part of the assertion it serves; a lexicon hidden "
+    "behind a regex is still an assertion the contract has to entail. The "
+    "remedy is either an amendment that states the requirement in the contract "
+    "or an assertion weakened to what the contract already states, and you must "
+    "not guess which: name the gap and leave the choice to the plan.\n"
+)
+
 
 def _clear_precreated_role_cwd(dest: Path) -> bool:
     """Empty a precreated role cwd without replacing its process-bound inode."""
@@ -907,6 +931,8 @@ class HerdrStageActor:
                 + self._PROHIBITION_REVIEW_RULE
                 + "\n"
                 + TEST_CRAFT_REVIEWER_QUESTION
+                + "\n"
+                + TEST_CONTRACT_ENTAILMENT_QUESTION
             ),
             "builder": (
                 "Modify only the declared product outputs. Never read private "

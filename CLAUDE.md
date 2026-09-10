@@ -307,7 +307,10 @@ no ambiguity.
   acceptance is its command's exit code. A test reviewer is asked whether the cases
   discharge the declared obligations, exercise real boundaries, and would fail a plausible
   wrong implementation — never "does this pass the gate on the merits", which is the wrong
-  question about a diff whose purpose is to be red (§19 M41).
+  question about a diff whose purpose is to be red (§19 M41). It is also asked the converse — could a
+  correct implementation of the public contract fail this case — because a sealed case may
+  only fail an implementation that violates the contract; an assertion on a phrase, ordering,
+  format, or literal the contract does not state is a located ERROR finding and a REVISE.
 - **A tests node's acceptance is measured, not counted.** The plan declares which case ids
   discharge which requirement and aspect, and code counts them; the declared falsifiability
   strategy is executed and its failure must match the declared reason. An implementation

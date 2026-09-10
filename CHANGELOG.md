@@ -7,6 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **A test reviewer is asked whether a right implementation could fail the
+  case.** The test-reviewer role contract carries one more obligation: for every
+  assertion, ask whether the public contract entails it. A sealed case may only
+  fail an implementation that violates the contract, so an assertion a correct
+  implementation could fail -- a phrase, vocabulary, ordering, format, or
+  literal the contract does not state -- is a located ERROR finding naming the
+  case id and the contract text it lacks, and the verdict is REVISE. A private
+  helper or shared matcher is read as part of the assertion it serves, because a
+  lexicon hidden behind a regex is still an assertion the contract has to
+  entail. The remedy is an amendment or a weaker assertion and the reviewer must
+  not guess which; it names the gap and leaves the choice to the plan. FDAdb run
+  d246ae95 sealed a suite for `lane-faq-producer-tests` requiring, through a
+  private helper regex, that a "No" answer contain one of "does not warn", "no
+  warning", "absent from", "not listed", "not mentioned". No contract text
+  stated that lexicon. A builder that wrote "does not name X in its warnings"
+  satisfied the contract and failed the suite for six rounds across two
+  amendments, and the reviewer PASSed that suite with zero findings three times
+  -- it was asked whether a case would fail a wrong implementation and never the
+  converse. Rubric only: no new state, gate, wait reason, finding type, or
+  scheduler branch (`maestro.py`, `docs/plan-authoring.md`).
 - **A gating obligation names its observation seam or does not ship.** A claim a
   tests lane must discharge carries an `observation_seam` in the Plan IR — the
   public export, module boundary, injectable observer, recorded effect, or
