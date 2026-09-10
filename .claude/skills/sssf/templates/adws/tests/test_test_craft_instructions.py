@@ -123,6 +123,34 @@ class TestCraftInstructions(unittest.TestCase):
             text,
         )
 
+    def test_test_reviewer_is_asked_whether_a_right_implementation_could_fail(self):
+        """The converse question, absent when FDAdb run d246ae95 PASSed a suite
+        whose private helper required a lexicon no contract text stated."""
+        text = self._instruction("test-reviewer")
+        self.assertIn(
+            "For every assertion, ask whether the public contract entails it.",
+            text,
+        )
+        self.assertIn(
+            "an assertion that a correct implementation of the contract could "
+            "fail",
+            text,
+        )
+        self.assertIn(
+            "a located ERROR finding naming the case id and the contract text "
+            "it lacks, and the verdict is REVISE",
+            text,
+        )
+        self.assertIn("a lexicon hidden behind a regex", text)
+        self.assertIn("you must not guess which", text)
+
+    def test_the_code_reviewer_is_not_asked_the_entailment_question(self):
+        text = self._instruction("code-reviewer", st.LANE_KIND_BUILD)
+        self.assertNotIn("Contract entailment", text)
+        self.assertNotIn(
+            "ask whether the public contract entails it", text
+        )
+
     def test_the_builder_is_not_told_about_test_craft(self):
         text = self._instruction("builder")
         for name in ANTIPATTERN_NAMES:

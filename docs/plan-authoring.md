@@ -234,6 +234,14 @@ must not quote the private assertion.
   each obligation visible in the plan, and to tell the tester which refusals a positive-only suite
   would silently omit; never read a green `required_cases` check as evidence that the obligations
   are met. What measures a suite is the test review, asked the question above.
+- **And ask the converse: could a correct implementation of the contract fail this case?** A sealed
+  case may only fail an implementation that violates the public contract. An assertion on a specific
+  phrase, vocabulary, ordering, format, or literal the contract does not state fails a builder that
+  was right, and no amount of redrafting on the builder's side can pass it. A private helper or
+  shared matcher is part of the assertion it serves — a lexicon hidden behind a regex is still an
+  assertion the contract has to entail. The test reviewer names such a case as a located ERROR
+  finding with the contract text it lacks; the remedy is either an amendment that states the
+  requirement or a weaker assertion, and the reviewer must not guess which.
 
 Three anti-patterns make a test worthless, and the acceptance you write is what steers the tester
 away from them or into them. The test reviewer is asked to name any case that matches one, with the
