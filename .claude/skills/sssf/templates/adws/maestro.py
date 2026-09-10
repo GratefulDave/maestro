@@ -29,6 +29,7 @@ import yaml
 from adw_modules import attend as att
 from adw_modules import git_publication as gitpub
 from adw_modules import hidden_vault as hv
+from adw_modules import interrupt
 from adw_modules.handoff_budget import (
     OMP_CONTEXT_WINDOW_TOKENS,
     route_publishes_a_window,
@@ -1836,7 +1837,16 @@ class HerdrStageActor:
             # no longer a second thing that can end the wait -- the envelope
             # ends it, and an agent that never declares leaves a lane visibly
             # waiting for the operator who is watching the run.
-            time.sleep(0.1)
+            #
+            # The operator's own interrupt is the one exception, and it is not
+            # a counter-example: it is not an observation about the agent at
+            # all. `interrupt.sleep` ends this wait the moment Ctrl-C is
+            # handled, by which time the lane is already paused in the ledger.
+            # Without it a worker thread polls here forever after the
+            # scheduler has returned WAITING, and `_python_exit` will not let
+            # the process go -- twenty minutes of "waiting on test-reviewer"
+            # after "run finished waiting" on FDAdb run d246ae95.
+            interrupt.sleep(0.1, "envelope:{0}".format(role or "-"))
             waited += 0.1
             # A silent minute is indistinguishable from a hung agent. Say the
             # wait is still a wait, at a cadence that does not flood a terminal.
