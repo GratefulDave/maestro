@@ -98,3 +98,57 @@ class AttendConfig(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class PlanIrResolution(unittest.TestCase):
+    """Where the IR an attended revision edits comes from."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.plans = Path(holder.name) / "plans"
+        self.plans.mkdir()
+
+    def _policy(self, plan_ir: Path | None = None) -> att.AttendPolicy:
+        return att.AttendPolicy(max_amendments_per_lane=1, plan_ir=plan_ir)
+
+    def test_an_attend_written_revision_is_preferred(self) -> None:
+        written = self.plans / "run-1.r3.ir.json"
+        written.write_text("{}", encoding="utf-8")
+        configured = self.plans / "authored.ir.json"
+        configured.write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            maestro._attend_plan_ir(self._policy(configured), self.plans, "run-1", 3),
+            written,
+        )
+
+    def test_the_configured_ir_answers_the_first_attend(self) -> None:
+        configured = self.plans / "authored.ir.json"
+        configured.write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            maestro._attend_plan_ir(self._policy(configured), self.plans, "run-1", 1),
+            configured,
+        )
+
+    def test_no_ir_refuses_rather_than_offering_the_projected_plan(self) -> None:
+        # The pinned plan artifact is a projection of an IR. Handing it to an
+        # agent asked to edit an IR produces a revision the ingress cannot
+        # read and a refusal three steps later that names none of this.
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._attend_plan_ir(self._policy(), self.plans, "run-1", 1)
+        self.assertEqual(caught.exception.code, att.PLAN_IR_UNRESOLVED)
+        self.assertIn("run-1.r1.ir.json", caught.exception.detail)
+        self.assertIn("attend.plan_ir", caught.exception.detail)
+
+    def test_a_relative_configured_ir_refuses_at_config_time(self) -> None:
+        with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+            maestro._canonical_attend(
+                {
+                    "max_amendments_per_lane": 1,
+                    "route": CLAUDE_ROUTE,
+                    "plan_ir": ".maestro/plans/plan.ir.json",
+                }
+            )
+        self.assertIn("absolute", str(caught.exception))

@@ -53,6 +53,8 @@ REVISION_REFUSED = "ATTEND_REVISION_REFUSED"
 PLANCTL_UNRESOLVED = "ATTEND_PLANCTL_UNRESOLVED"
 #: No reviewer key was resolvable, so no receipt can be minted.
 KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
+#: The Plan IR the live revision was projected from could not be located.
+PLAN_IR_UNRESOLVED = "ATTEND_PLAN_IR_UNRESOLVED"
 
 #: Why an attend session stopped. Recorded on the STOP `ATTEND_SESSION`.
 STOP_RUN_SETTLED = "RUN_SETTLED"
@@ -69,6 +71,7 @@ class AttendPolicy:
     max_amendments_per_run: int = 10
     route: Mapping[str, str] = field(default_factory=dict)
     planctl: Optional[Path] = None
+    plan_ir: Optional[Path] = None
     validate_argv: Tuple[str, ...] = ()
     reviewer_id: str = "maestro-attend"
     reviewer_vendor: str = "maestro"

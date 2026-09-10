@@ -25,6 +25,11 @@ attend:
   # Absolute path to the plan-contract validator. Absent refuses
   # ATTEND_PLANCTL_UNRESOLVED rather than approving an unvalidated revision.
   # planctl: /absolute/path/to/planctl.py
+  # Absolute path to the Plan IR the run's current revision was projected
+  # from. Read only until the first attended amendment, which writes its own
+  # under the plans directory. Absent refuses ATTEND_PLAN_IR_UNRESOLVED
+  # rather than handing an agent a projected plan to edit as an IR.
+  # plan_ir: /absolute/path/to/plan.ir.json
 role_routes:
   tester:
     route: omp

@@ -124,6 +124,7 @@ _ATTEND_FIELDS = frozenset(
         "max_amendments_per_run",
         "route",
         "planctl",
+        "plan_ir",
         "validate_argv",
         "reviewer_id",
         "reviewer_vendor",
@@ -297,12 +298,16 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
     planctl = _optional_config_string(value.get("planctl"), "attend.planctl")
     if planctl and not Path(planctl).is_absolute():
         raise _MaestroConfigurationError("attend.planctl must be absolute")
+    plan_ir = _optional_config_string(value.get("plan_ir"), "attend.plan_ir")
+    if plan_ir and not Path(plan_ir).is_absolute():
+        raise _MaestroConfigurationError("attend.plan_ir must be absolute")
     return MappingProxyType(
         {
             "max_amendments_per_lane": per_lane,
             "max_amendments_per_run": per_run,
             "route": route,
             "planctl": Path(planctl) if planctl else None,
+            "plan_ir": Path(plan_ir) if plan_ir else None,
             "validate_argv": _config_argv(
                 value.get("validate_argv"), "attend.validate_argv"
             )
@@ -1753,6 +1758,11 @@ class HerdrStageActor:
                 st.ReviewerVerdict.PASS.value,
                 st.ReviewerVerdict.REVISE.value,
             )
+        if role == "operator":
+            # Asked again here rather than refused later: an envelope with no
+            # revision_path is a turn the agent has not finished, and the
+            # attend loop's refusal would end the whole verb over it.
+            return bool(str(payload.get("revision_path") or "").strip())
         return True
 
     #: Set by FactoryScheduler when an operator console is attached. Reporting
@@ -3217,6 +3227,7 @@ def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
         max_amendments_per_run=int(raw.get("max_amendments_per_run") or 0),
         route=raw.get("route") or {},
         planctl=raw.get("planctl"),
+        plan_ir=raw.get("plan_ir"),
         validate_argv=tuple(raw.get("validate_argv") or ()),
         reviewer_id=str(raw.get("reviewer_id") or "maestro-attend"),
         reviewer_vendor=str(raw.get("reviewer_vendor") or "maestro"),
@@ -3348,6 +3359,30 @@ def _attend_sealed_files(
         path: hv.cat_blob(vault, blob).decode("utf-8", errors="replace")
         for path, blob in blobs.items()
     }
+
+
+def _attend_plan_ir(
+    policy: att.AttendPolicy, plans_dir: Path, run_id: str, revision: int
+) -> Path:
+    """The Plan IR the live revision was projected from.
+
+    Two places, in order: the copy `run attend` itself wrote for a revision it
+    applied, and the deployment's configured `attend.plan_ir` for the revision
+    a human authored. Neither present is a refusal rather than a fallback --
+    the pinned plan artifact is a *projection* of an IR, and handing it to an
+    agent asked to edit an IR would produce a revision the ingress cannot read
+    and a refusal three steps later that names none of this.
+    """
+    written = plans_dir / "{0}.r{1}.ir.json".format(run_id, revision)
+    if written.is_file():
+        return written
+    if policy.plan_ir is not None and policy.plan_ir.is_file():
+        return policy.plan_ir
+    raise att.AttendRefused(
+        att.PLAN_IR_UNRESOLVED,
+        "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
+        "({2})".format(revision, written, policy.plan_ir or "unset"),
+    )
 
 
 def _attend_request(
@@ -3553,8 +3588,6 @@ def _run_attend(args: argparse.Namespace) -> int:
         return runtime.path / "worktrees" / run_id / lane_id / "operator" / "checkout"
 
     def request_for(lane_id: str, plan: st.CompiledPlan) -> att.OperatorRequest:
-        pinned = _pinned_plan_artifact(runtime, run_id, plan.plan_revision)
-        source = plans_dir / "{0}.r{1}.ir.json".format(run_id, plan.plan_revision)
         return _attend_request(
             store,
             runtime,
@@ -3562,7 +3595,7 @@ def _run_attend(args: argparse.Namespace) -> int:
             run_id,
             lane_id,
             plan,
-            source if source.is_file() else pinned,
+            _attend_plan_ir(policy, plans_dir, run_id, plan.plan_revision),
             operator_cwd_for(lane_id),
         )
 

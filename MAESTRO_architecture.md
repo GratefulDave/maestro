@@ -159,6 +159,7 @@ Three bounds, all in the deployment's own `maestro.config.yaml` and therefore ne
 - `attend.max_amendments_per_lane` — absent or `0` refuses the verb with `ATTEND_DISABLED`. This is the whole opt-in.
 - `attend.max_amendments_per_run` — default `10`.
 - `attend.route` — required once the lane bound is set, validated like a lane role route and admitted by the same executed route receipt.
+- `attend.planctl` and `attend.plan_ir` — absolute paths to the plan-contract validator and to the Plan IR the run's current revision was projected from. Absent refuses `ATTEND_PLANCTL_UNRESOLVED` / `ATTEND_PLAN_IR_UNRESOLVED` rather than approving an unvalidated revision or handing an agent a projected plan to edit as an IR. After the first attended amendment the IR is the copy that amendment wrote under the plans directory.
 
 A revision that changes any lane other than the parked lane and the tests/build lane it is paired with is refused `ATTEND_AMENDMENT_TOO_WIDE`, and so is one that changes no lane projection at all. A wait for any other reason, a lane or run at its bound, an operator agent that refuses or crashes, and a revision that fails validation all park exactly as they do today and end the verb on the same `waiting` status `run resume` would have returned.
 
