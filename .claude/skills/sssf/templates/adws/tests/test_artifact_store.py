@@ -1822,7 +1822,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
         self.assertFalse(record.replayed)
         self.assertEqual(store.lane_stage(RUN_ID, "A"), st.LaneStage.WRITING_TESTS)
 
-    def test_v1_ledger_migrates_to_v2_preserving_rows_then_accepts_test_invalidation(
+    def test_v1_ledger_migrates_to_current_preserving_rows_then_accepts_new_kinds(
         self,
     ) -> None:
         self._advance_a_to_reviewing_code()
@@ -1868,8 +1868,16 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
 
         migrated = ArtifactStore(dest)
         self.addCleanup(migrated.close)
-        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v2")
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v3")
         self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
+        # v3 widened the run-artifact kind check the same way v2 widened the
+        # lane one. A migration that stops at the stamp leaves an ATTEND_SESSION
+        # insert refused by a CHECK the enum says nothing about.
+        run_sql = migrated.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='run_artifacts'"
+        ).fetchone()[0]
+        self.assertIn("ATTEND_SESSION", run_sql)
+        self.assertIn("AMENDMENT_RATIONALE", run_sql)
         after_sql = migrated.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
         ).fetchone()[0]

@@ -11,7 +11,8 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 CANONICAL_SCHEMA_VERSION = 1
 LEDGER_SCHEMA_VERSION_V1 = "artifact-factory.v1"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v2"
+LEDGER_SCHEMA_VERSION_V2 = "artifact-factory.v2"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v3"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
@@ -103,6 +104,11 @@ class ArtifactKind(str, Enum):
     FINAL_INTEGRATION_REVIEW = "FINAL_INTEGRATION_REVIEW"
     MAIN_PUBLICATION = "MAIN_PUBLICATION"
     PLAN_AMENDMENT = "PLAN_AMENDMENT"
+    # An attended amendment records why it was authored and under whose
+    # session. Neither kind causes a transition: the PLAN_AMENDMENT beside
+    # them is still the only thing `apply_amendment` keys on.
+    ATTEND_SESSION = "ATTEND_SESSION"
+    AMENDMENT_RATIONALE = "AMENDMENT_RATIONALE"
 
 
 class WaitReason(str, Enum):
@@ -208,6 +214,8 @@ RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.FINAL_INTEGRATION_REVIEW,
     ArtifactKind.MAIN_PUBLICATION,
     ArtifactKind.PLAN_AMENDMENT,
+    ArtifactKind.ATTEND_SESSION,
+    ArtifactKind.AMENDMENT_RATIONALE,
 )
 
 
@@ -706,6 +714,60 @@ def user_decision_input_digest(
             "decision_payload": json_ready(decision_payload),
             "schema_version": CANONICAL_SCHEMA_VERSION,
             "user_wait_artifact_id": user_wait_artifact_id,
+        }
+    )
+
+
+ATTEND_PHASE_START = "START"
+ATTEND_PHASE_STOP = "STOP"
+ATTEND_PHASES: Tuple[str, ...] = (ATTEND_PHASE_START, ATTEND_PHASE_STOP)
+
+
+def attend_session_input_digest(
+    *,
+    run_id: str,
+    session_id: str,
+    phase: str,
+) -> str:
+    """Identity of one end of one attend session.
+
+    `run_artifacts` is unique on `(run_id, artifact_kind, input_digest)`, so
+    the phase is part of the identity rather than only the payload: without it
+    the stop record would collide with the start record it closes, and a second
+    attend session on the same run would collide with the first.
+    """
+    if phase not in ATTEND_PHASES:
+        raise CanonicalIdentityError("attend phase")
+    return digest_canonical(
+        {
+            "phase": phase,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "session_id": session_id,
+        }
+    )
+
+
+def amendment_rationale_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    amendment_artifact_id: str,
+) -> str:
+    """Identity of the rationale for one amendment, named by that amendment.
+
+    Bound to the `PLAN_AMENDMENT` it explains, so a rationale cannot outlive or
+    be reattached to a different amendment, and a replay of the same amendment
+    writes the same row rather than a second one.
+    """
+    return digest_canonical(
+        {
+            "amendment_artifact_id": amendment_artifact_id,
+            "lane_id": lane_id,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
         }
     )
 
