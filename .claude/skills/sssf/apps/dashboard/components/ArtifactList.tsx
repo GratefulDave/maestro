@@ -32,7 +32,7 @@ export function ArtifactList({ results }: { results: MaestroResult[] }) {
       {results.map((result, index) => {
         const kind = result.artifact_kind;
         return (
-          <li key={`${result.sequence ?? index}-${result.node_id ?? "run"}`}>
+          <li key={`${index}-${result.sequence ?? ""}-${result.node_id ?? "run"}`}>
             <details className="artifact-entry">
               <summary>
                 <span className="artifact-seq">

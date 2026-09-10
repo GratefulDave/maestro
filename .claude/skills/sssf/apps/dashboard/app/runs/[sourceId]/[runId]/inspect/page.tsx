@@ -49,7 +49,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {run.run_transitions.map((row, index) => (
-                  <tr key={`run-${row.created_at ?? index}`}>
+                  <tr key={`run-${index}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
@@ -88,7 +88,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {nodeTransitions.map((row, index) => (
-                  <tr key={`node-${row.node_id}-${row.created_at ?? index}`}>
+                  <tr key={`node-${index}-${row.node_id}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
@@ -130,7 +130,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {run.results.map((row, index) => (
-                  <tr key={`${row.node_id ?? "r"}-${row.created_at ?? index}`}>
+                  <tr key={`result-${index}-${row.node_id ?? "r"}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
