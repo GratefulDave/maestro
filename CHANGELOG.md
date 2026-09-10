@@ -20,6 +20,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   seam. The seam reaches the tester, builder, and reviewer appended to the
   criterion it belongs to. `docs/plan-authoring.md` gains the authoring rule with
   the FDAdb obligation before and after.
+- **An artifact body is readable, and the API says which of its keys are
+  readable.** The Bun visualizer API published an artifact's payload through
+  one allowlist that kept `verdict`, a code reviewer's `findings`, and the
+  producing role — everything else a payload held was dropped, so an operator
+  could see that a lane was revised sixteen times and not once why. It now
+  publishes a per-kind key allowlist
+  (`visualizer/server/artifactFactoryDb.ts`): a LANE_PLAN's declared outputs
+  and needs, a draft's `public_contract` and digests, a BUILDER_OUTPUT's
+  `tree_delta`, a CODE_REVIEW's `advisory_findings` and
+  `public_result_summary`, a USER_WAIT's `wait_reason`. `MaestroResult` gains
+  `sequence`, `artifact_kind` and `artifact_ref`.
+
+  **This widens the private-test boundary, and that is the change, not a side
+  effect of one.** Two things move. A TEST_REVIEW's `findings` are published,
+  where the API previously refused them for every kind but CODE_REVIEW and
+  FINAL_INTEGRATION_REVIEW; the factory redacts them before it writes them
+  (`tests_chain.review_test_draft` builds them through
+  `private_review.actionable_findings`, which replaces every private token
+  with `[redacted]`, and `refuse_private_leak` then re-checks the artifact's
+  canonical bytes), so what the ledger holds is redacted text — but the API's
+  own guarantee is now *the runtime redacted this* rather than *this key can
+  never leave*. And TEST_DRAFT is no longer withheld wholesale: it is listed,
+  with its public contract and its digests, because the key allowlist names no
+  key a draft's private payload uses. A draft carrying `source`,
+  `private_files`, `selectors` or `expected` still publishes none of them, and
+  `server/artifactFactoryDb.test.ts` pins that from a hostile fixture.
+- **The run inspect page shows every artifact, openable to its body.** A new
+  Artifacts section lists each `lane_artifacts` / `run_artifacts` row in ledger
+  order — sequence, kind, lane, verdict, when, and the ref its bytes are pinned
+  under — and expands to the body as a collapsible tree with a copy button
+  (`dashboard/components/ArtifactList.tsx`, `ArtifactPayload.tsx`,
+  `lib/jsonTree.ts`). Collapsed by default; the first finding of a review opens
+  with the row, because a review artifact's findings are the reason to open it.
+  Expansion is a native `<details>`, so the list works before hydration.
+  Nothing was removed: the existing Results / adjudications table stays.
 - **The tester is told where a test double belongs, and how to report a subject
   it cannot reach.** `maestro.TEST_DOUBLE_BOUNDARY` is appended to both tester
   rules: substitute only at a boundary the lane does not own, never a

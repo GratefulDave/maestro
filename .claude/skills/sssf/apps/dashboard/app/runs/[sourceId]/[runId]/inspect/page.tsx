@@ -1,3 +1,4 @@
+import { ArtifactList } from "@/components/ArtifactList";
 import { EmptyState } from "@/components/EmptyState";
 import { RunChrome, loadRunOrBanner } from "@/components/RunFrame";
 import { StatusPill } from "@/components/StatusPill";
@@ -48,7 +49,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {run.run_transitions.map((row, index) => (
-                  <tr key={`run-${row.created_at ?? index}`}>
+                  <tr key={`run-${index}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
@@ -87,7 +88,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {nodeTransitions.map((row, index) => (
-                  <tr key={`node-${row.node_id}-${row.created_at ?? index}`}>
+                  <tr key={`node-${index}-${row.node_id}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
@@ -129,7 +130,7 @@ export default async function RunInspectPage({
               </thead>
               <tbody>
                 {run.results.map((row, index) => (
-                  <tr key={`${row.node_id ?? "r"}-${row.created_at ?? index}`}>
+                  <tr key={`result-${index}-${row.node_id ?? "r"}-${row.created_at ?? ""}`}>
                     <td>
                       <Timestamp value={row.created_at} />
                     </td>
@@ -145,6 +146,20 @@ export default async function RunInspectPage({
             </table>
           </div>
         )}
+      </section>
+      <section className="panel section-panel">
+        <div className="section-heading">
+          <div>
+            <h2>Artifacts</h2>
+            <p>
+              Every artifact this run recorded, in ledger order. Open one to read the body
+              the factory stored. Bodies are published through the API&apos;s per-kind key
+              allowlist, so a sealed test draft shows its public contract and its digests
+              and never its source.
+            </p>
+          </div>
+        </div>
+        <ArtifactList results={run.results} />
       </section>
     </RunChrome>
   );

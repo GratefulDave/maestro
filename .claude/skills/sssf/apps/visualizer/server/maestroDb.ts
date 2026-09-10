@@ -820,6 +820,11 @@ export class MaestroDb {
         subject_sha: result.subject_sha,
         adjudication: result.adjudication,
         created_at: result.created_at,
+        // A legacy-lifecycle ledger has no artifact table: its results rows
+        // are not artifacts and carry no sequence, kind or ref.
+        sequence: null,
+        artifact_kind: null,
+        artifact_ref: null,
         payload: parseJson<unknown>(result.payload_json, null),
       })),
       run_transitions: transitionRows

@@ -46,11 +46,149 @@ const WORKING_STAGES: Record<string, true> = {
 const PUBLIC_FINDING_KINDS: Record<string, true> = {
   CODE_REVIEW: true,
   FINAL_INTEGRATION_REVIEW: true,
+  TEST_REVIEW: true,
 };
 
-const HIDDEN_ARTIFACT_KINDS: Record<string, true> = {
-  TEST_DRAFT: true,
+/**
+ * Kinds withheld from the API entirely. Empty: every kind is now published
+ * through the per-kind key allowlist below, which is what decides what of a
+ * payload an operator may read. TEST_DRAFT used to be withheld wholesale
+ * because there was no such allowlist and the alternative was publishing a
+ * draft body; it is now published as its public contract and its digests.
+ */
+const HIDDEN_ARTIFACT_KINDS: Record<string, true> = {};
+
+/**
+ * Payload keys published per artifact kind — still an allowlist, and still
+ * keyed by name rather than by trusting the ledger. A key absent from this
+ * table never reaches the API, so a draft payload carrying `source`,
+ * `private_files`, `selectors`, `expected` or `vault` is stripped exactly as
+ * it was before this table existed.
+ *
+ * `findings` is published for the review kinds because the factory redacts
+ * them before it writes them. `tests_chain.review_test_draft` builds a
+ * TEST_REVIEW's findings through `private_review.actionable_findings`, which
+ * replaces every private token — file bodies, paths, quoted literals, vault
+ * path and refs, blob ids — with `[redacted]`, and then `refuse_private_leak`
+ * re-checks the artifact's canonical bytes before the row is written. The
+ * ledger holds the redacted text and nothing else.
+ *
+ * `private_*` keys that survive here are digests, ref names and a schema
+ * name. They are the same strings the factory itself allows into a public
+ * artifact; none of them is a file body. Nested values are published as the
+ * ledger stores them, so a key added to this table is a decision about what
+ * an operator may read.
+ */
+const PUBLIC_PAYLOAD_KEYS: Record<string, readonly string[]> = {
+  LANE_PLAN: ["declared_outputs", "lane_kind", "needs", "plan_artifact_ref"],
+  TEST_DRAFT: [
+    "private_draft_digest",
+    "private_draft_ref",
+    "private_manifest_digest",
+    "private_manifest_schema",
+    "public_contract",
+  ],
+  TEST_REVIEW: ["findings", "public_result_summary", "verdict"],
+  SEALED_TEST_BUNDLE: [
+    "private_manifest_digest",
+    "private_manifest_schema",
+    "public_contract",
+    "sealed_digest",
+  ],
+  BUILDER_OUTPUT: [
+    "builder_base_sha",
+    "candidate_ref",
+    "candidate_sha",
+    "changed",
+    "entry_kind",
+    "plan_revision",
+    "projection_digest",
+    "sealed_test_digest",
+    "spec_digest",
+    "tree_delta",
+  ],
+  CODE_REVIEW: [
+    "advisory_findings",
+    "builder_base_sha",
+    "candidate_ref",
+    "candidate_sha",
+    "findings",
+    "private_results_digest",
+    "public_result_summary",
+    "redacted_failures",
+    "sealed_digest",
+    "verdict",
+  ],
+  INTEGRATION_MERGE: [
+    "after_sha",
+    "before_sha",
+    "builder_base_sha",
+    "builder_output_artifact_id",
+    "candidate_ref",
+    "candidate_sha",
+    "code_review_artifact_id",
+    "expected_tree_sha",
+    "integration_head",
+    "kind",
+    "revalidated",
+    "schema_version",
+  ],
+  BASE_INVALIDATION: [
+    "integration_head",
+    "kind",
+    "observed_integration_head",
+    "schema_version",
+    "stale_builder_base_sha",
+    "stale_builder_output_artifact_id",
+    "stale_candidate_sha",
+    "stale_code_review_artifact_id",
+  ],
+  USER_WAIT: [
+    "final_review_artifact_id",
+    "predecessor_artifact_id",
+    "predecessor_sequence",
+    "resume_input_digest",
+    "resume_stage",
+    "wait_reason",
+  ],
+  USER_DECISION: [
+    "action",
+    "decision_payload",
+    "resume_input_digest",
+    "resume_stage",
+    "user_wait_artifact_id",
+  ],
+  FINAL_INTEGRATION_REVIEW: [
+    "affected_lanes",
+    "findings",
+    "integration_sha",
+    "observed_target_main_sha",
+    "verdict",
+  ],
+  MAIN_PUBLICATION: [
+    "expected_before_sha",
+    "kind",
+    "published_sha",
+    "receipt_object",
+    "receipt_ref",
+    "schema_version",
+  ],
+  PLAN_AMENDMENT: [
+    "final_review_artifact_id",
+    "integration_head",
+    "invalidated_inputs",
+    "new_plan_digest",
+    "new_plan_revision",
+    "prior_plan_digest",
+    "prior_plan_revision",
+    "projection",
+    "resets",
+    "retained_inputs",
+  ],
 };
+
+/** Published for every kind: the artifact's own inputs. */
+const COMMON_PAYLOAD_KEYS: readonly string[] = ["input_artifact_ids", "input_digest"];
 
 const ROLE_BY_KIND: Record<string, string> = {
   LANE_PLAN: "planner",
@@ -124,7 +262,15 @@ export function roleForArtifactKind(kind: string): string | null {
 }
 
 /**
- * Operator-safe artifact body. Explicit allowlist — never `payload_json`.
+ * Operator-safe artifact body. Explicit allowlist — never `payload_json`
+ * wholesale. Only keys named for this kind in `PUBLIC_PAYLOAD_KEYS` (plus the
+ * common input keys) are copied; anything else the ledger holds is dropped,
+ * whichever runtime wrote the row.
+ *
+ * `verdict` and `findings` keep their own rules on top of that table: a
+ * verdict is published only when it is a real one, and findings are reduced
+ * to their string fields so a finding that grew a nested body cannot carry
+ * it out.
  */
 export function publicArtifactBody(
   kind: string,
@@ -132,6 +278,10 @@ export function publicArtifactBody(
 ): Record<string, unknown> {
   const payload = parseObject(payloadJson);
   const body: Record<string, unknown> = {};
+  for (const key of [...COMMON_PAYLOAD_KEYS, ...(PUBLIC_PAYLOAD_KEYS[kind] ?? [])]) {
+    if (key === "verdict" || key === "findings") continue;
+    if (Object.hasOwn(payload, key)) body[key] = payload[key];
+  }
   if (payload.verdict === "PASS" || payload.verdict === "REVISE") {
     body.verdict = payload.verdict;
   }
@@ -386,6 +536,7 @@ export class ArtifactFactoryDb {
     const laneRows = db
       .query<
         {
+          sequence: number;
           artifact_id: string;
           lane_id: string;
           artifact_kind: string;
@@ -399,14 +550,16 @@ export class ArtifactFactoryDb {
         },
         [string]
       >(
-        `SELECT artifact_id, lane_id, artifact_kind, completed_stage, plan_revision,
-                input_digest, output_digest, artifact_ref, payload_json, created_at
+        `SELECT sequence, artifact_id, lane_id, artifact_kind, completed_stage,
+                plan_revision, input_digest, output_digest, artifact_ref,
+                payload_json, created_at
            FROM lane_artifacts WHERE run_id = ? ORDER BY sequence`,
       )
       .all(runId);
     const runRows = db
       .query<
         {
+          sequence: number;
           artifact_id: string;
           artifact_kind: string;
           plan_revision: number;
@@ -418,8 +571,8 @@ export class ArtifactFactoryDb {
         },
         [string]
       >(
-        `SELECT artifact_id, artifact_kind, plan_revision, input_digest, output_digest,
-                artifact_ref, payload_json, created_at
+        `SELECT sequence, artifact_id, artifact_kind, plan_revision, input_digest,
+                output_digest, artifact_ref, payload_json, created_at
            FROM run_artifacts WHERE run_id = ? ORDER BY sequence`,
       )
       .all(runId);
@@ -434,6 +587,9 @@ export class ArtifactFactoryDb {
         subject_sha: row.output_digest,
         adjudication: typeof body.verdict === "string" ? body.verdict : null,
         created_at: row.created_at,
+        sequence: row.sequence,
+        artifact_kind: row.artifact_kind,
+        artifact_ref: row.artifact_ref,
         payload: {
           artifact_id: row.artifact_id,
           artifact_kind: row.artifact_kind,
@@ -455,6 +611,9 @@ export class ArtifactFactoryDb {
         subject_sha: row.output_digest,
         adjudication: typeof body.verdict === "string" ? body.verdict : null,
         created_at: row.created_at,
+        sequence: row.sequence,
+        artifact_kind: row.artifact_kind,
+        artifact_ref: row.artifact_ref,
         payload: {
           artifact_id: row.artifact_id,
           artifact_kind: row.artifact_kind,
