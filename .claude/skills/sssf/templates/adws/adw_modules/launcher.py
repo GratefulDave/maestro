@@ -993,9 +993,12 @@ def run_harness_process(
     """Run one bounded, cancellable harness context in its own process group."""
     if cancel_requested is not None and cancel_requested():
         raise HarnessCancelled("HARNESS_CONTEXT_CANCELLED")
-    merged = dict(os.environ)
-    if env:
-        merged.update(env)
+    # A supplied `env` is the environment, not an overlay on the operator's.
+    # It used to be merged into `os.environ`, which made it impossible for a
+    # caller to *remove* an inherited variable -- and removing the ambient
+    # interpreter selection is the whole of what `tree_env.tree_environment`
+    # does for the one caller that provisions a tree.
+    merged = dict(os.environ) if env is None else dict(env)
     process = subprocess.Popen(
         list(argv),
         cwd=str(cwd),

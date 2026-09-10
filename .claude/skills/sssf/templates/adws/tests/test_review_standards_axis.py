@@ -222,6 +222,13 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         _git(self.repo, "config", "user.name", "Harness")
         _git(self.repo, "config", "core.hooksPath", str(self.root / "no-hooks"))
         (self.repo / "refund.py").write_text(PRODUCT)
+        # A root `conftest.py` is what puts the tree root on the suite's
+        # `sys.path`. Without it these fixtures imported `refund` only because
+        # the parent suite runs with a *relative* `PYTHONPATH=.`, which resolves
+        # against each child's cwd -- the tree. `tree_env.tree_environment`
+        # drops that inherited variable, so the tree now has to be importable on
+        # its own, which is what it has to be in a deployment anyway.
+        (self.repo / "conftest.py").write_text("")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "base")
         self.state = self.root / "state"

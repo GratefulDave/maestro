@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Protocol, Tuple
 from .launcher import quiesce_process_group
+from .tree_env import tree_environment
 
 PARTICIPANT_RESULT_SCHEMA = "maestro-participant-result.v1"
 _GIT_OBJECT = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -248,7 +249,9 @@ class SubprocessParticipantRunner:
                 active.cancel_finished.set()
 
 def _participant_environment(context: ParticipantContext) -> Mapping[str, str]:
-    environment = dict(os.environ)
+    # The participant runs with its candidate worktree as cwd, so it gets that
+    # tree's environment rather than the operator's ambient interpreter.
+    environment = tree_environment(Path(context.candidate_worktree))
     environment.update({"MAESTRO_WORKSPACE_RUN_ID": context.workspace_run_id, "MAESTRO_REPOSITORY_ID": context.repository_id, "MAESTRO_CHILD_RUN_ID": context.child_run_id, "MAESTRO_PLAN_PATH": str(context.plan_path), "MAESTRO_PLAN_DIGEST": context.plan_digest, "MAESTRO_CANDIDATE_BRANCH": context.candidate_branch, "MAESTRO_CANDIDATE_WORKTREE": str(context.candidate_worktree), "MAESTRO_PARTICIPANT_RESULT_PATH": str(context.participant_result_path)})
     return environment
 

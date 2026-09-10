@@ -15,6 +15,7 @@ from typing import Any, Collection, Mapping, Sequence
 from . import hidden_vault as hv
 from . import private_review as pr
 from . import runner_resolution as rr
+from .tree_env import tree_environment
 from . import scheduler_types as st
 
 _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfailed)")
@@ -714,6 +715,10 @@ def _interpreter_release(argv: Sequence[str], cwd: Path) -> tuple[int, ...] | No
         result = subprocess.run(
             list(argv) + ["-c", _VERSION_PROBE],
             cwd=str(cwd),
+            # The interpreter this asks about is the tree's, so ask it in the
+            # tree's environment. Under an inherited `VIRTUAL_ENV` this probe
+            # reports the release of a Python no sealed suite runs under.
+            env=tree_environment(Path(cwd)),
             capture_output=True,
             text=True,
             timeout=_VERSION_TIMEOUT_S,

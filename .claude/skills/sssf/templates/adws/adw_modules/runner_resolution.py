@@ -91,6 +91,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .tree_env import tree_environment
+
 #: The collection flags each runner needs, without its binary. This is the old
 #: `plan_validate.COLLECT_ARGV` with `argv[0]` removed — the binary is what
 #: this module exists to decide, so a table that carries one is the defect.
@@ -490,6 +492,12 @@ def resolve(
     """
     repo = Path(repo)
     working = (repo / cwd).resolve()
+    # Probe and version-read the runner in the tree's own environment. A probe
+    # that answers under the operator's interpreter has proven capability for
+    # an environment no later measurement runs in, and `_rank_candidates` rank
+    # 1 -- the tree's `.venv/bin` -- is exactly what an inherited `VIRTUAL_ENV`
+    # can talk a launcher out of using.
+    env = tree_environment(repo, env)
     if not _measured(runner):
         # No measured probe means capability cannot be established, and an
         # unproven runner is refused rather than trusted.
@@ -879,7 +887,10 @@ def collect_cases(
             detail="the gate's working directory does not exist: {0}".format(cwd),
         )
     argv = resolved.collect_argv(gate)
-    merged = dict(os.environ)
+    # The tree's environment, never the operator's ambient one: a `VIRTUAL_ENV`
+    # or `PYTHONPATH` inherited from whoever started the run selects a foreign
+    # interpreter inside a tree whose own dependencies were provisioned here.
+    merged = tree_environment(Path(tree))
     if env is not None:
         merged.update(env)
     merged["PYTEST_ADDOPTS"] = ""
@@ -958,7 +969,11 @@ def execute_cases(
             "returncode": -1,
         }
     argv = resolved.execute_argv(tuple(getattr(gate, "argv", ()) or ()))
-    merged = dict(os.environ)
+    # Same tree environment the suite was collected and accepted in. FDAdb run
+    # d246ae95 failed the sealed suite `ModuleNotFoundError: bcrypt` for three
+    # rounds here, against a tree whose `.venv` had bcrypt, because the
+    # scheduler's own `VIRTUAL_ENV` came through this copy of `os.environ`.
+    merged = tree_environment(Path(tree))
     if env is not None:
         merged.update(env)
     # `PYTEST_ADDOPTS` is the operator's, so it is cleared: a gate must not

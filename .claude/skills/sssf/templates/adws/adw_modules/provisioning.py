@@ -32,6 +32,7 @@ from typing import Sequence
 
 from .launcher import PROVISION_TIMEOUT_S, run_harness_process
 from .private_review import SealedEnvironmentError
+from .tree_env import tree_environment
 
 
 class ReviewProvisioningError(SealedEnvironmentError):
@@ -97,7 +98,17 @@ def provision_tree(
         return
     bound = PROVISION_TIMEOUT_S if timeout_s is None else float(timeout_s)
     try:
-        result = run_harness_process(argv, cwd=Path(dest), timeout=bound)
+        # Install into this tree with this tree's environment. `uv sync` and
+        # `poetry install` both write into whatever `VIRTUAL_ENV` names, so an
+        # ambient one inherited from the operator's shell would have this
+        # function install the tree's dependencies somewhere else entirely and
+        # report success.
+        result = run_harness_process(
+            argv,
+            cwd=Path(dest),
+            env=tree_environment(Path(dest)),
+            timeout=bound,
+        )
     except OSError as exc:
         # TimeoutError is an OSError; a missing provisioning executable is one
         # too. Both are the harness failing, and both must stay distinguishable

@@ -110,6 +110,13 @@ def _repo(root: Path) -> Path:
     _git(repo, "config", "user.name", "Harness")
     _git(repo, "config", "core.hooksPath", str(root / "no-hooks"))
     (repo / "refund.py").write_text(PRODUCT)
+    # A root `conftest.py` is what puts the tree root on the suite's
+    # `sys.path`. Without it these fixtures imported `refund` only because
+    # the parent suite runs with a *relative* `PYTHONPATH=.`, which resolves
+    # against each child's cwd -- the tree. `tree_env.tree_environment`
+    # drops that inherited variable, so the tree now has to be importable on
+    # its own, which is what it has to be in a deployment anyway.
+    (repo / "conftest.py").write_text("")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
     return repo

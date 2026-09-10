@@ -7,6 +7,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **A command the factory runs inside a provisioned tree runs in that tree's
+  environment, never the operator's ambient one.** Every child the runtime
+  started in a factory tree was handed a wholesale copy of `os.environ`, or no
+  `env=` at all, which is the same thing. The tree decided which files were
+  present and the operator's shell decided which interpreter and module set
+  resolved them. On FDAdb run `d246ae95` the sealed suite failed
+  `ModuleNotFoundError: No module named 'bcrypt'` in three consecutive review
+  rounds against a review tree whose own `.venv` had bcrypt: the scheduler was
+  started under `uv run`, which exports `VIRTUAL_ENV` naming the scheduler's
+  venv, and that variable reached the runner. Unsetting it in the same tree,
+  with no other change, removed the failure. The builder was told its code
+  failed a test.
+
+  `adw_modules/tree_env.py` adds one helper, `tree_environment(tree, base)`.
+  It drops the variables whose only job is to select an interpreter,
+  toolchain, or module set — `VIRTUAL_ENV`, `PYTHONHOME`, `PYTHONPATH`,
+  `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`, `__PYVENV_LAUNCHER__`, `PYTHONSTARTUP`,
+  `NODE_PATH`, `NODE_OPTIONS`, `npm_config_prefix`, `RUSTUP_TOOLCHAIN`,
+  `CARGO_TARGET_DIR`, `GOFLAGS`, `GOWORK` — together with the `bin` directory
+  an activation prepended to `PATH`, because dropping `VIRTUAL_ENV` while
+  leaving `$VIRTUAL_ENV/bin` first on `PATH` leaves a bare `python` resolving
+  to exactly the interpreter the drop was meant to avoid. It then prepends the
+  tree's own `.venv/bin` and `node_modules/.bin` where they exist and points
+  `VIRTUAL_ENV` at the tree's venv. `PATH`, `HOME`, `LANG`, SSH and Git
+  identity, provider credentials, and the §8.3 scratch redirects are the
+  operator's and pass through unchanged. Deterministic and pure: two `is_dir()`
+  checks and dictionary arithmetic, no config key, no per-language branch
+  beyond those two directories.
+
+  Applied at every site whose cwd is a factory tree and whose child resolves a
+  language toolchain: the runner probe and version read (`resolve`),
+  `collect_cases`, `execute_cases` (`adw_modules/runner_resolution.py`),
+  `provision_tree` (`adw_modules/provisioning.py`), the declared-interpreter
+  release probe (`adw_modules/tests_chain.py`), and the participant's candidate
+  worktree (`adw_modules/participant.py`). `launcher.run_harness_process` now
+  treats a supplied `env` as the environment rather than an overlay on
+  `os.environ`, since a caller could otherwise not remove an inherited
+  variable at all. Git and `herdr` invocations are unchanged: neither resolves
+  an interpreter or a module set, and none of the dropped variables changes
+  what they do. The agent pane is out of reach by construction — `herdr agent
+  start` has no environment option and the pane's shell is forked by the herdr
+  server from a login shell, so `--env` at pane split can set a variable and
+  never unset one.
+
+  New path only. No check is deleted, no verdict weakened, no error path
+  removed.
 - **A gating obligation names its observation seam or does not ship.** A claim a
   tests lane must discharge carries an `observation_seam` in the Plan IR — the
   public export, module boundary, injectable observer, recorded effect, or
