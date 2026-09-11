@@ -404,11 +404,13 @@ def bind_findings_to_contract(
             continue
         quote = _normalize_requirement_quote(requirement)
         if len(quote) < _MIN_CONTRACT_QUOTE or quote not in contract:
-            raise CanonicalIdentityError(
+            error = CanonicalIdentityError(
                 "REVISE finding does not cite the contract: {0}".format(
                     requirement[:80]
                 )
             )
+            error.offending_requirement = requirement
+            raise error
         bound.append(finding)
     return tuple(bound)
 

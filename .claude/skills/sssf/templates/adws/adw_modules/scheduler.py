@@ -68,6 +68,16 @@ class RunnerPreflightRefused(FactoryRefused):
     code = "RUNNER_PREFLIGHT_REFUSED"
 
 
+class ReviewFindingUncited(FactoryRefused):
+    """A reviewer that twice could not quote the contract it REVISEd against.
+
+    The run refuses rather than guessing. The operator reads the citation
+    to decide whether the contract or the reviewer is wrong.
+    """
+
+    code = "REVIEW_FINDING_UNCITED"
+
+
 class DraftCollectionRefused(FactoryRefused):
     """The lane's gate cannot be measured. Never a verdict about a draft.
 
@@ -2563,10 +2573,22 @@ class FactoryScheduler:
                     ),
                     "{0} finding(s)".format(len(findings)),
                 )
-                findings = _bind_reviewer_findings(
-                    findings,
-                    contract_text=_public_contract_text(ctx.public_contract),
-                )
+                try:
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=_public_contract_text(ctx.public_contract),
+                    )
+                except st.CanonicalIdentityError as exc:
+                    citation = getattr(exc, "offending_requirement", "")
+                    if not isinstance(citation, str):
+                        citation = ""
+                    raise ReviewFindingUncited(
+                        "{0}:{1}:{2}".format(
+                            lane_id,
+                            "test-reviewer",
+                            citation[:120],
+                        )
+                    ) from exc
         tokens = tc.draft_private_tokens(
             state_root=self.runtime.path,
             run_id=self.run_id,
@@ -3024,10 +3046,22 @@ class FactoryScheduler:
                     ),
                     "{0} finding(s)".format(len(findings)),
                 )
-                findings = _bind_reviewer_findings(
-                    findings,
-                    contract_text=_public_contract_text(product_contract),
-                )
+                try:
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=_public_contract_text(product_contract),
+                    )
+                except st.CanonicalIdentityError as exc:
+                    citation = getattr(exc, "offending_requirement", "")
+                    if not isinstance(citation, str):
+                        citation = ""
+                    raise ReviewFindingUncited(
+                        "{0}:{1}:{2}".format(
+                            lane_id,
+                            "code-reviewer",
+                            citation[:120],
+                        )
+                    ) from exc
             artifact = cr.review_builder_output(
                 request=request,
                 state_root=self.runtime.path,
@@ -3442,10 +3476,22 @@ class FactoryScheduler:
                     verdict, findings, affected = self.actor.review_integration(
                         ctx, lanes, head
                     )
-                    findings = _bind_reviewer_findings(
-                        findings,
-                        contract_text=contract_text,
-                    )
+                    try:
+                        findings = _bind_reviewer_findings(
+                            findings,
+                            contract_text=contract_text,
+                        )
+                    except st.CanonicalIdentityError as exc:
+                        citation = getattr(exc, "offending_requirement", "")
+                        if not isinstance(citation, str):
+                            citation = ""
+                        raise ReviewFindingUncited(
+                            "{0}:{1}:{2}".format(
+                                "RUN",
+                                "integration-reviewer",
+                                citation[:120],
+                            )
+                        ) from exc
             checked = prv.actionable_findings(verdict, findings)
             payload = {
                 "affected_lanes": list(affected)

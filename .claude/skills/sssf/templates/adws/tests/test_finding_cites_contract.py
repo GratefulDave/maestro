@@ -427,6 +427,55 @@ class ReviewKindSites(unittest.TestCase):
         self.assertEqual(recorded["payload"]["verdict"], st.ReviewerVerdict.PASS.value)
         self.assertEqual(recorded["affected"], ())
 
+    def test_a_twice_uncited_test_review_refuses_typed(self) -> None:
+        actor = _ScriptedReviewer(
+            [
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
+            ]
+        )
+        with self.assertRaises(sch.ReviewFindingUncited) as raised:
+            _drive_reviewing_tests(actor)
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, "REVIEW_FINDING_UNCITED")
+        self.assertTrue(
+            message.startswith("REVIEW_FINDING_UNCITED:lane-a:test-reviewer:")
+        )
+        self.assertIn(PROBE_35[:120], message)
+
+    def test_a_twice_uncited_code_review_refuses_typed(self) -> None:
+        actor = _ScriptedReviewer(
+            [
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
+            ]
+        )
+        with self.assertRaises(sch.ReviewFindingUncited) as raised:
+            _drive_reviewing_code(actor)
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, "REVIEW_FINDING_UNCITED")
+        self.assertTrue(
+            message.startswith("REVIEW_FINDING_UNCITED:lane-a:code-reviewer:")
+        )
+        self.assertIn(PROBE_35[:120], message)
+
+    def test_a_twice_uncited_final_review_refuses_typed(self) -> None:
+        actor = _ScriptedReviewer(
+            [
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),), ("lane-a",)),
+                (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),), ("lane-a",)),
+            ]
+        )
+        with self.assertRaises(sch.ReviewFindingUncited) as raised:
+            _drive_final_review(actor)
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, "REVIEW_FINDING_UNCITED")
+        self.assertTrue(
+            message.startswith("REVIEW_FINDING_UNCITED:RUN:integration-reviewer:")
+        )
+        self.assertIn(PROBE_35[:120], message)
+
+
     def test_a_cited_test_review_is_not_reasked(self) -> None:
         actor = _ScriptedReviewer(
             [(st.ReviewerVerdict.REVISE, (_finding(CONTRACT_CLAUSE),))]

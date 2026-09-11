@@ -207,7 +207,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `violated_requirement` was required and unread (B15).
   `bind_findings_to_contract` now checks it is a harness key or a normalized
   12+ character substring of the public contract the reviewer was handed; a
-  miss re-asks the reviewer. Receipt: FDAdb run `d246ae95` TEST_REVIEW seq 35.
+  miss re-asks the reviewer. A second miss refuses `ReviewFindingUncited` naming the lane (or RUN), the role, and the citation prefix. Receipt: FDAdb run `d246ae95` TEST_REVIEW seq 35.
 - **Published runs can resume completion cleanup without rebasing their initial
   integration baseline.** Resume authenticates the immutable publication receipt
   against the bound target and reviewed integration tip before treating the run
