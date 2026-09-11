@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Mapping, Optional, Sequence, Tuple
 
 
 CANONICAL_SCHEMA_VERSION = 1
@@ -361,6 +361,58 @@ def require_revise_findings(
             row["severity"] = severity
         normalized.append(row)
     return tuple(normalized)
+
+
+_REQUIREMENT_QUOTE_MARKS = frozenset("\"'`")
+_MIN_CONTRACT_QUOTE = 12
+
+
+def _normalize_requirement_quote(value: str) -> str:
+    text = value.strip()
+    while text and text[0] in _REQUIREMENT_QUOTE_MARKS:
+        text = text[1:].lstrip()
+    while text and text[-1] in _REQUIREMENT_QUOTE_MARKS:
+        text = text[:-1].rstrip()
+    return " ".join(text.split()).casefold()
+
+
+def bind_findings_to_contract(
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    contract_text: str,
+    harness_keys: Collection[str],
+) -> Tuple[Mapping[str, Any], ...]:
+    """A REVISE finding must quote the contract the reviewer was handed.
+
+    `violated_requirement` was required and unread. A check field with zero
+    readers is a build failure (B15); the unread field is what let a reviewer
+    REVISE against text the contract never said (A9).
+    """
+    contract = _normalize_requirement_quote(contract_text)
+    allowed = frozenset(harness_keys)
+    bound: list[Mapping[str, Any]] = []
+    for finding in findings:
+        axis = finding.get("axis")
+        if axis is not None and axis != FINDING_AXIS_SPEC:
+            bound.append(finding)
+            continue
+        requirement = finding.get("violated_requirement")
+        if not isinstance(requirement, str):
+            requirement = ""
+        if requirement in allowed:
+            bound.append(finding)
+            continue
+        quote = _normalize_requirement_quote(requirement)
+        if len(quote) < _MIN_CONTRACT_QUOTE or quote not in contract:
+            error = CanonicalIdentityError(
+                "REVISE finding does not cite the contract: {0}".format(
+                    requirement[:80]
+                )
+            )
+            error.offending_requirement = requirement
+            raise error
+        bound.append(finding)
+    return tuple(bound)
 
 
 def lane_projection_digest(

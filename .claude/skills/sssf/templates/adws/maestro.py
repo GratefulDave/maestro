@@ -637,7 +637,9 @@ TEST_CRAFT_REVIEWER_QUESTION = (
     "shape rather than behaviour (assertions on structure such as keys exist "
     "or type is list, with no behavioural expectation), with the case id. A "
     "named case is a located finding that discharges nothing, so the verdict "
-    "is REVISE.\n"
+    "is REVISE. The violated_requirement field is checked mechanically and "
+    "must quote the public contract verbatim; a finding that cannot quote "
+    "the contract is advisory and does not make the verdict REVISE.\n"
 )
 
 
@@ -1044,7 +1046,11 @@ class HerdrStageActor:
                 "declared outputs. If an external test contradicts the lane's "
                 "public contract, assess the candidate against the contract "
                 "instead of demanding a test edit. Private tests are absent and "
-                "must not be inferred, requested, or cited.\n"
+                "must not be inferred, requested, or cited. The "
+                "violated_requirement field is checked mechanically and must "
+                "quote the public contract verbatim; a finding that cannot "
+                "quote the contract is advisory and does not make the verdict "
+                "REVISE.\n"
                 "For every declared output the candidate changed, enumerate its "
                 "callers inside this checkout before deciding: "
                 "`codemap impact <file> --direction reverse`, then "

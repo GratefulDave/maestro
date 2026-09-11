@@ -169,6 +169,14 @@ def _drive(scheduler, artifact, measurement):
     return measure, review
 
 
+LOCATED = {
+    "implementation_area": "services/api/app.py",
+    "observed_behavior": "negative amounts are accepted",
+    "required_behavior": "reject amounts below zero",
+    "violated_requirement": "negative amounts are refused",
+}
+
+
 class ReviewerSeesTheSealedResult(unittest.TestCase):
     def test_the_reviewer_is_asked_after_the_suite_is_measured(self):
         actor = _RecordingActor([(st.ReviewerVerdict.PASS, ())])
@@ -188,7 +196,7 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
     def test_the_suite_runs_once_not_once_per_actor(self):
         # Provisioning a review tree costs minutes. Measuring in the scheduler
         # and again inside review_builder_output would double every review.
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, (LOCATED,))])
         scheduler, artifact = _scheduler(actor)
         measurement = _measurement()
 
@@ -239,7 +247,7 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
         Repeated work reaches the operator after grace, but distinct repairs
         may continue. Neither path may merge a rejected candidate.
         """
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, (LOCATED,))])
         scheduler, artifact = _scheduler(actor)
         scheduler._block_if_stalled = lambda lane_id: blocked.append(lane_id)
         blocked: list[str] = []
@@ -391,7 +399,7 @@ class StepsAreReported(unittest.TestCase):
 
     def test_provisioning_and_the_suite_are_announced_before_the_reviewer(self):
         steps = self._steps(
-            _measurement(), [(st.ReviewerVerdict.REVISE, ({"a": "b"},))]
+            _measurement(), [(st.ReviewerVerdict.REVISE, (LOCATED,))]
         )
         self.assertIn("provisioning review tree and running sealed suite", steps)
         self.assertIn("sealed suite FAILED", steps)
@@ -402,7 +410,7 @@ class StepsAreReported(unittest.TestCase):
         )
 
     def test_the_counts_are_carried_as_the_detail(self):
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, (LOCATED,))])
         scheduler, artifact = _scheduler(actor)
         said = []
         scheduler.step = lambda lane, msg, detail="": said.append((lane, msg, detail))
@@ -429,7 +437,7 @@ class StepsAreReported(unittest.TestCase):
     def test_the_second_ask_is_announced(self):
         steps = self._steps(
             _measurement(),
-            [(st.ReviewerVerdict.PASS, ()), (st.ReviewerVerdict.REVISE, ({"a": "b"},))],
+            [(st.ReviewerVerdict.PASS, ()), (st.ReviewerVerdict.REVISE, (LOCATED,))],
         )
         self.assertIn(
             "no actionable finding against a red suite, asking again", steps
@@ -439,7 +447,7 @@ class StepsAreReported(unittest.TestCase):
     def test_a_reporter_that_raises_cannot_fail_the_lane(self):
         # Reporting is never workflow state. A broken console must not be able
         # to take a lane down with it.
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, (LOCATED,))])
         scheduler, artifact = _scheduler(actor)
 
         def explode(*_args, **_kwargs):
@@ -449,6 +457,6 @@ class StepsAreReported(unittest.TestCase):
         _drive(scheduler, artifact, _measurement())  # must not raise
 
     def test_a_scheduler_with_no_reporter_is_silent_and_fine(self):
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, (LOCATED,))])
         scheduler, artifact = _scheduler(actor)
         _drive(scheduler, artifact, _measurement())  # no .step attribute at all

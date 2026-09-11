@@ -545,3 +545,14 @@ Two-lane vertical slice: untyped lane A has no `needs`; lane B `needs` A. Indepe
 | `.claude/skills/sssf/apps/dashboard/bin/maestro-dashboard` | detached Next.js dashboard launcher (observability only) |
 
 Herdr and OMP are transport for agent dispatch. Pane text, process liveness, idle status, and session directories are not workflow authority.
+
+---
+
+## 19. Receipts
+
+`violated_requirement` had no reader (B15). FDAdb run `d246ae95`
+`lane-geo-corpus-tests` TEST_REVIEW seq 35 wrote a finding that named no
+clause of the public contract and REVISEd anyway; the lane parked
+`NO_PROGRESS` after nine amendments (A9). The field is now read: a REVISE
+finding must quote the contract or name a harness key.
+
