@@ -1,0 +1,12 @@
+{
+  "sequence": 35,
+  "verdict": "REVISE",
+  "findings": [
+    {
+      "implementation_area": "[redacted]:284-305,312-322 (C1-C4, declaration order)",
+      "observed_behavior": "F6's affirmative-advertisement bypass is fixed in both clause orders for API and checkout, but the occurrence-scoped replacement rejects legal grouped prohibitions. Complete-case positive controls with a single prohibition governing API and checkout fail all four cases: both route orders, with either conjunction or comma separation. Repeating the prohibition separately for each route passes all four. policyObjectSpan terminates at the first comma or conjunction without distinguishing a coordinated object from a new affirmative predicate, so the second prohibited route is treated as advertised. Exact wording controls still pass when placed wholly in either output; deletions and alterations of every required sentence and duplicate occurrence controls fail. All 20 independent public-route deletions are rejected. The paired real command executes four draft cases and three baseline cases; four intended draft failures reach actual output wording assertions and all three baseline cases pass. Test-craft answers: no implementation-coupled, tautological, or shape-only cases found.",
+      "required_behavior": "Preserve the occurrence-specific rejection of independently affirmative advertisements while accepting a prohibition governing coordinated route objects. Add complete-case legal controls for both API[redacted] object orders and comma/conjunction forms beside the existing policy-before/after-advertisement refusals. Distinguish coordinated objects under the same prohibition from a new affirmative clause; do not require repeated prohibition wording. Keep exact corpus wording acceptance unchanged.",
+      "violated_requirement": "The public corpus contract withholds private routes while allowing robots policy alongside. A grouped prohibition does not advertise its second object. Reviewer obligations require satisfiable legal positive controls as well as rejection across the prohibited ordering family; no public contract restricts policy to one route per clause."
+    }
+  ]
+}

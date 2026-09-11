@@ -25,8 +25,17 @@ FINDING = {
     "implementation_area": "tests",
     "observed_behavior": "no cases",
     "required_behavior": "behavior is asserted",
-    "violated_requirement": "public acceptance",
+    "violated_requirement": "a.txt is written",
 }
+
+
+def _finding_for(ctx) -> dict:
+    clause = next(
+        iter(getattr(ctx.lane, "public_acceptance", ()) or ()),
+        FINDING["violated_requirement"],
+    )
+    return dict(FINDING, violated_requirement=clause)
+
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -120,7 +129,7 @@ class ScriptedActor:
         n = self.test_rounds[ctx.lane.lane_id]
         self.test_rounds[ctx.lane.lane_id] += 1
         if n == 0:
-            return st.ReviewerVerdict.REVISE, (FINDING,)
+            return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
         return st.ReviewerVerdict.PASS, ()
 
     def build(self, ctx: sch.LaneContext) -> dict:
@@ -172,7 +181,7 @@ class ScriptedActor:
         n = self.code_rounds[ctx.lane.lane_id]
         self.code_rounds[ctx.lane.lane_id] += 1
         if n == 0:
-            return st.ReviewerVerdict.REVISE, (FINDING,)
+            return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
         return st.ReviewerVerdict.PASS, ()
 
     def review_integration(self, ctx, lanes, integration_sha):
@@ -707,7 +716,7 @@ class FactoryCutoverTests(unittest.TestCase):
                 n = self.code_rounds[ctx.lane.lane_id]
                 self.code_rounds[ctx.lane.lane_id] += 1
                 if ctx.lane.lane_id == "lane-b" and n == 0:
-                    return st.ReviewerVerdict.REVISE, (FINDING,)
+                    return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
                 return st.ReviewerVerdict.PASS, ()
 
             def build(self, ctx):
@@ -1005,14 +1014,14 @@ class FactoryCutoverTests(unittest.TestCase):
                 n = self.test_rounds[ctx.lane.lane_id]
                 self.test_rounds[ctx.lane.lane_id] += 1
                 if ctx.lane.lane_id == "lane-a" and n < 2:
-                    return st.ReviewerVerdict.REVISE, (FINDING,)
+                    return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
                 return st.ReviewerVerdict.PASS, ()
 
             def review_code(self, ctx: sch.LaneContext):
                 n = self.code_rounds[ctx.lane.lane_id]
                 self.code_rounds[ctx.lane.lane_id] += 1
                 if ctx.lane.lane_id == "lane-a" and n == 0:
-                    return st.ReviewerVerdict.REVISE, (FINDING,)
+                    return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
                 return st.ReviewerVerdict.PASS, ()
 
             def build(self, ctx: sch.LaneContext) -> dict:

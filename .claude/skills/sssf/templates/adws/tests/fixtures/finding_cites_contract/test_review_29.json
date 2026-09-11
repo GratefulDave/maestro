@@ -1,0 +1,18 @@
+{
+  "sequence": 29,
+  "verdict": "REVISE",
+  "findings": [
+    {
+      "implementation_area": "[redacted]:660-667,1037,1070,1093,1131 (C1-C4)",
+      "observed_behavior": "F4: The refreshed contract specifies occurrence count of the exact two-word string, but labelSectionCount performs a case-insensitive whole-word regex count. Complete-case probes accept a second exact substring embedded in the plural form, while rejecting an added differently capitalized string that does not equal the specified bytes. Both results occur in all four cases. A complete positive control passes, deletion of each of S1-S5 independently fails all four cases, and an additional standalone exact string fails all four cases.",
+      "required_behavior": "Count occurrences of the exact case-sensitive string without adding word-boundary semantics. Preserve the five byte-identical sentence checks and test both an embedded second occurrence and a differently capitalized non-occurrence alongside the standalone duplicate control. Measure the combined real outputs, as already done.",
+      "violated_requirement": "The current public wording acceptance is exact substring presence plus occurrence count of the specified string. Case folding and word boundaries change that observable contract."
+    },
+    {
+      "implementation_area": "[redacted]:1017-1093,1127-1129 and retained semantic wording helpers (C1-C4, especially C3)",
+      "observed_behavior": "F5: The exact-sentence predicate was added, but the complete cases still impose the superseded semantic wording constraints on other corpus sentences. A complete corpus containing S1-S5 with the required occurrence count passes all four case bodies. Appending another sentence denying omission leaves all fixed substrings and the count unchanged, yet C3 rejects it through describesOmissionOfAbsentEvidence. The current public acceptance explicitly excludes assertions about negation, denial, paraphrases, referents, clause order, or other sentences. The paired real command collected and executed four draft cases and three baseline cases: all four draft failures reached production-output assertions; all three baseline cases passed. Test-craft answers: no product-implementation-coupled, tautological, or shape-only cases found; these are contract-overreach and count-semantics defects.",
+      "required_behavior": "Complete the cutover to the current wording contract throughout the case bodies. Remove superseded semantic wording restrictions and their obsolete helper controls; retain independently required public-route inventory and private-route exclusion checks. Add a complete-case positive control demonstrating that unrelated extra wording does not override the expressly limited fixed-substring acceptance. Do not extend this review into further semantic prose probes or prescribe product changes.",
+      "violated_requirement": "The latest public lane acceptance expressly limits wording tests to S1-S5 exact substring presence and the specified occurrence count, and forbids additional semantic wording assertions. Earlier wording requirements and review findings do not override that revised authority."
+    }
+  ]
+}

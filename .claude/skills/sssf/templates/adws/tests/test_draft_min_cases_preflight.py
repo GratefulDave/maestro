@@ -209,7 +209,7 @@ class DraftActor:
             "implementation_area": "private tests",
             "observed_behavior": "case {0} asserts nothing about refusal".format(index),
             "required_behavior": "assert the refusal path too",
-            "violated_requirement": "acceptance",
+            "violated_requirement": "a.txt is written",
         }
 
     def build(self, ctx: sch.LaneContext) -> dict:

@@ -1397,6 +1397,44 @@ def _draft_min_cases_findings(
     )
 
 
+HARNESS_VIOLATED_REQUIREMENTS = frozenset(
+    {
+        "gate collection",
+        "gate.required_cases",
+        "gate.min_cases",
+        cr._RUNNER_REVISE["violated_requirement"],
+        cr._COLLECTION_REVISE["violated_requirement"],
+        cr._INTEGRATION_GATE_REVISE["violated_requirement"],
+    }
+)
+
+
+def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
+    """The public contract the reviewer was handed, as searchable text.
+
+    Same mapping `pr.public_contract` / `tests_chain.write_test_draft` /
+    `code_review.builder_view` project -- acceptance_criteria plus
+    declared_outputs -- not a second projection.
+    """
+    if not isinstance(contract, Mapping):
+        return ""
+    criteria = contract.get("acceptance_criteria") or ()
+    outputs = contract.get("declared_outputs") or ()
+    return " ".join([str(item) for item in criteria] + [str(item) for item in outputs])
+
+
+def _bind_reviewer_findings(
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    contract_text: str,
+) -> tuple[Mapping[str, Any], ...]:
+    return st.bind_findings_to_contract(
+        findings,
+        contract_text=contract_text,
+        harness_keys=HARNESS_VIOLATED_REQUIREMENTS,
+    )
+
+
 def _remove_collect_tree(dest: Path, vault: Path) -> None:
     hv.remove_vault_worktree(vault, dest)
 
@@ -2507,6 +2545,28 @@ class FactoryScheduler:
                 "test reviewer answered {0}".format(verdict.value),
                 "{0} finding(s)".format(len(findings)),
             )
+            try:
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(ctx.public_contract),
+                )
+            except st.CanonicalIdentityError:
+                self._say(
+                    lane_id,
+                    "reviewer finding does not cite the contract, asking again",
+                )
+                verdict, findings = self.actor.review_tests(ctx)
+                self._say(
+                    lane_id,
+                    "test reviewer answered {0} on the second ask".format(
+                        verdict.value
+                    ),
+                    "{0} finding(s)".format(len(findings)),
+                )
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(ctx.public_contract),
+                )
         tokens = tc.draft_private_tokens(
             state_root=self.runtime.path,
             run_id=self.run_id,
@@ -2946,6 +3006,28 @@ class FactoryScheduler:
                     ),
                     "{0} finding(s)".format(len(findings)),
                 )
+            try:
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(product_contract),
+                )
+            except st.CanonicalIdentityError:
+                self._say(
+                    lane_id,
+                    "reviewer finding does not cite the contract, asking again",
+                )
+                verdict, findings = self.actor.review_code(ctx)
+                self._say(
+                    lane_id,
+                    "code reviewer answered {0} on the second ask".format(
+                        verdict.value
+                    ),
+                    "{0} finding(s)".format(len(findings)),
+                )
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(product_contract),
+                )
             artifact = cr.review_builder_output(
                 request=request,
                 state_root=self.runtime.path,
@@ -3345,6 +3427,25 @@ class FactoryScheduler:
                 verdict, findings, affected = self.actor.review_integration(
                     ctx, lanes, head
                 )
+                contract_text = " ".join(
+                    [
+                        *(item for lane in lanes for item in lane.public_acceptance),
+                        *(item for lane in lanes for item in lane.declared_outputs),
+                    ]
+                )
+                try:
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=contract_text,
+                    )
+                except st.CanonicalIdentityError:
+                    verdict, findings, affected = self.actor.review_integration(
+                        ctx, lanes, head
+                    )
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=contract_text,
+                    )
             checked = prv.actionable_findings(verdict, findings)
             payload = {
                 "affected_lanes": list(affected)

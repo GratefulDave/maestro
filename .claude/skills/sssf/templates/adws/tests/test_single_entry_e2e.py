@@ -59,8 +59,9 @@ FINDING = {
     "implementation_area": "a.txt",
     "observed_behavior": "the declared output is empty",
     "required_behavior": "behavior is asserted",
-    "violated_requirement": "public acceptance",
+    "violated_requirement": "a.txt is written",
 }
+
 _PROMPT = re.compile(r"@(\S+\.json)")
 
 
