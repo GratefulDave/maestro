@@ -29,6 +29,7 @@ import yaml
 from adw_modules import attend as att
 from adw_modules import git_publication as gitpub
 from adw_modules import hidden_vault as hv
+from adw_modules import operator_brief as ob
 from adw_modules.handoff_budget import (
     OMP_CONTEXT_WINDOW_TOKENS,
     route_publishes_a_window,
@@ -3766,6 +3767,14 @@ def _run_status(args: argparse.Namespace) -> int:
                     run_id, st.ArtifactKind.ATTEND_SESSION
                 )
             ]
+            # A projection of the same typed records the status is derived
+            # from, for the lanes an operator has to decide about. Rendered
+            # here because the store closes before anything is printed.
+            briefs = {
+                lane_id: ob.waiting_brief(store, run_id, lane_id)
+                for lane_id, stage in stages.items()
+                if stage == st.LaneStage.WAITING_FOR_USER.value
+            }
         finally:
             store.close()
     finally:
@@ -3782,6 +3791,13 @@ def _run_status(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    # Prose, on stderr: stdout is the machine surface and stays one JSON
+    # object. The brief decides nothing -- it renders the records the status
+    # above was already derived from.
+    for lane_id in sorted(briefs):
+        brief = briefs[lane_id]
+        if brief:
+            print(brief, file=sys.stderr)
     return 0
 
 
