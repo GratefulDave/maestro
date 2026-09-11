@@ -7,6 +7,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **A parked lane says what the operator should do about it.** A
+  `WAITING_FOR_USER` lane used to give one log line and a status JSON with a
+  stage in it, and neither says whether the next verb is `run resume` or
+  `run amend`. `adw_modules/operator_brief.py` renders the records that already
+  decided the park -- the `USER_WAIT` payload, the lane's last five reviews,
+  each review's `public_result_summary` and findings -- as prose: the reason and
+  stage, a one-line round history, whether the findings are converging or
+  repeating, the last finding's `violated_requirement` and `implementation_area`,
+  and the exact command line. Repeating findings recommend reading the finding
+  against the plan before resuming, because a finding that survived three rounds
+  is usually a contract defect. It is emitted on the step channel at both pause
+  sites in `FactoryScheduler` and on stderr by `run status`, so stdout stays one
+  JSON object. An operator decision is made from typed records rendered as
+  prose, never from a log line: the brief is a pure read, causes no transition,
+  and quotes only the public redacted half of a finding.
 - **`run attend` authors the amendment a `NO_PROGRESS` park needs.** FDAdb run
   `d246ae95` parked `lane-faq-producer` twice. Both times a human read the gate
   table, the latest `CODE_REVIEW` findings and the sealed suite, edited one

@@ -148,6 +148,10 @@ A final-review `REVISE` appends `USER_WAIT` with `wait_reason=AMENDMENT_REQUIRED
 
 `run amend` is a separate explicit verb. Ordinary stage-boundary continuation is `run resume <run-id>`.
 
+### Operator brief
+
+A `WAITING_FOR_USER` lane also renders an *operator brief*: a few sentences naming the wait reason, the lane's last five reviews with their `public_result_summary` and verdicts, whether each round's findings differ from the round before it, and the resume or amend line that follows. It is emitted on the step channel where the pause is recorded and on stderr by `run status`; stdout stays one JSON object. The brief is a projection of typed records and never workflow authority. It reads only stored artifacts, opens no transaction, records nothing, and causes no transition; `lane_state.stage` and the immutable artifacts remain the only things a verb keys on. It quotes only the public redacted half of a finding, `violated_requirement` and `implementation_area`, and never reads the vault or private results.
+
 ### Attended amendment
 
 A lane parked with `wait_reason=NO_PROGRESS` is resumable by definition (§5, `RESUMABLE_WAIT_REASONS`), and resuming it grants another window against the same contract. That is the right answer when the lane stalled on something a further round can fix and the wrong one when it stalled because its contract does not say what the sealed suite asserts — the second case parks again in the same place.

@@ -24,6 +24,7 @@ from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
 from . import hidden_vault as hv
+from . import operator_brief as ob
 from . import private_review as prv
 from . import provisioning as prov
 from . import runner_resolution as rr
@@ -1711,6 +1712,7 @@ class FactoryScheduler:
                 # flight, so there is nothing of it to pause. Its siblings
                 # still are.
                 continue
+            self._operator_brief(lane_id)
 
     def _pause_input(
         self, lane_id: str, stage: st.LaneStage
@@ -1929,6 +1931,21 @@ class FactoryScheduler:
             step(lane_id, message, detail)
         except Exception:
             pass
+
+    def _operator_brief(self, lane_id: str) -> None:
+        """Render the park's own records as prose, on the step channel.
+
+        A projection, never authority: the brief is derived after the pause is
+        already recorded, reads nothing but stored artifacts, and decides
+        nothing. Swallowing matches `_say` -- a reader that raises must not be
+        able to fail a lane that has already parked.
+        """
+        try:
+            brief = ob.waiting_brief(self.store, self.run_id, lane_id)
+        except Exception:
+            return
+        if brief:
+            self._say(lane_id, "operator brief", brief)
 
     def _advance(self, lane_id: str) -> None:
         stage = self.store.lane_stage(self.run_id, lane_id)
@@ -3052,6 +3069,7 @@ class FactoryScheduler:
                 st.NO_PROGRESS_GRACE_ROUNDS,
             ),
         )
+        self._operator_brief(lane_id)
 
     def _complete_test_invalidation(
         self,
@@ -3373,6 +3391,11 @@ class FactoryScheduler:
                 artifact,
                 payload["affected_lanes"],
             )
+            # The third site a `USER_WAIT` is recorded for a lane. The store
+            # writes it inside `complete_final_review`'s transaction, so the
+            # brief is derived here, after it has committed.
+            for lane_id in payload["affected_lanes"]:
+                self._operator_brief(lane_id)
         finally:
             self.locks.release()
 

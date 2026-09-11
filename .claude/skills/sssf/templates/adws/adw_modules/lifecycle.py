@@ -2488,6 +2488,32 @@ class ArtifactStore:
         ).fetchall()
         return tuple(_loads(row["payload_json"]) for row in reversed(rows))
 
+    def lane_artifact_records(
+        self, run_id: str, lane_id: str, kind: st.ArtifactKind, limit: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        """The newest `limit` artifacts of one kind, oldest first. Read-only.
+
+        `lane_artifact_payloads` answers the same rows without their sequence
+        or their timestamp, and a reader that has to say *when* a round
+        happened needs both. Nothing here opens a transaction.
+        """
+        rows = self.conn.execute(
+            "SELECT sequence, artifact_id, created_at, payload_json "
+            "FROM lane_artifacts "
+            "WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+            "ORDER BY sequence DESC LIMIT ?",
+            (run_id, lane_id, kind.value, max(0, int(limit))),
+        ).fetchall()
+        return tuple(
+            {
+                "sequence": row["sequence"],
+                "artifact_id": row["artifact_id"],
+                "created_at": row["created_at"],
+                "payload": _loads(row["payload_json"]),
+            }
+            for row in reversed(rows)
+        )
+
     def ready_lane_ids(self, run_id: str) -> tuple[str, ...]:
         run = self._run(run_id)
         ready = []
