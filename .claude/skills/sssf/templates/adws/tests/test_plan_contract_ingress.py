@@ -563,5 +563,88 @@ class PlanAuthorCliTests(unittest.TestCase):
             )
 
 
+class RequirementReferenceClosureTests(unittest.TestCase):
+    """A bound requirement may only name requirements the same lane receives."""
+
+    def setUp(self) -> None:
+        from adw_modules import plan_contract_ingress as ingress
+
+        self.ingress = ingress
+        self.repo = Path(".")
+
+    def _ir_with_text(self, requirement_id: str, text: str) -> dict:
+        ir = _ir()
+        for requirement in ir["requirements"]:
+            if requirement["requirement_id"] == requirement_id:
+                requirement["text"] = text
+                return ir
+        raise KeyError(requirement_id)
+
+    def _lane_binding(self, ir: dict, lane_id: str) -> list:
+        for lane in ir["lanes"]:
+            if lane["lane_id"] == lane_id:
+                return lane["requirement_ids"]
+        raise KeyError(lane_id)
+
+    def test_tests_lane_reference_to_a_requirement_it_does_not_bind(self) -> None:
+        ir = self._ir_with_text(
+            "req-t", "Assert the exact req-b payload the build lane writes.")
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self.ingress.project_draft(ir, self.repo)
+        self.assertEqual(
+            "REQUIREMENT_REFERENCE_OUTSIDE_LANE:lane-t:req-t:req-b",
+            str(caught.exception))
+
+    def test_build_lane_reference_to_a_requirement_it_does_not_bind(self) -> None:
+        ir = self._ir_with_text(
+            "req-b", "Implement what req-t asserts about the public contract.")
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self.ingress.project_draft(ir, self.repo)
+        self.assertEqual(
+            "REQUIREMENT_REFERENCE_OUTSIDE_LANE:lane-b:req-b:req-t",
+            str(caught.exception))
+
+    def test_binding_the_named_requirement_clears_the_refusal(self) -> None:
+        ir = self._ir_with_text(
+            "req-t", "Assert the exact req-b payload the build lane writes.")
+        self._lane_binding(ir, "lane-t").append("req-b")
+        draft = self.ingress.project_draft(ir, self.repo)
+        lane_t = [lane for lane in draft["lanes"] if lane["id"] == "lane-t"][0]
+        self.assertIn("req-b", lane_t["spec"]["instruction"])
+        self.assertEqual(
+            ["req-t", "req-b"], lane_t["spec"]["bindings"]["requirement_ids"])
+
+    def test_self_reference_resolves(self) -> None:
+        ir = self._ir_with_text(
+            "req-t", "req-t is discharged by tests/test_t.py alone.")
+        draft = self.ingress.project_draft(ir, self.repo)
+        lane_t = [lane for lane in draft["lanes"] if lane["id"] == "lane-t"][0]
+        self.assertIn(
+            "req-t is discharged", lane_t["spec"]["instruction"])
+
+    def test_a_near_match_is_not_a_reference(self) -> None:
+        ir = self._ir_with_text(
+            "req-t",
+            "Cover req-b-baseline and x-req-b; neither names a requirement.")
+        draft = self.ingress.project_draft(ir, self.repo)
+        lane_t = [lane for lane in draft["lanes"] if lane["id"] == "lane-t"][0]
+        self.assertIn("req-b-baseline", lane_t["spec"]["instruction"])
+
+    def test_prose_and_unknown_ids_are_not_this_predicates_business(self) -> None:
+        ir = self._ir_with_text(
+            "req-t",
+            "Honour the release contract and req-wp9-absent as written.")
+        self.ingress.project_draft(ir, self.repo)
+
+    def test_punctuation_does_not_hide_a_reference(self) -> None:
+        ir = self._ir_with_text(
+            "req-t", "Assert the payload (req-b), byte for byte.")
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self.ingress.project_draft(ir, self.repo)
+        self.assertEqual(
+            "REQUIREMENT_REFERENCE_OUTSIDE_LANE:lane-t:req-t:req-b",
+            str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
