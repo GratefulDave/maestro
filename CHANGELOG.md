@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **The herdr-lanes sidebar plugin moved to its own repository,
+  `GratefulDave/herdr-radar-plus` (private), with its history.** It was never
+  part of the ADW runtime; nothing here references it.
 - **`herdr-lanes` sidebar colours and WezTerm font order**
   (`.claude/skills/sssf/apps/herdr-lanes/`). `$name` renders in the foreground colour instead of
   dimmed. `$logo` is coloured per vendor from a new neutral `lib/brands.js` (colours from herdr-radar
