@@ -161,6 +161,41 @@ class RubricNamesTheCheck(unittest.TestCase):
         self.assertIn(sentence, maestro.TEST_CRAFT_REVIEWER_QUESTION)
         source = Path(maestro.__file__).read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count("checked mechanically"), 2)
+        # The rubric must describe what the code does: an uncited finding is
+        # sent back once and a second miss stops the run. It is never advisory.
+        self.assertNotIn("is advisory and does not make", source)
+        self.assertIn("a second miss stops the run", maestro.TEST_CRAFT_REVIEWER_QUESTION)
+
+
+class TheSecondAskNamesTheRejectedCitation(unittest.TestCase):
+    """The rejected citation reaches the reviewer's prompt, not just its ctx."""
+
+    def test_every_reviewer_prompt_carries_the_rejected_citation(self) -> None:
+        from types import SimpleNamespace
+
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor.lane_specs = {}
+        paraphrase = "verify-wp3-reader-tests requires case eight to execute"
+        for role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
+            ctx = SimpleNamespace(
+                lane=SimpleNamespace(lane_id="lane-a", lane_kind=st.LANE_KIND_BUILD),
+                plan_revision=1,
+                run_id="run1",
+                stage=st.LaneStage.REVIEWING_CODE,
+                rejected_citation=paraphrase,
+            )
+            text = maestro.HerdrStageActor._prompt(
+                actor, ctx, role, Path("/tmp/envelope.json"), Path("/tmp/cwd"), {}
+            )["instructions"]
+            with self.subTest(role=role):
+                self.assertIn(json.dumps(paraphrase), text)
+                self.assertIn("not a verbatim substring of the public contract", text)
+            ctx.rejected_citation = ""
+            first = maestro.HerdrStageActor._prompt(
+                actor, ctx, role, Path("/tmp/envelope.json"), Path("/tmp/cwd"), {}
+            )["instructions"]
+            with self.subTest(role=role, ask="first"):
+                self.assertNotIn("Your previous answer was rejected", first)
 
 
 class _EmptyStore:
@@ -179,20 +214,22 @@ class _ScriptedReviewer:
     def __init__(self, replies):
         self.replies = list(replies)
         self.seen: list[str] = []
+        self.rejected: list[str] = []
 
     def review_tests(self, ctx):
-        del ctx
         self.seen.append("tests")
+        self.rejected.append(ctx.rejected_citation)
         return self.replies.pop(0)
 
     def review_code(self, ctx):
-        del ctx
         self.seen.append("code")
+        self.rejected.append(ctx.rejected_citation)
         return self.replies.pop(0)
 
     def review_integration(self, ctx, lanes, integration):
-        del ctx, lanes, integration
+        del lanes, integration
         self.seen.append("final")
+        self.rejected.append(ctx.rejected_citation)
         return self.replies.pop(0)
 
 
@@ -398,6 +435,9 @@ class ReviewKindSites(unittest.TestCase):
         )
         completed, blocked = _drive_reviewing_tests(actor)
         self.assertEqual(actor.seen, ["tests", "tests"])
+        # The second ask says which citation was rejected; a byte-identical
+        # re-ask repeated the paraphrase on FDAdb run be064e58.
+        self.assertEqual(actor.rejected, ["", PROBE_35])
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].verdict, st.ReviewerVerdict.PASS)
         self.assertEqual(blocked, [])
@@ -411,6 +451,9 @@ class ReviewKindSites(unittest.TestCase):
         )
         completed, blocked = _drive_reviewing_code(actor)
         self.assertEqual(actor.seen, ["code", "code"])
+        # The second ask says which citation was rejected; a byte-identical
+        # re-ask repeated the paraphrase on FDAdb run be064e58.
+        self.assertEqual(actor.rejected, ["", PROBE_35])
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].verdict, st.ReviewerVerdict.PASS)
         self.assertEqual(blocked, [])
@@ -424,6 +467,9 @@ class ReviewKindSites(unittest.TestCase):
         )
         recorded = _drive_final_review(actor)
         self.assertEqual(actor.seen, ["final", "final"])
+        # The second ask says which citation was rejected; a byte-identical
+        # re-ask repeated the paraphrase on FDAdb run be064e58.
+        self.assertEqual(actor.rejected, ["", PROBE_35])
         self.assertEqual(recorded["payload"]["verdict"], st.ReviewerVerdict.PASS.value)
         self.assertEqual(recorded["affected"], ())
 

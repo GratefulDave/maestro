@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Fixed
+- **A reviewer asked again is told which citation was rejected.** A REVISE
+  finding whose `violated_requirement` did not quote the public contract was
+  re-asked with byte-identical input, so a reviewer that paraphrased once
+  paraphrased again and the run refused `REVIEW_FINDING_UNCITED`. FDAdb run
+  `be064e58` `lane-wp3-reader-tests` refused on "verify-wp3-reader-tests
+  requires case eight to execute manifest.test.mjs, ...", a requirement the
+  contract states in other words. The second ask now carries
+  `rejected_citation`, and every reviewer prompt names it and asks for the
+  exact contract words. The matcher is unchanged. The rubric also stopped
+  claiming an uncited finding is "advisory": it is sent back once, and a
+  second miss stops the run, which is what the code has always done.
 - **`run attend` reports a scheduler failure as itself.** The STOP
   `ATTEND_SESSION` record read `applied`, which was bound only on success or
   `AttendRefused`, so any other exception from the scheduler surfaced as

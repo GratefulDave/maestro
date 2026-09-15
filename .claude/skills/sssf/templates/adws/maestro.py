@@ -638,8 +638,8 @@ TEST_CRAFT_REVIEWER_QUESTION = (
     "or type is list, with no behavioural expectation), with the case id. A "
     "named case is a located finding that discharges nothing, so the verdict "
     "is REVISE. The violated_requirement field is checked mechanically and "
-    "must quote the public contract verbatim; a finding that cannot quote "
-    "the contract is advisory and does not make the verdict REVISE.\n"
+    "must quote the public contract verbatim; a finding that does not quote "
+    "it is sent back once, and a second miss stops the run.\n"
 )
 
 
@@ -1044,9 +1044,9 @@ class HerdrStageActor:
                 "instead of demanding a test edit. Private tests are absent and "
                 "must not be inferred, requested, or cited. The "
                 "violated_requirement field is checked mechanically and must "
-                "quote the public contract verbatim; a finding that cannot "
-                "quote the contract is advisory and does not make the verdict "
-                "REVISE.\n"
+                "quote the public contract verbatim; a finding that does not "
+                "quote it is sent back once, and a second miss stops the "
+                "run.\n"
                 "For every declared output the candidate changed, enumerate its "
                 "callers inside this checkout before deciding: "
                 "`codemap impact <file> --direction reverse`, then "
@@ -1347,6 +1347,17 @@ class HerdrStageActor:
             instructions += " " + self._PUBLIC_INTERFACE_RULE
         if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
             instructions += " PASS requires findings=[]. REVISE requires at least one actionable finding."
+            rejected = getattr(ctx, "rejected_citation", "")
+            if rejected:
+                instructions += (
+                    " Your previous answer was rejected: its violated_requirement "
+                    "{0} is not a verbatim substring of the public contract. "
+                    "Re-review, and for every finding copy the exact words of "
+                    "the contract sentence it violates into violated_requirement, "
+                    "character for character, at least 12 characters, with no "
+                    "paraphrase, summary, or added words. A second finding that "
+                    "does not quote the contract stops the run."
+                ).format(json.dumps(rejected[:300]))
         if role == "integration-reviewer":
             instructions += " PASS requires affected_lanes=[]. REVISE requires a nonempty affected_lanes subset."
         body: dict[str, Any] = {
