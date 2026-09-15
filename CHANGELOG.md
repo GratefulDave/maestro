@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Fixed
+- **`run attend` reports a scheduler failure as itself.** The STOP
+  `ATTEND_SESSION` record read `applied`, which was bound only on success or
+  `AttendRefused`, so any other exception from the scheduler surfaced as
+  `UnboundLocalError: local variable 'applied'` and hid the real traceback. On
+  FDAdb run `be064e58` the hidden cause was
+  `LaunchFailed: BINDING_MISMATCH:DUPLICATE_ROLE_PANE:test-reviewer`. `applied`
+  is now bound before the loop and the STOP record names the exception type.
 - **A merge completed again is one link in the integration chain.** An
   amendment that retains a merged lane completes the same `INTEGRATION_MERGE`
   again, and `integration_merge_payloads` returned one row per `complete_stage`

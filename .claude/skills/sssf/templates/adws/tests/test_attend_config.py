@@ -152,3 +152,65 @@ class PlanIrResolution(unittest.TestCase):
                 }
             )
         self.assertIn("absolute", str(caught.exception))
+
+
+class AttendSurfacesSchedulerFailure(unittest.TestCase):
+    """A scheduler failure inside `run attend` is reported as itself.
+
+    FDAdb run be064e58: restore_layout raised LaunchFailed, and the STOP
+    record's `len(applied)` replaced that traceback with UnboundLocalError.
+    """
+
+    def test_a_non_attend_exception_propagates_and_is_recorded(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        class LaunchBoom(RuntimeError):
+            pass
+
+        stops: list[dict] = []
+
+        class Store:
+            def record_attend_session(self, run_id, *, session_id, phase, payload):
+                if phase == "STOP":
+                    stops.append(dict(payload))
+
+            def active_projection(self, run_id):
+                return ()
+
+            def close(self):
+                pass
+
+        runtime = SimpleNamespace(
+            path=Path("/nonexistent"),
+            close=lambda: None,
+            ledger_path=lambda: Path("/nonexistent/lifecycle.sqlite3"),
+        )
+        row = {
+            "plan_revision": 1,
+            "target_repository_root": "/nonexistent/repo",
+            "target_main_ref": "refs/heads/main",
+            "plan_digest": "0" * 64,
+        }
+        layout = {"attend": {"max_amendments_per_lane": 3, "route": CLAUDE_ROUTE}}
+        compiled = SimpleNamespace(plan_revision=1, lanes=())
+
+        def boom(**_kwargs):
+            raise LaunchBoom("BINDING_MISMATCH:DUPLICATE_ROLE_PANE:test-reviewer")
+
+        with mock.patch.object(
+            maestro,
+            "_bind_existing_run",
+            return_value=(layout, runtime, Store(), row, object(), compiled),
+        ), mock.patch.object(maestro, "maybe_autoload_dashboard"), mock.patch.object(
+            maestro, "plan_artifact_ref_for", return_value="/nonexistent/plans/p.json"
+        ), mock.patch.object(
+            maestro.step_log, "RunReporter"
+        ), mock.patch.object(
+            maestro.att, "attend_run", side_effect=boom
+        ):
+            with self.assertRaises(LaunchBoom):
+                maestro._run_attend(SimpleNamespace(run_id="run-1"))
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["stop_reason"], "LaunchBoom")
+        self.assertEqual(stops[0]["revisions_applied"], 0)

@@ -3665,6 +3665,11 @@ def _run_attend(args: argparse.Namespace) -> int:
     )
     outcome: att.AttendOutcome | None = None
     stop_reason = ""
+    # Bound before the loop: the STOP record below runs on every exit, and a
+    # scheduler that raises anything but AttendRefused (FDAdb run be064e58:
+    # LaunchFailed from restore_layout) otherwise hid its own traceback behind
+    # `UnboundLocalError: applied`.
+    applied: tuple[att.AppliedAmendment, ...] = ()
     status = st.RunStatus.WAITING
     try:
         try:
@@ -3694,7 +3699,9 @@ def _run_attend(args: argparse.Namespace) -> int:
                 applied = outcome.applied
             except att.AttendRefused as refused:
                 stop_reason = refused.code
-                applied = ()
+                raise
+            except BaseException as exc:
+                stop_reason = type(exc).__name__
                 raise
             finally:
                 store.record_attend_session(
