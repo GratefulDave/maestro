@@ -7,16 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
-- **`maestro-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). This is a
-  display-only sidebar daemon, and the Maestro runtime is unchanged. It writes pane tokens
-  `logo` (vendor glyph from the Herdr Agent Icons Max font) and `mark` (spinner while
-  working, a `✓` held until the pane is focused, a `?` held until work resumes). On lane panes
-  and lane Spaces it also writes `stage`, `round` and `verdict`, read from the ledger with a
-  read-only connection that is opened and closed on each 2 s poll. Every write uses source
-  `maestro-lanes` and only those token names. Maestro's `kind/lane/role/run_id/parent/repo/scratch`
-  tokens are never touched. The plugin also installs the font and a marker-fenced Ghostty
-  `font-codepoint-map` block, and swaps the hand-written `[ui.sidebar.*]` tables for one
-  marker-fenced managed block. Icon font and approach come from herdr-radar (MIT).
+- **`herdr-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). A display-only sidebar
+  daemon for macOS; the Maestro runtime is unchanged. Under metadata source `lanes` it writes these
+  pane tokens:
+  - `logo`: a vendor glyph from the Herdr Agent Icons Max font.
+  - `mark`: a spinner while the agent works, a `✓` held until the pane is focused, and a `?` held
+    until work resumes.
+  - `name`: the lane id, or the workspace label for other panes.
+  - `title`: the terminal title, on non-lane panes only.
+  - `stage`, `round` and `verdict`: on lane panes and lane Spaces.
+
+  Everything specific to Maestro sits in `lib/adapters/maestro.js`: the `kind=lane` token
+  convention, ledger discovery, a read-only per-tick ledger query, and the stage and role colour
+  rules. The daemon holds an exclusive lock and signals a pid only when that pid's command line is
+  the daemon. The plugin swaps the hand-written `[ui.sidebar.*]` tables for one fenced managed block,
+  saving the removed tables only after `herdr config check` passes. It wires the icon font into
+  the detected terminal: WezTerm `font_with_fallback`, or a Ghostty codepoint map. Every edit is
+  recorded and exactly reversible. It migrates once from its first name, `maestro-lanes`. Icon
+  font and socket approach come from herdr-radar (MIT); mark licences are in `THIRD_PARTY_NOTICES.md`.
 
 ### Changed
 - **Contract change: a lane is a child Space again, nested under the repository's

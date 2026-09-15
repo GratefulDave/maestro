@@ -1,82 +1,106 @@
-# maestro-lanes
+# herdr-lanes
 
-A Herdr 0.9.0 plugin for the sidebar. It shows each agent's vendor logo and a held activity
-mark. On Maestro lane panes and lane Spaces it also shows the lane's stage, review round and
-latest verdict.
+A Herdr 0.9.0 plugin for macOS that improves the sidebar. Every agent pane gets a vendor logo, a held
+activity mark, a name and a short title. Panes and Spaces that belong to a lane also show the lane's
+stage, review round and latest verdict, read through a lane adapter.
 
-It only displays things. It does not create, close, rename or move panes, tabs or Spaces, and
-it never writes to the Maestro ledger.
+It only changes what the sidebar displays. It never creates, closes, renames or moves panes, tabs or
+Spaces, and it never writes to a lane factory's state.
+
+## Layout
+
+The same two agent rows are used for every pane. A token that has no value is hidden.
+
+| | lane pane | any other agent pane |
+|---|---|---|
+| row 1 | `state_icon  $logo  $name` (lane id) `$role` | `state_icon  $logo  $name` (workspace label) |
+| row 2 | `$mark  state_text  $stage  $round  $verdict` | `$mark  state_text  $title` (terminal title, max 40 chars) |
+
+Space rows show `state_icon  workspace  state_text  $stage`, then `branch git_status`, then `$usage`.
 
 ## What it writes
 
-Every write uses `--source maestro-lanes` and only these token names:
+Every write uses metadata source `lanes`, sends a monotonic `seq`, and uses only these token names.
 
-| Target | Token | Value |
-|---|---|---|
-| any agent pane | `logo` | vendor glyph from the Herdr agent id (claude, codex, omp, pi, grok, ...), in the Private Use Area of *Herdr Agent Icons Max*. Unset for unknown agents. |
-| any agent pane | `mark` | braille spinner frame while `working`, `✓` after work finishes (held until the pane is focused), `?` while `blocked` (held until it works again) |
-| lane pane (`kind=lane`, `lane`, `run_id` tokens) | `stage`, `round`, `verdict` | `lane_state.stage`, `r<N>` = number of `TEST_REVIEW` + `CODE_REVIEW` artifacts for the lane in that run, `verdict` of the newest one |
-| lane Space (workspace tokens `lane`, `run_id`) | `stage`, `round`, `verdict` | same values. Older runs keep lane tabs in one shared Space, so no Space gets these tokens. |
+| Target | Tokens |
+|---|---|
+| agent pane | `logo` (glyph from Herdr Agent Icons Max, chosen by agent id), `mark` (braille spinner while working; `✓` held until the pane is focused; `?` held until work resumes), `name`, `title` |
+| lane pane | `logo`, `mark`, `name`, plus `stage`, `round`, `verdict` |
+| lane Space | `stage`, `round`, `verdict` |
 
-Maestro's own tokens (`kind, lane, role, run_id, parent, repo, scratch`) and pane labels are
-read, never written. Tokens carry a 180 s TTL and are refreshed every 60 s, so they disappear
-on their own if the daemon dies. `stop` clears them straight away.
+Tokens that other tools write are only read, never written. Tokens expire after 180 s and the daemon
+re-sends them every 60 s, so they disappear on their own if the daemon dies. `stop` clears them
+straight away.
 
-The ledger is found at `~/.local/state/maestro-artifact-factory/*/lifecycle.sqlite3`, or at
-the colon-separated paths in `MAESTRO_LANES_LEDGERS`. Each poll (every 2 s) opens the file
-with `SQLITE_OPEN_READONLY` and busy timeout 0, runs one SELECT and closes it. If the database
-is busy, that tick is skipped. From a review payload the query reads only the typed `verdict`
-field, through `json_extract`.
+## Adapters
 
-Other files it changes, each backed up once to `<file>.bak-maestro-lanes` before the first
-edit:
+The daemon itself knows nothing about any particular lane factory. `lib/adapters/maestro.js` holds
+everything specific to Maestro: how lane panes and Spaces are recognised from their tokens, where the
+ledger lives, how rounds and verdicts are read, and the stage and role colour rules. The interface is
+documented at the top of that file.
 
-- `~/.config/herdr/config.toml`: `configure` swaps the `[ui.sidebar.agents]` and
-  `[ui.sidebar.spaces]` tables for one block between `# >>> maestro-lanes sidebar` and
-  `# <<< maestro-lanes sidebar`. The old tables are saved in the plugin state directory, and
-  `unconfigure` puts them back. If `herdr config check` fails, the original file is restored.
-- `~/.config/ghostty/config`: `install-font` adds a `font-codepoint-map` block fenced by
-  `# >>> maestro-lanes font`.
-- `~/Library/Fonts/HerdrAgentIconsMax-Regular.ttf`.
+The Maestro adapter opens each ledger read-only with busy timeout 0 and runs one SELECT per 2 s poll.
+If the ledger is busy, that tick is skipped. From review payloads it reads only the typed `verdict`
+field.
+
+## Files it changes
+
+Each change is backed up once, to `<file>.bak-herdr-lanes`, before the first edit. Each change is
+recorded in the plugin state directory.
+
+- `~/.config/herdr/config.toml`: `configure` removes the hand-written `[ui.sidebar.agents]` and
+  `[ui.sidebar.spaces]` tables and puts one block in their place, between `# >>> herdr-lanes sidebar`
+  and `# <<< herdr-lanes sidebar`. The removed tables are saved in the state directory only after
+  `herdr config check` passes. If the check fails, the original file is written back.
+  `unconfigure` restores the saved tables.
+- The icon font goes to `~/Library/Fonts/HerdrAgentIconsMax-Regular.ttf`.
+- The terminal that hosts the Herdr client is detected from the process tree. You can override this
+  with `HERDR_LANES_TERMINAL=wezterm` or `ghostty`.
+  - **WezTerm:** `config.font = wezterm.font("X")` becomes
+    `wezterm.font_with_fallback({ "Herdr Agent Icons Max", "X" })`, marked with a
+    `-- herdr-lanes:` comment. Any other form of that line is refused, and the line to add is printed.
+  - **Ghostty:** a fenced `font-codepoint-map` block is added.
+- `uninstall-font` reverses only what it recorded: the original WezTerm line is restored exactly, and
+  the font file is removed only if its sha256 still matches the copy it installed.
 
 ## Install
 
 ```sh
 herdr plugin link /path/to/.claude/skills/sssf/apps/herdr-lanes
-herdr plugin action invoke maestro-lanes.install-font   # then reopen Ghostty
-herdr plugin action invoke maestro-lanes.configure      # writes the block and reloads config
-herdr plugin action invoke maestro-lanes.start          # startup hooks do not run on link
+herdr plugin action invoke herdr-lanes.configure      # sidebar block + reload
+herdr plugin action invoke herdr-lanes.install-font   # then restart the terminal
+herdr plugin action invoke herdr-lanes.start          # startup hooks do not run on link
 ```
 
-After this, Herdr's startup hook starts the daemon on every server start. A
-`pane.agent_detected` hook restarts it if it has died. Commands go through `bin/run.sh`,
-which finds a `node` that has `node:sqlite` (Node 22.5 or newer). This is needed because
-Herdr's launchd server may not have `node` on its `PATH`. To choose a specific binary, set
-`MAESTRO_LANES_NODE`. The plugin has no npm dependencies.
+After this, Herdr's startup hook starts the daemon whenever the server starts. A
+`pane.agent_detected` hook restarts it if it has died. The daemon holds an exclusive lock
+(`daemon.lock`). A lock is trusted only if its pid is alive and that process's command line is this
+daemon; any other lock is treated as stale and its pid is never signalled. `bin/run.sh` finds a
+`node` that has `node:sqlite`, because Herdr's launchd server may not have `node` on its PATH. Set
+`HERDR_LANES_NODE` to choose a binary.
 
-The daemon log is `~/.local/state/herdr/plugins/maestro-lanes/daemon.log`.
+The plugin was first published as `maestro-lanes`. `configure` and `start` migrate from that name
+once: they stop the old daemon, clear tokens written under source `maestro-lanes`, replace the old
+fenced blocks, and carry over the saved tables and backups.
+
+Tests: `node --test tests/lanes.test.js`
 
 ## Uninstall
 
 ```sh
-herdr plugin action invoke maestro-lanes.stop            # stop and clear own tokens
-herdr plugin action invoke maestro-lanes.unconfigure     # restore previous sidebar tables
-herdr plugin action invoke maestro-lanes.uninstall-font  # remove font + Ghostty block
-herdr plugin unlink maestro-lanes
+herdr plugin action invoke herdr-lanes.stop
+herdr plugin action invoke herdr-lanes.unconfigure
+herdr plugin action invoke herdr-lanes.uninstall-font
+herdr plugin unlink herdr-lanes
 ```
 
 ## Limits
 
-- Herdr 0.9.0 only lets a client subscribe to `pane.agent_status_changed` for a given
-  `pane_id`, so status changes are picked up by the 2 s poll. Pane, Space and focus events
-  still wake the daemon immediately.
-- Each pane accepts sequenced token reports from at most 32 sources in its lifetime. This
-  plugin uses one.
+- Herdr 0.9.0 only lets a subscription to `pane.agent_status_changed` name a single pane, so status
+  changes are picked up by the 2 s poll. Pane, Space and focus events wake the daemon immediately.
+- WezTerm takes cell metrics from the first font in a fallback list. If cells look different after
+  the change, list your own font first.
 
 ## Attribution
 
-The icon font (`fonts/HerdrAgentIconsMax-Regular.ttf`), its codepoint map, and the socket,
-subscription and font-install approach come from
-[herdr-radar](https://github.com/hhdebb/herdr-radar) (MIT), which forks
-qintmb/herdr-icon-agent-ui. See `LICENSE-herdr-radar` and `THIRD_PARTY_NOTICES.md`. The vendor
-marks identify third-party products and do not imply affiliation.
+See `THIRD_PARTY_NOTICES.md`, `LICENSE-herdr-radar` (MIT) and `LICENSE-Apache-2.0.txt`.

@@ -1,31 +1,27 @@
 'use strict';
 
 // The resident daemon. Wakes on Herdr events (debounced) and on a slow poll,
-// takes a fresh snapshot of panes, workspaces and the ledger, and writes only
-// the tokens whose value changed. A spinner timer runs only while some pane
-// is working, and rewrites only `mark`.
+// takes a fresh snapshot of panes, workspaces and the lane adapter, and writes
+// only the tokens whose value changed. A spinner timer runs only while some
+// pane is working. A target with a report in flight is skipped until it lands,
+// so a stalled server never builds a queue.
 
 const herdr = require('./herdr');
-const ledger = require('./ledger');
 
 const POLL_MS = 2000;
 const FRAME_MS = 200;
 const TTL_MS = 180000; // tokens self-expire if the daemon dies
 const REFRESH_MS = 60000; // re-send live tokens well inside the TTL
+const TITLE_MAX = 40;
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-// Herdr agent id -> Private Use Area codepoint in Herdr Agent Icons Max
-// (codepoint map from herdr-radar tools/codepoints.toml).
-const LOGO = {
-  claude: 0xe1a0, codex: 0xe1a1, opencode: 0xe1a2, omp: 0xe1a3, cline: 0xe1a4, mastracode: 0xe1a5,
-  kimi: 0xe1a6, kilo: 0xe1a7, maki: 0xe1a8, pi: 0xe1a9, hermes: 0xe1aa, cursor: 0xe1ab, copilot: 0xe1ac,
-  deepseek: 0xe1ad, gemini: 0xe1ae, gpt: 0xe1af, qwen: 0xe1b0, grok: 0xe1b1, agy: 0xe1b2, kiro: 0xe1b3,
-  amp: 0xe1b4, devin: 0xe1b5, qodercli: 0xe1b6,
-};
+// Herdr agent id -> Private Use Area glyph in Herdr Agent Icons Max, U+E1A0 upward
+// (codepoint order from herdr-radar tools/codepoints.toml).
+const LOGO_ORDER = ('claude codex opencode omp cline mastracode kimi kilo maki pi hermes cursor copilot deepseek '
+  + 'gemini gpt qwen grok agy kiro amp devin qodercli').split(' ');
+const logoFor = (agent) => (LOGO_ORDER.includes(agent) ? String.fromCodePoint(0xe1a0 + LOGO_ORDER.indexOf(agent)) : null);
 
-function logoFor(agent) {
-  return agent && LOGO[agent] ? String.fromCodePoint(LOGO[agent]) : null;
-}
+const truncate = (text, max) => (!text ? null : [...text].length > max ? `${[...text].slice(0, max - 1).join('')}…` : text);
 
 // Held activity mark: working spins; done is held until the pane is focused;
 // blocked is held until the agent works again.
@@ -38,20 +34,12 @@ function nextMark(prev, status, focused) {
   return prev ?? null;
 }
 
-function markText(mark, frame) {
-  if (mark === 'working') return SPINNER[frame % SPINNER.length];
-  if (mark === 'done') return '✓';
-  if (mark === 'blocked') return '?';
-  return null;
-}
+const markText = (mark, frame) => (mark === 'working' ? SPINNER[frame % SPINNER.length] : { done: '✓', blocked: '?' }[mark] ?? null);
 
-function laneOf(tokens) {
-  return tokens?.lane && tokens?.run_id ? { lane: tokens.lane, run: tokens.run_id } : null;
-}
-
-function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} ${m}\n`) } = {}) {
+function start({ adapter, ownsLock = () => true, log = (m) => process.stderr.write(`${new Date().toISOString()} ${m}\n`) }) {
   const marks = new Map(); // pane_id -> held mark
   const written = { pane: new Map(), workspace: new Map() }; // id -> {token: value}
+  const inflight = new Set(); // "kind:id"
   let lanes = new Map();
   let frame = 0;
   let lastRefresh = Date.now();
@@ -63,13 +51,18 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
 
   // Send the diff between what is on screen and `desired`; refresh re-sends live values.
   async function apply(kind, id, desired, refresh) {
+    const slot = `${kind}:${id}`;
+    if (inflight.has(slot) || stopping) return;
     const prev = written[kind].get(id) ?? {};
     const patch = {};
     for (const [name, value] of Object.entries(desired)) {
       if ((prev[name] ?? null) !== value || (refresh && value !== null)) patch[name] = value;
     }
     if (Object.keys(patch).length === 0) return;
-    if (await herdr.report(kind, id, patch, TTL_MS)) written[kind].set(id, { ...prev, ...patch });
+    inflight.add(slot);
+    const ok = await herdr.report(kind, id, patch, { ttlMs: TTL_MS }).catch(() => false);
+    inflight.delete(slot);
+    if (ok) written[kind].set(id, { ...(written[kind].get(id) ?? {}), ...patch });
   }
 
   async function snapshot() {
@@ -78,24 +71,29 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
       herdr.list('workspace.list', 'workspaces'),
     ]);
     if (!panes || !workspaces) return; // failed read says nothing; try next tick
-    const runIds = new Set();
-    for (const p of panes) if (laneOf(p.tokens)) runIds.add(p.tokens.run_id);
-    for (const w of workspaces) if (laneOf(w.tokens)) runIds.add(w.tokens.run_id);
-    const fresh = ledger.readLanes([...runIds]);
-    if (fresh) lanes = fresh; // busy ledger: keep last values
+    const labels = new Map(workspaces.map((w) => [w.workspace_id, w.label]));
+    const keys = new Set();
+    for (const p of panes) { const r = adapter.paneLane(p.tokens); if (r) keys.add(r.key); }
+    for (const w of workspaces) { const r = adapter.spaceLane(w.tokens); if (r) keys.add(r.key); }
+    const fresh = adapter.readLanes([...keys]);
+    if (fresh) lanes = fresh; // busy source: keep last values
     const refresh = Date.now() - lastRefresh > REFRESH_MS;
     if (refresh) lastRefresh = Date.now();
 
-    const livePanes = new Set();
     const jobs = [];
+    const livePanes = new Set();
     for (const p of panes) {
       livePanes.add(p.pane_id);
+      const ref = adapter.paneLane(p.tokens);
+      if (!p.agent && !ref && !written.pane.has(p.pane_id)) continue;
       const mark = nextMark(marks.get(p.pane_id), p.agent ? p.agent_status : null, p.focused);
       marks.set(p.pane_id, mark);
-      const lane = laneOf(p.tokens) && p.tokens.kind === 'lane' ? lanes.get(`${p.tokens.run_id}/${p.tokens.lane}`) : null;
+      const lane = ref ? lanes.get(ref.key) : null;
       jobs.push(apply('pane', p.pane_id, {
         logo: logoFor(p.agent),
         mark: markText(mark, frame),
+        name: ref ? ref.name : (p.agent ? (labels.get(p.workspace_id) ?? null) : null),
+        title: ref || !p.agent ? null : truncate(p.terminal_title_stripped, TITLE_MAX),
         stage: lane?.stage ?? null,
         round: lane?.round ?? null,
         verdict: lane?.verdict ?? null,
@@ -108,13 +106,11 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
     const liveSpaces = new Set();
     for (const w of workspaces) {
       liveSpaces.add(w.workspace_id);
-      const ref = laneOf(w.tokens);
-      const lane = ref ? lanes.get(`${ref.run}/${ref.lane}`) : null;
+      const ref = adapter.spaceLane(w.tokens);
+      const lane = ref ? lanes.get(ref.key) : null;
       if (!lane && !written.workspace.has(w.workspace_id)) continue;
       jobs.push(apply('workspace', w.workspace_id, {
-        stage: lane?.stage ?? null,
-        round: lane?.round ?? null,
-        verdict: lane?.verdict ?? null,
+        stage: lane?.stage ?? null, round: lane?.round ?? null, verdict: lane?.verdict ?? null,
       }, refresh));
     }
     for (const id of [...written.workspace.keys()]) if (!liveSpaces.has(id)) written.workspace.delete(id);
@@ -124,31 +120,22 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
 
   async function tick() {
     if (stopping) return;
+    if (!ownsLock()) { log('lock held by another daemon; exiting without clearing'); process.exit(0); }
     if (busy) { again = true; return; }
     busy = true;
-    try {
-      await snapshot();
-    } catch (error) {
-      log(`tick: ${error?.stack ?? error}`);
-    } finally {
-      busy = false;
-      if (again) { again = false; wake(); }
-    }
+    try { await snapshot(); } catch (error) { log(`tick: ${error?.stack ?? error}`); }
+    busy = false;
+    if (again) { again = false; wake(); }
   }
 
-  function wake() {
-    clearTimeout(wakeTimer);
-    wakeTimer = setTimeout(tick, 50);
-  }
+  const wake = () => { clearTimeout(wakeTimer); wakeTimer = setTimeout(tick, 50); };
 
   function scheduleFrames() {
     const spinning = [...marks.values()].includes('working');
     if (spinning && !frameTimer) {
       frameTimer = setInterval(() => {
         frame += 1;
-        for (const [id, mark] of marks) {
-          if (mark === 'working') apply('pane', id, { mark: markText(mark, frame) }, false);
-        }
+        for (const [id, mark] of marks) if (mark === 'working') apply('pane', id, { mark: markText(mark, frame) }, false);
       }, FRAME_MS);
     } else if (!spinning && frameTimer) {
       clearInterval(frameTimer);
@@ -156,7 +143,7 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
     }
   }
 
-  // Clear every token this daemon wrote, then exit.
+  // Clear every token name this daemon may have written on every target it touched, then exit.
   async function stop(code = 0) {
     if (stopping) return;
     stopping = true;
@@ -164,13 +151,13 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
     clearInterval(poll);
     clearInterval(frameTimer);
     clearTimeout(wakeTimer);
-    const jobs = [];
-    for (const kind of ['pane', 'workspace']) {
-      for (const [id, tokens] of written[kind]) {
-        const patch = Object.fromEntries(Object.keys(tokens).map((name) => [name, null]));
-        if (Object.keys(patch).length) jobs.push(herdr.report(kind, id, patch));
-      }
-    }
+    const targets = { pane: new Set(written.pane.keys()), workspace: new Set(written.workspace.keys()) };
+    for (const slot of inflight) { const [kind, ...rest] = slot.split(':'); targets[kind].add(rest.join(':')); }
+    const clear = (names) => Object.fromEntries(names.map((n) => [n, null]));
+    const jobs = [
+      ...[...targets.pane].map((id) => herdr.report('pane', id, clear(herdr.PANE_TOKENS))),
+      ...[...targets.workspace].map((id) => herdr.report('workspace', id, clear(herdr.WORKSPACE_TOKENS))),
+    ];
     await Promise.all(jobs);
     log(`stopped; cleared tokens on ${jobs.length} targets`);
     process.exit(code);
@@ -187,7 +174,7 @@ function start({ log = (m) => process.stderr.write(`${new Date().toISOString()} 
   const poll = setInterval(tick, POLL_MS);
   process.on('SIGTERM', () => stop(0));
   process.on('SIGINT', () => stop(0));
-  log(`started pid ${process.pid}; ledgers: ${ledger.ledgerPaths().join(', ') || 'none'}`);
+  log(`started pid ${process.pid}; ${adapter.describe()}`);
   wake();
 }
 

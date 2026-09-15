@@ -1,64 +1,46 @@
 'use strict';
 
-// Herdr socket API: one request per connection, plus one long-lived event
-// subscription used only as a wake hint.
-// Adapted from herdr-radar lib/ipc.js and lib/subscribe.js (MIT, see LICENSE-herdr-radar).
+// Herdr socket API: one request per connection, plus one long-lived event subscription
+// used only as a wake hint. Adapted from herdr-radar lib/ipc.js + lib/subscribe.js (MIT).
 
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
-const SOURCE = 'maestro-lanes';
+const SOURCE = 'lanes';
 // Every token name this plugin writes. Nothing else is ever set or cleared.
-const PANE_TOKENS = ['logo', 'mark', 'stage', 'round', 'verdict'];
+const PANE_TOKENS = ['logo', 'mark', 'name', 'title', 'stage', 'round', 'verdict'];
 const WORKSPACE_TOKENS = ['stage', 'round', 'verdict'];
-const MAX_IN_FLIGHT = 8;
+// Herdr 0.9.0 requires a pane_id on pane.agent_status_changed; status flips come from the poll.
+const EVENT_KINDS = ['pane.created', 'pane.closed', 'pane.exited', 'pane.agent_detected', 'pane.focused',
+  'workspace.created', 'workspace.closed', 'workspace.focused'];
 
-function configDir() {
-  return path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'herdr');
-}
-
-function socketPath() {
-  return process.env.HERDR_SOCKET_PATH ?? path.join(configDir(), 'herdr.sock');
-}
-
-function rawCall(method, params, timeoutMs) {
-  return new Promise((resolve) => {
-    let body = '';
-    let settled = false;
-    const stream = net.connect({ path: socketPath() });
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      stream.destroy();
-      resolve(value);
-    };
-    stream.setTimeout(timeoutMs, () => finish(null));
-    stream.on('error', () => finish(null));
-    stream.on('connect', () => stream.write(`${JSON.stringify({ id: SOURCE, method, params })}\n`));
-    stream.on('data', (chunk) => {
-      body += chunk;
-      const nl = body.indexOf('\n');
-      if (nl < 0) return;
-      try {
-        finish(JSON.parse(body.slice(0, nl)));
-      } catch {
-        finish(null);
-      }
-    });
-  });
-}
+const configDir = () => path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'herdr');
+const socketPath = () => process.env.HERDR_SOCKET_PATH ?? path.join(configDir(), 'herdr.sock');
 
 let inFlight = 0;
 const waiters = [];
 
-// Parsed reply (which may carry `error`), or null on transport failure.
+// Parsed reply (which may carry `error`), or null on transport failure. At most 8 in flight.
 async function call(method, params, timeoutMs = 4000) {
-  if (inFlight >= MAX_IN_FLIGHT) await new Promise((wake) => waiters.push(wake));
+  if (inFlight >= 8) await new Promise((wake) => waiters.push(wake));
   inFlight += 1;
   try {
-    return await rawCall(method, params, timeoutMs);
+    return await new Promise((resolve) => {
+      let body = '';
+      const stream = net.connect({ path: socketPath() });
+      const finish = (value) => { stream.destroy(); resolve(value); };
+      stream.setTimeout(timeoutMs, () => finish(null));
+      stream.on('error', () => finish(null));
+      stream.on('connect', () => stream.write(`${JSON.stringify({ id: SOURCE, method, params })}\n`));
+      stream.on('data', (chunk) => {
+        body += chunk;
+        const nl = body.indexOf('\n');
+        if (nl < 0) return;
+        try { finish(JSON.parse(body.slice(0, nl))); } catch { finish(null); }
+      });
+    });
   } finally {
     inFlight -= 1;
     waiters.shift()?.();
@@ -68,37 +50,24 @@ async function call(method, params, timeoutMs = 4000) {
 // null on failure, never []: an empty list would read as "every pane is gone".
 async function list(method, key) {
   const reply = await call(method, {});
-  if (!reply || reply.error) return null;
-  return reply.result?.[key] ?? null;
+  return !reply || reply.error ? null : (reply.result?.[key] ?? null);
 }
 
-// tokens: name -> string | null (null clears). Refuses names this plugin does not own.
-async function report(kind, id, tokens, ttlMs) {
-  const owned = kind === 'pane' ? PANE_TOKENS : WORKSPACE_TOKENS;
-  for (const name of Object.keys(tokens)) {
-    if (!owned.includes(name)) throw new Error(`refusing to write foreign token ${name}`);
-  }
-  const target = kind === 'pane' ? { pane_id: id } : { workspace_id: id };
-  const params = { ...target, source: SOURCE, tokens };
+// Monotonic across restarts (microsecond clock floor): a newer process is never "stale".
+let lastSeq = 0;
+const nextSeq = () => (lastSeq = Math.max(lastSeq + 1, Date.now() * 1000));
+
+// tokens: name -> string | null (null clears). Refuses names outside `owned`.
+async function report(kind, id, tokens, { ttlMs, source = SOURCE, owned } = {}) {
+  const allowed = owned ?? (kind === 'pane' ? PANE_TOKENS : WORKSPACE_TOKENS);
+  for (const name of Object.keys(tokens)) if (!allowed.includes(name)) throw new Error(`refusing foreign token ${name}`);
+  const params = { [kind === 'pane' ? 'pane_id' : 'workspace_id']: id, source, tokens, seq: nextSeq() };
   if (ttlMs) params.ttl_ms = ttlMs;
   const reply = await call(`${kind}.report_metadata`, params);
   return Boolean(reply) && !reply.error;
 }
 
-// Herdr 0.9.0 requires a pane_id on pane.agent_status_changed, so status flips
-// are picked up by the daemon's poll rather than subscribed to.
-const EVENT_KINDS = [
-  'pane.created',
-  'pane.closed',
-  'pane.exited',
-  'pane.agent_detected',
-  'pane.focused',
-  'workspace.created',
-  'workspace.closed',
-  'workspace.focused',
-];
-
-// onWake(reconnected) on every event line; onGone() when the server socket vanished.
+// onWake(reconnected) per event batch; onGone() when the server socket vanished.
 // Write-silent after the subscribe request: the server treats client bytes as a disconnect.
 function subscribe(onWake, onGone) {
   let stopped = false;
@@ -106,8 +75,7 @@ function subscribe(onWake, onGone) {
   let current = null;
   const connect = () => {
     if (stopped) return;
-    const stream = net.connect({ path: socketPath() });
-    current = stream;
+    const stream = (current = net.connect({ path: socketPath() }));
     let body = '';
     let acked = false;
     let ended = false;
@@ -120,28 +88,20 @@ function subscribe(onWake, onGone) {
       attempts += 1;
       setTimeout(connect, Math.min(30000, 500 * 2 ** Math.min(attempts, 6)));
     };
-    stream.on('connect', () => {
-      const subscriptions = EVENT_KINDS.map((type) => ({ type }));
-      stream.write(`${JSON.stringify({ id: `${SOURCE}-sub`, method: 'events.subscribe', params: { subscriptions } })}\n`);
-    });
+    stream.on('connect', () => stream.write(`${JSON.stringify({ id: `${SOURCE}-sub`, method: 'events.subscribe',
+      params: { subscriptions: EVENT_KINDS.map((type) => ({ type })) } })}\n`));
     stream.on('data', (chunk) => {
       body += chunk;
-      let woke = false;
-      let reconnected = false;
-      let nl;
-      while ((nl = body.indexOf('\n')) >= 0) {
-        const line = body.slice(0, nl);
-        body = body.slice(nl + 1);
-        if (!acked) {
-          const refused = line.includes('"error"');
-          if (refused) process.stderr.write(`events.subscribe refused: ${line}\n`);
-          else attempts = 0; // a refusal keeps backing off
-          acked = true;
-          reconnected = true;
-        }
-        woke = true;
+      const lines = body.split('\n');
+      body = lines.pop();
+      if (lines.length === 0 || stopped) return;
+      const reconnected = !acked;
+      if (!acked) {
+        acked = true;
+        if (lines[0].includes('"error"')) process.stderr.write(`events.subscribe refused: ${lines[0]}\n`);
+        else attempts = 0; // a refusal keeps backing off
       }
-      if (woke && !stopped) onWake(reconnected);
+      onWake(reconnected);
     });
     stream.on('error', retry);
     stream.on('close', retry);
