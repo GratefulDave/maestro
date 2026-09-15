@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **A ledger migration keeps other tables' references on the table it rebuilds.**
+  The v2->v3 migration renamed `run_artifacts` aside, created the widened table,
+  copied the rows and dropped the backup. SQLite's rename also rewrote
+  `plan_revisions REFERENCES run_artifacts` onto the backup name, so every
+  ledger with an applied amendment was left with dangling references and refused
+  `ARTIFACT_STORE:foreign_key_check`: FDAdb run `be064e58` could not open on the
+  current runtime (31 rows), and the migration rolled back cleanly. The rename
+  now runs with `legacy_alter_table=ON` and foreign-key enforcement off, set
+  before the transaction because that pragma is ignored inside one;
+  `foreign_key_check` still gates the commit. The existing v1 migration test
+  never carried an amendment, so it could not see this.
+
 ### Added
 - **`run attend` authors the amendment a `NO_PROGRESS` park needs.** FDAdb run
   `d246ae95` parked `lane-faq-producer` twice. Both times a human read the gate

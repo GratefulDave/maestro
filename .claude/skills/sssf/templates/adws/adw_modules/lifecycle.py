@@ -397,11 +397,27 @@ class ArtifactStore:
         if extra_indexes:
             self._refuse_schema()
 
+    def _rename_for_rebuild(self, table: str, backup: str) -> None:
+        """Rename a table aside without dragging other tables' references along.
+
+        SQLite's default RENAME also rewrites every foreign key that names the
+        table, so `plan_revisions REFERENCES run_artifacts` came to name the
+        backup, which the rebuild then drops: FDAdb run `be064e58` refused its
+        v2->v3 migration with 31 dangling `foreign_key_check` rows. Legacy
+        rename leaves those references on the original name, which the rebuilt
+        table takes back -- but only while foreign-key enforcement is off, and
+        that pragma is a no-op inside a transaction, so the caller turns it off
+        before `_begin` (`_begin_migration`).
+        """
+        self.conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            self.conn.execute(f"ALTER TABLE {table} RENAME TO {backup}")
+        finally:
+            self.conn.execute("PRAGMA legacy_alter_table=OFF")
+
     def _rebuild_lane_artifacts_current_check(self) -> None:
         cols = ", ".join(LANE_ARTIFACT_COLUMNS)
-        self.conn.execute(
-            f"ALTER TABLE lane_artifacts RENAME TO {_LANE_ARTIFACTS_V1_BACKUP}"
-        )
+        self._rename_for_rebuild("lane_artifacts", _LANE_ARTIFACTS_V1_BACKUP)
         self.conn.execute(LANE_ARTIFACTS_SQL)
         self.conn.execute(
             f"INSERT INTO lane_artifacts ({cols}) "
@@ -431,9 +447,30 @@ class ArtifactStore:
         if version is None or version[0] != expected:
             raise ArtifactStoreError("schema_version")
 
+    def _begin_migration(self) -> None:
+        """Begin a table-rebuild transaction with foreign-key enforcement off.
+
+        Enforcement must be off for `_rename_for_rebuild` to leave other
+        tables' references alone, and `PRAGMA foreign_keys` is silently ignored
+        once a transaction is open. `_require_post_migration_integrity` still
+        runs `foreign_key_check`, which reports violations either way.
+        """
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._begin()
+        except BaseException:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            raise
+
+    def _end_migration(self) -> None:
+        try:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error:
+            pass
+
     def _migrate_v1_to_v2(self) -> None:
         self._require_supported_v1_lane_artifacts()
-        self._begin()
+        self._begin_migration()
         try:
             self._rebuild_lane_artifacts_current_check()
             cursor = self.conn.execute(
@@ -444,6 +481,7 @@ class ArtifactStore:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
             self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V2)
             self.conn.execute("COMMIT")
+            self._end_migration()
         except Exception:
             try:
                 self.conn.execute("ROLLBACK")
@@ -494,9 +532,7 @@ class ArtifactStore:
 
     def _rebuild_run_artifacts_current_check(self) -> None:
         cols = ", ".join(RUN_ARTIFACT_COLUMNS)
-        self.conn.execute(
-            f"ALTER TABLE run_artifacts RENAME TO {_RUN_ARTIFACTS_V2_BACKUP}"
-        )
+        self._rename_for_rebuild("run_artifacts", _RUN_ARTIFACTS_V2_BACKUP)
         self.conn.execute(RUN_ARTIFACTS_SQL)
         self.conn.execute(
             f"INSERT INTO run_artifacts ({cols}) "
@@ -515,7 +551,7 @@ class ArtifactStore:
         """
         rebuild = self._run_artifacts_need_rebuild()
         self._require_supported_v2_run_artifacts()
-        self._begin()
+        self._begin_migration()
         try:
             if rebuild:
                 self._rebuild_run_artifacts_current_check()
@@ -527,6 +563,7 @@ class ArtifactStore:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
             self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION)
             self.conn.execute("COMMIT")
+            self._end_migration()
         except Exception:
             try:
                 self.conn.execute("ROLLBACK")
