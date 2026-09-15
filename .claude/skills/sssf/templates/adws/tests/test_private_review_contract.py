@@ -728,7 +728,7 @@ def test_producer_artifact_pin():
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.REVISE,
             findings=(_finding(),),
-            scratch_root=self.root / "scratch-1",
+            scratch_root=self.state / "scratch-1",
             architecture_constraints=CONSTRAINTS,
         )
         self.assertIs(revise.kind, st.ArtifactKind.CODE_REVIEW)
@@ -766,7 +766,7 @@ def test_producer_artifact_pin():
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-pass-red",
+            scratch_root=self.state / "scratch-pass-red",
             architecture_constraints=CONSTRAINTS,
         )
         self.assertIs(demoted.verdict, st.ReviewerVerdict.REVISE)
@@ -792,7 +792,7 @@ def test_producer_artifact_pin():
             builder_base_sha=bad_sha,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-2",
+            scratch_root=self.state / "scratch-2",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -800,7 +800,7 @@ def test_producer_artifact_pin():
         self.assertGreater(accepted.payload["public_result_summary"]["passed"], 0)
         self.assertEqual(accepted.payload["public_result_summary"]["failed"], 0)
         self.assertNotEqual(revise.input_digest, accepted.input_digest)
-        self.assertFalse((self.root / "scratch-2" / ".git").exists())
+        self.assertFalse((self.state / "scratch-2" / ".git").exists())
 
 
     def test_a_reviewer_revise_stands_over_a_green_suite(self):
@@ -850,7 +850,7 @@ def test_producer_artifact_pin():
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.REVISE,
             findings=(located,),
-            scratch_root=self.root / "scratch-revise-stands",
+            scratch_root=self.state / "scratch-revise-stands",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -908,7 +908,7 @@ def test_producer_artifact_pin():
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.REVISE,
             findings=(located,),
-            scratch_root=self.root / "scratch-red-keeps",
+            scratch_root=self.state / "scratch-red-keeps",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -946,7 +946,7 @@ def test_producer_artifact_pin():
         base = _git(self.repo, "rev-parse", "HEAD")
         bad_sha, bad_ref = self._candidate(PRODUCT)
         review_digest = _digest("collide-code-review")
-        scratch = self.root / "scratch-collide"
+        scratch = self.state / "scratch-collide"
         with mock.patch.object(tc, "run_private_suite") as runner:
             with self.assertRaises(pr.PrivatePathCollisionError) as ctx:
                 cr.review_builder_output(
@@ -993,7 +993,7 @@ def test_producer_artifact_pin():
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / scratch_name,
+            scratch_root=self.state / scratch_name,
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -1113,7 +1113,7 @@ def test_producer_artifact_pin():
         base = _git(self.repo, "rev-parse", "HEAD")
         good_sha, good_ref = self._candidate(FIXED)
         review_digest = _digest("absent-path-code-review")
-        scratch = self.root / "scratch-absent"
+        scratch = self.state / "scratch-absent"
         accepted = cr.review_builder_output(
             request=_request(
                 run_id=self.run_id,
@@ -1462,7 +1462,7 @@ def test_producer_artifact_pin():
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-vitest",
+            scratch_root=self.state / "scratch-vitest",
             architecture_constraints=CONSTRAINTS,
             gate=gate,
             provision_argv=self._provision_fake_vitest(binary),
@@ -1488,7 +1488,7 @@ def test_producer_artifact_pin():
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-vitest-red",
+            scratch_root=self.state / "scratch-vitest-red",
             architecture_constraints=CONSTRAINTS,
             gate=gate,
             provision_argv=self._provision_fake_vitest(binary),

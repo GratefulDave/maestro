@@ -1644,7 +1644,19 @@ class HerdrStageActor:
             raise FactoryRefused("missing TEST_DRAFT")
         vault = hv.ensure_vault(self.state_root, ctx.run_id)
         hv.refresh_materialized_commit(
-            vault, hv.rev_parse(vault, draft.artifact_ref), cwd
+            vault,
+            hv.rev_parse(vault, draft.artifact_ref),
+            cwd,
+            state_root=self.state_root,
+            forbidden=self._materialization_forbidden(),
+        )
+
+    def _materialization_forbidden(self) -> tuple[Path, ...]:
+        """The target checkout and its git dirs, never a materialization site."""
+        return (
+            Path(self.target.target_repository_root),
+            Path(self.target.target_git_common_dir),
+            Path(self.target.target_worktree_git_dir),
         )
 
     @staticmethod
@@ -2123,7 +2135,13 @@ class HerdrStageActor:
             vault = hv.ensure_vault(self.state_root, ctx.run_id)
             if precreated:
                 _clear_precreated_role_cwd(cwd)
-            hv.materialize_commit(vault, hv.rev_parse(vault, draft.artifact_ref), cwd)
+            hv.materialize_commit(
+                vault,
+                hv.rev_parse(vault, draft.artifact_ref),
+                cwd,
+                state_root=self.state_root,
+                forbidden=self._materialization_forbidden(),
+            )
             lch.scratch_environment(cwd)
             return attempt, None
         if not sha:

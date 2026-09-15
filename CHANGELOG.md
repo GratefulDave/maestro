@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Contract change: a materialized tree is a git repository.** The
+  test-reviewer's private tree and every review / integration-gate tree came
+  from `git archive`, and `_extract_commit` refused a tree carrying `.git`, so
+  any repository test that runs git failed with "not a git repository". FDAdb
+  run `be064e58` `lane-wp3-reader-tests` parked `NO_PROGRESS` after four
+  rounds on `deploy/tests/runtime-wiring.test.mjs`, which runs `git grep`. The
+  tree now holds one commit of exactly the extracted files, with no remote, no
+  history and no ref but `refs/heads/materialized`. The archive is still
+  refused if it carries `.git`, before the init. Git runs in the tree with
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CEILING_DIRECTORIES` bound to it, inherited
+  `GIT_*` dropped and global/system config off, so a caller's `GIT_DIR`, hooks,
+  excludes or signing config cannot reach another repository or drop a file.
+  `materialize_commit` and `refresh_materialized_commit` now require
+  `state_root` and refuse `MATERIALIZED_TREE_UNCONTAINED` before clearing or
+  writing anything when the destination is not strictly inside it or overlaps
+  the target checkout, its git dirs, the source repository or the runtime's
+  own checkout. The test asserting the reviewer's tree has no `.git` now
+  asserts it is a one-commit, one-ref directory repository.
 - **Contract change: the runtime-state fingerprint no longer binds the device
   number.** It is SHA-256 over the root's absolute path and inode. macOS
   assigns a volume's `st_dev` at mount, so after a reboot (16777230 ->

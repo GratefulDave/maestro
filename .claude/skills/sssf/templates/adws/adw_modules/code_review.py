@@ -81,7 +81,12 @@ def run_integration_gate(
         lane_id, input_digest[:12]
     )
     _review_tree(
-        integration_repo, integration_sha, dest, provision_argv, provision_timeout_s
+        integration_repo,
+        integration_sha,
+        dest,
+        provision_argv,
+        provision_timeout_s,
+        state_root=state_root,
     )
     hv.copy_blobs_to_tree(vault, dest, files)
     run = tc.run_private_suite(dest, tuple(files), gate=gate)
@@ -188,12 +193,14 @@ def _review_tree(
     dest: Path,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
+    *,
+    state_root: Path,
 ) -> Path:
     dest = Path(dest)
     if dest.exists() and dest.is_dir() and any(dest.iterdir()):
-        tree = hv.refresh_materialized_commit(repo, sha, dest)
+        tree = hv.refresh_materialized_commit(repo, sha, dest, state_root=state_root)
     else:
-        tree = hv.materialize_commit(repo, sha, dest)
+        tree = hv.materialize_commit(repo, sha, dest, state_root=state_root)
     prov.provision_tree(tree, provision_argv, provision_timeout_s)
     return tree
 
@@ -248,6 +255,7 @@ def _collect_at_base(
     gate: Mapping[str, object] | object | None,
     provision_argv: Sequence[str],
     provision_timeout_s: float | None,
+    state_root: Path,
 ) -> bool:
     """Whether the same sealed suite reaches a case outcome at the base commit.
 
@@ -266,9 +274,13 @@ def _collect_at_base(
             base_dest,
             provision_argv,
             provision_timeout_s,
+            state_root=state_root,
         )
         hv.copy_blobs_to_tree(vault, base_dest, files)
         run, refusal = _run_sealed_suite(base_dest, files, gate=gate)
+    except hv.TreeContainmentRefused:
+        # Where the tree may be written is not a fact about the base commit.
+        raise
     except (pr.PrivateReviewError, hv.VaultError, OSError):
         return False
     return refusal is None and not _collected_no_case(run)
@@ -311,7 +323,7 @@ def detect_candidate_private_collisions(
     # Deliberately unprovisioned: this executes no suite, only a path check, and
     # `review_builder_output` re-materializes this same dest straight afterwards,
     # which would unlink anything installed here.
-    _review_tree(candidate_repo, candidate_sha, dest)
+    _review_tree(candidate_repo, candidate_sha, dest, state_root=state_root)
     _refuse_candidate_private_collisions(dest, files)
     return files
 
@@ -704,7 +716,12 @@ def measure_candidate(
         request.lane_id, request.input_digest[:12]
     )
     _review_tree(
-        candidate_repo, candidate_sha, dest, provision_argv, provision_timeout_s
+        candidate_repo,
+        candidate_sha,
+        dest,
+        provision_argv,
+        provision_timeout_s,
+        state_root=state_root,
     )
     if not allow_candidate_paths:
         _refuse_candidate_private_collisions(dest, files)
@@ -729,6 +746,7 @@ def measure_candidate(
             gate=gate,
             provision_argv=provision_argv,
             provision_timeout_s=provision_timeout_s,
+            state_root=state_root,
         ):
             # Not the candidate's doing. Re-raise the runner's own refusal when
             # there was one, so its interpreter detail reaches the operator.

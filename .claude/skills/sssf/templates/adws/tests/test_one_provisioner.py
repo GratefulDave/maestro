@@ -174,7 +174,14 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
     def test_the_review_tree(self) -> None:
         dest = self.root / "review"
         with mock.patch.object(cr.hv, "materialize_commit", return_value=dest) as materialize:
-            cr._review_tree(self.root / "repo", "a" * 40, dest, ("provisioner", "--install"), 7)
+            cr._review_tree(
+                self.root / "repo",
+                "a" * 40,
+                dest,
+                ("provisioner", "--install"),
+                7,
+                state_root=self.root,
+            )
         materialize.assert_called_once()
         self.assertEqual(
             self.recorder.calls, [(dest, ("provisioner", "--install"), 7)]
