@@ -10,6 +10,7 @@ from .plan_model import (
     SCHEMA_VERSION,
     PlanRefusal,
     decided_by_problems,
+    restriction_problems,
     normalize_declared_output,
     outputs_conflict,
     parse_acceptance_item,
@@ -259,7 +260,8 @@ def _validate_acceptance(
             )
         if not (parsed.gating or parsed.decided_by is not None):
             continue
-        for problem in decided_by_problems(
+        problems = restriction_problems(parsed.restriction) if parsed.gating else ()
+        for problem in problems + decided_by_problems(
             parsed.decided_by, refusal_required=parsed.refusal_required
         ):
             refusals.append(

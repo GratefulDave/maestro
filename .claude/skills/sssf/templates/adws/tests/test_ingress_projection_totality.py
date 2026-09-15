@@ -95,7 +95,7 @@ class IngressTotalityTests(unittest.TestCase):
         def drop(*args, **kwargs):
             items = real(*args, **kwargs)
             return [
-                {k: v for k, v in item.items() if k != "refusal_required"}
+                {k: v for k, v in item.items() if k != "restriction"}
                 if isinstance(item, dict) else item
                 for item in items
             ]
@@ -103,7 +103,7 @@ class IngressTotalityTests(unittest.TestCase):
         with mock.patch.object(self.ingress, "_acceptance", drop):
             with self.assertRaises(self.ingress.IngressProjectionIncomplete) as caught:
                 self.ingress.project_draft(ir, self.repo)
-        self.assertIn("refusal_required", str(caught.exception))
+        self.assertIn("restriction", str(caught.exception))
 
     def test_empty_table_reason_is_refused(self) -> None:
         with mock.patch.dict(

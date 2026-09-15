@@ -416,9 +416,16 @@ list in which each example has an exact `input` and exactly one of `expect` (the
 `refuses` (the exact refusal: its `error` type or code and, where the contract has one, its
 `message`). The compiler refuses a gating obligation that has no examples, has no `expect`
 example, or has a malformed example (`OBLIGATION_UNDECIDED`, naming the obligation and the
-missing part). A claim that restricts its input needs at least one `refuses` example too. Ingress
-reads that restriction off the claim's structure: `polarity: negative`, a non-empty
-`exception_ids`, or non-empty `preconditions`. It projects the restriction as `refusal_required`.
+missing part). A claim that restricts its input, or reads an upstream endpoint, needs at least
+one `refuses` example too. Ingress reads that off the claim's structure: `polarity: negative`, a
+non-empty `exception_ids`, non-empty `preconditions`, or `witness.store: external`. For an
+external store the refusal owed is the one for the endpoint being unavailable or returning a
+different release; FDAdb's builders invented `SOURCE_UNAVAILABLE` and
+`RELEASE_PROVENANCE_MISMATCH` because no plan stated them. Ingress carries that structure onto the
+criterion as `restriction` (`polarity`, `has_exception_ids`, `has_preconditions`,
+`external_store`). The compiler derives the
+refusal obligation from it itself, and refuses a gating criterion that has no `restriction`, so a
+plan started directly from canonical bytes cannot drop the obligation.
 
 Bad — FDAdb's onset provenance obligation, which parked three runs:
 
@@ -454,9 +461,22 @@ Three rules for writing them:
   sorted mapping" is a description; `{"a": 1, "b": 2}` serialized as `'{"a":1,"b":2}'` is an answer.
 - **An example decides a question someone would ask.** Plan review asks, once per gating obligation,
   for two implementations that satisfy every example and the seam yet produce different observable
-  results. Each such pair is a structured finding bound to the claim. `planctl review --findings`
-  will not sign the receipt until the claim has an example whose `input` is the finding's
-  `divergent_input`. Add that example; the same findings file then signs, and nobody is asked again.
+  results. Each pair is a structured finding bound to the claim, with the two outcomes `outcome_a`
+  and `outcome_b`. `planctl review --findings` will not sign the receipt until the claim has an
+  example at the finding's `divergent_input` whose answer is one of those two outcomes. Add that
+  example. The same findings file then signs, and nobody is asked again. Any other change to a
+  claim makes the findings stale.
+
+**Every workflow ends with the same two commands:** `planctl review --findings`, then
+`plan_author_cli.py --from-plan-contract`. The receipt records the findings it was signed with.
+`plan_author_cli.py` refuses a receipt without them (`RECEIPT_WITHOUT_FINDINGS`), and
+`planctl validate --require-approved` refuses one (`receipt.findings`). The step-by-step guide is
+the-library `skills/plan-contract/SKILL.md`, section "Writing a new plan, end to end".
+
+**Name every harness prerequisite.** If a required verifier command runs `git`, `docker`, or any
+other tool, the plan lists that tool as a prerequisite. The private test tree is a one-commit git
+repository with no remote and one ref, so forbid depending on git history, remotes, or refs, never
+running `git` (FDAdb `be064e58` `lane-wp3-reader-tests` parked four rounds on a `git grep` test).
 
 A run already bound to a plan is not re-judged. `run resume`, `run status`, `run attend` and the
 previous revision under `run amend` re-read the bound revision without this check, so only a plan

@@ -416,12 +416,19 @@ class ObservationSeamTests(unittest.TestCase):
     )
 
     _EXAMPLES = [{"input": {"path": "/faq"}, "expect": {"producer_imported": False}}]
+    _RESTRICTION = {
+        "polarity": "positive",
+        "has_exception_ids": False,
+        "has_preconditions": False,
+        "external_store": False,
+    }
 
     def _gating(self, **overrides) -> dict:
         criterion = {
             "criterion": "serving never calls the FAQ producer",
             "gating": True,
             "decided_by": self._EXAMPLES,
+            "restriction": self._RESTRICTION,
         }
         criterion.update(overrides)
         return criterion
@@ -565,11 +572,20 @@ class DecidedByTests(unittest.TestCase):
         "refuses": {"error": "ValueError", "message": "provenance is empty"},
     }
 
+    _OPEN = {
+        "polarity": "positive",
+        "has_exception_ids": False,
+        "has_preconditions": False,
+        "external_store": False,
+    }
+    _NEGATIVE = dict(_OPEN, polarity="negative")
+
     def _criterion(self, **fields) -> dict:
         payload = {
             "criterion": "claim-onset-provenance (positive): every observation carries provenance",
             "gating": True,
             "observation_seam": self._SEAM,
+            "restriction": self._OPEN,
         }
         payload.update(fields)
         return payload
@@ -602,15 +618,66 @@ class DecidedByTests(unittest.TestCase):
 
     def test_expect_and_refuses_are_accepted(self):
         compiled = self._compile(
-            self._criterion(decided_by=[self._EXPECT, self._REFUSES], refusal_required=True)
+            self._criterion(decided_by=[self._EXPECT, self._REFUSES], restriction=self._NEGATIVE)
         )
         self.assertEqual(1, len(_lane_of(compiled, "lane-a").public_acceptance))
 
     def test_a_restricted_obligation_with_only_expect_is_refused(self):
+        """The compiler derives the refusal obligation; no flag stands in for it."""
+        for restriction in (
+            self._NEGATIVE,
+            dict(self._OPEN, has_exception_ids=True),
+            dict(self._OPEN, has_preconditions=True),
+            dict(self._OPEN, external_store=True),
+        ):
+            with self.subTest(restriction=restriction):
+                refusal = self._refusal(
+                    self._criterion(decided_by=[self._EXPECT], restriction=restriction)
+                )
+                self.assertIn("no refuses example", refusal.message)
+
+    def test_a_negative_obligation_cannot_drop_its_refusal_by_omitting_a_flag(self):
+        """Direct `run start` of canonical bytes: no flag exists to omit.
+
+        The reviewed bypass: a negative claim's criterion copied into a plan with
+        `refusal_required` left out and only an `expect` example compiled. The
+        obligation is now derived from `restriction`, and the old flag is not an
+        admissible key at all.
+        """
+        criterion = self._criterion(decided_by=[self._EXPECT], restriction=self._NEGATIVE)
+        self.assertNotIn("refusal_required", criterion)
+        refusal = self._refusal(criterion)
+        self.assertEqual(pv.OBLIGATION_UNDECIDED, refusal.code)
+        with self.assertRaises(PlanCompileError) as caught:
+            self._compile(dict(criterion, refusal_required=False))
+        self.assertIn(pv.ACCEPTANCE_MISSING, _codes(caught.exception))
+
+    def test_an_external_source_obligation_owes_its_unavailable_refusal(self):
+        """FDAdb reads FAERSdb and lexgenius-maude; a builder invented SOURCE_UNAVAILABLE."""
+        external = dict(self._OPEN, external_store=True)
         refusal = self._refusal(
-            self._criterion(decided_by=[self._EXPECT], refusal_required=True)
+            self._criterion(decided_by=[self._EXPECT], restriction=external)
         )
-        self.assertIn("no refuses example", refusal.message)
+        self.assertEqual(pv.OBLIGATION_UNDECIDED, refusal.code)
+        self.assertIn("unavailable", refusal.message)
+        unavailable = {
+            "input": {"release_id": "2026Q2", "response": {"status": 503}},
+            "refuses": {"error": "SOURCE_UNAVAILABLE", "message": "FAERSdb returned 503"},
+        }
+        self._compile(
+            self._criterion(decided_by=[self._EXPECT, unavailable], restriction=external)
+        )
+
+    def test_a_gating_obligation_without_restriction_is_refused(self):
+        for restriction in (None, {"polarity": "negative"}, dict(self._OPEN, polarity="maybe")):
+            with self.subTest(restriction=restriction):
+                criterion = self._criterion(decided_by=[self._EXPECT])
+                if restriction is None:
+                    criterion.pop("restriction")
+                else:
+                    criterion["restriction"] = restriction
+                refusal = self._refusal(criterion)
+                self.assertIn("restriction", refusal.message)
 
     def test_a_malformed_example_names_the_missing_part(self):
         for example, part in (
@@ -634,7 +701,7 @@ class DecidedByTests(unittest.TestCase):
 
     def test_examples_reach_the_public_contract_verbatim(self):
         compiled = self._compile(
-            self._criterion(decided_by=[self._EXPECT, self._REFUSES], refusal_required=True)
+            self._criterion(decided_by=[self._EXPECT, self._REFUSES], restriction=self._NEGATIVE)
         )
         (text,) = _lane_of(compiled, "lane-a").public_acceptance
         self.assertIn(

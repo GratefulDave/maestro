@@ -13,7 +13,10 @@ NO_PLAN_ARTIFACT_REF = "NO_PLAN_ARTIFACT_REF"
 PLAN_KEYS = frozenset({"schema_version", "lanes"})
 LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance", "lane_kind"})
 ACCEPTANCE_KEYS = frozenset(
-    {"criterion", "gating", "observation_seam", "decided_by", "refusal_required"}
+    {"criterion", "gating", "observation_seam", "decided_by", "restriction"}
+)
+RESTRICTION_KEYS = frozenset(
+    {"polarity", "has_exception_ids", "has_preconditions", "external_store"}
 )
 DECIDED_BY_EXAMPLE_KEYS = frozenset({"input", "expect", "refuses"})
 REFUSAL_KEYS = frozenset({"error", "message"})
@@ -31,16 +34,32 @@ class AcceptanceCriterion:
 
     A gating obligation also states its expected answers as ``decided_by``:
     worked examples, each an exact ``input`` with exactly one exact ``expect``
-    or ``refuses``. ``refusal_required`` is the declared input restriction that
-    obliges at least one ``refuses`` example. The examples are public by
-    construction and reach every actor verbatim through ``public_text``.
+    or ``refuses``. ``restriction`` carries the claim's structure a refusal
+    example depends on -- ``polarity``, whether it has ``exception_ids`` or
+    ``preconditions``, and whether its witness store is ``external`` (it reads
+    an upstream endpoint that can be unavailable) -- and the compiler derives
+    from it, itself, whether a
+    ``refuses`` example is owed. No boolean is trusted in its place. The
+    examples are public by construction and reach every actor verbatim through
+    ``public_text``.
     """
 
     criterion: str
     gating: bool = False
     observation_seam: Optional[str] = None
     decided_by: Any = None
-    refusal_required: bool = False
+    restriction: Any = None
+
+    @property
+    def refusal_required(self) -> bool:
+        """Derived from ``restriction``: negative, exceptions, preconditions, or external."""
+        restriction = self.restriction
+        return isinstance(restriction, dict) and (
+            restriction.get("polarity") == "negative"
+            or restriction.get("has_exception_ids") is True
+            or restriction.get("has_preconditions") is True
+            or restriction.get("external_store") is True
+        )
 
     @property
     def public_text(self) -> str:
@@ -66,7 +85,7 @@ class AcceptanceCriterion:
             not self.gating
             and self.observation_seam is None
             and self.decided_by is None
-            and not self.refusal_required
+            and self.restriction is None
         ):
             return self.criterion
         payload: dict = {"criterion": self.criterion, "gating": self.gating}
@@ -74,9 +93,32 @@ class AcceptanceCriterion:
             payload["observation_seam"] = self.observation_seam
         if self.decided_by is not None:
             payload["decided_by"] = self.decided_by
-        if self.refusal_required:
-            payload["refusal_required"] = True
+        if self.restriction is not None:
+            payload["restriction"] = self.restriction
         return payload
+
+
+def restriction_problems(value: Any) -> Tuple[str, ...]:
+    """Whether a gating obligation declares the structure a refusal depends on."""
+    if value is None:
+        return (
+            "declares no restriction (polarity, has_exception_ids, "
+            "has_preconditions, external_store), so whether it owes a refuses "
+            "example cannot be decided",
+        )
+    if (
+        not isinstance(value, dict)
+        or set(value) != RESTRICTION_KEYS
+        or value.get("polarity") not in ("positive", "negative")
+        or not isinstance(value.get("has_exception_ids"), bool)
+        or not isinstance(value.get("has_preconditions"), bool)
+        or not isinstance(value.get("external_store"), bool)
+    ):
+        return (
+            "restriction must be exactly polarity (positive|negative), "
+            "has_exception_ids, has_preconditions and external_store (bools)",
+        )
+    return ()
 
 
 def decided_by_problems(value: Any, *, refusal_required: bool) -> Tuple[str, ...]:
@@ -126,8 +168,10 @@ def decided_by_problems(value: Any, *, refusal_required: bool) -> Tuple[str, ...
         problems.append("has no expect example stating an exact correct output")
     if not problems and refusal_required and not refuses:
         problems.append(
-            "declares an input restriction (refusal_required) but no refuses "
-            "example stating the exact refusal"
+            "restricts its input or reads an external store (negative "
+            "polarity, exception_ids, preconditions or external_store) but has "
+            "no refuses example stating the exact refusal, such as the source "
+            "being unavailable"
         )
     return tuple(problems)
 
@@ -137,7 +181,7 @@ def parse_acceptance_item(raw: Any) -> Optional[AcceptanceCriterion]:
 
     Accepts the historical plain-string form and the object form carrying the
     declared ``gating`` flag, ``observation_seam``, ``decided_by`` examples
-    and ``refusal_required`` flag. Example shape is judged by the compiler,
+    and ``restriction``. Example and restriction shape are judged by the compiler,
     which names what is missing (``OBLIGATION_UNDECIDED``). No prose is inspected.
     """
     if isinstance(raw, str):
@@ -155,11 +199,8 @@ def parse_acceptance_item(raw: Any) -> Optional[AcceptanceCriterion]:
     seam = raw.get("observation_seam")
     if seam is not None and (not isinstance(seam, str) or not seam.strip()):
         return None
-    refusal_required = raw.get("refusal_required", False)
-    if not isinstance(refusal_required, bool):
-        return None
     return AcceptanceCriterion(
-        criterion, gating, seam, raw.get("decided_by"), refusal_required
+        criterion, gating, seam, raw.get("decided_by"), raw.get("restriction")
     )
 
 

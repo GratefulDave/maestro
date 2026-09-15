@@ -3281,7 +3281,7 @@ def _planctl_binary(policy: att.AttendPolicy) -> Path:
 
 def _run_planctl(
     binary: Path, argv: Sequence[str], *, key: Optional[str] = None
-) -> None:
+) -> str:
     """One planctl subcommand, refused by exit status and nothing else.
 
     The refusal carries planctl's own output because a receipt or validation
@@ -3300,7 +3300,7 @@ def _run_planctl(
         env=environment,
     )
     if result.returncode == 0:
-        return
+        return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
     raise att.AttendRefused(
         att.REVISION_REFUSED,
@@ -3489,10 +3489,35 @@ def _attend_project(
     shutil.copyfile(revision_ir, ir)
     # The operator's two-implementations answer. Absent, planctl refuses
     # `review.findings_missing` and the revision is refused by exit status.
+    root = ["--repo-root", str(repo)]
     authored_findings = att.findings_path_for(revision_ir)
     if authored_findings.is_file():
-        shutil.copyfile(authored_findings, findings)
-    root = ["--repo-root", str(repo)]
+        # The operator answers the question; Maestro binds the answer to the
+        # revision it reviews and to the reviewer that signs it, so planctl can
+        # refuse a stale or foreign findings file.
+        try:
+            answered = json.loads(authored_findings.read_text(encoding="utf-8"))
+            surface = json.loads(
+                _run_planctl(binary, ["question-surface", str(ir), "--json"])
+            )
+        except (OSError, ValueError) as exc:
+            raise att.AttendRefused(
+                att.REVISION_REFUSED, "review findings: {0}".format(exc)
+            ) from exc
+        findings.write_text(
+            json.dumps(
+                {
+                    "schema_version": "plan-contract-review-findings.v1",
+                    "plan_id": surface.get("plan_id"),
+                    "question_surface_sha256": surface.get("question_surface_sha256"),
+                    "reviewer_id": policy.reviewer_id,
+                    "reviewer_vendor": policy.reviewer_vendor,
+                    "findings": answered.get("findings") if isinstance(answered, dict) else None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
         binary,

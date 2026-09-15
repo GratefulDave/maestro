@@ -86,6 +86,13 @@ def _verify_receipt(ir_bytes: bytes, receipt: Mapping[str, Any],
     digest = receipt.get("ir_sha256")
     if not isinstance(digest, str) or _sha256(ir_bytes) != digest:
         raise IngressError("RECEIPT_IR_MISMATCH")
+    # planctl records the two-implementations pass it signed over. A receipt
+    # without it was not produced by `planctl review --findings`, and every
+    # workflow ends there, so it does not ship.
+    findings = receipt.get("findings_sha256")
+    if (not isinstance(findings, str) or len(findings) != 64
+            or any(char not in "0123456789abcdef" for char in findings)):
+        raise IngressError("RECEIPT_WITHOUT_FINDINGS")
     if rendered is not None:
         rendered_digest = receipt.get("rendered_sha256")
         if (not isinstance(rendered_digest, str)
@@ -388,6 +395,12 @@ _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
     # ...and so are its worked examples, which the compiler refuses without
     # (OBLIGATION_UNDECIDED).
     "decided_by": "acceptance, spec.obligations.claims",
+    # The structure a refusal example depends on rides on the criterion as
+    # `restriction`, so the compiler derives the obligation itself.
+    "polarity": "acceptance, spec.obligations.claims",
+    "exception_ids": "acceptance, spec.obligations.claims",
+    "preconditions": "acceptance, spec.obligations.claims",
+    "witness": "acceptance, spec.obligations.claims",
 }
 _CLAIM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
@@ -636,17 +649,22 @@ def _observation_seam(claim: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def _refusal_required(claim: Mapping[str, Any]) -> bool:
-    """The claim declares an input restriction, so it owes a `refuses` example.
+def _restriction(claim: Mapping[str, Any]) -> dict:
+    """The claim structure a refusal example depends on, carried to the compiler.
 
-    Structural only: negative polarity, or a non-empty `exception_ids` or
-    `preconditions`.
+    The compiler derives from it whether a `refuses` example is owed (negative
+    polarity, a non-empty `exception_ids` or `preconditions`, or a witness
+    store of `external` -- a claim reading an upstream endpoint owes the
+    refusal for that endpoint being unavailable), so a plan started directly
+    from its canonical bytes is judged the same way.
     """
-    return (
-        claim.get("polarity") == "negative"
-        or bool(claim.get("exception_ids"))
-        or bool(claim.get("preconditions"))
-    )
+    witness = claim.get("witness")
+    return {
+        "polarity": claim.get("polarity"),
+        "has_exception_ids": bool(claim.get("exception_ids")),
+        "has_preconditions": bool(claim.get("preconditions")),
+        "external_store": isinstance(witness, dict) and witness.get("store") == "external",
+    }
 
 
 def _build_criterion(claim: Mapping[str, Any]) -> str:
@@ -667,7 +685,7 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
     criterion with no seam, and the objective compiler refuses the plan
     (`OBLIGATION_UNOBSERVABLE`) rather than shipping an obligation no case can
     observe. Its `decided_by` worked examples are carried the same way, with
-    `refusal_required` when the claim declares an input restriction; a gating
+    the claim's `restriction` structure; a gating
     criterion without them is refused `OBLIGATION_UNDECIDED`. Nothing here
     reads the claim's prose.
     """
@@ -690,8 +708,7 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
             criterion["observation_seam"] = seam
         if "decided_by" in claim:
             criterion["decided_by"] = claim["decided_by"]
-        if _refusal_required(claim):
-            criterion["refusal_required"] = True
+        criterion["restriction"] = _restriction(claim)
         projected.append(criterion)
     return head + projected
 
@@ -1065,10 +1082,10 @@ def _assert_ingress_projection_is_total(
                 _fail(
                     "acceptance[{0}].decided_by".format(offset + 1),
                     claim.get("decided_by"), item.get("decided_by"))
-            if _refusal_required(claim) != bool(item.get("refusal_required")):
+            if _restriction(claim) != item.get("restriction"):
                 _fail(
-                    "acceptance[{0}].refusal_required".format(offset + 1),
-                    _refusal_required(claim), item.get("refusal_required"))
+                    "acceptance[{0}].restriction".format(offset + 1),
+                    _restriction(claim), item.get("restriction"))
     else:
         for offset, claim in enumerate(
                 _bound_records(ir, lane, "claim_ids", "claims", "claim_id")):

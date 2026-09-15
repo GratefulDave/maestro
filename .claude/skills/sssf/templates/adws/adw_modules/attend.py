@@ -275,12 +275,18 @@ def require_rationale(payload: Any) -> Mapping[str, Any]:
 TWO_IMPLEMENTATIONS_QUESTION = (
     "For every claim a tests lane discharges in your revision, describe two "
     "implementations that satisfy every decided_by example and the "
-    "observation_seam yet produce different observable results. Write each such "
-    "pair to review_findings_out_path as a plan-contract-review-findings.v1 "
-    "finding (finding_id, claim_id, implementation_a, implementation_b, "
-    "divergent_input, observable_difference) and add to that claim the decided_by "
-    "example whose input is the divergent_input. Write {\"findings\": []} when "
-    "there is no such pair. Ask this once."
+    "observation_seam yet produce different observable results; for a claim whose "
+    "witness store is external (it reads an upstream endpoint), include pairs that "
+    "differ on the endpoint read, the response fields relied on, or the behavior "
+    "when it is unavailable or returns a different release. Write "
+    "{\"findings\": [...]} to review_findings_out_path, one finding per pair with "
+    "exactly finding_id, claim_id, implementation_a, implementation_b, "
+    "divergent_input, outcome_a, outcome_b (each {\"expect\": <exact output>} or "
+    "{\"refuses\": {\"error\": ..., \"message\": ...}}, and different) and "
+    "observable_difference. Then add to that claim the decided_by example at "
+    "divergent_input whose answer is the outcome the contract wants. Change "
+    "nothing else about a claim you wrote a finding for. Write "
+    "{\"findings\": []} when there is no such pair. Ask this once."
 )
 
 

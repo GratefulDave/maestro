@@ -27,6 +27,8 @@ def _receipt_for(ir: dict, **extra) -> dict:
         "ir_sha256": hashlib.sha256(
             json.dumps(ir, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
+        # planctl review --findings records the pass it signed over.
+        "findings_sha256": "f" * 64,
     }
     payload.update(extra)
     return payload
@@ -211,19 +213,20 @@ class IngressProjectionTests(unittest.TestCase):
 
 class PlanAuthorCliTests(unittest.TestCase):
     def _author(self, root: Path, out: Path,
-                ir: dict = None) -> subprocess.CompletedProcess[str]:
+                ir: dict = None, *,
+                with_findings: bool = True) -> subprocess.CompletedProcess[str]:
         ir = _ir() if ir is None else ir
         ir_path = root / "ir.json"
         ir_bytes = _write_json(ir_path, ir)
         receipt_path = root / "receipt.json"
-        _write_json(
-            receipt_path,
-            {
-                "schema_version": "plan-contract-review.v1",
-                "verdict": "PASS",
-                "ir_sha256": hashlib.sha256(ir_bytes).hexdigest(),
-            },
-        )
+        receipt = {
+            "schema_version": "plan-contract-review.v1",
+            "verdict": "PASS",
+            "ir_sha256": hashlib.sha256(ir_bytes).hexdigest(),
+        }
+        if with_findings:
+            receipt["findings_sha256"] = "f" * 64
+        _write_json(receipt_path, receipt)
         env = dict(os.environ)
         env["PYTHONPATH"] = str(ADWS)
         return subprocess.run(
@@ -332,6 +335,7 @@ class PlanAuthorCliTests(unittest.TestCase):
             ("polarity", "negative"),
             ("preconditions", ["the module is on sys.path"]),
             ("exception_ids", ["claim-b1"]),
+            ("witness", {"scope": "in_process", "store": "external"}),
         ):
             with self.subTest(field=field):
                 ir = _ir()
@@ -347,9 +351,24 @@ class PlanAuthorCliTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
                     (root / "repo").mkdir()
-                    result = self._author(root, root / "plan", ir)
-                    detail = result.stdout + result.stderr
-                    self.assertNotIn("OBLIGATION_UNDECIDED", detail)
+                    out = root / "plan"
+                    result = self._author(root, out, ir)
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(
+                        "PLAN_AUTHORED", json.loads(result.stdout)["outcome"])
+                    self.assertTrue(out.exists())
+
+    def test_cli_refuses_a_receipt_not_signed_with_findings(self) -> None:
+        """Every workflow ends with planctl review --findings, then this ship."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out, with_findings=False)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("RECEIPT_WITHOUT_FINDINGS", result.stdout + result.stderr)
+            self.assertFalse(out.exists())
 
     def test_cli_projects_the_examples_verbatim_into_the_public_contract(self) -> None:
         from adw_modules.plan_compiler import compile_plan

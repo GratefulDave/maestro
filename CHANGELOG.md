@@ -23,8 +23,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a plan keeps resuming: `_bind_existing_run` compiles with `bound_run=True`.
   The examples project verbatim into the lane's public acceptance and the tests
   lane's `spec.obligations.claims`, and the ingress totality check verifies
-  both. `run attend` now passes the operator's two-implementations findings to
-  `planctl review --findings`. That needs the-library's matching `planctl` with
+  both. A gating criterion carries `restriction` (polarity, has_exception_ids,
+  has_preconditions, external_store from `witness.store: external`; an
+  upstream-endpoint claim owes its unavailable refusal), and the compiler derives the refusal obligation from it
+  itself, so a plan started from canonical bytes cannot drop it.
+  `plan_author_cli.py --from-plan-contract` refuses a receipt that does not
+  record `findings_sha256` (`RECEIPT_WITHOUT_FINDINGS`). `run attend` now passes
+  the operator's two-implementations findings, bound to the revision's question
+  surface and the attend reviewer, to `planctl review --findings`. That needs the-library's matching `planctl` with
   `decided_by` and `--findings`. Why: in FDAdb's five amended runs about 16 of 36
   `NO_PROGRESS` parks came from contracts that named where to observe but not
   what value is correct.

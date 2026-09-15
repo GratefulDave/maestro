@@ -116,6 +116,7 @@ class ReceiptHandshake(unittest.TestCase):
             "schema_version": ingress.RECEIPT_VERSION,
             "verdict": "PASS",
             "ir_sha256": hashlib.sha256(self.ir_bytes).hexdigest(),
+            "findings_sha256": "f" * 64,
         }
         receipt.update(overrides)
         return receipt
@@ -128,6 +129,13 @@ class ReceiptHandshake(unittest.TestCase):
         with self.assertRaises(ingress.IngressError) as caught:
             ingress._verify_receipt(self.ir_bytes, stale, None)
         self.assertIn("RECEIPT_IR_MISMATCH", str(caught.exception))
+
+    def test_a_receipt_not_signed_with_findings_is_refused(self) -> None:
+        receipt = self._receipt()
+        receipt.pop("findings_sha256")
+        with self.assertRaises(ingress.IngressError) as caught:
+            ingress._verify_receipt(self.ir_bytes, receipt, None)
+        self.assertIn("RECEIPT_WITHOUT_FINDINGS", str(caught.exception))
 
     def test_a_receipt_that_is_not_a_pass_is_refused(self) -> None:
         with self.assertRaises(ingress.IngressError) as caught:
@@ -158,12 +166,17 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
 
         calls = []
         policy = att.AttendPolicy(max_amendments_per_lane=1, planctl=self.tmp / "p")
+
+        def run_planctl(binary, argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "question-surface":
+                return json.dumps({"plan_id": "p-1", "question_surface_sha256": "a" * 64})
+            return ""
+
         with (
             mock.patch.object(maestro, "_planctl_binary", return_value=Path("planctl")),
             mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
-            mock.patch.object(
-                maestro, "_run_planctl", side_effect=lambda b, argv, **k: calls.append(argv)
-            ),
+            mock.patch.object(maestro, "_run_planctl", side_effect=run_planctl),
             mock.patch.object(
                 ingress, "author_from_plan_contract", side_effect=RuntimeError("stop")
             ),
@@ -175,25 +188,86 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
         (review,) = [argv for argv in calls if argv[0] == "review"]
         return review
 
-    def test_the_operator_findings_are_copied_and_passed(self) -> None:
+    def test_the_operator_findings_are_bound_and_passed(self) -> None:
         self.assertEqual(
             self.tmp / "out" / "r2.review-findings.json",
             att.findings_path_for(self.revision),
         )
-        att.findings_path_for(self.revision).write_text('{"findings": []}', encoding="utf-8")
+        answer = [{"finding_id": "f-1", "claim_id": "claim-a"}]
+        att.findings_path_for(self.revision).write_text(
+            json.dumps({"findings": answer}), encoding="utf-8"
+        )
         review = self._review_argv()
         passed = Path(review[review.index("--findings") + 1])
         self.assertEqual(self.plans / "run.r2.review-findings.json", passed)
-        self.assertEqual('{"findings": []}', passed.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {
+                "schema_version": "plan-contract-review-findings.v1",
+                "plan_id": "p-1",
+                "question_surface_sha256": "a" * 64,
+                "reviewer_id": review[review.index("--reviewer") + 1],
+                "reviewer_vendor": review[review.index("--reviewer-vendor") + 1],
+                "findings": answer,
+            },
+            json.loads(passed.read_text(encoding="utf-8")),
+        )
 
     def test_absent_findings_are_still_named_so_planctl_refuses(self) -> None:
         review = self._review_argv()
         self.assertIn("--findings", review)
         self.assertFalse(Path(review[review.index("--findings") + 1]).exists())
 
-    def test_the_operator_is_asked_the_question(self) -> None:
-        self.assertIn("two implementations", att.TWO_IMPLEMENTATIONS_QUESTION)
-        self.assertIn("divergent_input", att.TWO_IMPLEMENTATIONS_QUESTION)
+    def test_the_operator_launch_asks_the_full_question(self) -> None:
+        """The dispatched operator prompt carries the question and the findings path."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from adw_modules import scheduler_types as st
+
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor.lane_specs = {}
+        ctx = SimpleNamespace(
+            lane=SimpleNamespace(lane_id="lane-a", lane_kind=st.LANE_KIND_BUILD),
+            plan_revision=2,
+            run_id="run1",
+            stage=st.LaneStage.WAITING_FOR_USER,
+        )
+        request = att.OperatorRequest(
+            run_id="run1",
+            lane_id="lane-a",
+            stage=st.LaneStage.WAITING_FOR_USER.value,
+            round_number=4,
+            plan_revision=2,
+            next_plan_revision=3,
+            public_contract={"acceptance_criteria": ["x"]},
+            reviews=(),
+            redacted_failures=(),
+            lane_gates="",
+            ir_path=str(self.revision),
+            revision_out_path=str(self.revision),
+            sealed_files={},
+            amendment_rules="rules",
+            allowed_lane_ids=("lane-a",),
+        )
+        launched = {}
+
+        def launch(ctx_, role, cwd, extra, prepare_cwd):
+            launched["body"] = maestro.HerdrStageActor._prompt(
+                actor, ctx_, role, self.tmp / "envelope.json", cwd, extra
+            )
+            return {}, None, cwd
+
+        with (
+            mock.patch.object(actor, "_role_dir", return_value=self.tmp / "operator", create=True),
+            mock.patch.object(actor, "_launch", side_effect=launch, create=True),
+        ):
+            actor.attend_operator(ctx, request)
+
+        body = launched["body"]
+        self.assertIn(att.TWO_IMPLEMENTATIONS_QUESTION, body["instructions"])
+        self.assertEqual(
+            str(att.findings_path_for(self.revision)), body["review_findings_out_path"]
+        )
 
 
 class RealValidatorInvocation(unittest.TestCase):
