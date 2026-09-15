@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **`maestro-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). This is a
+  display-only sidebar daemon, and the Maestro runtime is unchanged. It writes pane tokens
+  `logo` (vendor glyph from the Herdr Agent Icons Max font) and `mark` (spinner while
+  working, a `✓` held until the pane is focused, a `?` held until work resumes). On lane panes
+  and lane Spaces it also writes `stage`, `round` and `verdict`, read from the ledger with a
+  read-only connection that is opened and closed on each 2 s poll. Every write uses source
+  `maestro-lanes` and only those token names. Maestro's `kind/lane/role/run_id/parent/repo/scratch`
+  tokens are never touched. The plugin also installs the font and a marker-fenced Ghostty
+  `font-codepoint-map` block, and swaps the hand-written `[ui.sidebar.*]` tables for one
+  marker-fenced managed block. Icon font and approach come from herdr-radar (MIT).
+
 ### Changed
 - **Contract change: a lane is a child Space again, nested under the repository's
   Space.** Reverts #276 (lane = tab). Herdr 0.9.0's Spaces sidebar nests only
