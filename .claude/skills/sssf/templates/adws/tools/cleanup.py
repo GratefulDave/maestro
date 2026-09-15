@@ -24,9 +24,9 @@ Dry run is the default. ``--apply`` is the only thing that closes anything.
 What it will close, and nothing else: a pane Herdr reports with Maestro's own
 ``kind=lane`` token whose ``run_id`` token names a run in *this* repository's
 ledger. That selector is what keeps it away from an operator's own panes, from
-another repository's run, and from the parent Space -- which Maestro never
-closes, because it is the operator's. Closing a lane's last pane closes that
-lane's linked child workspace, which is Herdr's behaviour and the point.
+another repository's run, and from the repository workspace -- which Maestro
+never closes, because it is the operator's. It closes role panes and nothing
+else.
 
 **A live run's panes are its agents.** Closing one kills the turn it is in the
 middle of, so this refuses while a `maestro.py run` process is alive for the
