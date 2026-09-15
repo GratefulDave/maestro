@@ -527,16 +527,32 @@ def materialize_commit(repo: Path, sha: str, dest: Path) -> Path:
     return _extract_commit(repo, sha, dest)
 
 
+def clear_tree(dest: Path) -> None:
+    """Empty `dest`, keeping its root inode, even past read-only directories."""
+
+    def _owner_writable_parent(func, path, exc_info):
+        if not isinstance(exc_info[1], PermissionError):
+            raise exc_info[1]
+        parent = os.path.dirname(path)
+        mode = os.lstat(parent).st_mode
+        if stat.S_ISLNK(mode):
+            raise exc_info[1]
+        os.chmod(parent, stat.S_IMODE(mode) | stat.S_IWUSR)
+        func(path)
+
+    for child in Path(dest).iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child, onerror=_owner_writable_parent)
+
+
 def refresh_materialized_commit(repo: Path, sha: str, dest: Path) -> Path:
     """Replace one private tree without replacing its process-bound root inode."""
     dest = Path(dest)
     if dest.is_symlink() or not dest.is_dir():
         raise VaultError("refusing to refresh non-directory tree {0}".format(dest))
-    for child in dest.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        else:
-            shutil.rmtree(child)
+    clear_tree(dest)
     return _extract_commit(repo, sha, dest)
 
 
