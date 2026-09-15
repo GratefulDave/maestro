@@ -128,7 +128,7 @@ def _lane(
 
 
 
-def _materialize_hidden(_vault: object, _sha: object, dest: Path) -> None:
+def _materialize_hidden(_vault: object, _sha: object, dest: Path, **_kw: object) -> None:
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     hidden = dest / "tests" / "hidden.py"
@@ -1098,7 +1098,17 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             cwd = Path(record["worktree"])
             self.assertTrue(record["hidden_test_at_launch"])
-            self.assertFalse(record["has_git_at_launch"])
+            # Contract change: the private tree is a repository, so repository
+            # tests that ask git about it run. It is its own one-commit
+            # repository -- a directory, not a gitfile into the vault -- and
+            # carries no ref but its branch.
+            self.assertTrue(record["has_git_at_launch"])
+            self.assertTrue((cwd / ".git").is_dir())
+            self.assertEqual(_git(cwd, "rev-list", "--all", "--count"), "1")
+            self.assertEqual(
+                _git(cwd, "for-each-ref", "--format=%(refname)"),
+                "refs/heads/materialized",
+            )
             self.assertFalse(record["dirty_at_launch"])
             self.assertNotEqual(cwd.resolve(), product.resolve())
             self.assertTrue(cwd.exists())

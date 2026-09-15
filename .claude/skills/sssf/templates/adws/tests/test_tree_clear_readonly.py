@@ -79,11 +79,11 @@ class RefreshMaterializedCommitReadOnlyTest(_ReadOnlyTreeCase):
         _git(repo, "rm", "-q", "seed.txt")
         second = _commit(repo, "next.txt")
         tree = self.root / "tree"
-        hv.materialize_commit(repo, first, tree)
+        hv.materialize_commit(repo, first, tree, state_root=self.root)
         _read_only_leftover(tree)
         inode = tree.stat().st_ino
 
-        hv.refresh_materialized_commit(repo, second, tree)
+        hv.refresh_materialized_commit(repo, second, tree, state_root=self.root)
 
         self.assertEqual(tree.stat().st_ino, inode)
         self.assertTrue((tree / "next.txt").is_file())

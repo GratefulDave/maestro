@@ -249,7 +249,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "cr")
         base = _git(self.repo, "rev-parse", "HEAD~0")
         sha, ref = self._head()
-        scratch = self.root / "scratch-cr"
+        scratch = self.state / "scratch-cr"
 
         artifact = cr.review_builder_output(
             request=_request(
@@ -286,7 +286,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
     def test_integration_gate_provisions_after_materialize_before_suite(self):
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "gate")
         head = _git(self.repo, "rev-parse", "HEAD")
-        scratch = self.root / "scratch-gate"
+        scratch = self.state / "scratch-gate"
 
         result = cr.run_integration_gate(
             run_id=self.run_id,
@@ -330,7 +330,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 builder_base_sha=base,
                 sealed_bundle=sealed,
                 verdict=st.ReviewerVerdict.PASS,
-                scratch_root=self.root / "scratch-empty",
+                scratch_root=self.state / "scratch-empty",
                 architecture_constraints=CONSTRAINTS,
             )
             harness.assert_not_called()
@@ -351,7 +351,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-blank",
+                scratch_root=self.state / "scratch-blank",
                 provision_argv=("", ""),
             )
             harness.assert_not_called()
@@ -380,7 +380,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     builder_base_sha=base,
                     sealed_bundle=sealed,
                     verdict=st.ReviewerVerdict.PASS,
-                    scratch_root=self.root / "scratch-fail",
+                    scratch_root=self.state / "scratch-fail",
                     architecture_constraints=CONSTRAINTS,
                     provision_argv=self._provision_script("fail", exit_code=3),
                 )
@@ -408,7 +408,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     integration_repo=self.repo,
                     integration_sha=head,
                     sealed_bundle=sealed,
-                    scratch_root=self.root / "scratch-gatefail",
+                    scratch_root=self.state / "scratch-gatefail",
                     provision_argv=self._provision_script("gatefail", exit_code=3),
                 )
             runner.assert_not_called()
@@ -426,7 +426,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-absent",
+                scratch_root=self.state / "scratch-absent",
                 provision_argv=("maestro-no-such-provisioner",),
             )
 
@@ -449,7 +449,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-leak",
+                scratch_root=self.state / "scratch-leak",
                 provision_argv=self._provision_script("leak", exit_code=3),
             )
 
@@ -463,7 +463,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "isolate")
         head = _git(self.repo, "rev-parse", "HEAD")
         vault = hv.vault_path(self.state, self.run_id)
-        scratch = self.root / "scratch-isolate"
+        scratch = self.state / "scratch-isolate"
 
         repo_before = _tree_bytes(self.repo)
         vault_before = _tree_bytes(vault)
@@ -514,7 +514,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
 
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "shell")
         head = _git(self.repo, "rev-parse", "HEAD")
-        scratch = self.root / "scratch-shell"
+        scratch = self.state / "scratch-shell"
         stamp_writer = self.root / "provision-shell.py"
         stamp_writer.write_text(
             "import json, pathlib\n"
@@ -569,7 +569,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-shellfail",
+                scratch_root=self.state / "scratch-shellfail",
                 provision_argv=("bash", "-lc", "true && exit 7"),
             )
 
@@ -608,7 +608,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     builder_base_sha=base,
                     sealed_bundle=sealed,
                     verdict=st.ReviewerVerdict.PASS,
-                    scratch_root=self.root / "scratch-envfail",
+                    scratch_root=self.state / "scratch-envfail",
                     architecture_constraints=CONSTRAINTS,
                     provision_argv=self._provision_script("envfail", exit_code=3),
                 )
@@ -649,7 +649,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     builder_base_sha=base,
                     sealed_bundle=sealed,
                     verdict=st.ReviewerVerdict.PASS,
-                    scratch_root=self.root / "scratch-unusable",
+                    scratch_root=self.state / "scratch-unusable",
                     architecture_constraints=CONSTRAINTS,
                 )
 
@@ -693,7 +693,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     builder_base_sha=base,
                     sealed_bundle=sealed,
                     verdict=st.ReviewerVerdict.PASS,
-                    scratch_root=self.root / "scratch-undeclared",
+                    scratch_root=self.state / "scratch-undeclared",
                     architecture_constraints=CONSTRAINTS,
                 )
 
@@ -739,7 +739,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-broke",
+            scratch_root=self.state / "scratch-broke",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -775,7 +775,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             builder_base_sha=base,
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.PASS,
-            scratch_root=self.root / "scratch-genuine",
+            scratch_root=self.state / "scratch-genuine",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -822,7 +822,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-timeout",
+                scratch_root=self.state / "scratch-timeout",
                 provision_argv=("bun", "install"),
                 provision_timeout_s=5400.0,
             )
@@ -843,7 +843,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 integration_repo=self.repo,
                 integration_sha=head,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-deftimeout",
+                scratch_root=self.state / "scratch-deftimeout",
                 provision_argv=("bun", "install"),
             )
 
@@ -862,7 +862,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         """
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "reuse")
         head = _git(self.repo, "rev-parse", "HEAD")
-        scratch = self.root / "scratch-reuse"
+        scratch = self.state / "scratch-reuse"
         digest = _digest("integration-gate-reuse")
         argv = self._provision_script("reuse")
 
@@ -905,7 +905,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         """
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "bare")
         head = _git(self.repo, "rev-parse", "HEAD")
-        scratch = self.root / "scratch-bare"
+        scratch = self.state / "scratch-bare"
 
         result = cr.run_integration_gate(
             run_id=self.run_id,
@@ -938,7 +938,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 candidate_repo=self.repo,
                 candidate_sha=sha,
                 sealed_bundle=sealed,
-                scratch_root=self.root / "scratch-collide",
+                scratch_root=self.state / "scratch-collide",
             )
             harness.assert_not_called()
 

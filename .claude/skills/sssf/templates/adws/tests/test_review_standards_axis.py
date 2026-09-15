@@ -303,7 +303,7 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
             sealed_bundle=sealed,
             verdict=verdict,
             findings=findings,
-            scratch_root=self.root / ("scratch-" + label),
+            scratch_root=self.state / ("scratch-" + label),
             architecture_constraints=CONSTRAINTS,
         )
 

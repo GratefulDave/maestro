@@ -20,6 +20,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from .runtime_state import paths_overlap
+
 _IDENTITY = re.compile(r"^[A-Za-z0-9._-]+$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _HOOKS = "maestro-private-review-no-hooks"
@@ -27,6 +29,12 @@ _HOOKS = "maestro-private-review-no-hooks"
 
 class VaultError(RuntimeError):
     """The vault could not be created, seeded, or read."""
+
+
+class TreeContainmentRefused(VaultError):
+    """A materialization destination lies outside what the factory owns."""
+
+    code = "MATERIALIZED_TREE_UNCONTAINED"
 
 
 def _git(
@@ -507,18 +515,130 @@ def _extract_archive(tar: tarfile.TarFile, dest: Path) -> None:
         )
 
 
+def _source_repository_paths(repo: Path) -> tuple[str, ...]:
+    """The source repository's work tree, git dir and common dir, absolute."""
+    found = _git(
+        repo,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+        "--git-common-dir",
+    ).stdout.split("\n")
+    top = _git(repo, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode == 0:
+        found.append(top.stdout)
+    return tuple(item.strip() for item in found if item.strip())
+
+
+def _refuse_uncontained_tree(
+    repo: Path, dest: Path, state_root: Path, forbidden: Sequence[Path]
+) -> None:
+    """Refuse, before touching `dest`, a tree the factory does not own.
+
+    A materialized tree is emptied, extracted into, and made a git repository.
+    Aimed anywhere but a private directory under the runtime-state root, each
+    of those is a write to someone else's files. The overlap list is the one
+    `RuntimeStateRoot` refuses, plus the source repository's own git dirs and
+    the checkout this runtime copy is running from.
+    """
+    tree = Path(os.path.realpath(dest))
+    root = Path(os.path.realpath(state_root))
+    if tree == root or not tree.is_relative_to(root):
+        raise TreeContainmentRefused(
+            "materialized tree {0} is not inside runtime_state_root {1}".format(
+                tree, root
+            )
+        )
+    runtime_copy = Path(__file__).resolve().parents[1]
+    runtime_top = _git(runtime_copy, "rev-parse", "--show-toplevel", check=False)
+    others = [*forbidden, *_source_repository_paths(repo), runtime_copy]
+    if runtime_top.returncode == 0 and runtime_top.stdout.strip():
+        others.append(Path(runtime_top.stdout.strip()))
+    for other in others:
+        if paths_overlap(tree, os.path.realpath(other)):
+            raise TreeContainmentRefused(
+                "materialized tree {0} overlaps {1}".format(tree, other)
+            )
+
+
+def _tree_git_environment(dest: Path) -> dict[str, str]:
+    """An environment in which git can see only `dest` and its own `.git`.
+
+    Every inherited `GIT_*` variable is dropped: a caller's `GIT_DIR` or
+    `GIT_INDEX_FILE` would otherwise point `init` and `add` at another
+    repository. Global and system config are off, so a user's `core.hooksPath`,
+    `init.templateDir`, `core.excludesFile`, `commit.gpgSign` or LFS filters
+    cannot add hooks, drop a materialized file from the index, or block the
+    commit. The ceiling stops discovery at the tree's parent.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        {
+            "GIT_DIR": str(dest / ".git"),
+            "GIT_WORK_TREE": str(dest),
+            "GIT_CEILING_DIRECTORIES": str(dest.parent),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_AUTHOR_NAME": "maestro",
+            "GIT_AUTHOR_EMAIL": "maestro@materialized.invalid",
+            "GIT_COMMITTER_NAME": "maestro",
+            "GIT_COMMITTER_EMAIL": "maestro@materialized.invalid",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        }
+    )
+    return env
+
+
+def _commit_materialized_tree(dest: Path) -> None:
+    """Make `dest` a repository holding one commit of exactly its files.
+
+    Repository tests run against a real checkout, and some ask git about it:
+    FDAdb's `deploy/tests/runtime-wiring.test.mjs` runs `git grep`, which
+    fails with "not a git repository" in a bare archive export. `git archive`
+    exports tracked files only, so one commit of everything extracted is the
+    set `git grep` would search in the source checkout. No remote, no history,
+    no vault ref: the only object reachable here is that one commit.
+    """
+    env = _tree_git_environment(dest)
+    for argv in (
+        ("init", "-q", "--template=", "--initial-branch=materialized"),
+        ("add", "-A", "--force", "--", "."),
+        ("commit", "-q", "--no-verify", "--no-gpg-sign", "--allow-empty", "-m", "materialized"),
+    ):
+        result = subprocess.run(
+            ["git", *argv], cwd=str(dest), capture_output=True, text=True, env=env
+        )
+        if result.returncode != 0:
+            raise VaultError(
+                "git {0} in materialized tree {1} exited {2}: {3}".format(
+                    " ".join(argv), dest, result.returncode, result.stderr.strip()
+                )
+            )
+
+
 def _extract_commit(repo: Path, sha: str, dest: Path) -> Path:
     archive = _git(repo, "archive", "--format=tar", sha, text=False)
     with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:") as tar:
         _extract_archive(tar, dest)
     if (dest / ".git").exists():
         raise VaultError("materialized tree carried a .git directory")
+    _commit_materialized_tree(dest.resolve())
     return dest.resolve()
 
 
-def materialize_commit(repo: Path, sha: str, dest: Path) -> Path:
+def materialize_commit(
+    repo: Path,
+    sha: str,
+    dest: Path,
+    *,
+    state_root: Path,
+    forbidden: Sequence[Path] = (),
+) -> Path:
     """Extract a sealed tree into a new or pre-provisioned empty role cwd."""
     dest = Path(dest)
+    _refuse_uncontained_tree(repo, dest, state_root, forbidden)
     if dest.exists():
         if dest.is_symlink() or not dest.is_dir() or any(dest.iterdir()):
             raise VaultError("refusing to adopt existing tree {0}".format(dest))
@@ -547,9 +667,17 @@ def clear_tree(dest: Path) -> None:
             shutil.rmtree(child, onerror=_owner_writable_parent)
 
 
-def refresh_materialized_commit(repo: Path, sha: str, dest: Path) -> Path:
+def refresh_materialized_commit(
+    repo: Path,
+    sha: str,
+    dest: Path,
+    *,
+    state_root: Path,
+    forbidden: Sequence[Path] = (),
+) -> Path:
     """Replace one private tree without replacing its process-bound root inode."""
     dest = Path(dest)
+    _refuse_uncontained_tree(repo, dest, state_root, forbidden)
     if dest.is_symlink() or not dest.is_dir():
         raise VaultError("refusing to refresh non-directory tree {0}".format(dest))
     clear_tree(dest)
