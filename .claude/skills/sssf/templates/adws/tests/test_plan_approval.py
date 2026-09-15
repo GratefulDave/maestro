@@ -12,6 +12,7 @@ and a run already bound is never re-checked.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -71,6 +72,113 @@ class SameSignatureAsPlanctl(unittest.TestCase):
             planctl.receipt_signature(receipt, plan_receipts.KEY), receipt["signature"]
         )
         self.assertEqual(planctl.reviewer_key_id(plan_receipts.KEY), receipt["reviewer_key_id"])
+
+
+_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "plan_contract_minimal.json"
+#: planctl.question_surface_sha256 over tests/fixtures/plan_contract_minimal.json,
+#: computed with the-library planctl (feat/claim-decided-by, c73f4b7).
+_FIXTURE_SURFACE = "7f05fbc61cfff531365e7a4faf4e4914a41d3c9d7779821a873cc33fa28ff650"
+
+
+def _claims_only_surface(ir: dict) -> str:
+    """The v1 algorithm planctl used before the discharge relation was added."""
+    surface = sorted(
+        ({k: v for k, v in claim.items() if k != "decided_by"} for claim in ir["claims"]),
+        key=lambda claim: claim["claim_id"],
+    )
+    return plan_approval.hashlib.sha256(plan_approval.canonical_json(surface)).hexdigest()
+
+
+class SameQuestionSurfaceAsPlanctl(unittest.TestCase):
+    def test_the_pinned_vector(self) -> None:
+        ir = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual(_FIXTURE_SURFACE, plan_approval.question_surface_sha256(ir))
+        self.assertNotEqual(_FIXTURE_SURFACE, _claims_only_surface(ir))
+
+    def test_against_the_real_planctl_when_it_is_here(self) -> None:
+        path = _planctl_path()
+        if path is None:
+            self.skipTest("planctl.py is not checked out beside this repository")
+        spec = importlib.util.spec_from_file_location("planctl_surface_parity", path)
+        assert spec is not None and spec.loader is not None
+        planctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planctl)
+        base = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+        variants = {"fixture": base}
+        lane = copy.deepcopy(base)
+        lane["lanes"][0]["claim_ids"] = []
+        variants["lane mapping"] = lane
+        kind = copy.deepcopy(base)
+        kind["lanes"][0]["lane_kind"] = "build"
+        variants["lane kind"] = kind
+        verifier = copy.deepcopy(base)
+        verifier["verifiers"][0]["claim_ids"] = []
+        variants["verifier mapping"] = verifier
+        record = {"requirement_id": "req-t", "lane_ids": ["lane-t"],
+                  "verifier_ids": ["verify-t"], "claim_ids": ["claim-t"], "source_ids": ["src-a"]}
+        traced = dict(copy.deepcopy(base), traceability=[record])
+        variants["with traceability"] = traced
+        moved = copy.deepcopy(traced)
+        moved["traceability"][0]["lane_ids"] = ["lane-b"]
+        variants["traceability mapping"] = moved
+        example = copy.deepcopy(base)
+        example["claims"][0]["decided_by"] = [{"input": 1, "expect": 2}]
+        variants["decided_by only"] = example
+        digests = {name: plan_approval.question_surface_sha256(ir) for name, ir in variants.items()}
+        self.assertEqual(digests["fixture"], digests["decided_by only"])
+        for changed in ("lane mapping", "lane kind", "verifier mapping", "with traceability"):
+            self.assertNotEqual(digests["fixture"], digests[changed], changed)
+        self.assertNotEqual(digests["with traceability"], digests["traceability mapping"])
+        for name, ir in variants.items():
+            with self.subTest(variant=name):
+                self.assertEqual(
+                    planctl.question_surface_sha256(ir), plan_approval.question_surface_sha256(ir))
+                self.assertEqual(planctl.plan_record_manifest(ir), plan_receipts.record_manifest(ir))
+                self.assertEqual(
+                    planctl.source_inventory_digest(ir, Path(tempfile.gettempdir())),
+                    plan_receipts.source_inventory_sha256(ir),
+                )
+
+
+class StaleQuestionSurfaceIsRefused(unittest.TestCase):
+    """Cross-vendor review r3: a correctly signed receipt over the current IR, v1 surface."""
+
+    def test_ship_refuses_and_writes_no_plan(self) -> None:
+        from adw_modules import plan_contract_ingress as ingress
+
+        ir = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ir_path = root / "ir.json"
+            ir_path.write_bytes(_FIXTURE.read_bytes())
+            stale = plan_receipts.signed_receipt(
+                _FIXTURE.read_bytes(), question_surface_sha256=_claims_only_surface(ir))
+            self.assertEqual(stale["signature"], plan_approval.signature(stale, plan_receipts.KEY))
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps(stale), encoding="utf-8")
+            out = root / "plan.json"
+            (root / "repo").mkdir()
+            with self.assertRaises(ingress.IngressError) as caught:
+                ingress.author_from_plan_contract(
+                    ir_path, receipt, out, root / "repo", reviewer_key=plan_receipts.KEY)
+            self.assertIn("RECEIPT_QUESTION_SURFACE", str(caught.exception))
+            self.assertFalse(out.exists())
+
+    def test_a_receipt_derived_from_its_ir_ships(self) -> None:
+        from adw_modules import plan_contract_ingress as ingress
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ir_path = root / "ir.json"
+            ir_path.write_bytes(_FIXTURE.read_bytes())
+            receipt = root / "receipt.json"
+            receipt.write_text(
+                json.dumps(plan_receipts.signed_receipt(_FIXTURE.read_bytes())), encoding="utf-8")
+            (root / "repo").mkdir()
+            out = root / "plan.json"
+            ingress.author_from_plan_contract(
+                ir_path, receipt, out, root / "repo", reviewer_key=plan_receipts.KEY)
+            self.assertTrue(out.exists())
 
 
 class RequireApprovedPlan(unittest.TestCase):

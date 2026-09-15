@@ -9,6 +9,8 @@ a receipt without a valid signature is refused by the code under test.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,22 +22,76 @@ KEY_MATERIAL = "ab" * 32
 KEY = plan_approval.key_bytes(KEY_MATERIAL)
 
 
+def _ir(ir_bytes: bytes) -> dict:
+    try:
+        ir = json.loads(ir_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return {}
+    return ir if isinstance(ir, dict) else {}
+
+
+#: planctl's ID_BEARING_COLLECTIONS, for `record_manifest`.
+_ID_BEARING = (
+    ("claims", "claim_id"), ("fixtures", "fixture_id"), ("lanes", "lane_id"),
+    ("links", "link_id"), ("rendered_bindings", "binding_id"),
+    ("requirements", "requirement_id"), ("seams", "seam_id"),
+    ("source_artifacts", "source_id"), ("verifiers", "verifier_id"),
+)
+
+
+def record_manifest(ir: dict) -> dict:
+    """planctl's `plan_record_manifest`, derived from the IR (parity-tested)."""
+    manifest = {}
+    for name, id_field in _ID_BEARING:
+        digests = {
+            record[id_field]: hashlib.sha256(plan_approval.canonical_json(record)).hexdigest()
+            for record in ir.get(name) or []
+            if isinstance(record, dict) and isinstance(record.get(id_field), str)
+        }
+        if digests:
+            manifest[name] = dict(sorted(digests.items()))
+    return manifest
+
+
+def source_inventory_sha256(ir: dict) -> str:
+    """planctl's `source_inventory_digest` for repository-relative sources (parity-tested)."""
+    inventory = []
+    for source in ir.get("source_artifacts") or []:
+        if not (isinstance(source, dict) and all(
+                isinstance(source.get(k), str) for k in ("source_id", "path", "sha256"))):
+            continue
+        item = {
+            "source_id": source["source_id"],
+            "canonical_path": Path(os.path.normpath(source["path"])).as_posix(),
+            "sha256": source["sha256"],
+            "required": source.get("required"),
+        }
+        if "access" in source:
+            item["access"] = source["access"]
+        inventory.append(item)
+    inventory.sort(key=lambda item: (item["source_id"], item["canonical_path"]))
+    return hashlib.sha256(plan_approval.canonical_json(inventory)).hexdigest()
+
+
 def signed_receipt(
     ir_bytes: bytes,
     *,
     key: bytes = KEY,
     rendered: bytes = b"<html></html>",
+    findings: bytes = b'{"findings": []}',
     **overrides: Any,
 ) -> dict:
+    """A receipt whose every digest is derived from the IR it approves."""
+    ir = _ir(ir_bytes)
     receipt = {
         "schema_version": plan_approval.RECEIPT_VERSION,
         "verdict": "PASS",
         "ir_sha256": hashlib.sha256(ir_bytes).hexdigest(),
         "rendered_sha256": hashlib.sha256(rendered).hexdigest(),
-        "source_inventory_sha256": "1" * 64,
-        "record_manifest": {},
-        "findings_sha256": "2" * 64,
-        "question_surface_sha256": "3" * 64,
+        "source_inventory_sha256": source_inventory_sha256(ir),
+        "record_manifest": record_manifest(ir),
+        "findings_sha256": hashlib.sha256(findings).hexdigest(),
+        "question_surface_sha256": plan_approval.question_surface_sha256(ir),
         "validator_version": "test",
         "reviewer": {"id": "independent-reviewer", "vendor": "other-vendor"},
         "signature_algorithm": plan_approval.SIGNATURE_ALGORITHM,

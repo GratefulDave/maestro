@@ -12,7 +12,11 @@ own `receipt_signature` so the two cannot drift.
   signature, algorithm and key id, the verdict, the IR (and rendered) digests,
   and the two-implementations pass (`findings_sha256`,
   `question_surface_sha256`). A field's presence is author-controlled data; only
-  the signature makes it evidence.
+  the signature makes it evidence. And a signature proves who signed a value,
+  not that the value describes this IR, so the question-surface digest is
+  recomputed from the supplied IR (`question_surface_sha256`, the same
+  algorithm as planctl's, pinned by a fixed vector and a live parity test) and
+  must equal the signed one.
 - `approval_record` / `verify_approval` bind a projected plan's digest to that
   receipt. The trusted projection writes the record, and `run start` refuses
   a plan without a valid one. Nothing without the key can produce it.
@@ -29,6 +33,12 @@ RECEIPT_VERSION = "plan-contract-review.v1"
 SIGNATURE_ALGORITHM = "HMAC-SHA256"
 APPROVAL_VERSION = "maestro-plan-approval.v1"
 _SHA256_HEX = frozenset("0123456789abcdef")
+
+
+#: The question-surface algorithm this module and planctl share. v2 added the
+#: tests-lane discharge relation to v1's claims-only digest; a receipt signed
+#: over a v1 digest describes a question that no longer is the reviewed one.
+QUESTION_SURFACE_ALGORITHM = "plan-contract-question-surface.v2"
 
 
 class ApprovalRefused(ValueError):
@@ -58,6 +68,41 @@ def key_id(key: bytes) -> str:
 def signature(record: Mapping[str, Any], key: bytes) -> str:
     payload = {name: value for name, value in record.items() if name != "signature"}
     return hmac.new(key, canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def _records(ir: Mapping[str, Any], name: str) -> list:
+    value = ir.get(name)
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def question_surface_sha256(ir: Mapping[str, Any]) -> str:
+    """planctl's `question_surface_sha256`, v2 (`QUESTION_SURFACE_ALGORITHM`).
+
+    Claims with everything except `decided_by`, plus the tests-lane discharge
+    relation: each lane's id, kind, claim_ids and verifier_ids; each verifier's
+    lane_ids and claim_ids; each traceability record's lane, verifier and claim
+    ids. Every part is sorted by its id.
+    """
+
+    def part(name: str, key: str, fields: Optional[tuple] = None) -> list:
+        kept = [
+            {field: item.get(field) for field in fields}
+            if fields is not None
+            else {k: v for k, v in item.items() if k != "decided_by"}
+            for item in _records(ir, name)
+        ]
+        return sorted(kept, key=lambda item: str(item.get(key)))
+
+    surface = {
+        "claims": part("claims", "claim_id"),
+        "lanes": part("lanes", "lane_id", ("lane_id", "lane_kind", "claim_ids", "verifier_ids")),
+        "verifiers": part("verifiers", "verifier_id", ("verifier_id", "lane_ids", "claim_ids")),
+        "traceability": part(
+            "traceability", "requirement_id",
+            ("requirement_id", "lane_ids", "verifier_ids", "claim_ids"),
+        ),
+    }
+    return hashlib.sha256(canonical_json(surface)).hexdigest()
 
 
 def _sha256_hex(value: Any) -> bool:
@@ -105,6 +150,18 @@ def verify_receipt(
         and _sha256_hex(receipt.get("question_surface_sha256"))
     ):
         raise ApprovalRefused("RECEIPT_WITHOUT_FINDINGS")
+    try:
+        ir = json.loads(bytes(ir_bytes).decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise ApprovalRefused("RECEIPT_QUESTION_SURFACE", "IR is not JSON") from exc
+    if not isinstance(ir, Mapping) or (
+        receipt["question_surface_sha256"] != question_surface_sha256(ir)
+    ):
+        raise ApprovalRefused(
+            "RECEIPT_QUESTION_SURFACE",
+            "the signed question surface is not this IR's under {0}".format(
+                QUESTION_SURFACE_ALGORITHM),
+        )
     reviewer = receipt.get("reviewer")
     if not (
         isinstance(reviewer, Mapping)
