@@ -337,7 +337,7 @@ class ArtifactStore:
         version = versions[0]
         if version == st.LEDGER_SCHEMA_VERSION:
             return
-        # Chained, not branched: a v1 ledger reaches v3 through v2 rather than
+        # Chained, not branched: a v1 ledger reaches v4 through v2 and v3 rather than
         # through a second one-off script, so there is one definition of what
         # each version's tables are and no path that skips a rebuild.
         if version == st.LEDGER_SCHEMA_VERSION_V1:
