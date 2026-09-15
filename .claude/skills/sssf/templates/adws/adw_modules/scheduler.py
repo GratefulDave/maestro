@@ -1050,6 +1050,12 @@ class LaneContext:
     #: Set on the second ask, when the suite is red and the reviewer's first
     #: answer carried no finding the builder could act on.
     sealed_findings_required: bool = False
+    #: Set on the second ask, when the reviewer's first `violated_requirement`
+    #: was not a verbatim quote of the public contract. Without it the re-ask
+    #: is byte-identical and a paraphrase repeats: FDAdb run be064e58
+    #: `lane-wp3-reader-tests` refused REVIEW_FINDING_UNCITED on a finding the
+    #: contract does state, reworded both times.
+    rejected_citation: str = ""
     #: The names -- and only the names -- the sealed acceptance suite binds to:
     #: module specifiers, the symbols imported from each, and the result-object
     #: keys the assertions read. Names are contract; values are secrets. The
@@ -1431,6 +1437,11 @@ def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
     criteria = contract.get("acceptance_criteria") or ()
     outputs = contract.get("declared_outputs") or ()
     return " ".join([str(item) for item in criteria] + [str(item) for item in outputs])
+
+
+def _rejected_citation(exc: BaseException) -> str:
+    citation = getattr(exc, "offending_requirement", "")
+    return citation if isinstance(citation, str) else ""
 
 
 def _bind_reviewer_findings(
@@ -2560,12 +2571,16 @@ class FactoryScheduler:
                     findings,
                     contract_text=_public_contract_text(ctx.public_contract),
                 )
-            except st.CanonicalIdentityError:
+            except st.CanonicalIdentityError as first:
                 self._say(
                     lane_id,
                     "reviewer finding does not cite the contract, asking again",
                 )
-                verdict, findings = self.actor.review_tests(ctx)
+                verdict, findings = self.actor.review_tests(
+                    dataclasses.replace(
+                        ctx, rejected_citation=_rejected_citation(first)
+                    )
+                )
                 self._say(
                     lane_id,
                     "test reviewer answered {0} on the second ask".format(
@@ -3033,12 +3048,16 @@ class FactoryScheduler:
                     findings,
                     contract_text=_public_contract_text(product_contract),
                 )
-            except st.CanonicalIdentityError:
+            except st.CanonicalIdentityError as first:
                 self._say(
                     lane_id,
                     "reviewer finding does not cite the contract, asking again",
                 )
-                verdict, findings = self.actor.review_code(ctx)
+                verdict, findings = self.actor.review_code(
+                    dataclasses.replace(
+                        ctx, rejected_citation=_rejected_citation(first)
+                    )
+                )
                 self._say(
                     lane_id,
                     "code reviewer answered {0} on the second ask".format(
@@ -3472,9 +3491,13 @@ class FactoryScheduler:
                         findings,
                         contract_text=contract_text,
                     )
-                except st.CanonicalIdentityError:
+                except st.CanonicalIdentityError as first:
                     verdict, findings, affected = self.actor.review_integration(
-                        ctx, lanes, head
+                        dataclasses.replace(
+                            ctx, rejected_citation=_rejected_citation(first)
+                        ),
+                        lanes,
+                        head,
                     )
                     try:
                         findings = _bind_reviewer_findings(
