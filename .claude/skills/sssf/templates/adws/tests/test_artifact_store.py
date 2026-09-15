@@ -861,6 +861,34 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.artifact_id, merge_id)
 
+    def test_a_merge_completed_again_is_one_link_in_the_chain(self) -> None:
+        # An amendment that retains a merged lane completes the same merge
+        # again. FDAdb run be064e58 carried three completions of one merge and
+        # refused `merge chain break` on an intact chain.
+        tip = self._merge_both()
+        merge_a = self.store._latest_lane_artifact(
+            RUN_ID, "A", st.ArtifactKind.INTEGRATION_MERGE
+        )
+        assert merge_a is not None
+        self.store.conn.execute(
+            "INSERT INTO transitions"
+            "(run_id, lane_id, from_stage, to_stage, artifact_id, reason, created_at) "
+            "VALUES (?, 'A', 'READY_TO_MERGE', 'MERGED', ?, 'complete_stage', "
+            "'2099-01-01T00:00:00Z')",
+            (RUN_ID, merge_a["artifact_id"]),
+        )
+        merges = self.store.integration_merge_payloads(RUN_ID)
+        self.assertEqual(
+            [item["after_sha"] for item in merges],
+            [git_sha("merge-a"), git_sha("merge-b")],
+        )
+        self.assertEqual(
+            gitpub.durable_integration_tip(
+                self.store._run(RUN_ID)["integration_initial_sha"], merges
+            ),
+            tip,
+        )
+
     def test_dependent_building_uses_highest_integration_merge(self) -> None:
         self._to_sealed(self.lane_a)
         self._build(

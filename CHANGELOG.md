@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Fixed
+- **A merge completed again is one link in the integration chain.** An
+  amendment that retains a merged lane completes the same `INTEGRATION_MERGE`
+  again, and `integration_merge_payloads` returned one row per `complete_stage`
+  transition, so `durable_integration_tip` walked that merge twice and refused
+  `INTEGRATION_RECEIPT_REFUSED:merge chain break` on an intact chain. FDAdb run
+  `be064e58` carried three completions of `lane-wp3-raw-build`'s merge and two
+  of `lane-wp3-labels-build`'s, and `run status` refused. The query now returns
+  each merge once, at its first completion.
 - **A ledger migration keeps other tables' references on the table it rebuilds.**
   The v2->v3 migration renamed `run_artifacts` aside, created the widened table,
   copied the rows and dropped the backup. SQLite's rename also rewrote

@@ -724,13 +724,19 @@ class ArtifactStore:
     def integration_merge_payloads(
         self, run_id: str
     ) -> tuple[Mapping[str, Any], ...]:
+        # One receipt per merge, placed at its first completion. An amendment
+        # that retains a merged lane completes the same INTEGRATION_MERGE again
+        # (FDAdb run be064e58: raw-build's merge carries three `complete_stage`
+        # transitions), and a row per transition walks that merge twice and
+        # refuses `merge chain break` on a chain that is intact.
         rows = self.conn.execute(
-            "SELECT a.payload_json FROM lane_artifacts AS a "
+            "SELECT a.payload_json, MIN(t.id) AS first_completion "
+            "FROM lane_artifacts AS a "
             "JOIN transitions AS t "
             "ON t.run_id = a.run_id AND t.lane_id = a.lane_id "
             "AND t.artifact_id = a.artifact_id AND t.reason = 'complete_stage' "
             "WHERE a.run_id=? AND a.artifact_kind=? "
-            "ORDER BY t.id ASC",
+            "GROUP BY a.artifact_id ORDER BY first_completion ASC",
             (run_id, st.ArtifactKind.INTEGRATION_MERGE.value),
         )
         return tuple(_loads(row[0]) for row in rows)
