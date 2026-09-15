@@ -537,11 +537,7 @@ def _clear_precreated_role_cwd(dest: Path) -> bool:
     """Empty a precreated role cwd without replacing its process-bound inode."""
     if not _precreated_role_cwd(dest):
         return False
-    for child in dest.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        else:
-            shutil.rmtree(child)
+    hv.clear_tree(dest)
     return True
 
 
