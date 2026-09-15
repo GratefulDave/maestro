@@ -1,6 +1,6 @@
 'use strict';
 
-// node --test tests/   (no dependencies)
+// node --test tests/lanes.test.js   (no dependencies)
 // M1: a lock naming a live process that is not this daemon is never signalled.
 // M2: N concurrent `ensure` runs leave exactly one daemon.
 // M3: a multi-line rows table is cut whole; a failed config check leaves no saved fragment.

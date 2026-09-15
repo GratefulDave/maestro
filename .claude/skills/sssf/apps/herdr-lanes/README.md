@@ -18,6 +18,12 @@ The same two agent rows are used for every pane. A token that has no value is hi
 
 Space rows show `state_icon  workspace  state_text  $stage`, then `branch git_status`, then `$usage`.
 
+`$name` is drawn in the foreground colour rather than dimmed. `$logo` is coloured by vendor
+(`lib/brands.js`): a vendor with a published hue carries it, and a vendor whose mark is monochrome is
+drawn in white. Herdr allows at most 16 rules per token, so 16 vendors are coloured (claude, grok,
+kimi, omp, pi, codex, gpt, gemini, opencode, cursor, copilot, deepseek, qwen, cline, kilo, amp); the
+others (mastracode, maki, hermes, agy, kiro, devin, qodercli) keep the default colour.
+
 ## What it writes
 
 Every write uses metadata source `lanes`, sends a monotonic `seq`, and uses only these token names.
@@ -57,8 +63,10 @@ recorded in the plugin state directory.
 - The terminal that hosts the Herdr client is detected from the process tree. You can override this
   with `HERDR_LANES_TERMINAL=wezterm` or `ghostty`.
   - **WezTerm:** `config.font = wezterm.font("X")` becomes
-    `wezterm.font_with_fallback({ "Herdr Agent Icons Max", "X" })`, marked with a
-    `-- herdr-lanes:` comment. Any other form of that line is refused, and the line to add is printed.
+    `wezterm.font_with_fallback({ "X", "Herdr Agent Icons Max" })`, marked with a
+    `-- herdr-lanes:` comment. Your font stays first so it keeps the cell metrics; the icon font only
+    supplies the codepoints it lacks. A line wrapped by 0.1.0 (icon font first) is reordered in place.
+    Any other form of that line is refused, and the line to add is printed.
   - **Ghostty:** a fenced `font-codepoint-map` block is added.
 - `uninstall-font` reverses only what it recorded: the original WezTerm line is restored exactly, and
   the font file is removed only if its sha256 still matches the copy it installed.

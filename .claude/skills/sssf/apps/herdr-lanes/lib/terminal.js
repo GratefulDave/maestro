@@ -50,17 +50,23 @@ function detectTerminals() {
 const TERMINALS = {
   wezterm: {
     file: () => path.join(xdg(), 'wezterm', 'wezterm.lua'),
+    // The user's font comes first so it keeps the cell metrics; the icon font is only a
+    // fallback for the codepoints the user's font lacks.
     install(text) {
-      if (text.includes(MARK)) return { text };
+      if (text.includes(MARK)) {
+        // Migrate a line wrapped by 0.1.0 (icon font first); the recorded original is unchanged.
+        const legacy = new RegExp(`font_with_fallback\\(\\{ "${FAMILY}", "([^"]+)" \\}\\) ${MARK}`);
+        return { text: text.replace(legacy, (_, font) => `font_with_fallback({ "${font}", "${FAMILY}" }) ${MARK}`) };
+      }
       const lines = text.split('\n');
       const hits = lines.map((l, i) => [l, i]).filter(([l]) => /^\s*config\.font\s*=/.test(l));
       const shape = /^(\s*)config\.font\s*=\s*wezterm\.font\(\s*(["'])([^"']+)\2\s*\)\s*$/;
       const m = hits.length === 1 && hits[0][0].match(shape);
       if (!m) {
-        return { refused: `wezterm: config.font line not recognised; add by hand:\n  config.font = wezterm.font_with_fallback({ "${FAMILY}", "<your font>" })` };
+        return { refused: `wezterm: config.font line not recognised; add by hand:\n  config.font = wezterm.font_with_fallback({ "<your font>", "${FAMILY}" })` };
       }
       const [original, index] = hits[0];
-      lines[index] = `${m[1]}config.font = wezterm.font_with_fallback({ "${FAMILY}", "${m[3]}" }) ${MARK}`;
+      lines[index] = `${m[1]}config.font = wezterm.font_with_fallback({ "${m[3]}", "${FAMILY}" }) ${MARK}`;
       return { text: lines.join('\n'), record: { line: index, original } };
     },
     uninstall(text, rec) {
@@ -113,7 +119,7 @@ function installFont(stateDir) {
     if (result.text === text) { notes.push(`${name}: already configured`); continue; }
     backupOnce(file);
     fs.writeFileSync(file, result.text, 'utf8');
-    record.terminals[name] = { file, ...result.record };
+    record.terminals[name] = { ...record.terminals[name], file, ...result.record };
     notes.push(`${name}: font wired in ${file} (backup ${file}.bak-herdr-lanes); restart ${name} to load it`);
   }
   writeRecord(stateDir, record);

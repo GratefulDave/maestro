@@ -38,3 +38,7 @@ not the trademarks.
 The socket client and event subscription (`lib/herdr.js`) and the approach to installing the font
 and mapping its codepoints (`lib/terminal.js`) are adapted from herdr-radar `lib/ipc.js`,
 `lib/subscribe.js` and `lib/font.js`, under the MIT licence in `LICENSE-herdr-radar`.
+
+The vendor colours in `lib/brands.js` (the published hues and the dark-panel ink for monochrome
+marks) and its codepoint order are taken from herdr-radar `lib/palette.js` and
+`tools/codepoints.toml`, under the same MIT licence.

@@ -7,6 +7,7 @@
 // so a stalled server never builds a queue.
 
 const herdr = require('./herdr');
+const { logoFor } = require('./brands');
 
 const POLL_MS = 2000;
 const FRAME_MS = 200;
@@ -14,12 +15,6 @@ const TTL_MS = 180000; // tokens self-expire if the daemon dies
 const REFRESH_MS = 60000; // re-send live tokens well inside the TTL
 const TITLE_MAX = 40;
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-// Herdr agent id -> Private Use Area glyph in Herdr Agent Icons Max, U+E1A0 upward
-// (codepoint order from herdr-radar tools/codepoints.toml).
-const LOGO_ORDER = ('claude codex opencode omp cline mastracode kimi kilo maki pi hermes cursor copilot deepseek '
-  + 'gemini gpt qwen grok agy kiro amp devin qodercli').split(' ');
-const logoFor = (agent) => (LOGO_ORDER.includes(agent) ? String.fromCodePoint(0xe1a0 + LOGO_ORDER.indexOf(agent)) : null);
 
 const truncate = (text, max) => (!text ? null : [...text].length > max ? `${[...text].slice(0, max - 1).join('')}…` : text);
 
