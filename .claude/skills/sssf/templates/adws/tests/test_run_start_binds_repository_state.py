@@ -257,6 +257,8 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
             mock.patch.object(maestro, "require_deployment"),
             mock.patch.object(maestro, "_open_runtime", return_value=runtime),
             mock.patch.object(maestro, "_compile_plan", return_value=compiled),
+            # This case is about live output; approval has its own suite.
+            mock.patch.object(maestro, "_require_approved_plan"),
             mock.patch.object(
                 maestro.gitpub, "bind_target_worktree", return_value=target
             ),

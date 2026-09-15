@@ -467,6 +467,15 @@ Three rules for writing them:
   example. The same findings file then signs, and nobody is asked again. Any other change to a
   claim makes the findings stale.
 
+**`run start` binds only an approved projection.** `plan_author_cli.py --from-plan-contract`
+authenticates the planctl receipt's HMAC with the deployment's reviewer key
+(`<runtime_state_root>/keys/reviewer-hmac.key`). It writes the plan with an `approval` record,
+the plan digest plus that receipt, signed with the same key. `run start` refuses a plan without a
+valid record, or one edited after projection (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`). `run amend`
+still accepts a scripted edit of a projected plan, and a run already bound is never re-checked.
+Run the planctl commands from the repository root, with the IR under `.maestro/` and
+repository-relative `source_artifacts`, so `--repo-root .` resolves them.
+
 **Every workflow ends with the same two commands:** `planctl review --findings`, then
 `plan_author_cli.py --from-plan-contract`. The receipt records the findings it was signed with.
 `plan_author_cli.py` refuses a receipt without them (`RECEIPT_WITHOUT_FINDINGS`), and

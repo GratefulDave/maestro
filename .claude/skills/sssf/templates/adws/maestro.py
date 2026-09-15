@@ -33,6 +33,7 @@ from adw_modules.handoff_budget import (
 )
 from adw_modules import code_review as cr
 from adw_modules import launcher as lch
+from adw_modules import plan_approval
 from adw_modules import plan_compiler
 from adw_modules import plan_contract_ingress as ingress
 from adw_modules import route_admission as admission
@@ -2847,6 +2848,7 @@ def _run_plan(args: argparse.Namespace) -> int:
                     compiled = _compile_plan(
                         plan_path, revision=1, ref=str(plan_path)
                     )
+                    _require_approved_plan(plan_path, compiled, runtime)
                     start_id = uuid.uuid4().hex
                     create_factory_run(
                         store=store,
@@ -2873,6 +2875,39 @@ def _run_plan(args: argparse.Namespace) -> int:
     )
 
 
+def _require_approved_plan(
+    plan_path: Path, compiled: st.CompiledPlan, runtime: RuntimeStateRoot
+) -> None:
+    """A new run binds only a plan bound to authenticated approval evidence.
+
+    The approved projection (`plan_author_cli.py --from-plan-contract`, or
+    `run attend`'s) writes an `approval` record: the plan digest and the
+    planctl receipt it was projected from, both signed with this deployment's
+    reviewer key. A compiler-valid plan without it, or one edited after
+    projection, is refused `PLAN_UNAPPROVED`/`PLAN_APPROVAL_*` before a run
+    exists. `run amend` does not call this: a scripted amendment is still
+    accepted, and a run already bound is never re-checked.
+    """
+    try:
+        document = json.loads(plan_path.read_bytes().decode("utf-8"))
+        material = _reviewer_hmac_key(runtime)
+    except att.AttendRefused as exc:
+        raise _RunRefused("PLAN_UNAPPROVED", "reviewer key: {0}".format(exc.detail)) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _RunRefused("PLAN_UNAPPROVED", str(exc)) from exc
+    approval = document.get("approval") if isinstance(document, dict) else None
+    try:
+        plan_approval.verify_approval(
+            approval, compiled.plan_digest, plan_approval.key_bytes(material)
+        )
+    except plan_approval.ApprovalRefused as exc:
+        raise _RunRefused(
+            exc.code,
+            "run start binds only an approved projection: planctl review "
+            "--findings, then plan_author_cli.py --from-plan-contract ({0})".format(exc),
+        ) from exc
+
+
 def _run_start(args: argparse.Namespace) -> int:
     maestro_file = _executing_maestro_file()
     repo = Path(args.repo).resolve() if args.repo else _repository_from_cwd()
@@ -2888,6 +2923,7 @@ def _run_start(args: argparse.Namespace) -> int:
             revision=1,
             ref=str(plan_path.resolve()),
         )
+        _require_approved_plan(plan_path, compiled, runtime)
         target = gitpub.bind_target_worktree(repo, main_ref)
         store = _open_store(runtime)
         run_id = args.run_id or uuid.uuid4().hex
@@ -3553,7 +3589,10 @@ def _attend_project(
         ],
     )
     try:
-        ingress.author_from_plan_contract(ir, receipt, plan_out, repo, rendered)
+        ingress.author_from_plan_contract(
+            ir, receipt, plan_out, repo, rendered,
+            reviewer_key=plan_approval.key_bytes(key),
+        )
     except Exception as exc:
         raise att.AttendRefused(
             att.REVISION_REFUSED, "{0}: {1}".format(type(exc).__name__, exc)

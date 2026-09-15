@@ -27,8 +27,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   has_preconditions, external_store from `witness.store: external`; an
   upstream-endpoint claim owes its unavailable refusal), and the compiler derives the refusal obligation from it
   itself, so a plan started from canonical bytes cannot drop it.
-  `plan_author_cli.py --from-plan-contract` refuses a receipt that does not
-  record `findings_sha256` (`RECEIPT_WITHOUT_FINDINGS`). `run attend` now passes
+  `plan_author_cli.py --from-plan-contract` authenticates the planctl receipt's
+  HMAC with the deployment's reviewer key (a forged or unsigned receipt is
+  refused and no plan is written) and writes a signed `approval` record.
+  **`run start` now refuses a plan that is not an approved projection**
+  (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`); `run amend` still accepts a scripted
+  edit, and runs already bound are unaffected. The approval is not recorded in
+  the `PLAN_AMENDMENT` payload: that would change the amendment artifact's
+  identity, so it stays in the pinned plan bytes under `runtime_state_root`. `run attend` now passes
   the operator's two-implementations findings, bound to the revision's question
   surface and the attend reviewer, to `planctl review --findings`. That needs the-library's matching `planctl` with
   `decided_by` and `--findings`. Why: in FDAdb's five amended runs about 16 of 36

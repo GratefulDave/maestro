@@ -111,36 +111,54 @@ class ReceiptHandshake(unittest.TestCase):
         self.tmp = Path(holder.name)
         self.ir_bytes = json.dumps({"plan_id": "p-1"}, sort_keys=True).encode("utf-8")
 
-    def _receipt(self, **overrides: object) -> dict:
-        receipt = {
-            "schema_version": ingress.RECEIPT_VERSION,
-            "verdict": "PASS",
-            "ir_sha256": hashlib.sha256(self.ir_bytes).hexdigest(),
-            "findings_sha256": "f" * 64,
-        }
-        receipt.update(overrides)
+    def _receipt(self, *, drop: tuple = (), **overrides: object) -> dict:
+        from tests import plan_receipts
+
+        receipt = plan_receipts.signed_receipt(self.ir_bytes, **overrides)
+        for name in drop:
+            receipt.pop(name)
+        receipt["signature"] = plan_receipts.plan_approval.signature(
+            receipt, plan_receipts.KEY)
         return receipt
 
+    def _verify(self, receipt: dict) -> None:
+        from tests import plan_receipts
+
+        ingress._verify_receipt(self.ir_bytes, receipt, None, plan_receipts.KEY)
+
     def test_a_pass_receipt_over_these_exact_bytes_verifies(self) -> None:
-        ingress._verify_receipt(self.ir_bytes, self._receipt(), None)
+        self._verify(self._receipt())
 
     def test_a_receipt_for_an_earlier_revision_is_refused(self) -> None:
         stale = self._receipt(ir_sha256=hashlib.sha256(b"older").hexdigest())
         with self.assertRaises(ingress.IngressError) as caught:
-            ingress._verify_receipt(self.ir_bytes, stale, None)
+            self._verify(stale)
         self.assertIn("RECEIPT_IR_MISMATCH", str(caught.exception))
 
     def test_a_receipt_not_signed_with_findings_is_refused(self) -> None:
-        receipt = self._receipt()
-        receipt.pop("findings_sha256")
-        with self.assertRaises(ingress.IngressError) as caught:
-            ingress._verify_receipt(self.ir_bytes, receipt, None)
-        self.assertIn("RECEIPT_WITHOUT_FINDINGS", str(caught.exception))
+        for field in ("findings_sha256", "question_surface_sha256"):
+            with self.subTest(field=field):
+                with self.assertRaises(ingress.IngressError) as caught:
+                    self._verify(self._receipt(drop=(field,)))
+                self.assertIn("RECEIPT_WITHOUT_FINDINGS", str(caught.exception))
 
     def test_a_receipt_that_is_not_a_pass_is_refused(self) -> None:
         with self.assertRaises(ingress.IngressError) as caught:
-            ingress._verify_receipt(self.ir_bytes, self._receipt(verdict="REVISE"), None)
+            self._verify(self._receipt(verdict="REVISE"))
         self.assertIn("RECEIPT_NOT_PASS", str(caught.exception))
+
+    def test_a_receipt_without_a_valid_signature_is_refused(self) -> None:
+        genuine = self._receipt()
+        for name, forged, code in (
+            ("unsigned", {k: v for k, v in genuine.items() if k != "signature"}, "RECEIPT_SIGNATURE"),
+            ("edited", dict(genuine, findings_sha256="9" * 64), "RECEIPT_SIGNATURE"),
+            ("other key id", dict(genuine, reviewer_key_id="0" * 64), "RECEIPT_KEY_ID"),
+            ("algorithm", dict(genuine, signature_algorithm="none"), "RECEIPT_SIGNATURE_ALGORITHM"),
+        ):
+            with self.subTest(forgery=name):
+                with self.assertRaises(ingress.IngressError) as caught:
+                    self._verify(forged)
+                self.assertIn(code, str(caught.exception))
 
 
 class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):

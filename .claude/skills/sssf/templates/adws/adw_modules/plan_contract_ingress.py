@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from . import plan_approval
 from . import plan_author
+from . import plan_compiler
 from . import scheduler_types as st
 from .plan_model import LANE_KEYS, SCHEMA_VERSION, AcceptanceCriterion
 
@@ -78,26 +80,17 @@ def _require_relative(path: str, label: str) -> str:
 
 
 def _verify_receipt(ir_bytes: bytes, receipt: Mapping[str, Any],
-                    rendered: Optional[bytes]) -> None:
-    if receipt.get("schema_version") != RECEIPT_VERSION:
-        raise IngressError("RECEIPT_SCHEMA")
-    if receipt.get("verdict") != "PASS":
-        raise IngressError("RECEIPT_NOT_PASS")
-    digest = receipt.get("ir_sha256")
-    if not isinstance(digest, str) or _sha256(ir_bytes) != digest:
-        raise IngressError("RECEIPT_IR_MISMATCH")
-    # planctl records the two-implementations pass it signed over. A receipt
-    # without it was not produced by `planctl review --findings`, and every
-    # workflow ends there, so it does not ship.
-    findings = receipt.get("findings_sha256")
-    if (not isinstance(findings, str) or len(findings) != 64
-            or any(char not in "0123456789abcdef" for char in findings)):
-        raise IngressError("RECEIPT_WITHOUT_FINDINGS")
-    if rendered is not None:
-        rendered_digest = receipt.get("rendered_sha256")
-        if (not isinstance(rendered_digest, str)
-                or _sha256(rendered) != rendered_digest):
-            raise IngressError("RECEIPT_RENDERED_MISMATCH")
+                    rendered: Optional[bytes], key: bytes) -> None:
+    """Authenticate planctl's receipt with the deployment's reviewer key.
+
+    The whole canonical receipt, signature included (`plan_approval`). A
+    receipt whose fields merely look right was not produced by `planctl
+    review --findings` unless its HMAC says so.
+    """
+    try:
+        plan_approval.verify_receipt(ir_bytes, receipt, rendered, key)
+    except plan_approval.ApprovalRefused as exc:
+        raise IngressError(str(exc)) from exc
 
 
 def _maestro_extension(ir: Mapping[str, Any]) -> dict:
@@ -1344,24 +1337,39 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
 
 def project_canonical_plan(
         ir_path: Path, receipt_path: Path, repo: Path,
-        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict, dict]:
-    """Verify the receipt and project, without writing anything."""
+        rendered_path: Optional[Path] = None, *,
+        reviewer_key: bytes) -> Tuple[bytes, dict, dict]:
+    """Authenticate the receipt and project, without writing anything.
+
+    The projected plan carries an `approval` record binding its digest to the
+    authenticated receipt, signed with the same key (`plan_approval`). `run
+    start` refuses a plan without one. The record is outside the compiled
+    canonical document, so the plan digest is the digest of the lanes alone.
+    """
     ir_bytes = Path(ir_path).read_bytes()
     ir = _load_json(ir_path, "IR_UNREADABLE")
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     rendered = Path(rendered_path).read_bytes() if rendered_path else None
-    _verify_receipt(ir_bytes, receipt, rendered)
+    _verify_receipt(ir_bytes, receipt, rendered, reviewer_key)
     draft = project_draft(ir, repo)
-    stored = plan_author.author_plan(draft)
+    digest = plan_compiler.compile_plan(plan_author.author_plan(draft)).plan_digest
+    approved = dict(
+        draft,
+        approval=plan_approval.approval_record(digest, receipt, reviewer_key),
+    )
+    stored = plan_author.author_plan(approved)
+    if plan_compiler.compile_plan(stored).plan_digest != digest:
+        raise IngressError("PLAN_APPROVAL_DIGEST")
     return stored, draft, ir
 
 
 def author_from_plan_contract(
         ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
-        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
-    """Verify the receipt, project, canonicalize, and write a Maestro plan."""
+        rendered_path: Optional[Path] = None, *,
+        reviewer_key: bytes) -> Tuple[bytes, dict]:
+    """Authenticate the receipt, project, canonicalize, and write a Maestro plan."""
     stored, draft, ir = project_canonical_plan(
-        ir_path, receipt_path, repo, rendered_path)
+        ir_path, receipt_path, repo, rendered_path, reviewer_key=reviewer_key)
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     plan_author.write_canonical_plan(destination, stored)
     trace = {

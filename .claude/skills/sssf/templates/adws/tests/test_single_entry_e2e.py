@@ -409,7 +409,9 @@ class FactoryEndToEndBase(SingleEntryBase):
         super().setUp()
         # The shipped one-lane plan from the base fixture is replaced by the
         # two-lane plan this file drives; both live at the installed path.
-        self.plan_path.write_bytes(two_lane_plan())
+        from tests import plan_receipts
+
+        self.plan_path.write_bytes(plan_receipts.approve_plan_bytes(two_lane_plan()))
         _git(self.repo, "add", "-f", str(self.plan_path))
         _git(self.repo, "commit", "-m", "ship two-lane")
         self.maestro_file = self._install_full_deployment()

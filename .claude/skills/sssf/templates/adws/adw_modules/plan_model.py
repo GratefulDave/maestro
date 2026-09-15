@@ -10,7 +10,10 @@ from typing import Any, Mapping, Optional, Tuple
 SCHEMA_VERSION = "maestro-plan.artifact-factory.v1"
 NO_PLAN_ARTIFACT_REF = "NO_PLAN_ARTIFACT_REF"
 
-PLAN_KEYS = frozenset({"schema_version", "lanes"})
+# `approval` is the projection's signed binding to a plan-contract receipt
+# (`plan_approval`). The compiler does not judge it and it is not part of the
+# canonical document or digest; `run start` verifies it.
+PLAN_KEYS = frozenset({"schema_version", "lanes", "approval"})
 LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance", "lane_kind"})
 ACCEPTANCE_KEYS = frozenset(
     {"criterion", "gating", "observation_seam", "decided_by", "restriction"}

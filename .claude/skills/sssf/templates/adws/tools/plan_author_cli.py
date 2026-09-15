@@ -27,8 +27,36 @@ _RUNTIME_ROOT = _TOOLS_DIR.parent
 if str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 
+from adw_modules import plan_approval  # noqa: E402
 from adw_modules import plan_author  # noqa: E402
 from adw_modules import plan_contract_ingress as ingress  # noqa: E402
+from adw_modules import route_admission as admission  # noqa: E402
+
+import yaml  # noqa: E402
+
+
+def _reviewer_key() -> bytes:
+    """This deployment's reviewer key, from its own runtime state root.
+
+    The same key `run attend` hands planctl and `run start` verifies approval
+    with. Resolved from the `maestro.config.yaml` beside this runtime, never
+    from an argument, so a receipt is authenticated against the deployment
+    that will run the plan.
+    """
+    config = _RUNTIME_ROOT / "maestro.config.yaml"
+    try:
+        loaded = yaml.safe_load(config.read_text(encoding="utf-8"))
+        root = Path(loaded["runtime_state_root"])
+        material = (root / "keys" / admission.REVIEWER_HMAC_KEY_FILE).read_text(
+            encoding="ascii"
+        )
+    except (OSError, UnicodeError, KeyError, TypeError, yaml.YAMLError) as exc:
+        raise plan_author.AuthoringError(
+            "REVIEWER_KEY_UNRESOLVED:{0}".format(exc)
+        ) from exc
+    if not material.strip():
+        raise plan_author.AuthoringError("REVIEWER_KEY_UNRESOLVED:empty key")
+    return plan_approval.key_bytes(material)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +84,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(args.destination),
             Path(args.repo),
             Path(args.rendered) if args.rendered else None,
+            reviewer_key=_reviewer_key(),
         )
     except (plan_author.AuthoringError, ingress.IngressProjectionIncomplete) as exc:
         print(
