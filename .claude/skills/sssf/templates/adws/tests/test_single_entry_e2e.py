@@ -7,11 +7,11 @@ by `tests/herdr_fake.py`, and the coding agent is simulated by writing the
 files and envelope the pane would have produced when a prompt is offered to it.
 Assertions are durable ledger rows, Git refs, and the Herdr resource graph.
 
-The Herdr topology asserted here is one existing repository workspace. Each
-lane is one tab in that workspace, and every lane-role pane lives inside its
-lane tab at its role checkout. Maestro neither creates, tags, renames, nor
-closes the repository workspace. `NoRepositoryWorkspaceTest` covers refusal when no
-repository workspace is open.
+The Herdr topology asserted here is Shape A: the operator's own Space is open
+on the repository, every lane is a linked child of it, and Maestro neither
+creates, tags, renames nor closes that Space -- completion closes the lane
+children only. `NoOperatorSpaceTest` covers the one case where no Space is
+open and Maestro creates the parent itself, which it then also keeps.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ FINDING = {
     "required_behavior": "behavior is asserted",
     "violated_requirement": "a.txt is written",
 }
+
 _PROMPT = re.compile(r"@(\S+\.json)")
 
 
@@ -138,7 +139,6 @@ class SimulatedPanes:
         self.verdicts: list[tuple[str, str, str]] = []
         self.test_rounds: dict[str, int] = defaultdict(int)
         self.code_rounds: dict[str, int] = defaultdict(int)
-        self.role_worktrees: dict[tuple[str, str], Path] = {}
         herdr.hooks_after.setdefault(("agent", "start"), []).append(self._started)
         herdr.hooks_after.setdefault(("pane", "send-text"), []).append(self._offered)
 
@@ -191,7 +191,6 @@ class SimulatedPanes:
 
     def _work(self, role: str, prompt: Mapping[str, Any], cwd: Path) -> dict:
         lane = str(prompt.get("lane_id") or "")
-        self.role_worktrees[(lane, role)] = cwd.resolve()
         self.turns.append((lane, role))
         if role == "tester":
             return self._tester(lane, prompt, cwd)
@@ -254,49 +253,40 @@ class SimulatedPanes:
 
 
 def herdr_graph(herdr: FakeHerdr) -> dict[str, Any]:
-    """The live repository-workspace → lane-tab → role-pane graph."""
+    """The live Herdr resource graph: parents, lane children, panes, agents.
+
+    Read under the fake's own lock: lanes run concurrently, so a graph built
+    while another lane is opening a child would otherwise race its writes.
+    """
     with herdr.lock:
         live = {
             key: record
             for key, record in herdr.workspaces.items()
             if key not in herdr.closed_workspaces
         }
-        parents = list(live)
-        tabs: dict[str, dict[str, str]] = defaultdict(dict)
-        for tab_id, tab in herdr.tabs.items():
-            workspace_id = str(tab.get("workspace_id") or "")
-            if workspace_id in live:
-                tabs[workspace_id][tab_id] = str(tab.get("label") or "")
-
-        panes: dict[str, dict[str, dict[str, str]]] = defaultdict(
-            lambda: defaultdict(dict)
-        )
-        lane_tabs: dict[str, list[str]] = defaultdict(list)
-        lane_panes: dict[str, dict[str, dict[str, str]]] = defaultdict(
-            lambda: defaultdict(dict)
-        )
-        pane_cwds: dict[str, str] = {}
+        parents = [
+            key
+            for key, record in live.items()
+            if not (record.get("worktree") or {}).get("is_linked_worktree")
+        ]
+        children: dict[str, list[str]] = defaultdict(list)
+        child_ids: dict[str, list[str]] = defaultdict(list)
+        for parent_id, opened in herdr.worktrees.items():
+            for record in opened:
+                workspace_id = str(record.get("open_workspace_id") or "")
+                if workspace_id and workspace_id in live:
+                    children[parent_id].append(str(record.get("label") or ""))
+                    child_ids[parent_id].append(workspace_id)
+        panes: dict[str, list[str]] = defaultdict(list)
         for pane_id, pane in herdr.panes.items():
             if pane_id in herdr.closed_panes:
                 continue
             workspace_id = str(pane.get("workspace_id") or "")
-            tab_id = str(pane.get("tab_id") or "")
             if workspace_id not in live:
                 continue
             label = str(pane.get("label") or "")
-            panes[workspace_id][tab_id][pane_id] = label
-            pane_cwds[pane_id] = str(pane.get("cwd") or "")
-            tokens = lch._herdr_tokens(pane)
-            lane = str(tokens.get(lch.METADATA_TOKEN_LANE) or "")
-            if (
-                tokens.get(lch.METADATA_TOKEN_KIND) == lch.METADATA_KIND_LANE
-                and tokens.get(lch.METADATA_TOKEN_PARENT) == workspace_id
-                and lane
-            ):
-                if tab_id not in lane_tabs[lane]:
-                    lane_tabs[lane].append(tab_id)
-                lane_panes[lane][tab_id][pane_id] = label
-
+            if label:
+                panes[workspace_id].append(label)
         agents = {
             name: str(record.get("pane_id") or "")
             for name, record in herdr.agents.items()
@@ -304,63 +294,46 @@ def herdr_graph(herdr: FakeHerdr) -> dict[str, Any]:
         }
         return {
             "parents": sorted(parents),
-            "tabs": {
-                workspace_id: dict(sorted(items.items()))
-                for workspace_id, items in tabs.items()
-            },
-            "lane_tabs": {lane: sorted(tab_ids) for lane, tab_ids in lane_tabs.items()},
-            "panes": {
-                workspace_id: {
-                    tab_id: dict(sorted(items.items()))
-                    for tab_id, items in by_tab.items()
-                }
-                for workspace_id, by_tab in panes.items()
-            },
-            "lane_panes": {
-                lane: {
-                    tab_id: dict(sorted(items.items()))
-                    for tab_id, items in by_tab.items()
-                }
-                for lane, by_tab in lane_panes.items()
-            },
-            "pane_cwds": pane_cwds,
+            "children": {key: sorted(value) for key, value in children.items()},
+            "child_ids": {key: sorted(value) for key, value in child_ids.items()},
+            "panes": {key: sorted(value) for key, value in panes.items()},
             "agents": agents,
             "live_workspaces": sorted(live),
         }
 
 
-def plant_operator_workspace(herdr: FakeHerdr, primary: Path) -> str:
-    """Plant the repository workspace from which the operator invokes Maestro."""
+def plant_operator_space(herdr: FakeHerdr, primary: Path) -> str:
+    """The operator's own Space on the repository -- Shape A's parent.
+
+    Open at the primary checkout, untagged, with a second tab of its own, a
+    pane in it, and the operator's own agent working there. None of it is
+    Maestro's to tag, rename, or close.
+    """
     operator = herdr.add_workspace(primary.name, primary)
-    tab_id = str(herdr.workspaces[operator]["active_tab_id"])
-    tab = herdr.tabs[tab_id]
-    tab["label"] = "notes"
-    pane = next(
-        pane
-        for pane in herdr.panes.values()
-        if pane["workspace_id"] == operator and pane["tab_id"] == tab_id
-    )
+    tab = herdr._new_tab(operator, "notes")
+    pane = herdr._new_pane(operator, tab["tab_id"], str(primary))
     herdr.start_agent("operator-claude", pane["pane_id"], status="working")
     return operator
 
 
-def workspace_records(herdr: FakeHerdr, workspace_id: str) -> set[str]:
-    """The original tab, pane, and agent records the operator owns."""
-    tab_ids = {
+def space_records(herdr: FakeHerdr, workspace_id: str) -> set[str]:
+    """Every record id inside one Space: itself, its tabs, panes, agents."""
+    ids = {workspace_id}
+    ids |= {
         key for key, tab in herdr.tabs.items() if tab["workspace_id"] == workspace_id
     }
-    pane_ids = {
-        key for key, pane in herdr.panes.items() if pane["workspace_id"] == workspace_id
+    panes = {
+        key
+        for key, pane in herdr.panes.items()
+        if pane["workspace_id"] == workspace_id
     }
-    return (
-        tab_ids
-        | pane_ids
-        | {
-            name
-            for name, agent in herdr.agents.items()
-            if str(agent.get("pane_id") or "") in pane_ids
-        }
-    )
+    ids |= panes
+    ids |= {
+        name
+        for name, agent in herdr.agents.items()
+        if str(agent.get("pane_id") or "") in panes
+    }
+    return ids
 
 
 #: Verbs that change the Herdr resource graph. The topology is asserted after
@@ -370,13 +343,9 @@ TOPOLOGY_VERBS = frozenset(
         ("workspace", "create"),
         ("workspace", "close"),
         ("worktree", "open"),
-        ("tab", "create"),
-        ("tab", "close"),
         ("pane", "split"),
-        ("pane", "rename"),
-        ("pane", "report-metadata"),
         ("pane", "close"),
-        ("agent", "start"),
+        ("tab", "close"),
     }
 )
 
@@ -401,9 +370,12 @@ class RecordingHerdr:
 
 
 class FactoryEndToEndBase(SingleEntryBase):
-    #: One operator-owned repository workspace is required.
-    #: `False` models the required refusal when none is open.
-    operator_workspace = True
+    plan_name = "two-lane"
+
+    #: Shape A: lanes hang under the operator's own Space on the repository.
+    #: `False` models the repository with no Space open, the one case where
+    #: Maestro creates the parent itself.
+    operator_space = True
 
     def setUp(self) -> None:
         super().setUp()
@@ -420,16 +392,14 @@ class FactoryEndToEndBase(SingleEntryBase):
         self.reset_herdr("transcripts")
 
     def reset_herdr(self, transcripts: str, **panes: Any) -> None:
-        """A fresh Herdr, the operator's workspace, and a clean baseline."""
+        """A fresh Herdr, the operator's Space in it, and a clean baseline."""
         self.herdr = FakeHerdr()
         self.panes = SimulatedPanes(self.herdr, self.root / transcripts, **panes)
         self.operator = (
-            plant_operator_workspace(self.herdr, self.repo)
-            if self.operator_workspace
-            else ""
+            plant_operator_space(self.herdr, self.repo) if self.operator_space else ""
         )
         self.operator_records = (
-            workspace_records(self.herdr, self.operator) if self.operator else set()
+            space_records(self.herdr, self.operator) if self.operator else set()
         )
         self.before = self.herdr.snapshot()
         self.graphs = []
@@ -461,7 +431,9 @@ class FactoryEndToEndBase(SingleEntryBase):
             return original(actor, run_id)
 
         with (
-            mock.patch.object(maestro.HerdrStageActor, "complete_run_spaces", capture),
+            mock.patch.object(
+                maestro.HerdrStageActor, "complete_run_spaces", capture
+            ),
             mock.patch.object(
                 maestro, "_executing_maestro_file", return_value=self.maestro_file
             ),
@@ -474,11 +446,6 @@ class FactoryEndToEndBase(SingleEntryBase):
             # composer takes the paste synchronously, so waiting for it only
             # makes the suite slow; the sequence of calls is unchanged.
             mock.patch.object(lch, "PASTE_SETTLE_S", 0.0),
-            mock.patch.dict(
-                os.environ,
-                {"GIT_CONFIG_GLOBAL": os.devnull, "PATH": os.environ["PATH"]},
-                clear=True,
-            ),
             mock.patch("sys.stdout", buf),
             working_directory(self.repo),
         ):
@@ -494,101 +461,57 @@ class FactoryEndToEndBase(SingleEntryBase):
     def calls_of(self, *verb: str) -> list[tuple[str, ...]]:
         return [call for call in self.herdr.calls if call[:2] == verb]
 
-    def repository_workspace(self) -> str:
-        """The repository workspace selected for this run."""
+    def parent_space(self) -> str:
+        """The one non-linked Space on the repository once the run is over."""
         if self.operator:
             return self.operator
         parents = herdr_graph(self.herdr)["parents"]
         self.assertEqual(len(parents), 1, parents)
         return parents[0]
 
-    def assert_lanes_share_repository_workspace(self, parent: str) -> None:
-        """Every lane is one direct tab inside `parent`."""
-        self.assertEqual(self.calls_of("workspace", "create"), [])
-        self.assertEqual(self.calls_of("worktree", "open"), [])
+    def assert_lanes_hang_under_one_parent(self, parent: str) -> None:
+        """Every lane was opened as a linked child of `parent`, and `parent`
+        is the only non-linked Space the run ever saw on the repository.
+
+        With the operator's own Space open, Maestro creates none and leaves
+        that Space byte-identical; with none open it creates exactly one at
+        the primary checkout. Checked after every topology change, not only
+        once the run is over.
+        """
+        creates = self.calls_of("workspace", "create")
         if self.operator:
+            self.assertEqual(creates, [], creates)
             self.assertTrue(
                 self.herdr.records_unchanged(self.before, self.operator_records),
-                "the operator's original tab, pane, or agent was modified",
+                "the operator's own Space, tab, pane or agent was modified",
             )
-        tab_creates = self.calls_of("tab", "create")
-        self.assertTrue(tab_creates, "no lane tab was ever created")
-        for call in tab_creates:
+        else:
+            self.assertEqual(len(creates), 1, creates)
+            self.assertEqual(
+                Path(str(flag(creates[0], "--cwd"))).resolve(), self.repo.resolve()
+            )
+        opens = self.calls_of("worktree", "open")
+        self.assertTrue(opens, "no lane child was ever opened")
+        for call in opens:
             self.assertEqual(flag(call, "--workspace"), parent, call)
-        self.assertNotIn(parent, self.herdr.closed_workspaces)
         self.assertTrue(self.graphs, "no topology change was observed")
         for graph in self.graphs:
-            self.assertEqual(graph["live_workspaces"], [parent], graph)
-            self.assertLessEqual(set(graph["lane_tabs"]), set(LANES), graph)
+            self.assertLessEqual(set(graph["parents"]), {parent}, graph)
+            self.assertLessEqual(set(graph["child_ids"]), {parent}, graph)
+            linked = set(graph["live_workspaces"]) - set(graph["parents"])
+            self.assertEqual(linked, set(graph["child_ids"].get(parent, ())), graph)
 
-    def assert_direct_topology(
-        self, *, unowned_pane_ids: set[str] | None = None
-    ) -> str:
-        """Prove repository workspace → lane tabs → role panes."""
-        parent = self.repository_workspace()
-        self.assert_lanes_share_repository_workspace(parent)
-        final = self.final_graph
-        allowed_unowned_pane_ids = unowned_pane_ids or set()
-        seen_unowned_pane_ids: set[str] = set()
-        self.assertEqual(final["parents"], [parent], final)
+    def assert_shape_a(self) -> str:
+        """Shape A, end to end: lanes were children of the one Space on the
+        repository, and completion closed them and nothing else.
+
+        Returns the parent's id.
+        """
+        parent = self.parent_space()
+        self.assert_lanes_hang_under_one_parent(parent)
+        final = herdr_graph(self.herdr)
         self.assertEqual(final["live_workspaces"], [parent], final)
-        self.assertEqual(set(final["lane_tabs"]), set(LANES), final)
-        expected_roles = ("tester", "builder", "test-reviewer", "code-reviewer")
-        agents_by_pane: dict[str, list[str]] = defaultdict(list)
-        for name, pane_id in final["agents"].items():
-            agents_by_pane[pane_id].append(name)
-        for lane in LANES:
-            self.assertEqual(len(final["lane_tabs"][lane]), 1, (lane, final))
-            lane_roles = expected_roles + (
-                ("integration-reviewer",) if lane == LANES[-1] else ()
-            )
-            expected_labels = {role: lch.pane_label_for(role) for role in lane_roles}
-            tabs = final["lane_tabs"][lane]
-            self.assertEqual(len(tabs), 1, (lane, final))
-            tab_id = tabs[0]
-            role_panes = final["lane_panes"].get(lane, {}).get(tab_id, {})
-            unowned_role_panes = {
-                pane_id: label
-                for pane_id, label in role_panes.items()
-                if pane_id in allowed_unowned_pane_ids
-            }
-            seen_unowned_pane_ids.update(unowned_role_panes)
-            self.assertTrue(
-                all(label == "" for label in unowned_role_panes.values()),
-                (lane, unowned_role_panes, final),
-            )
-            self.assertTrue(
-                all(pane_id not in agents_by_pane for pane_id in unowned_role_panes),
-                (lane, unowned_role_panes, final),
-            )
-            role_panes = {
-                pane_id: label
-                for pane_id, label in role_panes.items()
-                if pane_id not in allowed_unowned_pane_ids
-            }
-            self.assertEqual(
-                set(role_panes.values()), set(expected_labels.values()), (lane, final)
-            )
-            self.assertEqual(len(role_panes), len(expected_labels), (lane, final))
-            for role, label in expected_labels.items():
-                pane_ids = [
-                    pane_id
-                    for pane_id, pane_label in role_panes.items()
-                    if pane_label == label
-                ]
-                self.assertEqual(len(pane_ids), 1, (lane, role, final))
-                pane_id = pane_ids[0]
-                self.assertEqual(
-                    Path(final["pane_cwds"][pane_id]).resolve(),
-                    self.panes.role_worktrees[(lane, role)],
-                    (lane, role, final),
-                )
-                self.assertEqual(len(agents_by_pane[pane_id]), 1, (pane_id, final))
-        self.assertEqual(
-            seen_unowned_pane_ids,
-            allowed_unowned_pane_ids,
-            (allowed_unowned_pane_ids, final),
-        )
+        self.assertEqual(final["parents"], [parent], final)
         return parent
 
     # -- durable assertions -------------------------------------------------
@@ -636,7 +559,9 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
         self.assertEqual(len(run_ids), 1)
         run_id = run_ids[0]
 
-        self.assertEqual(self.lane_stages(run_id), {lane: "MERGED" for lane in LANES})
+        self.assertEqual(
+            self.lane_stages(run_id), {lane: "MERGED" for lane in LANES}
+        )
         self.assertEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
 
         kinds = self.artifact_kinds(run_id)
@@ -689,15 +614,20 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
             self.assertEqual(blob.strip(), passed)
             self.assertNotEqual(blob.strip(), revised)
 
-        parent = self.assert_direct_topology()
+        # Shape A: the lanes were linked children of the operator's own Space,
+        # which Maestro neither created, tagged, nor closed.
+        parent = self.assert_shape_a()
         self.assertEqual(parent, self.operator)
         self.assertEqual(self.final_graph["parents"], [self.operator])
+        self.assertEqual(
+            sorted(self.final_graph["children"][self.operator]), sorted(LANES)
+        )
 
     def test_a_repeat_invocation_after_completion_starts_a_second_run(self) -> None:
         self.run_cli()
         first = self.run_ids()
         self.assertEqual(len(first), 1)
-        self.assert_direct_topology()
+        self.assert_shape_a()
         self.reset_herdr("transcripts-2", nonce="2")
         self.run_cli()
         second = self.run_ids()
@@ -705,8 +635,8 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
         self.assertEqual(set(first) - set(second), set())
         for run_id in second:
             self.assertEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
-        # The second run reused the same operator workspace and left it as it was.
-        self.assert_direct_topology()
+        # The second run reused the same operator Space and left it as it was.
+        self.assert_shape_a()
 
 
 class AmendmentWaitTest(FactoryEndToEndBase):
@@ -753,14 +683,15 @@ class AmendmentWaitTest(FactoryEndToEndBase):
             ]
         self.assertIn("USER_WAIT", kinds)
         self.assertNotIn("MAIN_PUBLICATION", self.run_artifact_kinds(run_id))
-        # A waiting run keeps its lane tabs inside the repository workspace.
-        self.assert_lanes_share_repository_workspace(self.operator)
+        # A run that waits still never touched the operator's own Space, and
+        # its lane children are still open under it.
+        self.assert_lanes_hang_under_one_parent(self.operator)
         self.assertNotIn(self.operator, self.herdr.closed_workspaces)
-        self.assertEqual(set(herdr_graph(self.herdr)["lane_tabs"]), set(LANES))
+        self.assertTrue(herdr_graph(self.herdr)["child_ids"][self.operator])
 
 
 class ConcurrentLaneTopologyTest(FactoryEndToEndBase):
-    def test_two_ready_lanes_share_one_parent_and_get_one_tab_each(self) -> None:
+    def test_two_ready_lanes_share_one_parent_and_get_one_child_each(self) -> None:
         graphs: list[dict[str, Any]] = []
 
         original = maestro.HerdrStageActor.write_tests
@@ -776,15 +707,16 @@ class ConcurrentLaneTopologyTest(FactoryEndToEndBase):
         self.assertTrue(graphs)
         for graph in graphs:
             self.assertEqual(graph["parents"], [self.operator], graph)
-            self.assertEqual(graph["live_workspaces"], [self.operator], graph)
-            self.assertLessEqual(set(graph["lane_tabs"]), set(LANES), graph)
-            self.assertTrue(
-                all(len(tab_ids) == 1 for tab_ids in graph["lane_tabs"].values()),
-                graph,
-            )
+            parent = graph["parents"][0]
+            opened = graph["children"].get(parent, [])
+            self.assertEqual(sorted(set(opened)), sorted(opened), graph)
+            self.assertTrue(set(opened) <= set(LANES), graph)
         last = graphs[-1]
-        self.assertEqual(set(last["lane_tabs"]), set(LANES), last)
-        self.assertEqual(self.assert_direct_topology(), self.operator)
+        parent = last["parents"][0]
+        self.assertEqual(sorted(last["children"][parent]), sorted(LANES))
+        # Every lane child is a direct child of the one parent: no nesting.
+        self.assertEqual(list(last["children"]), [parent])
+        self.assertEqual(self.assert_shape_a(), self.operator)
 
     def test_each_role_gets_exactly_one_pane_and_one_agent_per_lane(self) -> None:
         graphs: list[dict[str, Any]] = []
@@ -799,41 +731,40 @@ class ConcurrentLaneTopologyTest(FactoryEndToEndBase):
 
         self.assertTrue(graphs)
         graph = graphs[-1]
-        expected = {
-            lch.pane_label_for(role)
-            for role in ("tester", "builder", "test-reviewer", "code-reviewer")
-        }
-        agents_by_pane: dict[str, list[str]] = defaultdict(list)
+        for workspace_id, labels in graph["panes"].items():
+            self.assertEqual(sorted(set(labels)), sorted(labels), workspace_id)
+        panes = {name for labels in graph["panes"].values() for name in labels}
+        self.assertTrue({"tester", "builder", "code-reviewer"} <= panes, panes)
+        by_pane: dict[str, list[str]] = defaultdict(list)
         for name, pane_id in graph["agents"].items():
-            agents_by_pane[pane_id].append(name)
-        for lane in LANES:
-            tabs = graph["lane_tabs"].get(lane, [])
-            self.assertEqual(len(tabs), 1, (lane, graph))
-            role_panes = graph["lane_panes"].get(lane, {}).get(tabs[0], {})
-            self.assertEqual(set(role_panes.values()), expected, (lane, graph))
-            self.assertEqual(len(role_panes), len(expected), (lane, graph))
-            for pane_id in role_panes:
-                self.assertEqual(len(agents_by_pane[pane_id]), 1, (pane_id, graph))
+            by_pane[pane_id].append(name)
+        for pane_id, names in by_pane.items():
+            self.assertEqual(len(names), 1, (pane_id, names))
 
 
 class ReconstructionBase(FactoryEndToEndBase):
     """Termination after an external side effect, then a plain re-invocation."""
 
-    def converge(
-        self, run_id: str, *, unowned_pane_ids: set[str] | None = None
-    ) -> None:
-        """One run, one repository workspace, one tab per lane and pane per role."""
+    def converge(self, run_id: str) -> None:
+        """One run, one parent, one child per lane, one pane per active role."""
         self.assertEqual(self.run_ids(), (run_id,))
         self.assertEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
-        self.assert_direct_topology(unowned_pane_ids=unowned_pane_ids)
+        # Shape A: one parent, kept; one child per lane, all closed at the end.
+        parent = self.assert_shape_a()
+        graph = self.final_graph
+        self.assertEqual(graph["parents"], [parent], graph)
+        self.assertEqual(list(graph["children"]), [parent], graph)
+        self.assertEqual(sorted(graph["children"][parent]), sorted(LANES), graph)
+        for workspace_id, labels in graph["panes"].items():
+            self.assertEqual(sorted(set(labels)), sorted(labels), workspace_id)
+        by_pane: dict[str, list[str]] = defaultdict(list)
+        for name, pane_id in graph["agents"].items():
+            by_pane[pane_id].append(name)
+        for pane_id, names in by_pane.items():
+            self.assertEqual(len(names), 1, (pane_id, names))
 
     def _crash_then_resume(
-        self,
-        verb: tuple[str, str],
-        nth: int = 1,
-        *,
-        before: bool = False,
-        expected_unowned_blank_panes: int | None = None,
+        self, verb: tuple[str, str], nth: int = 1, *, before: bool = False
     ) -> None:
         """Terminate right after one external side effect, then re-invoke.
 
@@ -854,47 +785,19 @@ class ReconstructionBase(FactoryEndToEndBase):
             self.assertNotEqual(code, 0, payload)
         created = self.run_ids()
         self.assertEqual(len(created), 1, "a stopped process created no second run")
-        crash_snapshot = self.herdr.snapshot()
-        unowned_pane_ids: set[str] = set()
-        if expected_unowned_blank_panes is not None:
-            seed_pane_ids = {
-                str(workspace.get("tokens", {}).get("seed_pane") or "")
-                for workspace in crash_snapshot["workspaces"].values()
-            }
-            unowned_pane_ids = {
-                pane_id
-                for pane_id, pane in crash_snapshot["panes"].items()
-                if pane_id not in self.before["panes"]
-                and pane_id not in crash_snapshot["closed_panes"]
-                and pane_id not in seed_pane_ids
-                and not pane.get("label")
-                and not pane.get("tokens")
-                and not any(
-                    str(agent.get("pane_id") or "") == pane_id
-                    for agent in crash_snapshot["agents"].values()
-                )
-            }
-            self.assertEqual(
-                len(unowned_pane_ids),
-                expected_unowned_blank_panes,
-                crash_snapshot,
-            )
         self.run_cli()
-        if unowned_pane_ids:
-            self.assertTrue(
-                self.herdr.records_unchanged(crash_snapshot, unowned_pane_ids),
-                "the split-before-label pane was modified or closed",
-            )
-        self.converge(created[0], unowned_pane_ids=unowned_pane_ids)
+        self.converge(created[0])
 
 
 class ReconstructionTest(ReconstructionBase):
-    """Reconstruction with the operator's repository workspace."""
+    """Reconstruction under Shape A: the operator's Space is the parent."""
 
+    def test_termination_after_the_first_lane_child_is_opened(self) -> None:
+        self._crash_then_resume(("worktree", "open"))
 
     def test_termination_after_a_role_pane_is_split(self) -> None:
-        """A split-before-label pane stays unowned through one restart."""
-        self._crash_then_resume(("pane", "split"), expected_unowned_blank_panes=1)
+        """A pane split but never labelled or tagged, then one restart."""
+        self._crash_then_resume(("pane", "split"))
 
     def test_termination_after_a_role_agent_is_started(self) -> None:
         self._crash_then_resume(("agent", "start"))
@@ -905,16 +808,22 @@ class ReconstructionTest(ReconstructionBase):
         # rightly keeps that declared result instead of dying.
         self._crash_then_resume(("pane", "send-text"), nth=2, before=True)
 
-    def test_termination_after_pane_metadata_tagging(self) -> None:
-        self._crash_then_resume(("pane", "report-metadata"))
+    def test_termination_after_metadata_tagging(self) -> None:
+        self._crash_then_resume(("workspace", "report-metadata"))
 
 
-class NoRepositoryWorkspaceTest(ReconstructionBase):
-    """No repository workspace is open, so the run refuses without creating one."""
+class NoOperatorSpaceTest(ReconstructionBase):
+    """No Space is open on the repository, so the run has no parent.
 
-    operator_workspace = False
+    Herdr fixes a lane's placement at `worktree open` and cannot move it
+    afterwards, so a parent Maestro built for itself would orphan every lane
+    under it the moment it went. There is no such parent to build: the run
+    refuses and waits for the operator to open the repository.
+    """
 
-    def test_the_run_refuses_and_creates_no_workspace(self) -> None:
+    operator_space = False
+
+    def test_the_run_refuses_and_creates_no_space(self) -> None:
         code, _ = self.run_cli(expect=None)
         self.assertNotEqual(code, 0)
         run_ids = self.run_ids()
@@ -922,10 +831,6 @@ class NoRepositoryWorkspaceTest(ReconstructionBase):
             self.assertNotEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
         self.assertEqual(
             [call for call in self.herdr.calls if call[:2] == ("workspace", "create")],
-            [],
-        )
-        self.assertEqual(
-            [call for call in self.herdr.calls if call[:2] == ("worktree", "open")],
             [],
         )
         self.assertEqual(herdr_graph(self.herdr)["parents"], [])
