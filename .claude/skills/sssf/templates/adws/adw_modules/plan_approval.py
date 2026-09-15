@@ -2,8 +2,10 @@
 
 Two records, one primitive. Both use planctl's receipt format exactly:
 HMAC-SHA256, keyed by the deployment's reviewer key
-(`<runtime_state_root>/keys/reviewer-hmac.key`, the value `run attend` already
-hands planctl), over the canonical JSON of the record without its `signature`
+(`<keys_dir>/reviewer-hmac.key`, where `keys_dir` is resolved from the
+deployment configuration by `maestro._reviewer_hmac_key(layout)`: the
+configured `keys_dir`, else `<runtime_state_root>/keys`; the same value `run
+attend` hands planctl), over the canonical JSON of the record without its `signature`
 (UTF-8, sorted keys, compact separators, no NaN). `reviewer_key_id` is the
 SHA-256 of the key. `tests/test_plan_approval.py` pins this against planctl's
 own `receipt_signature` so the two cannot drift.
