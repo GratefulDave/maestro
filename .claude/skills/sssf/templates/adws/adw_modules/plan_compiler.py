@@ -32,11 +32,13 @@ def compile_plan(
     *,
     plan_revision: int = 1,
     plan_artifact_ref: str = NO_PLAN_ARTIFACT_REF,
+    bound_run: bool = False,
 ) -> CompiledPlan:
     """Admit a plan iff every objective check holds, then freeze its projection.
 
     ``plan_revision`` and ``plan_artifact_ref`` are supplied by the store.
-    ``create_run`` requires ``plan_revision == 1``.
+    ``create_run`` requires ``plan_revision == 1``. ``bound_run`` re-reads a
+    revision a run already holds; see ``validate_objective_plan``.
     """
     if plan_revision < 1:
         raise ValueError("plan_revision must be >= 1")
@@ -46,7 +48,7 @@ def compile_plan(
         data = parse_stored_mapping(stored)
     except PlanParseError as exc:
         raise PlanCompileError((PlanRefusal(SCHEMA_INVALID, "/", str(exc)),)) from exc
-    refusals = validate_objective_plan(data)
+    refusals = validate_objective_plan(data, bound_run=bound_run)
     if refusals:
         raise PlanCompileError(refusals)
 

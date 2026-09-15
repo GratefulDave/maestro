@@ -49,6 +49,7 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - No duplicate, equal, ancestor, or descendant ownership conflicts exist across lanes.
 - Each lane declares public acceptance criteria.
 - Every gating acceptance criterion declares an `observation_seam`.
+- Every gating acceptance criterion states its expected answers as `decided_by` worked examples.
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -405,6 +406,93 @@ can fail. Two rules for writing one:
   requirement and leave the tester to discover it is undecidable. Either move the boundary so the
   behaviour is observable — that is usually a lane-shape change, see the section above — or write
   the obligation as advisory and gate on something a case can see.
+
+## A gating obligation states its expected answers
+
+A seam says where a case looks. It does not say what value is correct there, and a tester and a
+reviewer who disagree about that value argue it round after round. Every gating obligation therefore
+also states its expected answers as **worked examples**: the claim's `decided_by` field, a nonempty
+list in which each example has an exact `input` and exactly one of `expect` (the exact output) or
+`refuses` (the exact refusal: its `error` type or code and, where the contract has one, its
+`message`). The compiler refuses a gating obligation that has no examples, has no `expect`
+example, or has a malformed example (`OBLIGATION_UNDECIDED`, naming the obligation and the
+missing part). A claim that restricts its input, or reads an upstream endpoint, needs at least
+one `refuses` example too. Ingress reads that off the claim's structure: `polarity: negative`, a
+non-empty `exception_ids`, non-empty `preconditions`, or `witness.store: external`. For an
+external store the refusal owed is the one for the endpoint being unavailable or returning a
+different release; FDAdb's builders invented `SOURCE_UNAVAILABLE` and
+`RELEASE_PROVENANCE_MISMATCH` because no plan stated them. Ingress carries that structure onto the
+criterion as `restriction` (`polarity`, `has_exception_ids`, `has_preconditions`,
+`external_store`). The compiler derives the
+refusal obligation from it itself, and refuses a gating criterion that has no `restriction`, so a
+plan started directly from canonical bytes cannot drop the obligation.
+
+Bad — FDAdb's onset provenance obligation, which parked three runs:
+
+```
+claim-onset-provenance: every observation carries provenance
+  observation_seam: ObservationStore.record(observation, provenance) is the public export
+  (provenance declared only as Mapping)
+```
+
+Is `{}` provenance? One tester wrote a case that records it; the reviewer refused, reading
+"carries provenance" as non-empty. Another tester refused it; a different reviewer called that an
+invented restriction. Both implementations satisfy the sentence and the seam, so no round could
+settle it, and each park cost a human amendment.
+
+Good — the same obligation with the answer written down:
+
+```
+claim-onset-provenance: every observation carries provenance
+  observation_seam: ObservationStore.record(observation, provenance) is the public export
+  preconditions: [provenance names its source]
+  decided_by:
+    - input:   {"provenance": {"source": "spl", "release_id": "r1"}}
+      expect:  {"recorded": true, "provenance": {"source": "spl", "release_id": "r1"}}
+    - input:   {"provenance": {}}
+      refuses: {"error": "ValueError", "message": "provenance must name its source"}
+```
+
+Three rules for writing them:
+
+- **Examples are public.** They reach the tester, the builder and every reviewer verbatim, in the
+  lane's acceptance text. State the contract's answers there, never a sealed case's fixtures or selectors.
+- **Exact, not described.** `input` and `expect` are literals a case can compare with `==`. "A
+  sorted mapping" is a description; `{"a": 1, "b": 2}` serialized as `'{"a":1,"b":2}'` is an answer.
+- **An example decides a question someone would ask.** Plan review asks, once per gating obligation,
+  for two implementations that satisfy every example and the seam yet produce different observable
+  results. Each pair is a structured finding bound to the claim, with the two outcomes `outcome_a`
+  and `outcome_b`. `planctl review --findings` will not sign the receipt until the claim has an
+  example at the finding's `divergent_input` whose answer is one of those two outcomes. Add that
+  example. The same findings file then signs, and nobody is asked again. Any other change to a
+  claim makes the findings stale.
+
+**`run start` binds only an approved projection.** `plan_author_cli.py --from-plan-contract`
+authenticates the planctl receipt's HMAC with the deployment's reviewer key: `reviewer-hmac.key`
+in the deployment's `keys_dir` (`maestro.config.yaml`; omitted, `<runtime_state_root>/keys`). A
+deployment whose keys live in `~/.maestro/<project>/keys` while its state root is elsewhere, as
+FDAdb's do, sets `keys_dir`. That must be the same key planctl signs with
+(`PLANCTL_REVIEWER_HMAC_KEY` in `reviewer-hmac.env`). It writes the plan with an `approval` record,
+the plan digest plus that receipt, signed with the same key. `run start` refuses a plan without a
+valid record, or one edited after projection (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`). `run amend`
+still accepts a scripted edit of a projected plan, and a run already bound is never re-checked.
+Run the planctl commands from the repository root, with the IR under `.maestro/` and
+repository-relative `source_artifacts`, so `--repo-root .` resolves them.
+
+**Every workflow ends with the same two commands:** `planctl review --findings`, then
+`plan_author_cli.py --from-plan-contract`. The receipt records the findings it was signed with.
+`plan_author_cli.py` refuses a receipt without them (`RECEIPT_WITHOUT_FINDINGS`), and
+`planctl validate --require-approved` refuses one (`receipt.findings`). The step-by-step guide is
+the-library `skills/plan-contract/SKILL.md`, section "Writing a new plan, end to end".
+
+**Name every harness prerequisite.** If a required verifier command runs `git`, `docker`, or any
+other tool, the plan lists that tool as a prerequisite. The private test tree is a one-commit git
+repository with no remote and one ref, so forbid depending on git history, remotes, or refs, never
+running `git` (FDAdb `be064e58` `lane-wp3-reader-tests` parked four rounds on a `git grep` test).
+
+A run already bound to a plan is not re-judged. `run resume`, `run status`, `run attend` and the
+previous revision under `run amend` re-read the bound revision without this check, so only a plan
+being shipped, started, or amended into a run needs examples.
 
 ## What a review rejection costs
 

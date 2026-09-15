@@ -71,34 +71,55 @@ class ValidatorResolution(unittest.TestCase):
 
 
 class ReviewerKeyResolution(unittest.TestCase):
+    """One resolver: `keys_dir` from the deployment config, else the state root's `keys/`."""
+
     def setUp(self) -> None:
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         self.tmp = Path(holder.name)
-        self.runtime = _Runtime(self.tmp)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
 
-    def test_the_key_comes_from_the_state_root_and_nowhere_else(self) -> None:
-        keys = self.tmp / "keys"
+    def _layout(self, **extra: str) -> dict:
+        from tests import plan_receipts
+
+        config = plan_receipts.write_deployment_config(self.tmp / "adws", self.state, **extra)
+        return maestro._load_maestro_config(self.tmp, config)
+
+    def test_without_keys_dir_the_key_comes_from_the_state_root(self) -> None:
+        keys = self.state / "keys"
         keys.mkdir()
         material = "ab" * 32
         (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text(material)
-        self.assertEqual(maestro._reviewer_hmac_key(self.runtime), material)
-        # planctl's own floor. A key shorter than this mints no receipt, so a
-        # deployment whose keys directory was reprovisioned by hand finds out
-        # here rather than at the review call.
+        self.assertEqual(maestro._reviewer_hmac_key(self._layout()), material)
+        # planctl's own floor. A key shorter than this mints no receipt.
         self.assertGreaterEqual(len(material.encode("utf-8")), 32)
+
+    def test_keys_dir_outside_the_state_root_is_where_the_key_is_read(self) -> None:
+        """FDAdb: state root moved, keys stayed in ~/.maestro/FDAdb/keys."""
+        keys = self.tmp / "dot-maestro" / "FDAdb" / "keys"
+        keys.mkdir(parents=True)
+        (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text("cd" * 32 + "\n")
+        layout = self._layout(keys_dir=str(keys))
+        self.assertFalse((self.state / "keys").exists())
+        self.assertEqual(keys, layout["keys_dir"])
+        self.assertEqual("cd" * 32, maestro._reviewer_hmac_key(layout))
+
+    def test_a_relative_keys_dir_is_a_configuration_error(self) -> None:
+        with self.assertRaises(maestro._MaestroConfigurationError):
+            self._layout(keys_dir="keys")
 
     def test_an_absent_key_refuses_by_name(self) -> None:
         with self.assertRaises(att.AttendRefused) as caught:
-            maestro._reviewer_hmac_key(self.runtime)
+            maestro._reviewer_hmac_key(self._layout())
         self.assertEqual(caught.exception.code, att.KEY_UNRESOLVED)
 
     def test_an_empty_key_file_is_not_a_key(self) -> None:
-        keys = self.tmp / "keys"
+        keys = self.state / "keys"
         keys.mkdir()
         (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text("   \n")
         with self.assertRaises(att.AttendRefused) as caught:
-            maestro._reviewer_hmac_key(self.runtime)
+            maestro._reviewer_hmac_key(self._layout())
         self.assertEqual(caught.exception.code, att.KEY_UNRESOLVED)
 
 
@@ -111,28 +132,182 @@ class ReceiptHandshake(unittest.TestCase):
         self.tmp = Path(holder.name)
         self.ir_bytes = json.dumps({"plan_id": "p-1"}, sort_keys=True).encode("utf-8")
 
-    def _receipt(self, **overrides: object) -> dict:
-        receipt = {
-            "schema_version": ingress.RECEIPT_VERSION,
-            "verdict": "PASS",
-            "ir_sha256": hashlib.sha256(self.ir_bytes).hexdigest(),
-        }
-        receipt.update(overrides)
+    def _receipt(self, *, drop: tuple = (), **overrides: object) -> dict:
+        from tests import plan_receipts
+
+        receipt = plan_receipts.signed_receipt(self.ir_bytes, **overrides)
+        for name in drop:
+            receipt.pop(name)
+        receipt["signature"] = plan_receipts.plan_approval.signature(
+            receipt, plan_receipts.KEY)
         return receipt
 
+    def _verify(self, receipt: dict) -> None:
+        from tests import plan_receipts
+
+        ingress._verify_receipt(self.ir_bytes, receipt, None, plan_receipts.KEY)
+
     def test_a_pass_receipt_over_these_exact_bytes_verifies(self) -> None:
-        ingress._verify_receipt(self.ir_bytes, self._receipt(), None)
+        self._verify(self._receipt())
 
     def test_a_receipt_for_an_earlier_revision_is_refused(self) -> None:
         stale = self._receipt(ir_sha256=hashlib.sha256(b"older").hexdigest())
         with self.assertRaises(ingress.IngressError) as caught:
-            ingress._verify_receipt(self.ir_bytes, stale, None)
+            self._verify(stale)
         self.assertIn("RECEIPT_IR_MISMATCH", str(caught.exception))
+
+    def test_a_receipt_not_signed_with_findings_is_refused(self) -> None:
+        for field in ("findings_sha256", "question_surface_sha256"):
+            with self.subTest(field=field):
+                with self.assertRaises(ingress.IngressError) as caught:
+                    self._verify(self._receipt(drop=(field,)))
+                self.assertIn("RECEIPT_WITHOUT_FINDINGS", str(caught.exception))
 
     def test_a_receipt_that_is_not_a_pass_is_refused(self) -> None:
         with self.assertRaises(ingress.IngressError) as caught:
-            ingress._verify_receipt(self.ir_bytes, self._receipt(verdict="REVISE"), None)
+            self._verify(self._receipt(verdict="REVISE"))
         self.assertIn("RECEIPT_NOT_PASS", str(caught.exception))
+
+    def test_a_receipt_without_a_valid_signature_is_refused(self) -> None:
+        genuine = self._receipt()
+        for name, forged, code in (
+            ("unsigned", {k: v for k, v in genuine.items() if k != "signature"}, "RECEIPT_SIGNATURE"),
+            ("edited", dict(genuine, findings_sha256="9" * 64), "RECEIPT_SIGNATURE"),
+            ("other key id", dict(genuine, reviewer_key_id="0" * 64), "RECEIPT_KEY_ID"),
+            ("algorithm", dict(genuine, signature_algorithm="none"), "RECEIPT_SIGNATURE_ALGORITHM"),
+        ):
+            with self.subTest(forgery=name):
+                with self.assertRaises(ingress.IngressError) as caught:
+                    self._verify(forged)
+                self.assertIn(code, str(caught.exception))
+
+
+class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
+    """`planctl review` refuses without `--findings`; attend always passes one.
+
+    The operator agent writes its answer beside the revision it authored
+    (`attend.findings_path_for`). `_attend_project` copies it next to the IR it
+    reviews and names it on the review argv. When the operator wrote none, the
+    path is still passed and planctl refuses `review.findings_missing`.
+    """
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+        self.revision = self.tmp / "out" / "r2.ir.json"
+        self.revision.parent.mkdir()
+        self.revision.write_text("{}", encoding="utf-8")
+        self.plans = self.tmp / "plans"
+
+    def _review_argv(self) -> list:
+        from unittest import mock
+
+        calls = []
+        policy = att.AttendPolicy(max_amendments_per_lane=1, planctl=self.tmp / "p")
+
+        def run_planctl(binary, argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "question-surface":
+                return json.dumps({"plan_id": "p-1", "question_surface_sha256": "a" * 64})
+            return ""
+
+        with (
+            mock.patch.object(maestro, "_planctl_binary", return_value=Path("planctl")),
+            mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
+            mock.patch.object(maestro, "_run_planctl", side_effect=run_planctl),
+            mock.patch.object(
+                ingress, "author_from_plan_contract", side_effect=RuntimeError("stop")
+            ),
+        ):
+            with self.assertRaises(att.AttendRefused):
+                maestro._attend_project(
+                    policy, {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
+                    "run", self.revision, 2,
+                )
+        (review,) = [argv for argv in calls if argv[0] == "review"]
+        return review
+
+    def test_the_operator_findings_are_bound_and_passed(self) -> None:
+        self.assertEqual(
+            self.tmp / "out" / "r2.review-findings.json",
+            att.findings_path_for(self.revision),
+        )
+        answer = [{"finding_id": "f-1", "claim_id": "claim-a"}]
+        att.findings_path_for(self.revision).write_text(
+            json.dumps({"findings": answer}), encoding="utf-8"
+        )
+        review = self._review_argv()
+        passed = Path(review[review.index("--findings") + 1])
+        self.assertEqual(self.plans / "run.r2.review-findings.json", passed)
+        self.assertEqual(
+            {
+                "schema_version": "plan-contract-review-findings.v1",
+                "plan_id": "p-1",
+                "question_surface_sha256": "a" * 64,
+                "reviewer_id": review[review.index("--reviewer") + 1],
+                "reviewer_vendor": review[review.index("--reviewer-vendor") + 1],
+                "findings": answer,
+            },
+            json.loads(passed.read_text(encoding="utf-8")),
+        )
+
+    def test_absent_findings_are_still_named_so_planctl_refuses(self) -> None:
+        review = self._review_argv()
+        self.assertIn("--findings", review)
+        self.assertFalse(Path(review[review.index("--findings") + 1]).exists())
+
+    def test_the_operator_launch_asks_the_full_question(self) -> None:
+        """The dispatched operator prompt carries the question and the findings path."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from adw_modules import scheduler_types as st
+
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor.lane_specs = {}
+        ctx = SimpleNamespace(
+            lane=SimpleNamespace(lane_id="lane-a", lane_kind=st.LANE_KIND_BUILD),
+            plan_revision=2,
+            run_id="run1",
+            stage=st.LaneStage.WAITING_FOR_USER,
+        )
+        request = att.OperatorRequest(
+            run_id="run1",
+            lane_id="lane-a",
+            stage=st.LaneStage.WAITING_FOR_USER.value,
+            round_number=4,
+            plan_revision=2,
+            next_plan_revision=3,
+            public_contract={"acceptance_criteria": ["x"]},
+            reviews=(),
+            redacted_failures=(),
+            lane_gates="",
+            ir_path=str(self.revision),
+            revision_out_path=str(self.revision),
+            sealed_files={},
+            amendment_rules="rules",
+            allowed_lane_ids=("lane-a",),
+        )
+        launched = {}
+
+        def launch(ctx_, role, cwd, extra, prepare_cwd):
+            launched["body"] = maestro.HerdrStageActor._prompt(
+                actor, ctx_, role, self.tmp / "envelope.json", cwd, extra
+            )
+            return {}, None, cwd
+
+        with (
+            mock.patch.object(actor, "_role_dir", return_value=self.tmp / "operator", create=True),
+            mock.patch.object(actor, "_launch", side_effect=launch, create=True),
+        ):
+            actor.attend_operator(ctx, request)
+
+        body = launched["body"]
+        self.assertIn(att.TWO_IMPLEMENTATIONS_QUESTION, body["instructions"])
+        self.assertEqual(
+            str(att.findings_path_for(self.revision)), body["review_findings_out_path"]
+        )
 
 
 class RealValidatorInvocation(unittest.TestCase):
@@ -181,6 +356,21 @@ class RealValidatorInvocation(unittest.TestCase):
         self.assertEqual(
             os.environ[admission.REVIEWER_HMAC_KEY_ENV], "leaked-from-the-shell"
         )
+
+
+    def test_the_binary_accepts_the_findings_argument_attend_passes(self) -> None:
+        """A stubbed subprocess cannot observe the argv parser; ask the binary."""
+        import subprocess
+        import sys
+
+        usage = subprocess.run(
+            [sys.executable, str(self.binary), "review", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+        self.assertIn("--findings", usage.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

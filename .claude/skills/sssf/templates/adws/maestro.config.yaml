@@ -1,5 +1,8 @@
 schema: maestro-config.v1
 runtime_state_root: /nonexistent/maestro-runtime-state
+# keys_dir: absolute directory holding reviewer-hmac.key (and the other keys
+# route_admission.provision_keys mints). Omitted, it is <runtime_state_root>/keys.
+# Set it when the keys live elsewhere, e.g. /Users/<you>/.maestro/<project>/keys.
 # Worker threads for independent ready lanes (author/review/build stages).
 # Merges are serialized at any value. 1 keeps every stage inline.
 concurrency: 1

@@ -33,6 +33,7 @@ from adw_modules.handoff_budget import (
 )
 from adw_modules import code_review as cr
 from adw_modules import launcher as lch
+from adw_modules import plan_approval
 from adw_modules import plan_compiler
 from adw_modules import plan_contract_ingress as ingress
 from adw_modules import route_admission as admission
@@ -388,6 +389,18 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     if not root.is_absolute():
         raise _MaestroConfigurationError("runtime_state_root must be absolute")
     loaded["runtime_state_root"] = root
+    # The one place a deployment's keys directory is decided. `keys_dir` names
+    # it; without it the keys are where `route_admission.provision_keys` mints
+    # them, under the state root. FDAdb's live beside its route receipts in
+    # `~/.maestro/FDAdb/keys` while its state root moved, so reading the state
+    # root alone refused every reviewer-key read there.
+    if "keys_dir" in loaded:
+        keys_dir = Path(_config_string(loaded.get("keys_dir"), "keys_dir"))
+        if not keys_dir.is_absolute():
+            raise _MaestroConfigurationError("keys_dir must be absolute")
+        loaded["keys_dir"] = keys_dir
+    else:
+        loaded["keys_dir"] = root / "keys"
     loaded["role_routes"] = _canonical_role_routes(loaded.get("role_routes"))
     loaded["provision_argv"] = _config_argv(
         loaded.get("provision_argv"), "provision_argv"
@@ -1338,7 +1351,8 @@ class HerdrStageActor:
                 "lane gate table, and the reviews. Write the revised IR at "
                 "revision_out_path and return that exact path plus the "
                 "rationale. Change only lanes in allowed_lane_ids. Run no "
-                "maestro verb, no git command, and no planctl."
+                "maestro verb, no git command, and no planctl. "
+                + att.TWO_IMPLEMENTATIONS_QUESTION
             )
         if role in ("tester", "test-reviewer", "builder"):
             instructions += " " + self._PUBLIC_INTERFACE_RULE
@@ -2451,6 +2465,9 @@ class HerdrStageActor:
                 (cwd / self._OPERATOR_INPUTS / "reviews.json").resolve()
             ),
             "revision_out_path": request.revision_out_path,
+            "review_findings_out_path": str(
+                att.findings_path_for(Path(request.revision_out_path))
+            ),
             "round": request.round_number,
             "sealed_suite_dir": str((cwd / self._OPERATOR_SEALED).resolve()),
             "sealed_suite_files": sorted(request.sealed_files),
@@ -2648,8 +2665,14 @@ def _actor_for(
     )
 
 
-def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
+def _compile_plan(
+    path: Path, *, revision: int, ref: str, bound_run: bool = False
+) -> st.CompiledPlan:
     """Read and compile one plan artifact.
+
+    ``bound_run`` is true only for a revision a run already holds, so an
+    authoring obligation added after that run was bound (``OBLIGATION_UNDECIDED``)
+    never refuses it mid-run. Start and amend compile strictly.
 
     Reading it is the only place a missing or unreadable *plan file* is a
     configuration fact, so the mapping belongs here rather than in `main`:
@@ -2665,7 +2688,7 @@ def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
             "cannot read plan artifact {0}: {1}".format(path, exc)
         ) from exc
     return plan_compiler.compile_plan(
-        stored, plan_revision=revision, plan_artifact_ref=ref
+        stored, plan_revision=revision, plan_artifact_ref=ref, bound_run=bound_run
     )
 
 
@@ -2818,7 +2841,11 @@ def _run_plan(args: argparse.Namespace) -> int:
         locks = OrderedLocks(runtime, _worktree_git_dir(repo))
         locks.acquire(1)
         try:
-            compiled = _compile_plan(plan_path, revision=1, ref=str(plan_path))
+            # Read as bound first: this plan may already be a run's revision,
+            # and resuming it must not re-judge authoring obligations.
+            compiled = _compile_plan(
+                plan_path, revision=1, ref=str(plan_path), bound_run=True
+            )
             target = gitpub.bind_target_worktree(repo, main_ref)
             store = _open_store(runtime)
             try:
@@ -2830,6 +2857,10 @@ def _run_plan(args: argparse.Namespace) -> int:
                 if matches:
                     resume_id = matches[0]
                 else:
+                    compiled = _compile_plan(
+                        plan_path, revision=1, ref=str(plan_path)
+                    )
+                    _require_approved_plan(plan_path, compiled, layout)
                     start_id = uuid.uuid4().hex
                     create_factory_run(
                         store=store,
@@ -2856,6 +2887,39 @@ def _run_plan(args: argparse.Namespace) -> int:
     )
 
 
+def _require_approved_plan(
+    plan_path: Path, compiled: st.CompiledPlan, layout: Mapping[str, Any]
+) -> None:
+    """A new run binds only a plan bound to authenticated approval evidence.
+
+    The approved projection (`plan_author_cli.py --from-plan-contract`, or
+    `run attend`'s) writes an `approval` record: the plan digest and the
+    planctl receipt it was projected from, both signed with this deployment's
+    reviewer key. A compiler-valid plan without it, or one edited after
+    projection, is refused `PLAN_UNAPPROVED`/`PLAN_APPROVAL_*` before a run
+    exists. `run amend` does not call this: a scripted amendment is still
+    accepted, and a run already bound is never re-checked.
+    """
+    try:
+        document = json.loads(plan_path.read_bytes().decode("utf-8"))
+        material = _reviewer_hmac_key(layout)
+    except att.AttendRefused as exc:
+        raise _RunRefused("PLAN_UNAPPROVED", "reviewer key: {0}".format(exc.detail)) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _RunRefused("PLAN_UNAPPROVED", str(exc)) from exc
+    approval = document.get("approval") if isinstance(document, dict) else None
+    try:
+        plan_approval.verify_approval(
+            approval, compiled.plan_digest, plan_approval.key_bytes(material)
+        )
+    except plan_approval.ApprovalRefused as exc:
+        raise _RunRefused(
+            exc.code,
+            "run start binds only an approved projection: planctl review "
+            "--findings, then plan_author_cli.py --from-plan-contract ({0})".format(exc),
+        ) from exc
+
+
 def _run_start(args: argparse.Namespace) -> int:
     maestro_file = _executing_maestro_file()
     repo = Path(args.repo).resolve() if args.repo else _repository_from_cwd()
@@ -2871,6 +2935,7 @@ def _run_start(args: argparse.Namespace) -> int:
             revision=1,
             ref=str(plan_path.resolve()),
         )
+        _require_approved_plan(plan_path, compiled, layout)
         target = gitpub.bind_target_worktree(repo, main_ref)
         store = _open_store(runtime)
         run_id = args.run_id or uuid.uuid4().hex
@@ -3057,6 +3122,7 @@ def _bind_existing_run(
             pinned if pinned.is_file() else plan_ref,
             revision=revision,
             ref=str(plan_ref),
+            bound_run=True,
         )
         if compiled.plan_digest != row["plan_digest"]:
             raise FactoryRefused("PLAN_ARTIFACT_MISMATCH")
@@ -3228,16 +3294,17 @@ def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
     )
 
 
-def _reviewer_hmac_key(runtime: RuntimeStateRoot) -> str:
-    """The plan-contract reviewer key, from where the runtime already keeps it.
+def _reviewer_hmac_key(layout: Mapping[str, Any]) -> str:
+    """The plan-contract reviewer key, from the deployment's keys directory.
 
-    `route_admission.provision_keys` mints it once under the state root's keys
-    directory and never regenerates it, because a new key silently invalidates
-    every approval receipt already signed with the old one. Resolved here
-    rather than hardcoded so a deployment that moved its state root moves its
-    key with it.
+    `layout["keys_dir"]` is resolved once, in `_load_maestro_config`: the
+    configured `keys_dir`, or `<runtime_state_root>/keys` where
+    `route_admission.provision_keys` mints it. Ship, the `run start` approval
+    gate and `run attend` all read it here and nowhere else. The key is never
+    regenerated, because a new key silently invalidates every approval receipt
+    already signed with the old one.
     """
-    path = runtime.path / "keys" / admission.REVIEWER_HMAC_KEY_FILE
+    path = Path(layout["keys_dir"]) / admission.REVIEWER_HMAC_KEY_FILE
     try:
         material = path.read_text(encoding="ascii").strip()
     except OSError as exc:
@@ -3263,7 +3330,7 @@ def _planctl_binary(policy: att.AttendPolicy) -> Path:
 
 def _run_planctl(
     binary: Path, argv: Sequence[str], *, key: Optional[str] = None
-) -> None:
+) -> str:
     """One planctl subcommand, refused by exit status and nothing else.
 
     The refusal carries planctl's own output because a receipt or validation
@@ -3282,7 +3349,7 @@ def _run_planctl(
         env=environment,
     )
     if result.returncode == 0:
-        return
+        return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
     raise att.AttendRefused(
         att.REVISION_REFUSED,
@@ -3441,7 +3508,7 @@ def _attend_request(
 
 def _attend_project(
     policy: att.AttendPolicy,
-    runtime: RuntimeStateRoot,
+    layout: Mapping[str, Any],
     repo: Path,
     plans_dir: Path,
     run_id: str,
@@ -3457,18 +3524,49 @@ def _attend_project(
     has to survive the operator agent's scratch tree.
     """
     binary = _planctl_binary(policy)
-    key = _reviewer_hmac_key(runtime)
+    key = _reviewer_hmac_key(layout)
     plans_dir.mkdir(parents=True, exist_ok=True)
     stem = "{0}.r{1}".format(run_id, revision)
     ir = plans_dir / (stem + ".ir.json")
     rendered = plans_dir / (stem + ".html")
     receipt = plans_dir / (stem + ".receipt.json")
     plan_out = plans_dir / (stem + ".plan.json")
-    for stale in (rendered, receipt, plan_out):
+    findings = plans_dir / (stem + ".review-findings.json")
+    for stale in (rendered, receipt, plan_out, findings):
         if stale.exists():
             stale.unlink()
     shutil.copyfile(revision_ir, ir)
+    # The operator's two-implementations answer. Absent, planctl refuses
+    # `review.findings_missing` and the revision is refused by exit status.
     root = ["--repo-root", str(repo)]
+    authored_findings = att.findings_path_for(revision_ir)
+    if authored_findings.is_file():
+        # The operator answers the question; Maestro binds the answer to the
+        # revision it reviews and to the reviewer that signs it, so planctl can
+        # refuse a stale or foreign findings file.
+        try:
+            answered = json.loads(authored_findings.read_text(encoding="utf-8"))
+            surface = json.loads(
+                _run_planctl(binary, ["question-surface", str(ir), "--json"])
+            )
+        except (OSError, ValueError) as exc:
+            raise att.AttendRefused(
+                att.REVISION_REFUSED, "review findings: {0}".format(exc)
+            ) from exc
+        findings.write_text(
+            json.dumps(
+                {
+                    "schema_version": "plan-contract-review-findings.v1",
+                    "plan_id": surface.get("plan_id"),
+                    "question_surface_sha256": surface.get("question_surface_sha256"),
+                    "reviewer_id": policy.reviewer_id,
+                    "reviewer_vendor": policy.reviewer_vendor,
+                    "findings": answered.get("findings") if isinstance(answered, dict) else None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
         binary,
@@ -3483,6 +3581,8 @@ def _attend_project(
             policy.reviewer_id,
             "--reviewer-vendor",
             policy.reviewer_vendor,
+            "--findings",
+            str(findings),
             *root,
         ],
         key=key,
@@ -3502,7 +3602,10 @@ def _attend_project(
         ],
     )
     try:
-        ingress.author_from_plan_contract(ir, receipt, plan_out, repo, rendered)
+        ingress.author_from_plan_contract(
+            ir, receipt, plan_out, repo, rendered,
+            reviewer_key=plan_approval.key_bytes(key),
+        )
     except Exception as exc:
         raise att.AttendRefused(
             att.REVISION_REFUSED, "{0}: {1}".format(type(exc).__name__, exc)
@@ -3628,7 +3731,7 @@ def _run_attend(args: argparse.Namespace) -> int:
 
     def project(revision_ir: Path, revision: int) -> st.CompiledPlan:
         plan, plan_out = _attend_project(
-            policy, runtime, repo, plans_dir, run_id, revision_ir, revision
+            policy, layout, repo, plans_dir, run_id, revision_ir, revision
         )
         state["plan_path"] = plan_out
         return plan

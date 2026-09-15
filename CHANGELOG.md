@@ -7,6 +7,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **A bound run is not re-judged for `OBLIGATION_UNOBSERVABLE` either.**
+  `bound_run=True` now skips both authoring obligations when `_bind_existing_run`
+  re-reads a revision a run already holds, so a run bound before the seam check
+  existed resumes instead of refusing mid-run. This narrows a check only for
+  runs already bound; ship, `run start` and every new amendment are unchanged.
+- **Contract change: a gating obligation states its expected answers or does not
+  ship.** Every gating acceptance criterion now carries `decided_by` worked
+  examples: an exact `input` with exactly one exact `expect` or `refuses`. There
+  must be at least one `expect`, and at least one `refuses` when the claim is
+  negative or has `exception_ids`/`preconditions`. Anything less refuses
+  `OBLIGATION_UNDECIDED` (`adw_modules/plan_validate.py`) at ship, `run start`,
+  `run amend` and `run attend`. **Plans without examples that previously
+  shipped now refuse when re-shipped or amended.** A run already bound to such
+  a plan keeps resuming: `_bind_existing_run` compiles with `bound_run=True`.
+  The examples project verbatim into the lane's public acceptance and the tests
+  lane's `spec.obligations.claims`, and the ingress totality check verifies
+  both. A gating criterion carries `restriction` (polarity, has_exception_ids,
+  has_preconditions, external_store from `witness.store: external`; an
+  upstream-endpoint claim owes its unavailable refusal), and the compiler derives the refusal obligation from it
+  itself, so a plan started from canonical bytes cannot drop it.
+  `plan_author_cli.py --from-plan-contract` authenticates the planctl receipt's
+  HMAC with the deployment's reviewer key (a forged or unsigned receipt is
+  refused and no plan is written), and recomputes the question-surface digest
+  from the IR, refusing a signed receipt whose digest is stale or from the older
+  claims-only algorithm (`RECEIPT_QUESTION_SURFACE`). The key is `reviewer-hmac.key` in the new
+  `keys_dir` config value, defaulting to `<runtime_state_root>/keys`. **FDAdb
+  must set `keys_dir: /Users/davidandrews/.maestro/FDAdb/keys`**: its state root
+  has no `keys/`, which also broke `run attend`'s planctl step there and writes a signed `approval` record.
+  **`run start` now refuses a plan that is not an approved projection**
+  (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`); `run amend` still accepts a scripted
+  edit, and runs already bound are unaffected. The approval is not recorded in
+  the `PLAN_AMENDMENT` payload: that would change the amendment artifact's
+  identity, so it stays in the pinned plan bytes under `runtime_state_root`. `run attend` now passes
+  the operator's two-implementations findings, bound to the revision's question
+  surface and the attend reviewer, to `planctl review --findings`. That needs the-library's matching `planctl` with
+  `decided_by` and `--findings`. Why: in FDAdb's five amended runs about 16 of 36
+  `NO_PROGRESS` parks came from contracts that named where to observe but not
+  what value is correct.
 - **Contract change: lane panes open as a tab in the repository workspace.**
   Each lane used to get a linked child Space (`herdr worktree open`, #173/#237),
   which put its panes outside the operator's FDAdb workspace, where they could
@@ -46,6 +84,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the target checkout, its git dirs, the source repository or the runtime's
   own checkout. The test asserting the reviewer's tree has no `.git` now
   asserts it is a one-commit, one-ref directory repository.
+||||||| parent of 2739128 (Contract change: a gating obligation states its expected answers or does not ship)
 - **Contract change: the runtime-state fingerprint no longer binds the device
   number.** It is SHA-256 over the root's absolute path and inode. macOS
   assigns a volume's `st_dev` at mount, so after a reboot (16777230 ->

@@ -67,6 +67,7 @@ def _two_pair_ir() -> dict:
         "observation_seam": (
             "src/c.py is imported by its public module path; the contract it "
             "exports is what a case asserts on."),
+        "decided_by": [{"input": {"module": "src.c"}, "expect": {"importable": True}}],
         "polarity": "positive",
         "source_requirement_ids": ["req-t2"],
         "source_ids": ["src-a"],

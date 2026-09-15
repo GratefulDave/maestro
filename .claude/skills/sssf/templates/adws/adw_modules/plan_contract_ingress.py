@@ -10,9 +10,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from . import plan_approval
 from . import plan_author
+from . import plan_compiler
 from . import scheduler_types as st
-from .plan_model import LANE_KEYS, SCHEMA_VERSION
+from .plan_model import LANE_KEYS, SCHEMA_VERSION, AcceptanceCriterion
 
 
 EXECUTABLE_KINDS = frozenset({"implementation", "brownfield", "prd", "workflow"})
@@ -78,19 +80,17 @@ def _require_relative(path: str, label: str) -> str:
 
 
 def _verify_receipt(ir_bytes: bytes, receipt: Mapping[str, Any],
-                    rendered: Optional[bytes]) -> None:
-    if receipt.get("schema_version") != RECEIPT_VERSION:
-        raise IngressError("RECEIPT_SCHEMA")
-    if receipt.get("verdict") != "PASS":
-        raise IngressError("RECEIPT_NOT_PASS")
-    digest = receipt.get("ir_sha256")
-    if not isinstance(digest, str) or _sha256(ir_bytes) != digest:
-        raise IngressError("RECEIPT_IR_MISMATCH")
-    if rendered is not None:
-        rendered_digest = receipt.get("rendered_sha256")
-        if (not isinstance(rendered_digest, str)
-                or _sha256(rendered) != rendered_digest):
-            raise IngressError("RECEIPT_RENDERED_MISMATCH")
+                    rendered: Optional[bytes], key: bytes) -> None:
+    """Authenticate planctl's receipt with the deployment's reviewer key.
+
+    The whole canonical receipt, signature included (`plan_approval`). A
+    receipt whose fields merely look right was not produced by `planctl
+    review --findings` unless its HMAC says so.
+    """
+    try:
+        plan_approval.verify_receipt(ir_bytes, receipt, rendered, key)
+    except plan_approval.ApprovalRefused as exc:
+        raise IngressError(str(exc)) from exc
 
 
 def _maestro_extension(ir: Mapping[str, Any]) -> dict:
@@ -327,6 +327,7 @@ _CLAIM_FIELDS = (
     "antecedent_claim_id",
     "claim_id",
     "compression",
+    "decided_by",
     "domain",
     "exception_ids",
     "identifier_pattern",
@@ -363,8 +364,12 @@ _CLAIM_PROJECTION: Dict[str, Optional[str]] = {
     "polarity": "acceptance",
     "value": "acceptance",
     "unit": "acceptance",
+    # Worked examples are public by construction: the builder reads the same
+    # expected answers the tester's cases assert.
+    "decided_by": "acceptance",
     **{name: None for name in _CLAIM_FIELDS if name not in {
         "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+        "decided_by",
     }},
 }
 _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
@@ -372,6 +377,7 @@ _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
     for name in _CLAIM_FIELDS
     if name not in {
         "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+        "decided_by",
     }
 }
 _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
@@ -379,6 +385,15 @@ _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
     # A tests lane's claim is a gating obligation, so its declared seam is
     # carried onto the acceptance criterion the compiler refuses without.
     "observation_seam": "acceptance, spec.obligations.claims",
+    # ...and so are its worked examples, which the compiler refuses without
+    # (OBLIGATION_UNDECIDED).
+    "decided_by": "acceptance, spec.obligations.claims",
+    # The structure a refusal example depends on rides on the criterion as
+    # `restriction`, so the compiler derives the obligation itself.
+    "polarity": "acceptance, spec.obligations.claims",
+    "exception_ids": "acceptance, spec.obligations.claims",
+    "preconditions": "acceptance, spec.obligations.claims",
+    "witness": "acceptance, spec.obligations.claims",
 }
 _CLAIM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
@@ -627,6 +642,32 @@ def _observation_seam(claim: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _restriction(claim: Mapping[str, Any]) -> dict:
+    """The claim structure a refusal example depends on, carried to the compiler.
+
+    The compiler derives from it whether a `refuses` example is owed (negative
+    polarity, a non-empty `exception_ids` or `preconditions`, or a witness
+    store of `external` -- a claim reading an upstream endpoint owes the
+    refusal for that endpoint being unavailable), so a plan started directly
+    from its canonical bytes is judged the same way.
+    """
+    witness = claim.get("witness")
+    return {
+        "polarity": claim.get("polarity"),
+        "has_exception_ids": bool(claim.get("exception_ids")),
+        "has_preconditions": bool(claim.get("preconditions")),
+        "external_store": isinstance(witness, dict) and witness.get("store") == "external",
+    }
+
+
+def _build_criterion(claim: Mapping[str, Any]) -> str:
+    """A build lane's advisory criterion, carrying the claim's worked examples."""
+    sentence = _claim_sentence(claim)
+    if "decided_by" not in claim:
+        return sentence
+    return AcceptanceCriterion(sentence, decided_by=claim["decided_by"]).public_text
+
+
 def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]],
                 gating: bool) -> list:
     """The lane's public acceptance: the verifier oracle, then one per claim.
@@ -636,7 +677,10 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
     declared `observation_seam`. A claim that declares none projects a gating
     criterion with no seam, and the objective compiler refuses the plan
     (`OBLIGATION_UNOBSERVABLE`) rather than shipping an obligation no case can
-    observe. Nothing here reads the claim's prose.
+    observe. Its `decided_by` worked examples are carried the same way, with
+    the claim's `restriction` structure; a gating
+    criterion without them is refused `OBLIGATION_UNDECIDED`. Nothing here
+    reads the claim's prose.
     """
     verifier_id = _require_text(
         verifier.get("verifier_id"), "UNMAPPABLE_VERIFIERS", "verifier_id")
@@ -645,7 +689,7 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
         "{}.oracle".format(verifier_id))
     head = ["{}: {}".format(verifier_id, oracle)]
     if not gating:
-        return head + [_claim_sentence(claim) for claim in claims]
+        return head + [_build_criterion(claim) for claim in claims]
     projected = []
     for claim in claims:
         criterion: dict = {
@@ -655,6 +699,9 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
         seam = _observation_seam(claim)
         if seam is not None:
             criterion["observation_seam"] = seam
+        if "decided_by" in claim:
+            criterion["decided_by"] = claim["decided_by"]
+        criterion["restriction"] = _restriction(claim)
         projected.append(criterion)
     return head + projected
 
@@ -1023,6 +1070,24 @@ def _assert_ingress_projection_is_total(
                 _fail(
                     "acceptance[{0}].observation_seam".format(offset + 1),
                     declared, carried)
+            item = item if isinstance(item, dict) else {}
+            if claim.get("decided_by") != item.get("decided_by"):
+                _fail(
+                    "acceptance[{0}].decided_by".format(offset + 1),
+                    claim.get("decided_by"), item.get("decided_by"))
+            if _restriction(claim) != item.get("restriction"):
+                _fail(
+                    "acceptance[{0}].restriction".format(offset + 1),
+                    _restriction(claim), item.get("restriction"))
+    else:
+        for offset, claim in enumerate(
+                _bound_records(ir, lane, "claim_ids", "claims", "claim_id")):
+            if claim.get("decided_by") is None:
+                continue
+            expected = _build_criterion(claim)
+            if acceptance[offset + 1] != expected:
+                _fail("acceptance[{0}].decided_by".format(offset + 1),
+                      expected, acceptance[offset + 1])
     branch = maestro.get("integration_branch")
     if spec.get("integration", {}).get("integration_branch") != branch:
         _fail("spec.integration.integration_branch", branch,
@@ -1272,24 +1337,39 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
 
 def project_canonical_plan(
         ir_path: Path, receipt_path: Path, repo: Path,
-        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict, dict]:
-    """Verify the receipt and project, without writing anything."""
+        rendered_path: Optional[Path] = None, *,
+        reviewer_key: bytes) -> Tuple[bytes, dict, dict]:
+    """Authenticate the receipt and project, without writing anything.
+
+    The projected plan carries an `approval` record binding its digest to the
+    authenticated receipt, signed with the same key (`plan_approval`). `run
+    start` refuses a plan without one. The record is outside the compiled
+    canonical document, so the plan digest is the digest of the lanes alone.
+    """
     ir_bytes = Path(ir_path).read_bytes()
     ir = _load_json(ir_path, "IR_UNREADABLE")
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     rendered = Path(rendered_path).read_bytes() if rendered_path else None
-    _verify_receipt(ir_bytes, receipt, rendered)
+    _verify_receipt(ir_bytes, receipt, rendered, reviewer_key)
     draft = project_draft(ir, repo)
-    stored = plan_author.author_plan(draft)
+    digest = plan_compiler.compile_plan(plan_author.author_plan(draft)).plan_digest
+    approved = dict(
+        draft,
+        approval=plan_approval.approval_record(digest, receipt, reviewer_key),
+    )
+    stored = plan_author.author_plan(approved)
+    if plan_compiler.compile_plan(stored).plan_digest != digest:
+        raise IngressError("PLAN_APPROVAL_DIGEST")
     return stored, draft, ir
 
 
 def author_from_plan_contract(
         ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
-        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
-    """Verify the receipt, project, canonicalize, and write a Maestro plan."""
+        rendered_path: Optional[Path] = None, *,
+        reviewer_key: bytes) -> Tuple[bytes, dict]:
+    """Authenticate the receipt, project, canonicalize, and write a Maestro plan."""
     stored, draft, ir = project_canonical_plan(
-        ir_path, receipt_path, repo, rendered_path)
+        ir_path, receipt_path, repo, rendered_path, reviewer_key=reviewer_key)
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     plan_author.write_canonical_plan(destination, stored)
     trace = {

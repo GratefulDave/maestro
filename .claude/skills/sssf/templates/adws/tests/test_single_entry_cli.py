@@ -116,14 +116,25 @@ def install_deployment(product: Path, state: Path) -> Path:
     return maestro_file
 
 
-def ship_plan(repo: Path, name: str, body: bytes) -> Path:
+def ship_plan(repo: Path, name: str, body: bytes, *, approved: bool = True) -> Path:
     """Ship one plan the installed way: `.maestro/plans/<name>/maestro-plan.v1`.
 
     Committed, because publication refuses a target worktree carrying
-    untracked files and a real shipped plan lives in the repository.
+    untracked files and a real shipped plan lives in the repository. A shipped
+    plan is an approved projection (`run start` refuses anything else), so a
+    parseable plan is written with the approval record the projection signs
+    with the test deployment's reviewer key; `approved=False` or bytes that do
+    not parse are written as given.
     """
+    from tests import plan_receipts
+
     path = repo / ".maestro" / "plans" / name / "maestro-plan.v1"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if approved:
+        try:
+            body = plan_receipts.approve_plan_bytes(body)
+        except ValueError:
+            pass
     path.write_bytes(body)
     _git(repo, "add", "-f", str(path))
     _git(repo, "commit", "-m", "ship " + name)
@@ -261,6 +272,9 @@ class SingleEntryBase(unittest.TestCase):
         self.repo = self.root / "product"
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
+        from tests import plan_receipts
+
+        plan_receipts.install_key(self.state)
         _init_repo(self.repo)
         self.maestro_file = install_deployment(self.repo, self.state)
         _git(self.repo, "add", "-A")

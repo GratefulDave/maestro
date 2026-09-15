@@ -269,6 +269,34 @@ def require_rationale(payload: Any) -> Mapping[str, Any]:
     return {key: payload[key] for key in RATIONALE_KEYS}
 
 
+#: The two-implementations question the operator answers for its own revision.
+#: `planctl review --findings` refuses to sign while a finding's claim has no
+#: `decided_by` example whose input is the finding's `divergent_input`.
+TWO_IMPLEMENTATIONS_QUESTION = (
+    "For every claim a tests lane discharges in your revision, describe two "
+    "implementations that satisfy every decided_by example and the "
+    "observation_seam yet produce different observable results; for a claim whose "
+    "witness store is external (it reads an upstream endpoint), include pairs that "
+    "differ on the endpoint read, the response fields relied on, or the behavior "
+    "when it is unavailable or returns a different release. Write "
+    "{\"findings\": [...]} to review_findings_out_path, one finding per pair with "
+    "exactly finding_id, claim_id, implementation_a, implementation_b, "
+    "divergent_input, outcome_a, outcome_b (each {\"expect\": <exact output>} or "
+    "{\"refuses\": {\"error\": ..., \"message\": ...}}, and different) and "
+    "observable_difference. Then add to that claim the decided_by example at "
+    "divergent_input whose answer is the outcome the contract wants. Change "
+    "nothing else about a claim you wrote a finding for. Write "
+    "{\"findings\": []} when there is no such pair. Ask this once."
+)
+
+
+def findings_path_for(revision: Path) -> Path:
+    """Where the two-implementations findings for a revision IR are written."""
+    name = Path(revision).name
+    stem = name[: -len(".ir.json")] if name.endswith(".ir.json") else Path(name).stem
+    return Path(revision).with_name(stem + ".review-findings.json")
+
+
 def revision_path(envelope: Any, expected: Path) -> Path:
     """The IR the operator agent says it wrote, proved to be the one asked for."""
     if not isinstance(envelope, Mapping):

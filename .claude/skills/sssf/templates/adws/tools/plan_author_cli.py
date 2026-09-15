@@ -27,8 +27,31 @@ _RUNTIME_ROOT = _TOOLS_DIR.parent
 if str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 
+from adw_modules import plan_approval  # noqa: E402
 from adw_modules import plan_author  # noqa: E402
 from adw_modules import plan_contract_ingress as ingress  # noqa: E402
+
+
+def _reviewer_key() -> bytes:
+    """This deployment's reviewer key, through Maestro's one resolver.
+
+    The deployment config beside this runtime decides the keys directory
+    (`keys_dir`, else the state root's `keys/`); `maestro._reviewer_hmac_key`
+    reads it, exactly as `run start` and `run attend` do. Never an argument, so
+    a receipt is authenticated against the deployment that will run the plan.
+    """
+    import maestro
+
+    try:
+        layout = maestro._load_deployment_config(_RUNTIME_ROOT / "maestro.py")
+        material = maestro._reviewer_hmac_key(layout)
+    except maestro._MaestroConfigurationError as exc:
+        raise plan_author.AuthoringError(
+            "REVIEWER_KEY_UNRESOLVED:{0}".format(exc)) from exc
+    except maestro.att.AttendRefused as exc:
+        raise plan_author.AuthoringError(
+            "REVIEWER_KEY_UNRESOLVED:{0}".format(exc.detail)) from exc
+    return plan_approval.key_bytes(material)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +79,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(args.destination),
             Path(args.repo),
             Path(args.rendered) if args.rendered else None,
+            reviewer_key=_reviewer_key(),
         )
     except (plan_author.AuthoringError, ingress.IngressProjectionIncomplete) as exc:
         print(
