@@ -67,3 +67,17 @@ def approve_plan_bytes(stored: bytes, *, key: bytes = KEY,
         digest, receipt or signed_receipt(b"{}", key=key), key
     )
     return plan_author.author_plan(document)
+
+
+def write_deployment_config(adws_dir: Path, state_root: Path, **extra: Any) -> Path:
+    """The template's own config with this deployment's state root and extras."""
+    import yaml
+
+    template = Path(__file__).resolve().parents[1] / "maestro.config.yaml"
+    config = yaml.safe_load(template.read_text(encoding="utf-8"))
+    config["runtime_state_root"] = str(state_root)
+    config.update({key: str(value) for key, value in extra.items()})
+    path = Path(adws_dir) / "maestro.config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    return path

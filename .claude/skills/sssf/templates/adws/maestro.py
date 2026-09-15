@@ -389,6 +389,18 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     if not root.is_absolute():
         raise _MaestroConfigurationError("runtime_state_root must be absolute")
     loaded["runtime_state_root"] = root
+    # The one place a deployment's keys directory is decided. `keys_dir` names
+    # it; without it the keys are where `route_admission.provision_keys` mints
+    # them, under the state root. FDAdb's live beside its route receipts in
+    # `~/.maestro/FDAdb/keys` while its state root moved, so reading the state
+    # root alone refused every reviewer-key read there.
+    if "keys_dir" in loaded:
+        keys_dir = Path(_config_string(loaded.get("keys_dir"), "keys_dir"))
+        if not keys_dir.is_absolute():
+            raise _MaestroConfigurationError("keys_dir must be absolute")
+        loaded["keys_dir"] = keys_dir
+    else:
+        loaded["keys_dir"] = root / "keys"
     loaded["role_routes"] = _canonical_role_routes(loaded.get("role_routes"))
     loaded["provision_argv"] = _config_argv(
         loaded.get("provision_argv"), "provision_argv"
@@ -2848,7 +2860,7 @@ def _run_plan(args: argparse.Namespace) -> int:
                     compiled = _compile_plan(
                         plan_path, revision=1, ref=str(plan_path)
                     )
-                    _require_approved_plan(plan_path, compiled, runtime)
+                    _require_approved_plan(plan_path, compiled, layout)
                     start_id = uuid.uuid4().hex
                     create_factory_run(
                         store=store,
@@ -2876,7 +2888,7 @@ def _run_plan(args: argparse.Namespace) -> int:
 
 
 def _require_approved_plan(
-    plan_path: Path, compiled: st.CompiledPlan, runtime: RuntimeStateRoot
+    plan_path: Path, compiled: st.CompiledPlan, layout: Mapping[str, Any]
 ) -> None:
     """A new run binds only a plan bound to authenticated approval evidence.
 
@@ -2890,7 +2902,7 @@ def _require_approved_plan(
     """
     try:
         document = json.loads(plan_path.read_bytes().decode("utf-8"))
-        material = _reviewer_hmac_key(runtime)
+        material = _reviewer_hmac_key(layout)
     except att.AttendRefused as exc:
         raise _RunRefused("PLAN_UNAPPROVED", "reviewer key: {0}".format(exc.detail)) from exc
     except (OSError, UnicodeError, ValueError) as exc:
@@ -2923,7 +2935,7 @@ def _run_start(args: argparse.Namespace) -> int:
             revision=1,
             ref=str(plan_path.resolve()),
         )
-        _require_approved_plan(plan_path, compiled, runtime)
+        _require_approved_plan(plan_path, compiled, layout)
         target = gitpub.bind_target_worktree(repo, main_ref)
         store = _open_store(runtime)
         run_id = args.run_id or uuid.uuid4().hex
@@ -3282,16 +3294,17 @@ def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
     )
 
 
-def _reviewer_hmac_key(runtime: RuntimeStateRoot) -> str:
-    """The plan-contract reviewer key, from where the runtime already keeps it.
+def _reviewer_hmac_key(layout: Mapping[str, Any]) -> str:
+    """The plan-contract reviewer key, from the deployment's keys directory.
 
-    `route_admission.provision_keys` mints it once under the state root's keys
-    directory and never regenerates it, because a new key silently invalidates
-    every approval receipt already signed with the old one. Resolved here
-    rather than hardcoded so a deployment that moved its state root moves its
-    key with it.
+    `layout["keys_dir"]` is resolved once, in `_load_maestro_config`: the
+    configured `keys_dir`, or `<runtime_state_root>/keys` where
+    `route_admission.provision_keys` mints it. Ship, the `run start` approval
+    gate and `run attend` all read it here and nowhere else. The key is never
+    regenerated, because a new key silently invalidates every approval receipt
+    already signed with the old one.
     """
-    path = runtime.path / "keys" / admission.REVIEWER_HMAC_KEY_FILE
+    path = Path(layout["keys_dir"]) / admission.REVIEWER_HMAC_KEY_FILE
     try:
         material = path.read_text(encoding="ascii").strip()
     except OSError as exc:
@@ -3495,7 +3508,7 @@ def _attend_request(
 
 def _attend_project(
     policy: att.AttendPolicy,
-    runtime: RuntimeStateRoot,
+    layout: Mapping[str, Any],
     repo: Path,
     plans_dir: Path,
     run_id: str,
@@ -3511,7 +3524,7 @@ def _attend_project(
     has to survive the operator agent's scratch tree.
     """
     binary = _planctl_binary(policy)
-    key = _reviewer_hmac_key(runtime)
+    key = _reviewer_hmac_key(layout)
     plans_dir.mkdir(parents=True, exist_ok=True)
     stem = "{0}.r{1}".format(run_id, revision)
     ir = plans_dir / (stem + ".ir.json")
@@ -3718,7 +3731,7 @@ def _run_attend(args: argparse.Namespace) -> int:
 
     def project(revision_ir: Path, revision: int) -> st.CompiledPlan:
         plan, plan_out = _attend_project(
-            policy, runtime, repo, plans_dir, run_id, revision_ir, revision
+            policy, layout, repo, plans_dir, run_id, revision_ir, revision
         )
         state["plan_path"] = plan_out
         return plan

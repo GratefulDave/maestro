@@ -71,34 +71,55 @@ class ValidatorResolution(unittest.TestCase):
 
 
 class ReviewerKeyResolution(unittest.TestCase):
+    """One resolver: `keys_dir` from the deployment config, else the state root's `keys/`."""
+
     def setUp(self) -> None:
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         self.tmp = Path(holder.name)
-        self.runtime = _Runtime(self.tmp)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
 
-    def test_the_key_comes_from_the_state_root_and_nowhere_else(self) -> None:
-        keys = self.tmp / "keys"
+    def _layout(self, **extra: str) -> dict:
+        from tests import plan_receipts
+
+        config = plan_receipts.write_deployment_config(self.tmp / "adws", self.state, **extra)
+        return maestro._load_maestro_config(self.tmp, config)
+
+    def test_without_keys_dir_the_key_comes_from_the_state_root(self) -> None:
+        keys = self.state / "keys"
         keys.mkdir()
         material = "ab" * 32
         (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text(material)
-        self.assertEqual(maestro._reviewer_hmac_key(self.runtime), material)
-        # planctl's own floor. A key shorter than this mints no receipt, so a
-        # deployment whose keys directory was reprovisioned by hand finds out
-        # here rather than at the review call.
+        self.assertEqual(maestro._reviewer_hmac_key(self._layout()), material)
+        # planctl's own floor. A key shorter than this mints no receipt.
         self.assertGreaterEqual(len(material.encode("utf-8")), 32)
+
+    def test_keys_dir_outside_the_state_root_is_where_the_key_is_read(self) -> None:
+        """FDAdb: state root moved, keys stayed in ~/.maestro/FDAdb/keys."""
+        keys = self.tmp / "dot-maestro" / "FDAdb" / "keys"
+        keys.mkdir(parents=True)
+        (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text("cd" * 32 + "\n")
+        layout = self._layout(keys_dir=str(keys))
+        self.assertFalse((self.state / "keys").exists())
+        self.assertEqual(keys, layout["keys_dir"])
+        self.assertEqual("cd" * 32, maestro._reviewer_hmac_key(layout))
+
+    def test_a_relative_keys_dir_is_a_configuration_error(self) -> None:
+        with self.assertRaises(maestro._MaestroConfigurationError):
+            self._layout(keys_dir="keys")
 
     def test_an_absent_key_refuses_by_name(self) -> None:
         with self.assertRaises(att.AttendRefused) as caught:
-            maestro._reviewer_hmac_key(self.runtime)
+            maestro._reviewer_hmac_key(self._layout())
         self.assertEqual(caught.exception.code, att.KEY_UNRESOLVED)
 
     def test_an_empty_key_file_is_not_a_key(self) -> None:
-        keys = self.tmp / "keys"
+        keys = self.state / "keys"
         keys.mkdir()
         (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text("   \n")
         with self.assertRaises(att.AttendRefused) as caught:
-            maestro._reviewer_hmac_key(self.runtime)
+            maestro._reviewer_hmac_key(self._layout())
         self.assertEqual(caught.exception.code, att.KEY_UNRESOLVED)
 
 
@@ -201,7 +222,8 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
         ):
             with self.assertRaises(att.AttendRefused):
                 maestro._attend_project(
-                    policy, _Runtime(self.tmp), self.tmp, self.plans, "run", self.revision, 2
+                    policy, {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
+                    "run", self.revision, 2,
                 )
         (review,) = [argv for argv in calls if argv[0] == "review"]
         return review

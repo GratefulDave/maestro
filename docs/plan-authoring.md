@@ -468,8 +468,11 @@ Three rules for writing them:
   claim makes the findings stale.
 
 **`run start` binds only an approved projection.** `plan_author_cli.py --from-plan-contract`
-authenticates the planctl receipt's HMAC with the deployment's reviewer key
-(`<runtime_state_root>/keys/reviewer-hmac.key`). It writes the plan with an `approval` record,
+authenticates the planctl receipt's HMAC with the deployment's reviewer key: `reviewer-hmac.key`
+in the deployment's `keys_dir` (`maestro.config.yaml`; omitted, `<runtime_state_root>/keys`). A
+deployment whose keys live in `~/.maestro/<project>/keys` while its state root is elsewhere, as
+FDAdb's do, sets `keys_dir`. That must be the same key planctl signs with
+(`PLANCTL_REVIEWER_HMAC_KEY` in `reviewer-hmac.env`). It writes the plan with an `approval` record,
 the plan digest plus that receipt, signed with the same key. `run start` refuses a plan without a
 valid record, or one edited after projection (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`). `run amend`
 still accepts a scripted edit of a projected plan, and a run already bound is never re-checked.

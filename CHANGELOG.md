@@ -29,7 +29,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   itself, so a plan started from canonical bytes cannot drop it.
   `plan_author_cli.py --from-plan-contract` authenticates the planctl receipt's
   HMAC with the deployment's reviewer key (a forged or unsigned receipt is
-  refused and no plan is written) and writes a signed `approval` record.
+  refused and no plan is written). The key is `reviewer-hmac.key` in the new
+  `keys_dir` config value, defaulting to `<runtime_state_root>/keys`. **FDAdb
+  must set `keys_dir: /Users/davidandrews/.maestro/FDAdb/keys`**: its state root
+  has no `keys/`, which also broke `run attend`'s planctl step there and writes a signed `approval` record.
   **`run start` now refuses a plan that is not an approved projection**
   (`PLAN_UNAPPROVED`, `PLAN_APPROVAL_*`); `run amend` still accepts a scripted
   edit, and runs already bound are unaffected. The approval is not recorded in

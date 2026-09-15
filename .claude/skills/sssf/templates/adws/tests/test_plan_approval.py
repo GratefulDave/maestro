@@ -80,12 +80,13 @@ class RequireApprovedPlan(unittest.TestCase):
         self.root = Path(holder.name)
         self.runtime = SimpleNamespace(path=self.root / "state")
         plan_receipts.install_key(self.runtime.path)
+        self.layout = {"keys_dir": self.runtime.path / "keys"}
         self.plan = self.root / "plan.json"
 
     def _check(self, stored: bytes) -> None:
         self.plan.write_bytes(stored)
         compiled = plan_compiler.compile_plan(stored)
-        maestro._require_approved_plan(self.plan, compiled, self.runtime)
+        maestro._require_approved_plan(self.plan, compiled, self.layout)
 
     def _refusal(self, stored: bytes) -> str:
         with self.assertRaises(maestro._RunRefused) as caught:
@@ -130,14 +131,59 @@ class RequireApprovedPlan(unittest.TestCase):
         )
 
 
+class KeysOutsideTheStateRoot(unittest.TestCase):
+    """FDAdb's layout: runtime_state_root has no keys/; keys_dir names ~/.maestro/<project>/keys.
+
+    Ship, the start gate and attend all read the key through
+    `maestro._reviewer_hmac_key(layout)`, so one deployment config reaches all three.
+    """
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.root = Path(holder.name)
+        self.product = self.root / "product"
+        (self.product / "adws").mkdir(parents=True)
+        self.state = self.root / "local-state" / "fdadb"
+        self.state.mkdir(parents=True)
+        self.keys = self.root / "dot-maestro" / "FDAdb" / "keys"
+        plan_receipts.install_key(self.keys.parent)
+        plan_receipts.write_deployment_config(
+            self.product / "adws", self.state, keys_dir=self.keys)
+        self.layout = maestro._load_deployment_config(self.product / "adws" / "maestro.py")
+
+    def test_the_layout_does_not_hold_the_key_under_the_state_root(self) -> None:
+        self.assertFalse((self.state / "keys").exists())
+        self.assertEqual(self.keys, self.layout["keys_dir"])
+
+    def test_start_gate_finds_the_key(self) -> None:
+        plan = self.root / "plan.json"
+        stored = plan_receipts.approve_plan_bytes(_plan_bytes())
+        plan.write_bytes(stored)
+        maestro._require_approved_plan(plan, plan_compiler.compile_plan(stored), self.layout)
+
+    def test_ship_finds_the_key(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(Path(maestro.__file__).resolve().parent / "tools"))
+        import plan_author_cli
+
+        with mock.patch.object(plan_author_cli, "_RUNTIME_ROOT", self.product / "adws"):
+            self.assertEqual(plan_receipts.KEY, plan_author_cli._reviewer_key())
+
+    def test_attend_finds_the_key(self) -> None:
+        self.assertEqual(plan_receipts.KEY_MATERIAL, maestro._reviewer_hmac_key(self.layout))
+
+
 class StartAndAmendWiring(unittest.TestCase):
     """`run start` refuses before a run exists; `run amend` does not ask."""
 
     def _start(self, plan: Path, runtime: SimpleNamespace, create: mock.Mock) -> None:
+        layout = {"keys_dir": runtime.path / "keys"}
         args = argparse.Namespace(plan=str(plan), repo="/product", main_ref="refs/heads/main", run_id="r1")
         with (
             mock.patch.object(maestro, "_executing_maestro_file", return_value=Path("/d/maestro.py")),
-            mock.patch.object(maestro, "_load_deployment_config", return_value={}),
+            mock.patch.object(maestro, "_load_deployment_config", return_value=layout),
             mock.patch.object(maestro, "require_deployment"),
             mock.patch.object(maestro, "_open_runtime", return_value=runtime),
             mock.patch.object(maestro.gitpub, "bind_target_worktree", return_value=mock.Mock()),
