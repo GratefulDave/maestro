@@ -2902,11 +2902,35 @@ class HerdrLauncher:
                 "workspace list: {0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
-        matches: List[Tuple[str, str]] = []
+        # The repository workspace is the one opened on the repository root.
+        # Herdr names that binding as worktree.checkout_path on a Space it
+        # bound; a Space bound to another checkout is never this repository's,
+        # even when an agent pane inside it has the repository as its cwd (an
+        # operator session opened on FDAdb from the maestro Space, run
+        # be064e58). Herdr does not backfill the binding on every Space, so
+        # unbound Spaces still fall back to a pane at the repository root.
+        bound: List[str] = []
+        unbound: List[str] = []
         for workspace in _herdr_list(payload, "workspaces"):
             workspace_id = str(workspace.get("workspace_id") or "")
             if not workspace_id:
                 continue
+            worktree = workspace.get("worktree")
+            checkout = worktree.get("checkout_path") if isinstance(worktree, dict) else None
+            if not checkout:
+                unbound.append(workspace_id)
+            elif Path(str(checkout)).resolve() == root:
+                bound.append(workspace_id)
+        if len(bound) > 1:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "AMBIGUOUS_REPOSITORY_WORKSPACE:{}".format(",".join(bound)),
+                pane_created=False,
+            )
+        if bound:
+            return bound[0]
+        matches: List[Tuple[str, str]] = []
+        for workspace_id in unbound:
             try:
                 panes_payload = self._herdr(
                     "pane", "list", "--workspace", workspace_id, env=environment
