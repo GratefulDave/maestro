@@ -7,6 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Contract change: lane panes open as a tab in the repository workspace.**
+  Each lane used to get a linked child Space (`herdr worktree open`, #173/#237),
+  which put its panes outside the operator's FDAdb workspace, where they could
+  not be seen. The layout is now: workspace = the one open on the repository
+  the run targets, found by a live pane whose `cwd` is the repository root
+  (none refuses `WORKSPACE_UNRESOLVED:NO_REPOSITORY_WORKSPACE`, more than one
+  refuses as ambiguous, Maestro never creates one); tab = one per lane,
+  created with a provisional label, its seed pane tagged, then renamed to the
+  `lane_id`; pane = one per role in that tab, each at its own checkout.
+  Pane metadata, not labels, is role identity, and a user-renamed role pane is
+  relabelled. Completion renames every available session, then closes every
+  run-owned role pane; the workspace is never closed. Removed with the child
+  Space: `HERDR_WORKSPACE_ID` capture, the `ui-worktrees` anchor worktrees,
+  `SPLIT_PARENT_UNRESOLVED`, workspace metadata tagging and `agent focus`.
+  Ported from e748549 without its attended-repair work (`--attend`,
+  `role_instance` reviewer sessions). The topology tests, Herdr fake and
+  `test_amend_closes_run_panes` launcher stub are updated to the new layout,
+  and `test_lane_space_counted_once` is deleted with the child Space it tested.
+  Placement was driven against the real herdr 0.9.0 binary in a throwaway
+  workspace: two roles of one lane landed side by side in one tab, and no
+  other workspace was created.
 - **Contract change: a materialized tree is a git repository.** The
   test-reviewer's private tree and every review / integration-gate tree came
   from `git archive`, and `_extract_commit` refused a tree carrying `.git`, so

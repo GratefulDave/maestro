@@ -7,10 +7,13 @@ dedicated process groups so inventory brackets close over a quiescent tree.
 
 from __future__ import annotations
 
+import fcntl
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import signal
+import tempfile
 import subprocess
 import threading
 import time
@@ -33,6 +36,10 @@ from typing import (
 
 from . import handoff_budget as hb
 from .route_receipts import AdmittedRouteSet
+
+
+_LAYOUT_THREAD_LOCKS_GUARD = threading.Lock()
+_LAYOUT_THREAD_LOCKS: Dict[str, Tuple[Any, int]] = {}
 
 
 class PollState(str, Enum):
@@ -131,23 +138,12 @@ class LaunchRefusal(Enum):
     #: exists yet restate it. Previously a bare `RuntimeError` that no
     #: operator-facing clause mapped, so the operator saw a traceback.
     HERDR_UNAVAILABLE = ("HERDR_UNAVAILABLE", None, True)
-    #: herdr could not say which pane this launcher splits from. Raised
-    #: before any split, so no pane exists. **Non**-deterministic: the answer
-    #: is herdr's to give and the next attempt may get it, and the launcher
-    #: does not cache the failure, so a retry genuinely re-asks. This member
-    #: replaced a silent fall back to the `--current` selector: a selector is
-    #: mutable focus state, so splitting it lands the pane in whichever
-    #: workspace happens to hold focus — the scatter across w13F..w13K — and
-    #: §1.2 forbids keying a decision on ambient mutable state. Refusing is
-    #: honest; splitting into an unknown workspace is not.
-    SPLIT_PARENT_UNRESOLVED = ("SPLIT_PARENT_UNRESOLVED", False, False)
-    #: herdr refused to create the workspace this run's panes belong to.
-    #: Raised before any pane exists. **Non**-deterministic and not cached,
-    #: for the same reason `SPLIT_PARENT_UNRESOLVED` is not: the answer is
-    #: herdr's to give and the next attempt genuinely re-asks. Creating the
-    #: workspace rather than reading whichever one holds focus is what makes
-    #: a run's placement a property of the run instead of a property of where
-    #: the operator's cursor happened to be (§1.2).
+    #: herdr could not resolve the repository workspace this run's panes
+    #: belong to. Raised before any pane exists. Non-deterministic and not
+    #: cached: the answer is herdr's to give and the next attempt genuinely
+    #: re-asks. Resolving the repository workspace rather than reading ambient
+    #: focus makes placement a property of the run, not of the operator's
+    #: cursor (§1.2).
     WORKSPACE_UNRESOLVED = ("WORKSPACE_UNRESOLVED", False, False)
     #: herdr refused to create the tab this node's panes belong to. Raised
     #: before any pane of this launch exists; same non-deterministic,
@@ -188,7 +184,6 @@ class LaunchRefusal(Enum):
     #: and collect trees raise, restated as a launch refusal rather than
     #: escaping as a bare `RuntimeError` no operator-facing clause mapped.
     PROVISION_FAILED = ("PROVISION_FAILED", False, True)
-
 
     def __init__(
         self, code: str, pane_created: Optional[bool], deterministic: bool
@@ -257,14 +252,12 @@ class HarnessQuiescenceError(RuntimeError):
 
 
 class _WorkspaceGone(RuntimeError):
-    """A memoized workspace id no longer names a live workspace.
+    """A cached repository workspace no longer names a live workspace.
 
     Internal to the launcher and never raised past it: lane placement either
-    recovers by re-resolving, or restates this as a typed `LaunchRefused`.
-    A dead child invalidates that lane only; a dead parent invalidates every
-    lane layout.
+    recovers by re-resolving the repository workspace, or restates this as a
+    typed `LaunchRefused`.
     """
-
 
 
 class AgentNotInteractive(RuntimeError):
@@ -324,9 +317,7 @@ AGENT_NOT_FOUND = "agent_not_found"
 AGENT_NOT_READY = "agent_not_ready"
 PANE_NOT_FOUND = "pane_not_found"
 WORKSPACE_NOT_FOUND = "workspace_not_found"
-#: A `worktree` call was handed a path outside any Git work tree. Absence of a
-#: repository, not a failure: the caller reads it as "no binding here".
-NOT_GIT_WORKTREE = "not_git_worktree"
+TAB_NOT_FOUND = "tab_not_found"
 
 #: Maestro-owned Herdr report-metadata source. Tokens, not labels, are identity.
 MAESTRO_METADATA_SOURCE = "maestro"
@@ -338,7 +329,6 @@ METADATA_TOKEN_ROLE = "role"
 METADATA_TOKEN_SCRATCH = "scratch"
 METADATA_SCRATCH_REDIRECT = "redirect-v1"
 METADATA_TOKEN_PARENT = "parent"
-METADATA_KIND_RUN = "run"
 METADATA_KIND_LANE = "lane"
 METADATA_TOKEN_VALUE_MAX = 80
 
@@ -566,20 +556,20 @@ class LaunchSpec:
     #: catalog means importing `agent_pi`, which `enforcement.py`'s
     #: `base-execution-import` forbids every module in this package to do.
     context_window_tokens: Optional[int] = None
-    #: The authored plan name shown on the Herdr workspace. Runtime identity
-    #: remains in `correlation_token`; it is never parsed for placement.
+    #: Authored run caption. Runtime identity remains in
+    #: `correlation_token`; it is never parsed for placement.
     workspace_label: str = ""
     #: Tab grouping key for panes of one lane. Not a session-adoption identity.
     lane_key: str = ""
-    #: Authored lane name shown on the linked child worktree workspace.
+    #: Authored lane name shown on its Herdr tab.
     lane_label: str = ""
     pane_role: str = ""
-    #: Durable lane coordinates used only to probe a pre-fix live agent.
+    #: Durable lane coordinates used only to probe an existing live agent.
     run_id: str = ""
     #: Canonical repository fingerprint for Herdr metadata identity.
     repository_fingerprint: str = ""
-    #: Git repository parent working tree. Herdr `worktree open` requires this
-    #: as the parent workspace cwd, not a linked role checkout.
+    #: Git repository source checkout used to resolve the existing
+    #: operator-visible parent workspace.
     repository_root: Path = Path()
     stage: str = ""
     input_digest: str = ""
@@ -588,15 +578,10 @@ class LaunchSpec:
     pane_group_size: int = 0
     #: Per-role checkout roots used when a role pane is created lazily.
     role_cwds: Mapping[str, Path] = field(default_factory=dict)
-    #: Path Herdr opens the lane's child Space on, when the launching role's
-    #: own cwd is not a git worktree. A private-tree role is materialized out
-    #: of the vault without `.git`, and `worktree open` refuses such a path.
-    child_anchor: Optional[Path] = None
     #: Refresh an adopted stable role's existing CWD before prompt delivery.
     prepare_adopted_cwd: Optional[Callable[[Path], None]] = None
     #: Optional callback once launch holds pane/actor ids. Transport only.
     on_identity: Optional[Callable[["LaunchHandle"], None]] = None
-
 
 
 #: Pane status meaning the composer is not currently producing a turn.
@@ -736,19 +721,12 @@ class LaunchHandle:
     #: own shell, and the attempt keeps exactly the two clocks it has today.
     liveness_pid: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
-    #: Pane's Herdr workspace: the linked lane child for a run, else empty.
+    #: Repository workspace containing the lane tab and role pane.
     workspace_id: str = ""
     tab_id: str = ""
     lane_key: str = ""
-    #: The Space the lane child hangs under: the operator's own Space on the
-    #: repository, or one Maestro created at the primary checkout. Never
-    #: closed by Maestro. Empty for non-run launchers.
-    parent_workspace_id: str = ""
-    #: Linked child worktree workspace. Empty for non-run launchers.
-    child_workspace_id: str = ""
     pane_role: str = ""
     lane_label: str = ""
-
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -789,7 +767,6 @@ class LauncherAdapter(Protocol):
         project_identity: str = "",
         timeout_s: float = 60.0,
     ) -> None: ...
-
 
 
 def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
@@ -868,9 +845,7 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         str(spec.session_dir),
     ]
     if spec.system_prompt_path is not None:
-        argv.extend(
-            ("--append-system-prompt", str(spec.system_prompt_path.resolve()))
-        )
+        argv.extend(("--append-system-prompt", str(spec.system_prompt_path.resolve())))
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
     return tuple(argv)
@@ -1085,15 +1060,6 @@ PANE_ROLE_LABELS = {
     "operator": "operator",
 }
 
-PANE_LABEL_ROLES = {
-    "tester": "tester",
-    "tester-reviewer": "test-reviewer",
-    "test-reviewer": "test-reviewer",
-    "builder": "builder",
-    "code-reviewer": "code-reviewer",
-    "integration-reviewer": "integration-reviewer",
-    "operator": "operator",
-}
 
 #: Herdr 0.8.2 `AgentInfo.agent_status` is `idle | working | blocked | done |
 #: unknown`. There is no `status` field and no dead/exited/stopped value: a
@@ -1129,9 +1095,10 @@ def run_hash_prefix(run_id: str) -> str:
 
 
 def workspace_label_for(project_identity: str, run_id: str) -> str:
-    """Caption for a parent Space Maestro has to create itself (no Space open
-    on the repository): ``<basename>-<four-hash-chars>``. An operator's own
-    Space keeps its own label."""
+    """Stable run caption used in metadata and completed session names.
+
+    The operator's repository workspace keeps its own label.
+    """
     return "{}-{}".format(
         _sanitize_project_identity(project_identity), run_hash_prefix(run_id)
     )
@@ -1143,15 +1110,15 @@ def pane_label_for(role: str) -> str:
     return PANE_ROLE_LABELS.get(key, key)
 
 
-def pane_role_for_label(label: str) -> str:
-    """Internal pane_role for an operator-visible pane label, or ``""``."""
-    return PANE_LABEL_ROLES.get(str(label or ""), "")
 
 
 def session_name_for(
-    project_identity: str, run_id: str, lane_id: str, role: str
+    project_identity: str,
+    run_id: str,
+    lane_id: str,
+    role: str,
 ) -> str:
-    """OMP/Claude ``/rename`` target before COMPLETE cleanup closes the pane."""
+    """OMP/Claude ``/rename`` target for a completed persistent role."""
     return "{}-{}-{}".format(
         workspace_label_for(project_identity, run_id),
         str(lane_id or ""),
@@ -1160,7 +1127,7 @@ def session_name_for(
 
 
 def session_rename_confirmation(session_name: str) -> str:
-    """Exact composer confirmation required before a pane may close."""
+    """Exact composer confirmation required to finish role cleanup."""
     return 'Session renamed to "{}".'.format(session_name)
 
 
@@ -1173,9 +1140,7 @@ def _unchromed(text: str) -> str:
     Both of those renamed the session. Removing the decoration is what
     compares the confirmation rather than one composer's typography.
     """
-    return "".join(
-        ch for ch in str(text) if not ch.isspace() and ch not in "\"'.:"
-    )
+    return "".join(ch for ch in str(text) if not ch.isspace() and ch not in "\"'.:")
 
 
 def session_rename_confirmed(text: str, session_name: str) -> bool:
@@ -1247,18 +1212,16 @@ def _herdr_tokens(item: Mapping[str, object]) -> Dict[str, str]:
 
 
 def _metadata_token_flags(tokens: Mapping[str, str]) -> Tuple[str, ...]:
-    """`--token k=v` flags for `report-metadata`; refuses an unwritable token.
-
-    An over-long value used to be dropped silently, which tagged the object
-    with an incomplete identity and turned it into a label-only workspace that
-    every later lookup refuses. Identity is refused before it is written, and
-    the callers validate before creating the object the tokens describe.
-    """
+    """Render metadata tokens, refusing empty or unwritable values."""
     flags: List[str] = []
     for name, value in tokens.items():
         text = str(value or "")
-        if not text:
-            continue
+        if not name or not text:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "METADATA_TOKEN_EMPTY:{}".format(name or "<name>"),
+                pane_created=False,
+            )
         if len(text) > METADATA_TOKEN_VALUE_MAX:
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
@@ -1276,7 +1239,6 @@ def _tokens_match(actual: Mapping[str, str], expected: Mapping[str, str]) -> boo
         if actual.get(key) != value:
             return False
     return True
-
 
 
 def _herdr_label(item: Mapping[str, object]) -> str:
@@ -2449,7 +2411,6 @@ def wait_for_interactive_agent(
     raise refusal()
 
 
-
 def wait_for_agent_transcript(
     herdr_call: Callable[..., dict],
     name: str,
@@ -2593,12 +2554,7 @@ def _start_agent_when_free(
 
 
 class _TabLayout:
-    """One lane child's pane grid: parent/child workspace ids, tab, slots.
-
-    Parent and child workspace ids are distinct fields. The parent is the run
-    Space group; the child is the linked worktree workspace whose tab holds
-    these panes. Splits stay inside that child.
-    """
+    """One lane tab's pane grid in the repository workspace."""
 
     __slots__ = (
         "tab_id",
@@ -2609,7 +2565,7 @@ class _TabLayout:
         "role_panes",
         "refresh_roles",
         "parent_workspace_id",
-        "child_workspace_id",
+        "seed_pane_id",
         "lane_key",
         "lane_label",
     )
@@ -2621,7 +2577,7 @@ class _TabLayout:
         claimed: int,
         *,
         parent_workspace_id: str = "",
-        child_workspace_id: str = "",
+        seed_pane_id: str = "",
         lane_key: str = "",
         lane_label: str = "",
     ) -> None:
@@ -2633,7 +2589,7 @@ class _TabLayout:
         self.role_panes: Dict[str, str] = {}
         self.refresh_roles: set[str] = set()
         self.parent_workspace_id = str(parent_workspace_id or "")
-        self.child_workspace_id = str(child_workspace_id or "")
+        self.seed_pane_id = str(seed_pane_id or "")
         self.lane_key = str(lane_key or "")
         self.lane_label = str(lane_label or "")
 
@@ -2650,6 +2606,8 @@ class _TabLayout:
         return None
 
     def forget(self, pane_id: str) -> bool:
+        if self.seed_pane_id == pane_id:
+            self.seed_pane_id = ""
         for slot, pane in enumerate(self.panes):
             if pane == pane_id:
                 self.panes[slot] = None
@@ -2663,7 +2621,6 @@ class _TabLayout:
         return not any(self.panes)
 
 
-
 class HerdrLauncher:
     def __init__(
         self,
@@ -2675,7 +2632,6 @@ class HerdrLauncher:
         provision_argv: Sequence[str] = (),
         provision_timeout_s: float = PROVISION_TIMEOUT_S,
         workspace_label: str = "",
-        parent_workspace_id: str = "",
     ) -> None:
         if not isinstance(admitted_routes, AdmittedRouteSet):
             raise TypeError("VERIFIED_ADMITTED_ROUTES_REQUIRED")
@@ -2689,12 +2645,8 @@ class HerdrLauncher:
         #: cold cache outruns the default, so a deployment can raise it; a
         #: timeout must read as a slow install, not a broken command.
         self.provision_timeout_s = float(provision_timeout_s)
-        #: Label for a parent Space Maestro creates when none is open on the
-        #: repository (the operator's own Space, when open, is the parent and
-        #: keeps its label). Empty keeps the non-run path: panes split from
-        #: the caller's once-resolved pane, with no workspaces.
+        #: Run caption retained in role metadata and completed session names.
         self.workspace_label = str(workspace_label or "")
-        self._invocation_workspace_id = str(parent_workspace_id or "")
         self.agent_start_busy_window_s = AGENT_START_BUSY_WINDOW_S
         self.quiescence_confirm_s = AGENT_QUIESCENCE_CONFIRM_S
         self._handles_lock = threading.RLock()
@@ -2704,27 +2656,22 @@ class HerdrLauncher:
         #: Records already in the transcript when each turn was submitted,
         #: so `_transcript_turns` can answer about THIS turn.
         self._proven_absent: Dict[str, LaunchHandle] = {}
-        self._split_parent_id: Optional[str] = None
-        #: Parent run workspace id. Not the lane child.
+        #: Repository workspace shared by every lane tab.
         self._parent_workspace_id: str = ""
-        #: Deprecated alias of the parent id for the non-run split-parent path.
-        self._workspace_id: str = ""
         self._run_id: str = ""
         self._repository_fingerprint: str = ""
         self._repository_root: Path = Path()
-        #: lane_key -> linked child layout.
+        #: lane_key -> direct lane-tab layout.
         self._tabs: Dict[str, _TabLayout] = {}
         self._role_handles: Dict[Tuple[str, str], LaunchHandle] = {}
         self._cleaned_absent: set[str] = set()
-
+        self._restored_role_cwds: Dict[str, Path] = {}
 
     @property
     def workspace_id(self) -> str:
         """The parent run workspace bound to this launcher, if any."""
         with self._handles_lock:
-            return self._parent_workspace_id or self._workspace_id
-
-
+            return self._parent_workspace_id
 
     def _herdr(
         self, *args: str, env: Optional[Mapping[str, str]] = None, timeout: float = 30.0
@@ -2771,55 +2718,6 @@ class HerdrLauncher:
             raise RuntimeError("PROTOCOL_INVALID_RESPONSE")
         return payload
 
-    def _split_parent(self, environment: Mapping[str, str]) -> str:
-        """The pane id every split of this run is taken from, resolved once.
-
-        `--current` is not an identifier, it is a server-side selector over
-        mutable state: whichever pane holds focus at the instant the split
-        arrives. Two lanes splitting concurrently read that selector at two
-        different instants, so the second can split a pane the first has just
-        created — and did, on 2026-08-18, when one lane's agent landed in a
-        pane the sibling launch had opened 30ms earlier. Resolving the
-        selector once, to the pane id it named the first time it was asked,
-        makes every subsequent split name a fixed pane and removes the shared
-        mutable read from the race entirely.
-
-        Cached deliberately: re-asking would reintroduce the moving target.
-
-        **An unanswerable selector is a refusal, not a fallback.** Using
-        `--current` unchanged used to be the answer here, and it was wrong
-        twice over: it reinstated exactly the race the caching removes, and
-        because focus can sit in any workspace, each such split landed
-        wherever focus happened to be — the run whose agents scattered across
-        w13F, w13G, w13H, w13J and w13K while its first pane was in w13A. A
-        lifecycle decision keyed on ambient mutable state is what §1.2
-        forbids, so this raises `SPLIT_PARENT_UNRESOLVED` and the failure is
-        not cached: the member is non-deterministic, the launcher budget is
-        spent, and the next attempt genuinely re-asks herdr.
-
-        Resolved on first use rather than in `__init__` because a constructor
-        that calls herdr cannot be built offline at all, and a launcher that
-        cannot exist while herdr is briefly unreachable is a worse failure
-        than a refused launch. It is still resolved once per launcher.
-        """
-        with self._handles_lock:
-            if self._split_parent_id is None:
-                try:
-                    payload = self._herdr("pane", "current", env=environment)
-                except BaseException as exc:
-                    raise LaunchRefused(
-                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED,
-                        "{0}: {1}".format(type(exc).__name__, exc),
-                    ) from exc
-                pane = _extract(payload, "pane")
-                pane_id = pane.get("pane_id") if isinstance(pane, dict) else None
-                if not pane_id:
-                    raise LaunchRefused(
-                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED, "NO_PANE_ID"
-                    )
-                self._split_parent_id = str(pane_id)
-                self._workspace_id = workspace_of(self._split_parent_id)
-            return self._split_parent_id
 
     def _bind_run_identity(self, spec: LaunchSpec) -> None:
         run_id = str(spec.run_id or "")
@@ -2850,7 +2748,10 @@ class HerdrLauncher:
                 self._repository_fingerprint = fingerprint
             if repo_root != Path():
                 resolved = git_primary_workdir(repo_root)
-                if self._repository_root != Path() and self._repository_root != resolved:
+                if (
+                    self._repository_root != Path()
+                    and self._repository_root != resolved
+                ):
                     raise LaunchRefused(
                         LaunchRefusal.WORKSPACE_DRIFT,
                         "repo cwd {} != {}".format(resolved, self._repository_root),
@@ -2860,21 +2761,12 @@ class HerdrLauncher:
             if requested and self.workspace_label and requested != self.workspace_label:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_DRIFT,
-                    "workspace label {} != {}".format(
-                        requested, self.workspace_label
-                    ),
+                    "workspace label {} != {}".format(requested, self.workspace_label),
                     pane_created=False,
                 )
             if requested and not self.workspace_label:
                 self.workspace_label = requested
 
-    def _parent_identity_tokens(self) -> Dict[str, str]:
-        tokens = {METADATA_TOKEN_KIND: METADATA_KIND_RUN}
-        if self._run_id:
-            tokens[METADATA_TOKEN_RUN] = self._run_id
-        if self._repository_fingerprint:
-            tokens[METADATA_TOKEN_REPO] = self._repository_fingerprint
-        return tokens
 
     def _lane_identity_tokens(self, lane_id: str, parent_id: str) -> Dict[str, str]:
         tokens = {
@@ -2903,34 +2795,43 @@ class HerdrLauncher:
         required = (METADATA_TOKEN_KIND, METADATA_TOKEN_RUN, METADATA_TOKEN_REPO)
         return all(tokens.get(key) for key in required)
 
-    def _tag_workspace(
-        self,
-        workspace_id: str,
-        tokens: Mapping[str, str],
-        environment: Mapping[str, str],
-    ) -> None:
-        flags = _metadata_token_flags(tokens)
-        if not workspace_id or not flags:
-            return
-        self._herdr(
-            "workspace",
-            "report-metadata",
-            workspace_id,
-            "--source",
-            MAESTRO_METADATA_SOURCE,
-            *flags,
-            env=environment,
-        )
 
     def _tag_pane(
         self,
         pane_id: str,
         tokens: Mapping[str, str],
         environment: Mapping[str, str],
+        *,
+        partial: bool = False,
     ) -> None:
+        if not pane_id:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "METADATA_TARGET_MISSING:pane",
+                pane_created=False,
+            )
+        if not partial:
+            required = (
+                METADATA_TOKEN_KIND,
+                METADATA_TOKEN_RUN,
+                METADATA_TOKEN_REPO,
+                METADATA_TOKEN_LANE,
+                METADATA_TOKEN_PARENT,
+                METADATA_TOKEN_ROLE,
+                METADATA_TOKEN_SCRATCH,
+            )
+            missing = [key for key in required if not tokens.get(key)]
+            if tokens.get(METADATA_TOKEN_KIND) != METADATA_KIND_LANE:
+                missing.append(METADATA_TOKEN_KIND)
+            if missing:
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "METADATA_IDENTITY_INCOMPLETE:pane:{}".format(
+                        ",".join(sorted(set(missing)))
+                    ),
+                    pane_created=False,
+                )
         flags = _metadata_token_flags(tokens)
-        if not pane_id or not flags:
-            return
         self._herdr(
             "pane",
             "report-metadata",
@@ -2959,154 +2860,9 @@ class HerdrLauncher:
             )
         return workspace
 
-    def _worktree_listing(
-        self,
-        environment: Mapping[str, str],
-        *,
-        cwd: Optional[Path] = None,
-        workspace_id: str = "",
-    ) -> Optional[Mapping[str, object]]:
-        """`herdr worktree list` for a checkout or a Space; `None` off-repo.
-
-        A Space's repository binding is read here rather than from
-        `WorkspaceInfo.worktree`, because that field is not the binding: Herdr
-        fills it in only when it creates the Space itself on a resolvable
-        checkout *and* the repository has no source Space yet, and it never
-        backfills. Observed on herdr 0.8.2 / protocol 20: the operator's own
-        Space -- opened by the UI or restored with the session -- carries no
-        such field even while `worktree list` names it the repository's
-        source, and a second `workspace create --cwd <same repo>` is handed
-        `worktree: null`. Reading the field therefore answers "unbound" for
-        exactly the Spaces a run must adopt. `worktree list` recomputes the
-        binding on every call, so it answers for every Space.
-        """
-        if bool(cwd) == bool(workspace_id):
-            raise ValueError("worktree list takes one of cwd, workspace_id")
-        flags = ("--cwd", str(cwd)) if cwd else ("--workspace", workspace_id)
-        try:
-            return self._herdr("worktree", "list", *flags, env=environment)
-        except HerdrCallError as exc:
-            if exc.code == NOT_GIT_WORKTREE:
-                return None
-            if exc.code == WORKSPACE_NOT_FOUND and workspace_id:
-                raise _WorkspaceGone(workspace_id) from exc
-            raise
-
-    def _listing_source(
-        self, listing: Optional[Mapping[str, object]], key: str
-    ) -> str:
-        """One `source` field of a `worktree list` reply, or ``""``."""
-        source = _extract(listing, "source") if listing is not None else None
-        if not isinstance(source, dict):
-            return ""
-        return str(source.get(key) or "")
-
-    def _source_space_id(self, listing: Optional[Mapping[str, object]]) -> str:
-        """The Space open on the repository's source checkout, or ``""``.
-
-        `source_workspace_id` states it, but the schema permits `null` and
-        Herdr omits the key entirely when no Space is open. The listing
-        carries the same fact a second way -- the non-linked worktree entry
-        is the source checkout, and its `open_workspace_id` is the Space on
-        it -- so the entry answers when the summary field does not, and
-        answers `""` in exactly the same case.
-        """
-        named = self._listing_source(listing, "source_workspace_id")
-        if named or listing is None:
-            return named
-        for item in _herdr_list(listing, "worktrees"):
-            if item.get("is_linked_worktree") is False:
-                return str(item.get("open_workspace_id") or "")
-        return ""
-
-    def _open_checkout(
-        self, listing: Optional[Mapping[str, object]], workspace_id: str
-    ) -> Optional[dict]:
-        """The worktree a `worktree list` reply reports this Space as open on.
-
-        Keyed on `open_workspace_id`, so a listing taken against the parent
-        answers for a child and the reverse: Herdr returns the repository's
-        whole worktree set whichever Space or path it was asked about.
-        """
-        if listing is None or not workspace_id:
-            return None
-        for item in _herdr_list(listing, "worktrees"):
-            if str(item.get("open_workspace_id") or "") == workspace_id:
-                return item
-        return None
-
-    def _space_is_linked(
-        self, workspace_id: str, environment: Mapping[str, str]
-    ) -> bool:
-        """Whether `workspace_id` is a Space open on a linked worktree."""
-        entry = self._open_checkout(
-            self._worktree_listing(environment, workspace_id=workspace_id),
-            workspace_id,
-        )
-        return entry is not None and entry.get("is_linked_worktree") is True
-
-    def _parent_binding_defect(
-        self, workspace_id: str, repo_cwd: Path, environment: Mapping[str, str]
-    ) -> str:
-        """Why a Space is not the repository's source Space, or ``""``.
-
-        The parent must be the Space Herdr reports as open on the primary
-        checkout of `repo_cwd` -- `source_workspace_id`, and non-linked.
-        """
-        if not workspace_id:
-            return "NO_WORKSPACE_ID"
-        return self._binding_defect_in(
-            self._worktree_listing(environment, workspace_id=workspace_id),
-            workspace_id,
-            repo_cwd,
-        )
-
-    def _binding_defect_in(
-        self,
-        listing: Optional[Mapping[str, object]],
-        workspace_id: str,
-        repo_cwd: Path,
-    ) -> str:
-        """The same judgement against a listing already in hand.
-
-        Adoption reads the repository's listing to find the source Space and
-        then judges that Space by it, in one call rather than two: a Space
-        that opened and closed around a second call would otherwise be
-        adopted or refused on a repository state that no longer exists.
-        """
-        if listing is None:
-            return "NO_WORKTREE_BINDING"
-        repo_root = self._listing_source(listing, "repo_root")
-        if not repo_root:
-            return "NO_REPO_ROOT"
-        if Path(repo_root).resolve() != Path(repo_cwd).resolve():
-            return "REPO_ROOT_MISMATCH:{}".format(repo_root)
-        # Identity before shape: a Space that is not the repository's source
-        # is refused for that reason, which names the Space that took it,
-        # rather than for the missing checkout entry that follows from it.
-        source_id = self._source_space_id(listing)
-        if source_id != workspace_id:
-            return "NOT_SOURCE_SPACE:{}".format(source_id or "none")
-        entry = self._open_checkout(listing, workspace_id)
-        if entry is None:
-            return "NO_WORKTREE_BINDING"
-        if entry.get("is_linked_worktree") is not False:
-            return "PARENT_IS_LINKED"
-        return ""
 
     def _run_workspace(self, environment: Mapping[str, str]) -> str:
-        """The parent Space lanes hang under: the operator's own Space, open
-        on the repository.
-
-        Herdr fixes a lane's placement when `worktree open` names its parent
-        and gives nothing to move it with afterwards, so the parent has to be
-        a Space that outlives the run. A Space Maestro created for itself is
-        not: when it goes, every lane it parented is orphaned at the top level
-        permanently, and `_repin_lane` can only rewrite the `parent` token,
-        never the placement. So the operator's Space is the only parent, and
-        a run started with the repository closed refuses here rather than
-        building a sidebar the operator cannot read.
-        """
+        """The repository workspace whose lane tabs operators monitor."""
         with self._handles_lock:
             if self._parent_workspace_id:
                 return self._parent_workspace_id
@@ -3116,100 +2872,72 @@ class HerdrLauncher:
                     "NO_WORKSPACE_LABEL",
                     pane_created=False,
                 )
-            adopted = self._invocation_workspace_id
-            if adopted:
-                try:
-                    self._workspace_record(adopted, environment)
-                except _WorkspaceGone as exc:
-                    raise LaunchRefused(
-                        LaunchRefusal.WORKSPACE_UNRESOLVED,
-                        "INVOKING_WORKSPACE_GONE:{}".format(adopted),
-                        pane_created=False,
-                    ) from exc
-            else:
-                adopted = self._adopt_existing_workspace(environment)
+            adopted = self._adopt_existing_workspace(environment)
             if not adopted:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "NO_SOURCE_SPACE:{}".format(self._repository_root),
+                    "NO_REPOSITORY_WORKSPACE:{}".format(self._repository_root),
                     pane_created=False,
                 )
             self._parent_workspace_id = adopted
-            self._workspace_id = adopted
             return adopted
 
     def invoking_repository(self, environment: Mapping[str, str]) -> Path | None:
-        """Git UI owner, independent of the role execution repository."""
-        if not self._invocation_workspace_id:
-            return None
-        parent = self._run_workspace(environment)
-        listing = self._worktree_listing(environment, workspace_id=parent)
-        cwd = self._listing_source(listing, "repo_root") if listing is not None else ""
-        if not cwd:
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_UNRESOLVED,
-                "INVALID_INVOKING_SOURCE:{}".format(parent), pane_created=False,
-            )
-        root = Path(cwd)
-        defect = self._binding_defect_in(listing, parent, root)
-        if defect:
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_UNRESOLVED, defect, pane_created=False,
-            )
-        return root
+        """Repository whose workspace owns this launcher's lane tabs."""
+        del environment
+        root = self._repository_root
+        return None if root == Path() else root.resolve()
 
     def _adopt_existing_workspace(self, environment: Mapping[str, str]) -> str:
-        """Adopt the Space Herdr names as the repository's source checkout.
-
-        The parent is the operator's own Space when one is open on the
-        repository (the one the command is run from); lanes are its linked
-        children. Identity is the repository binding, never run tokens: the
-        operator's Space is not Maestro's to tag, and several runs may share
-        it. Herdr binds one Space per repository and reports it as
-        `worktree list --cwd <primary>`'s `source_workspace_id`, so the
-        parent is unique by construction -- there is no second Space to name
-        and no `workspace list` scan, which could not answer this anyway
-        (its records carry no binding). No source Space means the operator
-        has the repository closed and Maestro creates its own
-        (`_run_workspace`).
-        """
+        """Find the open workspace rooted at the repository this ADW runs."""
         root = self._repository_root
         if root == Path():
             return ""
+        root = root.resolve()
         try:
-            listing = self._worktree_listing(environment, cwd=root)
+            payload = self._herdr("workspace", "list", env=environment)
         except BaseException as exc:
             raise LaunchRefused(
                 LaunchRefusal.WORKSPACE_UNRESOLVED,
-                "worktree list: {0}: {1}".format(type(exc).__name__, exc),
+                "workspace list: {0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
-        if listing is None:
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_UNRESOLVED,
-                "REPO_NOT_A_WORKTREE:{}".format(root),
-                pane_created=False,
+        matches: List[Tuple[str, str]] = []
+        for workspace in _herdr_list(payload, "workspaces"):
+            workspace_id = str(workspace.get("workspace_id") or "")
+            if not workspace_id:
+                continue
+            try:
+                panes_payload = self._herdr(
+                    "pane", "list", "--workspace", workspace_id, env=environment
+                )
+            except HerdrCallError as exc:
+                if exc.code == WORKSPACE_NOT_FOUND:
+                    continue
+                raise LaunchRefused(
+                    LaunchRefusal.WORKSPACE_UNRESOLVED,
+                    "pane list {0}: {1}".format(workspace_id, exc),
+                    pane_created=False,
+                ) from exc
+            matches.extend(
+                (workspace_id, str(pane.get("pane_id") or ""))
+                for pane in _herdr_list(panes_payload, "panes")
+                if pane.get("pane_id")
+                and pane.get("cwd")
+                and Path(str(pane["cwd"])).resolve() == root
             )
-        repo_root = self._listing_source(listing, "repo_root")
-        if repo_root and Path(repo_root).resolve() != root.resolve():
+        if len(matches) > 1:
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
-                "RUN_WORKSPACE_BINDING_MISMATCH::REPO_ROOT_MISMATCH:{}".format(
-                    repo_root
+                "AMBIGUOUS_REPOSITORY_PANE:{}".format(
+                    ",".join(
+                        "{0}:{1}".format(workspace_id, pane_id)
+                        for workspace_id, pane_id in matches
+                    )
                 ),
                 pane_created=False,
             )
-        workspace_id = self._source_space_id(listing)
-        if not workspace_id:
-            return ""
-        defect = self._binding_defect_in(listing, workspace_id, root)
-        if defect:
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "RUN_WORKSPACE_BINDING_MISMATCH:{}:{}".format(workspace_id, defect),
-                pane_created=False,
-            )
-        return workspace_id
+        return matches[0][0] if matches else ""
 
     def _validated_role_layout(
         self,
@@ -3217,14 +2945,15 @@ class HerdrLauncher:
         panes_payload: Mapping[str, object],
         *,
         parent_workspace_id: str = "",
-        child_workspace_id: str = "",
         lane_key: str = "",
         lane_label: str = "",
+        seed_pane_id: str = "",
+        expected_role: str = "",
+        expected_worktree: Optional[Path] = None,
     ) -> _TabLayout:
         pane_ids: List[Optional[str]] = []
         role_panes: Dict[str, str] = {}
         refresh_roles: set[str] = set()
-        unlabeled: List[str] = []
         for pane in _herdr_list(panes_payload, "panes"):
             pane_tab = str(pane.get("tab_id") or "")
             if pane_tab and pane_tab != tab_id:
@@ -3241,21 +2970,59 @@ class HerdrLauncher:
                 or workspace_of(pane_tab)
                 or workspace_of(pane_id)
             )
-            if child_workspace_id and pane_ws and pane_ws != child_workspace_id:
+            if parent_workspace_id and pane_ws and pane_ws != parent_workspace_id:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_DRIFT,
-                    "{}!={}".format(pane_ws, child_workspace_id),
+                    "{}!={}".format(pane_ws, parent_workspace_id),
+                    pane_created=False,
+                )
+            tokens = _herdr_tokens(pane)
+            token_role = str(tokens.get(METADATA_TOKEN_ROLE) or "")
+            if (
+                token_role
+                and token_role not in PERSISTENT_PANE_ROLES
+                and token_role not in PANE_ROLE_LABELS
+            ):
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "UNKNOWN_ROLE_PANE_IDENTITY:{}:{}".format(pane_id, token_role),
+                    pane_created=False,
+                )
+            if pane_id == seed_pane_id and token_role:
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "SEED_PANE_ROLE_MISMATCH:{}".format(pane_id),
+                    pane_created=False,
+                )
+            role = token_role
+            if (
+                role
+                and expected_role
+                and role != expected_role
+                and expected_worktree is not None
+                and pane.get("cwd")
+                and _same_resolved_path(pane.get("cwd"), expected_worktree)
+            ):
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "ROLE_PANE_TOKEN_MISMATCH:{}:{}!={}".format(
+                        pane_id, role, expected_role
+                    ),
                     pane_created=False,
                 )
             pane_label = _herdr_label(pane)
-            role = pane_role_for_label(pane_label) if pane_label else ""
-            if pane_label and not role:
-                raise LaunchRefused(
-                    LaunchRefusal.BINDING_MISMATCH,
-                    "UNMIGRATED_PANE_LABEL:{}".format(pane_label),
-                    pane_created=False,
+            if token_role:
+                expected = self._pane_identity_tokens(
+                    lane_label or lane_key,
+                    token_role,
+                    parent_workspace_id,
                 )
-            if role:
+                if not _tokens_match(tokens, expected):
+                    raise LaunchRefused(
+                        LaunchRefusal.BINDING_MISMATCH,
+                        "ROLE_PANE_TOKEN_MISMATCH:{}".format(pane_id),
+                        pane_created=False,
+                    )
                 if role in role_panes:
                     raise LaunchRefused(
                         LaunchRefusal.BINDING_MISMATCH,
@@ -3263,28 +3030,18 @@ class HerdrLauncher:
                         pane_created=False,
                     )
                 role_panes[role] = pane_id
-                tokens = _herdr_tokens(pane)
                 if (
-                    pane.get("agent_status") == "unknown"
-                    or tokens.get(METADATA_TOKEN_SCRATCH)
-                    != METADATA_SCRATCH_REDIRECT
+                    pane_label != pane_label_for(token_role)
+                    or pane.get("agent_status") == "unknown"
                 ):
                     refresh_roles.add(role)
-            else:
-                unlabeled.append(pane_id)
             pane_ids.append(pane_id)
-        if unlabeled and role_panes and len(unlabeled) > 1:
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "UNLABELLED_LANE_PANES",
-                pane_created=False,
-            )
         layout = _TabLayout(
             tab_id=tab_id,
             panes=pane_ids or [None],
             claimed=len(role_panes),
             parent_workspace_id=parent_workspace_id,
-            child_workspace_id=child_workspace_id,
+            seed_pane_id=seed_pane_id if seed_pane_id in pane_ids else "",
             lane_key=lane_key,
             lane_label=lane_label,
         )
@@ -3294,263 +3051,264 @@ class HerdrLauncher:
             layout.claimed = 0
         return layout
 
-    def _layout_from_child_workspace(
-        self,
-        child_workspace_id: str,
-        parent_workspace_id: str,
-        group: str,
-        label: str,
-        environment: Mapping[str, str],
-    ) -> _TabLayout:
-        try:
-            payload = self._herdr(
-                "tab", "list", "--workspace", child_workspace_id, env=environment
+    def _pending_lane_tab_label(self, parent_workspace_id: str, label: str) -> str:
+        """Atomic creation marker for a not-yet-tagged lane tab."""
+        identity = "\0".join(
+            (
+                str(parent_workspace_id),
+                self._run_id,
+                self._repository_fingerprint,
+                str(label),
             )
-        except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                raise _WorkspaceGone(child_workspace_id) from exc
-            raise LaunchRefused(
-                LaunchRefusal.TAB_UNRESOLVED,
-                "{0}: {1}".format(type(exc).__name__, exc),
-            ) from exc
-        tab_ids = [
-            str(tab.get("tab_id") or "")
-            for tab in _herdr_list(payload, "tabs")
-            if tab.get("tab_id")
-        ]
-        if not tab_ids:
-            raise LaunchRefused(
-                LaunchRefusal.TAB_UNRESOLVED,
-                "NO_CHILD_TAB:{}".format(child_workspace_id),
-                pane_created=False,
-            )
-        try:
-            panes_payload = self._herdr(
-                "pane", "list", "--workspace", child_workspace_id, env=environment
-            )
-        except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                raise _WorkspaceGone(child_workspace_id) from exc
-            raise LaunchRefused(
-                LaunchRefusal.TAB_UNRESOLVED,
-                "{0}: {1}".format(type(exc).__name__, exc),
-                pane_created=False,
-            ) from exc
-        # The role panes name the tab, not the listing order: a child that
-        # holds more than one tab (an operator opened one) used to be read
-        # through `tabs[0]`, which hid every role pane in another tab and
-        # split duplicates beside them.
-        role_tabs: List[str] = []
-        for pane in _herdr_list(panes_payload, "panes"):
-            pane_label = _herdr_label(pane)
-            if pane_label and pane_role_for_label(pane_label):
-                pane_tab = str(pane.get("tab_id") or "")
-                if pane_tab and pane_tab not in role_tabs:
-                    role_tabs.append(pane_tab)
-        if len(role_tabs) > 1:
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "ROLE_PANES_SPAN_TABS:{}".format(label),
-                pane_created=False,
-            )
-        if role_tabs:
-            tab_id = role_tabs[0]
-        elif len(tab_ids) == 1:
-            tab_id = tab_ids[0]
-        else:
-            raise LaunchRefused(
-                LaunchRefusal.TAB_UNRESOLVED,
-                "AMBIGUOUS_LANE_TAB:{}".format(label),
-                pane_created=False,
-            )
-        return self._validated_role_layout(
-            tab_id,
-            panes_payload,
-            parent_workspace_id=parent_workspace_id,
-            child_workspace_id=child_workspace_id,
-            lane_key=group,
-            lane_label=label,
+        )
+        return "maestro-pending-{}".format(
+            hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         )
 
-    def _lane_pinned_to_dead_parent(
+    def _confirm_lane_tab_label(
         self,
-        child_id: str,
-        tokens: Mapping[str, str],
-        expected: Mapping[str, str],
+        tab_id: str,
+        parent_workspace_id: str,
+        label: str,
         environment: Mapping[str, str],
-    ) -> bool:
-        """Whether a tagged lane child is ours but names a parent that is gone.
-
-        The `parent` token pins a child to the Space id it was opened under.
-        When the operator closes and reopens their Space (a new id) and Herdr
-        leaves the linked children open, the child still matches this run,
-        repository and lane but its `parent` names a workspace `workspace
-        get` no longer knows. Such a child is retagged to the current parent
-        and adopted; a child whose tagged parent is a different live Space
-        stays a refusal. Keyed on typed fields only: token equality and the
-        typed `workspace_not_found` answer, never labels.
-        """
-        without_parent = {
-            key: value
-            for key, value in expected.items()
-            if key != METADATA_TOKEN_PARENT
-        }
-        if not without_parent or not _tokens_match(tokens, without_parent):
-            return False
-        tagged_parent = str(tokens.get(METADATA_TOKEN_PARENT) or "")
-        current_parent = str(expected.get(METADATA_TOKEN_PARENT) or "")
-        if not tagged_parent or tagged_parent == current_parent:
-            return False
-        try:
-            self._workspace_record(tagged_parent, environment)
-        except _WorkspaceGone:
-            return True
-        return False
-
-    def _repin_lane(
-        self, child_id: str, parent_id: str, environment: Mapping[str, str]
     ) -> None:
-        """Point a surviving lane child, and every Maestro pane in it, at the
-        parent resolved now. Only the `parent` token is rewritten; the panes'
-        other tokens (role, scratch contract) are theirs to keep."""
-        repin = {METADATA_TOKEN_PARENT: parent_id}
-        self._tag_workspace(child_id, repin, environment)
-        try:
-            panes = _herdr_list(
-                self._herdr("pane", "list", "--workspace", child_id, env=environment),
-                "panes",
-            )
-        except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                raise _WorkspaceGone(child_id) from exc
-            raise
-        for pane in panes:
-            pane_id = str(pane.get("pane_id") or "")
-            tagged = _herdr_tokens(pane).get(METADATA_TOKEN_PARENT, "")
-            if pane_id and tagged and tagged != parent_id:
-                self._tag_pane(pane_id, repin, environment)
+        """Finish or verify the pending-label creation transaction."""
 
-    def _adopt_existing_lane(
+        def listed_tabs() -> List[Mapping[str, object]]:
+            try:
+                payload = self._herdr(
+                    "tab",
+                    "list",
+                    "--workspace",
+                    parent_workspace_id,
+                    env=environment,
+                )
+            except HerdrCallError as exc:
+                if _herdr_error_code_of(exc) == WORKSPACE_NOT_FOUND:
+                    raise _WorkspaceGone(parent_workspace_id) from exc
+                raise
+            return _herdr_list(payload, "tabs")
+
+        tabs = listed_tabs()
+        matches = [
+            tab
+            for tab in tabs
+            if str(tab.get("tab_id") or "") == tab_id
+        ]
+        if len(matches) != 1:
+            raise LaunchRefused(
+                LaunchRefusal.TAB_UNRESOLVED,
+                "LANE_TAB_MISSING:{}".format(tab_id),
+                pane_created=True,
+            )
+        collisions = [
+            str(tab.get("tab_id") or "")
+            for tab in tabs
+            if str(tab.get("tab_id") or "") != tab_id
+            and _herdr_label(tab) == label
+        ]
+        if collisions:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "DUPLICATE_LANE_TAB:{}:{}".format(label, ",".join(collisions)),
+                pane_created=False,
+            )
+        current = _herdr_label(matches[0])
+        if current == label:
+            return
+        try:
+            self._herdr("tab", "rename", tab_id, label, env=environment)
+        except HerdrCallError as exc:
+            if _herdr_error_code_of(exc) == WORKSPACE_NOT_FOUND:
+                raise _WorkspaceGone(parent_workspace_id) from exc
+            if _herdr_error_code_of(exc) == TAB_NOT_FOUND:
+                try:
+                    self._workspace_record(parent_workspace_id, environment)
+                except _WorkspaceGone as gone:
+                    raise gone from exc
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "LANE_TAB_MISSING:{}".format(tab_id),
+                    pane_created=True,
+                ) from exc
+            raise
+        if not any(
+            str(tab.get("tab_id") or "") == tab_id
+            and _herdr_label(tab) == label
+            for tab in listed_tabs()
+        ):
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "LANE_TAB_LABEL_UNCONFIRMED:{}".format(tab_id),
+                pane_created=True,
+            )
+
+    def _adopt_parent_lane_tab(
         self,
-        parent_id: str,
+        parent_workspace_id: str,
         group: str,
         label: str,
         worktree: Path,
         environment: Mapping[str, str],
     ) -> Optional[_TabLayout]:
-        """Adopt the unique linked child whose metadata identity matches.
-
-        A child with no tokens is adopted only when it is provably ours by
-        the other identity Herdr holds: it is listed under this parent
-        (`source.source_workspace_id == parent`) and its `WorktreeInfo.path`
-        is this role's checkout. That is the window "open succeeded, process
-        stopped before tagging"; the child is tagged here and adopted, so a
-        restart converges instead of refusing the lane forever. A token-less
-        child at any other path stays a label-only refusal.
-        """
-        expected = self._lane_identity_tokens(label or group, parent_id)
-        if not self._identity_complete(expected) or not expected.get(
-            METADATA_TOKEN_LANE
-        ):
-            return None
+        """Find this lane's tagged tab directly inside the parent workspace."""
         try:
-            payload = self._worktree_listing(environment, workspace_id=parent_id)
+            panes_payload = self._herdr(
+                "pane",
+                "list",
+                "--workspace",
+                parent_workspace_id,
+                env=environment,
+            )
         except HerdrCallError as exc:
+            if exc.code == WORKSPACE_NOT_FOUND:
+                raise _WorkspaceGone(parent_workspace_id) from exc
             raise LaunchRefused(
                 LaunchRefusal.TAB_UNRESOLVED,
                 "{0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
-        if payload is None:
-            return None
-        source = _extract(payload, "source")
-        if isinstance(source, dict):
-            source_id = self._source_space_id(payload)
-            if source_id and source_id != parent_id:
+        expected = self._lane_identity_tokens(label, parent_workspace_id)
+        tab_ids: List[str] = []
+        seed_pane_id = ""
+        panes = _herdr_list(panes_payload, "panes")
+        for pane in panes:
+            if not _tokens_match(_herdr_tokens(pane), expected):
+                continue
+            tab_id = str(pane.get("tab_id") or "")
+            if not tab_id:
                 raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_DRIFT,
-                    "{}!={}".format(source_id, parent_id),
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "LANE_PANE_TAB_MISSING:{}".format(label),
                     pane_created=False,
                 )
-        # Herdr lists one Space on more than one row when that Space has
-        # more than one linked worktree open (e.g. a ui-worktree row beside
-        # the role checkout row). Group by `open_workspace_id` first and
-        # classify each distinct child once, using the union of its rows for
-        # any row-level fact (path match, row label) -- otherwise a single
-        # Space is double-counted into DUPLICATE_LANE_WORKSPACE.
-        rows_by_child: Dict[str, List[Mapping[str, object]]] = {}
-        for item in _herdr_list(payload, "worktrees"):
-            child_id = str(item.get("open_workspace_id") or "")
-            if not child_id:
-                continue
-            if item.get("is_linked_worktree") is not True:
-                continue
-            rows_by_child.setdefault(child_id, []).append(item)
-        matches: List[str] = []
-        untagged_ours: List[str] = []
-        pinned_elsewhere: List[str] = []
-        label_only = 0
-        for child_id, rows in rows_by_child.items():
+            if tab_id not in tab_ids:
+                tab_ids.append(tab_id)
+            tokens = _herdr_tokens(pane)
+            if (
+                not seed_pane_id
+                and not tokens.get(METADATA_TOKEN_ROLE)
+                and not _herdr_label(pane)
+            ):
+                seed_pane_id = str(pane.get("pane_id") or "")
+        if not tab_ids:
             try:
-                live = self._workspace_record(child_id, environment)
-            except _WorkspaceGone:
-                continue
-            tokens = _herdr_tokens(live)
-            if not tokens:
-                if any(
-                    _same_resolved_path(row.get("path"), worktree) for row in rows
+                tabs_payload = self._herdr(
+                    "tab",
+                    "list",
+                    "--workspace",
+                    parent_workspace_id,
+                    env=environment,
+                )
+            except HerdrCallError as exc:
+                if exc.code == WORKSPACE_NOT_FOUND:
+                    raise _WorkspaceGone(parent_workspace_id) from exc
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                    pane_created=False,
+                ) from exc
+            recoverable: List[Tuple[str, str]] = []
+            exact_label_collisions: List[str] = []
+            pending = self._pending_lane_tab_label(parent_workspace_id, label)
+            for tab in _herdr_list(tabs_payload, "tabs"):
+                candidate_tab = str(tab.get("tab_id") or "")
+                candidate_workspace = str(tab.get("workspace_id") or "")
+                candidate_label = _herdr_label(tab)
+                if candidate_workspace not in ("", parent_workspace_id):
+                    continue
+                if candidate_label == label:
+                    exact_label_collisions.append(candidate_tab)
+                    continue
+                if not candidate_tab or candidate_label != pending:
+                    continue
+                members = [
+                    pane
+                    for pane in panes
+                    if str(pane.get("tab_id") or "") == candidate_tab
+                ]
+                if len(members) != 1:
+                    continue
+                candidate = members[0]
+                pane_id = str(candidate.get("pane_id") or "")
+                tokens = _herdr_tokens(candidate)
+                if (
+                    not pane_id
+                    or _herdr_label(candidate)
+                    or tokens.get(METADATA_TOKEN_ROLE)
+                    or any(
+                        tokens.get(key) not in (None, "", value)
+                        for key, value in expected.items()
+                    )
+                    or not self._pane_cwd_within(
+                        pane_id, worktree, environment
+                    )
                 ):
-                    untagged_ours.append(child_id)
-                elif _herdr_label(live) == label or any(
-                    _herdr_label(row) == label for row in rows
+                    continue
+                recoverable.append((candidate_tab, pane_id))
+            if exact_label_collisions:
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "UNOWNED_LANE_TAB_LABEL_COLLISION:{}:{}".format(
+                        label, ",".join(exact_label_collisions)
+                    ),
+                    pane_created=False,
+                )
+            if len(recoverable) > 1:
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "AMBIGUOUS_UNTAGGED_LANE_TAB:{}".format(label),
+                    pane_created=True,
+                )
+            if recoverable:
+                candidate_tab, pane_id = recoverable[0]
+                self._tag_pane(pane_id, expected, environment, partial=True)
+                confirmed = _extract(
+                    self._herdr("pane", "get", pane_id, env=environment),
+                    "pane",
+                )
+                if not isinstance(confirmed, Mapping) or not _tokens_match(
+                    _herdr_tokens(confirmed), expected
                 ):
-                    label_only += 1
-                continue
-            if _tokens_match(tokens, expected):
-                matches.append(child_id)
-            elif self._lane_pinned_to_dead_parent(
-                child_id, tokens, expected, environment
-            ):
-                # Listed under the current parent, ours by run/repo/lane,
-                # pinned to a Space that no longer exists: re-pin it here.
-                self._repin_lane(child_id, parent_id, environment)
-                matches.append(child_id)
-            elif _tokens_match(
-                tokens,
-                {k: v for k, v in expected.items() if k != METADATA_TOKEN_PARENT},
-            ):
-                pinned_elsewhere.append(child_id)
-        if pinned_elsewhere and not matches and not untagged_ours:
-            # Ours by run/repo/lane but pinned to a different live Space:
-            # refused here rather than after a `worktree open` that would
-            # only report it already open.
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "LANE_WORKSPACE_TOKEN_MISMATCH:{}".format(pinned_elsewhere[0]),
-                pane_created=False,
-            )
-        if label_only and not matches and not untagged_ours:
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "LABEL_ONLY_LANE_WORKSPACE:{}".format(label),
-                pane_created=False,
-            )
-        if len(matches) + len(untagged_ours) > 1:
-            raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "DUPLICATE_LANE_WORKSPACE:{}".format(label),
-                pane_created=False,
-            )
-        if untagged_ours:
-            child_id = untagged_ours[0]
-            self._tag_workspace(child_id, expected, environment)
-            return self._layout_from_child_workspace(
-                child_id, parent_id, group, label, environment
-            )
-        if not matches:
+                    raise LaunchRefused(
+                        LaunchRefusal.BINDING_MISMATCH,
+                        "LANE_TAB_IDENTITY_UNCONFIRMED:{}".format(label),
+                        pane_created=True,
+                    )
+                tab_ids.append(candidate_tab)
+                seed_pane_id = pane_id
+        if not tab_ids:
             return None
-        return self._layout_from_child_workspace(
-            matches[0], parent_id, group, label, environment
+        if len(tab_ids) > 1:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "DUPLICATE_LANE_TAB:{}".format(label),
+                pane_created=False,
+            )
+        tab_id = tab_ids[0]
+        self._confirm_lane_tab_label(
+            tab_id, parent_workspace_id, label, environment
+        )
+        for pane in panes:
+            if str(pane.get("tab_id") or "") != tab_id:
+                continue
+            tokens = _herdr_tokens(pane)
+            if (
+                tokens.get(METADATA_TOKEN_KIND) == METADATA_KIND_LANE
+                and not _tokens_match(tokens, expected)
+            ):
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "FOREIGN_LANE_PANE_IN_LANE_TAB:{}".format(label),
+                    pane_created=False,
+                )
+        return self._validated_role_layout(
+            tab_id,
+            panes_payload,
+            parent_workspace_id=parent_workspace_id,
+            lane_key=group,
+            lane_label=label,
+            seed_pane_id=seed_pane_id,
         )
 
 
@@ -3716,7 +3474,9 @@ class HerdrLauncher:
         for pane in panes:
             tokens = _herdr_tokens(pane)
             expected = self._pane_identity_tokens(
-                lane, role, tokens.get(METADATA_TOKEN_PARENT, "")
+                lane,
+                role,
+                tokens.get(METADATA_TOKEN_PARENT, ""),
             )
             expected.pop(METADATA_TOKEN_SCRATCH, None)
             if _tokens_match(tokens, expected):
@@ -3727,9 +3487,17 @@ class HerdrLauncher:
             pane = self._prove_live_pane(spec, owned[0], environment)
             pane_id = str(pane["pane_id"])
             self._register_adopted_role_layout(
-                spec, pane_id, str(pane["tab_id"]),
-                str(pane["workspace_id"]), environment,
+                spec,
+                pane_id,
+                str(pane["tab_id"]),
+                str(pane["workspace_id"]),
+                environment,
             )
+            restored = getattr(self, "_restored_role_cwds", None)
+            if restored is None:
+                restored = {}
+                self._restored_role_cwds = restored
+            restored[pane_id] = Path(str(pane["cwd"])).resolve()
             name = _agent_name(spec.correlation_token)
             agent = self._fetch_agent(name, environment)
             if agent is not None:
@@ -3738,7 +3506,6 @@ class HerdrLauncher:
                 self._handle_from_live_agent(spec, name, agent, pane, environment)
         else:
             pane_id, _, _ = self._acquire_pane(spec, spec.worktree, environment)
-            self._label_pane(pane_id, spec, environment)
         return pane_id
 
     def _prove_live_pane(
@@ -3758,8 +3525,6 @@ class HerdrLauncher:
         if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
             self._refuse_live_pane(pane_id)
         role = str(spec.pane_role or "")
-        if role and _herdr_label(pane) not in (role, pane_label_for(role)):
-            self._refuse_live_pane("NO_PANE_LABEL" if not _herdr_label(pane) else "PANE_LABEL_MISMATCH")
         cwd = pane.get("cwd")
         if not cwd:
             self._refuse_live_pane("NO_CWD")
@@ -3769,7 +3534,11 @@ class HerdrLauncher:
             actual.relative_to(scope)
         except ValueError:
             self._refuse_live_pane("{}!={}".format(actual, scope))
-        source_id = str(pane.get("workspace_id") or "") or workspace_of(str(pane.get("tab_id") or "")) or workspace_of(pane_id)
+        source_id = (
+            str(pane.get("workspace_id") or "")
+            or workspace_of(str(pane.get("tab_id") or ""))
+            or workspace_of(pane_id)
+        )
         source = self._workspace_record(source_id, environment)
         source_tokens = _herdr_tokens(source)
         if source_tokens:
@@ -3777,45 +3546,84 @@ class HerdrLauncher:
                 str(spec.lane_label or spec.lane_key or ""),
                 source_tokens.get(METADATA_TOKEN_PARENT, ""),
             )
-            if source_tokens.get(METADATA_TOKEN_KIND) == METADATA_KIND_LANE and not _tokens_match(source_tokens, expected_lane):
+            if source_tokens.get(
+                METADATA_TOKEN_KIND
+            ) == METADATA_KIND_LANE and not _tokens_match(source_tokens, expected_lane):
                 self._refuse_live_pane("LANE_TOKEN_MISMATCH:{}".format(source_id))
         layout = self._tab_for(
             spec, actual, pane_env_flags_for_role(actual, environment), environment
         )
-        if str(pane.get("workspace_id") or "") != layout.child_workspace_id:
+        if (
+            role
+            and layout.role_panes.get(role) == pane_id
+            and role in layout.refresh_roles
+        ):
+            self._label_pane(pane_id, spec, environment)
+            layout.refresh_roles.discard(role)
+        placement_workspace = layout.parent_workspace_id
+        pane_workspace = (
+            str(pane.get("workspace_id") or "")
+            or workspace_of(str(pane.get("tab_id") or ""))
+            or workspace_of(pane_id)
+        )
+        if (
+            pane_workspace != placement_workspace
+            or str(pane.get("tab_id") or "") != layout.tab_id
+        ):
             role = str(spec.pane_role or "")
             lane = str(spec.lane_label or spec.lane_key or "")
             tokens = _herdr_tokens(pane)
-            expected = self._pane_identity_tokens(lane, role, tokens.get(METADATA_TOKEN_PARENT, ""))
+            expected = self._pane_identity_tokens(
+                lane,
+                role,
+                tokens.get(METADATA_TOKEN_PARENT, ""),
+            )
             expected.pop(METADATA_TOKEN_SCRATCH, None)
-            if not role or _herdr_label(pane) not in (role, pane_label_for(role)) or not _tokens_match(tokens, expected):
+            if not role or not _tokens_match(tokens, expected):
                 self._refuse_live_pane("FOREIGN_ROLE_PANE:{}".format(pane_id))
             parent_id = layout.parent_workspace_id
             seed = layout.nearest_live(0)
             if seed is None:
                 self._refuse_live_pane("NO_DESTINATION_PANE")
             moved_payload = self._herdr(
-                "pane", "move", pane_id, "--tab", layout.tab_id,
-                "--target-pane", seed, "--split", "right", "--no-focus",
+                "pane",
+                "move",
+                pane_id,
+                "--tab",
+                layout.tab_id,
+                "--target-pane",
+                seed,
+                "--split",
+                "right",
+                "--no-focus",
                 env=environment,
             )
             moved_pane = _extract(moved_payload, "pane")
-            moved_id = str(moved_pane.get("pane_id") or "") if isinstance(moved_pane, dict) else ""
-            moved = _extract(self._herdr("pane", "get", moved_id, env=environment), "pane")
-            if not isinstance(moved, dict) or str(moved.get("workspace_id") or "") != layout.child_workspace_id or str(moved.get("tab_id") or "") != layout.tab_id or not _same_resolved_path(moved.get("cwd"), actual):
-                self._refuse_live_pane("MOVED_ROLE_BINDING_MISMATCH")
-            self._tag_pane(
-                moved_id, {METADATA_TOKEN_PARENT: parent_id}, environment
+            moved_id = (
+                str(moved_pane.get("pane_id") or "")
+                if isinstance(moved_pane, Mapping)
+                else ""
             )
+            moved = _extract(
+                self._herdr("pane", "get", moved_id, env=environment), "pane"
+            )
+            if (
+                not isinstance(moved, dict)
+                or str(moved.get("workspace_id") or "") != placement_workspace
+                or str(moved.get("tab_id") or "") != layout.tab_id
+                or not _same_resolved_path(moved.get("cwd"), actual)
+            ):
+                self._refuse_live_pane("MOVED_ROLE_BINDING_MISMATCH")
             moved["tokens"] = dict(tokens, **{METADATA_TOKEN_PARENT: parent_id})
+            self._label_pane(moved_id, spec, environment)
             pane = moved
-            if layout.claimed == 0 and self._pane_cwd_within(seed, Path(spec.child_anchor or spec.worktree), environment):
+            if seed == layout.seed_pane_id:
                 self._herdr("pane", "close", seed, env=environment)
                 layout.forget(seed)
         else:
-            # Lane adoption may have repinned a surviving child whose parent
-            # was closed. Placement proof must see those refreshed tokens.
-            pane = _extract(self._herdr("pane", "get", pane_id, env=environment), "pane")
+            pane = _extract(
+                self._herdr("pane", "get", pane_id, env=environment), "pane"
+            )
         self._prove_live_placement(spec, pane, environment)
         return pane
 
@@ -3835,111 +3643,54 @@ class HerdrLauncher:
                 self._refuse_live_pane("{}!={}".format(pane_label, want_label))
         pane_id = str(pane.get("pane_id") or "")
         tab_id = str(pane.get("tab_id") or "")
-        child_id = (
+        workspace_id = (
             str(pane.get("workspace_id") or "")
             or workspace_of(tab_id)
             or workspace_of(pane_id)
         )
-        if not child_id:
-            self._refuse_live_pane("NO_CHILD_WORKSPACE_ID")
+        if not workspace_id:
+            self._refuse_live_pane("NO_WORKSPACE_ID")
         try:
-            child = self._workspace_record(child_id, environment)
+            workspace = self._workspace_record(workspace_id, environment)
         except _WorkspaceGone as exc:
-            self._refuse_live_pane("child workspace_not_found", exc)
-        try:
-            child_linked = self._space_is_linked(child_id, environment)
-        except _WorkspaceGone as exc:
-            self._refuse_live_pane("child workspace_not_found", exc)
-        if not child_linked:
-            self._refuse_live_pane("CHILD_NOT_LINKED:{}".format(child_id))
+            self._refuse_live_pane("workspace_not_found", exc)
         lane_id = str(spec.lane_label or spec.lane_key or "")
-        parent_id = self._parent_workspace_id
-        child_tokens = _herdr_tokens(child)
         pane_tokens = _herdr_tokens(pane)
-        if parent_id:
-            expected_lane = self._lane_identity_tokens(lane_id, parent_id)
-            if self._identity_complete(expected_lane):
-                if not child_tokens:
-                    self._refuse_live_pane("LABEL_ONLY_LANE_WORKSPACE:{}".format(child_id))
-                if not _tokens_match(child_tokens, expected_lane):
-                    self._refuse_live_pane("LANE_TOKEN_MISMATCH:{}".format(child_id))
-            if child_tokens.get(METADATA_TOKEN_PARENT) not in ("", parent_id):
-                if child_tokens.get(METADATA_TOKEN_PARENT) != parent_id:
-                    self._refuse_live_pane(
-                        "{}!={}".format(
-                            child_tokens.get(METADATA_TOKEN_PARENT), parent_id
-                        )
-                    )
-        elif self._identity_complete(self._parent_identity_tokens()):
-            parent_token = child_tokens.get(METADATA_TOKEN_PARENT) or ""
-            if not parent_token:
-                self._refuse_live_pane("NO_PARENT_TOKEN")
-            parent_id = parent_token
-            try:
-                # Read for liveness only: the binding is proven below against
-                # Herdr's worktree listing, not against this record.
-                self._workspace_record(parent_id, environment)
-            except _WorkspaceGone:
-                # The Space the child was opened under is gone (closed and
-                # reopened by the operator) while the child and its agent
-                # survived. The same self-heal as lane adoption: the child
-                # must be listed under the parent resolved now, and is
-                # re-pinned to it.
-                parent_id = self._run_workspace(environment)
-                try:
-                    listed = self._child_listed_under(parent_id, child_id, environment)
-                except _WorkspaceGone as exc:
-                    self._refuse_live_pane("parent workspace_not_found", exc)
-                if not listed:
-                    self._refuse_live_pane(
-                        "LANE_CHILD_NOT_UNDER_PARENT:{}:{}".format(child_id, parent_id)
-                    )
-                self._repin_lane(child_id, parent_id, environment)
-                child_tokens = dict(child_tokens)
-                child_tokens[METADATA_TOKEN_PARENT] = parent_id
-                if pane_tokens.get(METADATA_TOKEN_PARENT):
-                    pane_tokens = dict(pane_tokens)
-                    pane_tokens[METADATA_TOKEN_PARENT] = parent_id
-                self._workspace_record(parent_id, environment)
-            # The parent the child names must be a non-linked Space bound to
-            # this repository; run tokens on it are not required (an
-            # operator's Space carries none, a Maestro-created one may).
-            try:
-                if self._space_is_linked(parent_id, environment):
-                    self._refuse_live_pane(
-                        "PARENT_IS_LINKED_CHILD:{}".format(parent_id)
-                    )
-                if self._repository_root != Path():
-                    defect = self._parent_binding_defect(
-                        parent_id, self._repository_root, environment
-                    )
-                    if defect:
-                        self._refuse_live_pane(
-                            "PARENT_NOT_REPO_BOUND:{}:{}".format(parent_id, defect)
-                        )
-            except _WorkspaceGone as exc:
-                self._refuse_live_pane("parent workspace_not_found", exc)
-            # The child's own identity is proven against the parent it
-            # names, not only the pane's: a lane child retagged for another
-            # run must not lend its pane to this one.
-            expected_lane = self._lane_identity_tokens(lane_id, parent_id)
-            if self._identity_complete(expected_lane) and not _tokens_match(
-                child_tokens, expected_lane
-            ):
-                self._refuse_live_pane("LANE_TOKEN_MISMATCH:{}".format(child_id))
+        parent_id = (
+            self._parent_workspace_id
+            or str(pane_tokens.get(METADATA_TOKEN_PARENT) or "")
+            or workspace_id
+        )
+        if workspace_id != parent_id:
+            self._refuse_live_pane(
+                "ROLE_OUTSIDE_PARENT_WORKSPACE:{}!={}".format(
+                    workspace_id, parent_id
+                )
+            )
+        expected_lane = self._lane_identity_tokens(lane_id, parent_id)
+        if self._identity_complete(expected_lane) and not _tokens_match(
+            pane_tokens, expected_lane
+        ):
+            self._refuse_live_pane(
+                "LANE_TOKEN_MISMATCH:{}".format(workspace_id)
+            )
         if role and pane_tokens:
             expected_pane = self._pane_identity_tokens(
-                lane_id, role, parent_id or self._parent_workspace_id
+                lane_id,
+                role,
+                parent_id,
             )
             expected_pane.pop(METADATA_TOKEN_SCRATCH, None)
             if self._identity_complete(expected_pane) and not _tokens_match(
                 pane_tokens, expected_pane
             ):
-                self._refuse_live_pane("PANE_TOKEN_MISMATCH:{}".format(pane_id))
+                self._refuse_live_pane(
+                    "PANE_TOKEN_MISMATCH:{}".format(pane_id)
+                )
         if not tab_id:
             self._refuse_live_pane("NO_TAB_ID")
-        if str(child.get("workspace_id") or child_id) != child_id:
-            self._refuse_live_pane(child_id)
+        if str(workspace.get("workspace_id") or workspace_id) != workspace_id:
+            self._refuse_live_pane(workspace_id)
 
     def _register_adopted_role_layout(
         self,
@@ -3951,17 +3702,25 @@ class HerdrLauncher:
     ) -> None:
         if not workspace_id or not tab_id:
             self._refuse_live_pane("ROLE_LAYOUT_ID_MISSING")
-        parent_id = self._parent_workspace_id
         try:
-            child = self._workspace_record(workspace_id, environment)
+            self._workspace_record(workspace_id, environment)
         except _WorkspaceGone as exc:
-            self._refuse_live_pane("child workspace_not_found", exc)
-        try:
-            child_linked = self._space_is_linked(workspace_id, environment)
-        except _WorkspaceGone as exc:
-            self._refuse_live_pane("child workspace_not_found", exc)
-        if child_linked:
-            parent_id = parent_id or _herdr_tokens(child).get(METADATA_TOKEN_PARENT, "")
+            self._refuse_live_pane("workspace_not_found", exc)
+        pane = _extract(
+            self._herdr("pane", "get", pane_id, env=environment), "pane"
+        )
+        tokens = _herdr_tokens(pane) if isinstance(pane, Mapping) else {}
+        parent_id = (
+            self._parent_workspace_id
+            or str(tokens.get(METADATA_TOKEN_PARENT) or "")
+            or workspace_id
+        )
+        if workspace_id != parent_id:
+            self._refuse_live_pane(
+                "ROLE_OUTSIDE_PARENT_WORKSPACE:{}!={}".format(
+                    workspace_id, parent_id
+                )
+            )
         group = str(spec.lane_key or "")
         label = str(spec.lane_label or group)
         try:
@@ -3974,16 +3733,14 @@ class HerdrLauncher:
             tab_id,
             listed,
             parent_workspace_id=parent_id,
-            child_workspace_id=workspace_id,
             lane_key=group,
             lane_label=label,
         )
         role = str(spec.pane_role or "")
         if role and layout.role_panes.get(role) not in (pane_id, None):
-            if layout.role_panes.get(role) != pane_id:
-                self._refuse_live_pane(
-                    "{}!={}".format(pane_id, layout.role_panes.get(role))
-                )
+            self._refuse_live_pane(
+                "{}!={}".format(pane_id, layout.role_panes.get(role))
+            )
         if role and pane_id not in layout.panes:
             self._refuse_live_pane("ADOPTED_PANE_NOT_IN_LAYOUT")
         if role:
@@ -3991,16 +3748,10 @@ class HerdrLauncher:
         with self._handles_lock:
             if parent_id and not self._parent_workspace_id:
                 self._parent_workspace_id = parent_id
-                self._workspace_id = parent_id
             existing = self._tabs.get(group)
             if existing is not None and existing.tab_id != tab_id:
-                self._refuse_live_pane("{}!={}".format(tab_id, existing.tab_id))
-            if existing is not None and existing.child_workspace_id not in (
-                "",
-                workspace_id,
-            ):
                 self._refuse_live_pane(
-                    "{}!={}".format(workspace_id, existing.child_workspace_id)
+                    "{}!={}".format(tab_id, existing.tab_id)
                 )
             self._tabs[group] = layout
 
@@ -4015,20 +3766,23 @@ class HerdrLauncher:
         pane_id = str(pane.get("pane_id") or "")
         launched = Path(str(pane.get("cwd"))).resolve()
         tab_id = str(pane.get("tab_id") or "")
-        child_id = (
+        workspace_id = (
             str(pane.get("workspace_id") or "")
             or workspace_of(tab_id)
             or workspace_of(pane_id)
         )
-        parent_id = self._parent_workspace_id
-        if child_id:
-            try:
-                child = self._workspace_record(child_id, environment)
-                parent_id = parent_id or _herdr_tokens(child).get(
-                    METADATA_TOKEN_PARENT, ""
+        pane_tokens = _herdr_tokens(pane)
+        parent_id = (
+            self._parent_workspace_id
+            or str(pane_tokens.get(METADATA_TOKEN_PARENT) or "")
+            or workspace_id
+        )
+        if workspace_id != parent_id:
+            self._refuse_live_pane(
+                "ROLE_OUTSIDE_PARENT_WORKSPACE:{}!={}".format(
+                    workspace_id, parent_id
                 )
-            except _WorkspaceGone:
-                parent_id = parent_id
+            )
         transcript = _agent_transcript_path(agent, launched, environment)
         if transcript is None:
             transcript = wait_for_agent_transcript(
@@ -4046,28 +3800,24 @@ class HerdrLauncher:
             transcript_path=transcript,
             envelope_path=spec.envelope_path,
             environment=environment,
-            workspace_id=child_id,
+            workspace_id=workspace_id,
             tab_id=tab_id,
             lane_key=spec.lane_key,
-            parent_workspace_id=parent_id,
-            child_workspace_id=child_id,
             pane_role=str(spec.pane_role or ""),
             lane_label=str(spec.lane_label or spec.lane_key or ""),
         )
         with self._handles_lock:
             if parent_id and not self._parent_workspace_id:
                 self._parent_workspace_id = parent_id
-                self._workspace_id = parent_id
             self._handles[spec.correlation_token] = handle
             self._proven_absent.pop(spec.correlation_token, None)
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
         self._register_adopted_role_layout(
-            spec, pane_id, tab_id, child_id, environment
+            spec, pane_id, tab_id, workspace_id, environment
         )
         self._register_role_handle(spec, handle)
         return handle
-
 
     def _reconnect_live_agent(
         self, spec: LaunchSpec, environment: Mapping[str, str]
@@ -4085,7 +3835,9 @@ class HerdrLauncher:
                 "AGENT_STATUS_UNOBSERVABLE:{}".format(status or "<missing>")
             )
         existing_pane = _extract(
-            self._herdr("pane", "get", str(agent.get("pane_id") or ""), env=environment),
+            self._herdr(
+                "pane", "get", str(agent.get("pane_id") or ""), env=environment
+            ),
             "pane",
         )
         if isinstance(existing_pane, dict) and existing_pane.get("cwd"):
@@ -4101,123 +3853,78 @@ class HerdrLauncher:
             return None
         return self._handle_from_live_agent(spec, stable_name, agent, pane, environment)
 
-    def _parse_worktree_opened(self, payload: Mapping[str, object]) -> dict:
-        workspace = _extract(payload, "workspace")
-        tab = _extract(payload, "tab")
-        root = _extract(payload, "root_pane")
-        worktree = _extract(payload, "worktree")
-        child_id = (
-            workspace.get("workspace_id") if isinstance(workspace, dict) else None
-        )
-        tab_id = tab.get("tab_id") if isinstance(tab, dict) else None
-        root_id = root.get("pane_id") if isinstance(root, dict) else None
-        if not child_id or not tab_id or not root_id:
-            raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED, "NO_CHILD_TAB_PANE")
-        tab_ws = str(tab.get("workspace_id") or "") if isinstance(tab, dict) else ""
-        root_ws = str(root.get("workspace_id") or "") if isinstance(root, dict) else ""
-        root_tab = str(root.get("tab_id") or "") if isinstance(root, dict) else ""
-        if tab_ws and tab_ws != str(child_id):
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_DRIFT,
-                "{}!={}".format(tab_ws, child_id),
-                pane_created=True,
-            )
-        if root_ws and root_ws != str(child_id):
-            raise LaunchRefused(
-                LaunchRefusal.WORKSPACE_DRIFT,
-                "{}!={}".format(root_ws, child_id),
-                pane_created=True,
-            )
-        if root_tab and root_tab != str(tab_id):
-            raise LaunchRefused(
-                LaunchRefusal.TAB_UNRESOLVED,
-                "{}!={}".format(root_tab, tab_id),
-                pane_created=True,
-            )
-        already_open = _extract(payload, "already_open") is True
-        path = ""
-        if isinstance(worktree, dict):
-            path = str(worktree.get("path") or "")
-        return {
-            "child_workspace_id": str(child_id),
-            "tab_id": str(tab_id),
-            "root_pane_id": str(root_id),
-            "already_open": already_open,
-            "path": path,
-            "workspace": workspace if isinstance(workspace, dict) else {},
-        }
-
-    def _worktree_open(
-        self,
-        parent_id: str,
-        path: Path,
-        label: str,
-        environment: Mapping[str, str],
-    ) -> dict:
-        """Open a linked lane child under the parent Space (the operator's
-        own, or the one Maestro created at the primary checkout)."""
-        try:
-            payload = self._herdr(
-                "worktree",
-                "open",
-                "--workspace",
-                parent_id,
-                "--path",
-                str(path),
-                "--label",
-                label,
-                "--no-focus",
-                env=environment,
-            )
-        except HerdrCallError as exc:
-            if _herdr_error_code_of(exc) != WORKSPACE_NOT_FOUND:
-                raise
-            self._invalidate_workspace_layout(parent_id)
-            raise _WorkspaceGone(str(exc)) from exc
-        return self._parse_worktree_opened(payload)
-
-    def _child_listed_under(
-        self, parent_id: str, child_id: str, environment: Mapping[str, str]
-    ) -> bool:
-        """Whether `worktree list --workspace parent` holds `child` as open."""
-        payload = self._worktree_listing(environment, workspace_id=parent_id)
-        if payload is None:
-            return False
-        source = _extract(payload, "source")
-        if isinstance(source, dict):
-            source_id = self._source_space_id(payload)
-            if source_id and source_id != parent_id:
-                return False
-        return any(
-            str(item.get("open_workspace_id") or "") == child_id
-            and item.get("is_linked_worktree") is True
-            for item in _herdr_list(payload, "worktrees")
-        )
-
-    def _invalidate_lane_layout(self, child_workspace_id: str) -> None:
-        if not child_workspace_id:
-            return
-        with self._handles_lock:
-            for key, layout in list(self._tabs.items()):
-                if layout.child_workspace_id == child_workspace_id:
-                    self._tabs.pop(key, None)
-                    for role_key in list(self._role_handles):
-                        if role_key[0] == key:
-                            self._role_handles.pop(role_key, None)
-
     def _invalidate_workspace_layout(self, workspace_id: str) -> None:
-        """Release placement state whose workspace Herdr has proved absent."""
+        """Release placement state when the repository workspace disappears."""
         if not workspace_id:
             return
         with self._handles_lock:
-            parent_id = self._parent_workspace_id or self._workspace_id
-            if workspace_id == parent_id:
-                self._parent_workspace_id = ""
-                self._workspace_id = ""
-                self._tabs.clear()
-                self._role_handles.clear()
+            parent_id = self._parent_workspace_id
+            if workspace_id != parent_id:
                 return
-        self._invalidate_lane_layout(workspace_id)
+            self._parent_workspace_id = ""
+            self._tabs.clear()
+            self._role_handles.clear()
+
+    def _lane_layout_lock_path(
+        self, spec: LaunchSpec, group: str, boundary: str
+    ) -> Path:
+        primary = git_primary_workdir(self._repository_root)
+        git_dir = primary / ".git"
+        if git_dir.is_dir():
+            lock_root = git_dir / "maestro-herdr-layout-locks"
+        else:
+            # Unit adapters and non-Git refused launches still need a shared
+            # lock location, but must never create their declared repository.
+            lock_root = Path(tempfile.gettempdir()) / "maestro-herdr-layout-locks"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        identity = "\0".join(
+            (
+                str(spec.repository_fingerprint or self._repository_fingerprint),
+                str(spec.run_id or self._run_id),
+                str(group),
+                boundary,
+            )
+        )
+        return lock_root / hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @contextmanager
+    def _lane_layout_lock(self, spec: LaunchSpec, group: str, boundary: str) -> Any:
+        """Serialize one run/lane Herdr mutation across threads and processes."""
+        lock_path = self._lane_layout_lock_path(spec, group, boundary)
+        lock_key = str(lock_path)
+        with _LAYOUT_THREAD_LOCKS_GUARD:
+            entry = _LAYOUT_THREAD_LOCKS.get(lock_key)
+            if entry is None:
+                local_lock, users = threading.RLock(), 0
+            else:
+                local_lock, users = entry
+            _LAYOUT_THREAD_LOCKS[lock_key] = (local_lock, users + 1)
+        try:
+            with local_lock:
+                fd = os.open(lock_key, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+        finally:
+            with _LAYOUT_THREAD_LOCKS_GUARD:
+                current_lock, users = _LAYOUT_THREAD_LOCKS[lock_key]
+                if users == 1:
+                    del _LAYOUT_THREAD_LOCKS[lock_key]
+                else:
+                    _LAYOUT_THREAD_LOCKS[lock_key] = (current_lock, users - 1)
+
+    @contextmanager
+    def _lane_tab_creation_lock(self, spec: LaunchSpec, group: str) -> Any:
+        with self._lane_layout_lock(spec, group, "tab"):
+            yield
+
+    @contextmanager
+    def _lane_pane_acquisition_lock(self, spec: LaunchSpec, group: str) -> Any:
+        with self._lane_layout_lock(spec, group, "pane"):
+            yield
 
 
     def _tab_for(
@@ -4227,163 +3934,144 @@ class HerdrLauncher:
         env_flags: Sequence[str],
         environment: Mapping[str, str],
     ) -> _TabLayout:
-        """The linked lane child this role's panes live in, created lazily."""
+        """One lane tab inside the operator-visible repository workspace."""
         self._bind_run_identity(spec)
-        # `worktree` is the launching role's own cwd, and a private-tree role's
-        # cwd is materialized out of the vault with no `.git`, because the
-        # reviewer must not carry the repository's object database.
-        # `herdr worktree open` resolves a registered git worktree and answers
-        # `worktree_not_found` for anything else, so anchoring the lane's child
-        # there refuses every launch of that role. The child is a per-lane
-        # container, not the role's cwd -- the pane still runs in
-        # `spec.worktree` -- so the caller names a git-backed anchor when the
-        # role cwd is not one.
-        worktree = Path(spec.child_anchor) if spec.child_anchor else worktree
         group = spec.lane_key or ""
-        with self._handles_lock:
-            existing = self._tabs.get(group)
-            if existing is not None and not existing.empty():
-                return existing
-            if not self.workspace_label:
-                seed = self._split_parent(environment)
-                layout = _TabLayout(tab_id="", panes=[seed], claimed=1)
-                self._tabs[group] = layout
-                return layout
-            label = str(spec.lane_label or group)
-            parent_id = self._run_workspace(environment)
-            try:
-                adopted = self._adopt_existing_lane(
-                    parent_id, group, label, worktree, environment
-                )
-            except _WorkspaceGone as exc:
-                # The parent this launcher resolved is gone (the operator
-                # closed their Space). Every placement under it is released
-                # and this launch refuses; the next one resolves the parent
-                # afresh by the normal rule instead of inheriting a dead id.
-                self._invalidate_workspace_layout(parent_id)
-                raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "PARENT_WORKSPACE_GONE:{}".format(exc),
-                    pane_created=False,
-                ) from exc
-            if adopted is not None:
-                self._tabs[group] = adopted
-                return adopted
-            # The lane's identity must be writable before the child exists;
-            # a child that cannot be tagged must not be opened.
-            lane_tokens = self._lane_identity_tokens(label, parent_id)
-            _metadata_token_flags(lane_tokens)
-
-            def open_child(current_parent: str) -> dict:
+        with self._lane_tab_creation_lock(spec, group):
+            with self._handles_lock:
+                existing = self._tabs.get(group)
+                if existing is not None and not existing.empty():
+                    return existing
+                label = str(spec.lane_label or group)
+                parent_id = self._run_workspace(environment)
                 try:
-                    return self._worktree_open(
-                        current_parent, worktree, label, environment
+                    adopted = self._adopt_parent_lane_tab(
+                        parent_id, group, label, worktree, environment
                     )
-                except _WorkspaceGone:
-                    current_parent = self._run_workspace(environment)
-                    try:
-                        return self._worktree_open(
-                            current_parent, worktree, label, environment
-                        )
-                    except _WorkspaceGone as exc:
+                except _WorkspaceGone as exc:
+                    self._invalidate_workspace_layout(parent_id)
+                    raise LaunchRefused(
+                        LaunchRefusal.WORKSPACE_UNRESOLVED,
+                        "PARENT_WORKSPACE_GONE:{}".format(exc),
+                        pane_created=False,
+                    ) from exc
+                if adopted is not None:
+                    self._tabs[group] = adopted
+                    return adopted
+
+                lane_tokens = self._lane_identity_tokens(label, parent_id)
+                _metadata_token_flags(lane_tokens)
+                root_id = ""
+                try:
+                    payload = self._herdr(
+                        "tab",
+                        "create",
+                        "--workspace",
+                        parent_id,
+                        "--label",
+                        self._pending_lane_tab_label(parent_id, label),
+                        "--cwd",
+                        str(worktree),
+                        "--no-focus",
+                        *env_flags,
+                        env=environment,
+                    )
+                    tab = _extract(payload, "tab")
+                    root = _extract(payload, "root_pane")
+                    tab_id = (
+                        str(tab.get("tab_id") or "")
+                        if isinstance(tab, Mapping)
+                        else ""
+                    )
+                    root_id = (
+                        str(root.get("pane_id") or "")
+                        if isinstance(root, Mapping)
+                        else ""
+                    )
+                    tab_workspace = (
+                        str(tab.get("workspace_id") or "")
+                        if isinstance(tab, Mapping)
+                        else ""
+                    )
+                    root_workspace = (
+                        str(root.get("workspace_id") or "")
+                        if isinstance(root, Mapping)
+                        else ""
+                    )
+                    root_tab = (
+                        str(root.get("tab_id") or "")
+                        if isinstance(root, Mapping)
+                        else ""
+                    )
+                    if (
+                        not tab_id
+                        or not root_id
+                        or tab_workspace != parent_id
+                        or root_workspace != parent_id
+                        or root_tab != tab_id
+                    ):
                         raise LaunchRefused(
                             LaunchRefusal.TAB_UNRESOLVED,
-                            "workspace vanished twice: {0}".format(exc),
+                            "PARENT_TAB_BINDING_MISMATCH:{}".format(label),
+                            pane_created=bool(root_id),
+                        )
+                    self._tag_pane(
+                        root_id, lane_tokens, environment, partial=True
+                    )
+                    confirmed = _extract(
+                        self._herdr(
+                            "pane", "get", root_id, env=environment
+                        ),
+                        "pane",
+                    )
+                    if not isinstance(confirmed, Mapping) or not _tokens_match(
+                        _herdr_tokens(confirmed), lane_tokens
+                    ):
+                        raise LaunchRefused(
+                            LaunchRefusal.BINDING_MISMATCH,
+                            "LANE_TAB_IDENTITY_UNCONFIRMED:{}".format(label),
+                            pane_created=True,
+                        )
+                    self._confirm_lane_tab_label(
+                        tab_id, parent_id, label, environment
+                    )
+                except BaseException as exc:
+                    if not isinstance(exc, Exception):
+                        raise
+                    closed = (
+                        self._reap_pane(root_id, environment)
+                        if root_id
+                        else True
+                    )
+                    if isinstance(exc, _WorkspaceGone):
+                        self._invalidate_workspace_layout(parent_id)
+                        raise LaunchRefused(
+                            LaunchRefusal.WORKSPACE_UNRESOLVED,
+                            "PARENT_WORKSPACE_GONE:{}".format(parent_id),
+                            pane_created=not closed,
                         ) from exc
-
-            try:
-                opened = open_child(parent_id)
-            except LaunchRefused:
-                raise
-            except BaseException as exc:
-                raise LaunchRefused(
-                    LaunchRefusal.TAB_UNRESOLVED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                ) from exc
-            child_id = str(opened["child_workspace_id"])
-            if opened["already_open"]:
-                # Another process opened this checkout between our listing
-                # and our open. The workspace Herdr returned is the one that
-                # holds exactly `--path worktree`, so an untagged one is ours
-                # by path; it is tagged and adopted rather than refused, which
-                # is the same rule `_adopt_existing_lane` applies.
-                live = self._workspace_record(child_id, environment)
-                tokens = _herdr_tokens(live)
-                expected = lane_tokens
-                if not tokens:
-                    if not _same_resolved_path(
-                        opened["path"], worktree
-                    ) or not self._child_listed_under(
-                        parent_id, child_id, environment
-                    ):
-                        raise LaunchRefused(
-                            LaunchRefusal.BINDING_MISMATCH,
-                            "LABEL_ONLY_LANE_WORKSPACE:{}".format(label),
-                            pane_created=False,
-                        )
-                    self._tag_workspace(child_id, expected, environment)
-                elif self._identity_complete(expected) and not _tokens_match(
-                    tokens, expected
-                ):
-                    if not (
-                        self._child_listed_under(parent_id, child_id, environment)
-                        and self._lane_pinned_to_dead_parent(
-                            child_id, tokens, expected, environment
-                        )
-                    ):
-                        raise LaunchRefused(
-                            LaunchRefusal.BINDING_MISMATCH,
-                            "LANE_WORKSPACE_TOKEN_MISMATCH:{}".format(child_id),
-                            pane_created=False,
-                        )
-                    self._repin_lane(child_id, parent_id, environment)
-                layout = self._layout_from_child_workspace(
-                    child_id, parent_id, group, label, environment
+                    if isinstance(exc, LaunchRefused):
+                        if not closed and not exc.pane_created:
+                            raise LaunchRefused(
+                                exc.refusal, exc.detail, pane_created=True
+                            ) from exc
+                        raise
+                    raise LaunchRefused(
+                        LaunchRefusal.TAB_UNRESOLVED,
+                        "{0}: {1}".format(type(exc).__name__, exc),
+                        pane_created=not closed,
+                    ) from exc
+                layout = _TabLayout(
+                    tab_id=tab_id,
+                    panes=[root_id],
+                    claimed=0,
+                    parent_workspace_id=parent_id,
+                    seed_pane_id=root_id,
+                    lane_key=group,
+                    lane_label=label,
                 )
                 self._tabs[group] = layout
                 return layout
-            # `--workspace` names the parent we asked for; where Herdr
-            # actually grouped the child is a separate fact, read back from
-            # `worktree list --workspace parent` (`source_workspace_id` and
-            # the child's presence). Should a second non-linked Space bound
-            # to the repository appear between our lookup and our open,
-            # which one Herdr treats as the source is undocumented. A child
-            # placed elsewhere is closed and refused before it is ever
-            # tagged as ours; tagging it would make every restart drift.
-            try:
-                under_parent = self._child_listed_under(
-                    parent_id, child_id, environment
-                )
-            except _WorkspaceGone as exc:
-                raise LaunchRefused(
-                    LaunchRefusal.TAB_UNRESOLVED,
-                    "parent vanished after open: {0}".format(exc),
-                ) from exc
-            if not under_parent:
-                closed = True
-                try:
-                    self._close_workspace_absent_ok(child_id, environment)
-                except HerdrCallError:
-                    closed = False
-                raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_DRIFT,
-                    "LANE_CHILD_NOT_UNDER_PARENT:{}:{}{}".format(
-                        child_id, parent_id, "" if closed else ":child close refused"
-                    ),
-                    pane_created=not closed,
-                )
-            self._tag_workspace(child_id, lane_tokens, environment)
-            layout = _TabLayout(
-                tab_id=str(opened["tab_id"]),
-                panes=[str(opened["root_pane_id"])],
-                claimed=0,
-                parent_workspace_id=parent_id,
-                child_workspace_id=child_id,
-                lane_key=group,
-                lane_label=label,
-            )
-            self._tabs[group] = layout
-            return layout
 
     def _acquire_pane(
         self,
@@ -4391,7 +4079,22 @@ class HerdrLauncher:
         worktree: Path,
         environment: Mapping[str, str],
     ) -> Tuple[str, _TabLayout, bool]:
-        """Create a scratch-bound role pane lazily inside its linked lane child."""
+        group = str(spec.lane_key or "")
+        with self._lane_pane_acquisition_lock(spec, group):
+            # Another controller may have added a role while this process
+            # waited for the cross-process mutation lock. Re-adopt the
+            # authoritative Herdr layout before deciding a role is absent.
+            with self._handles_lock:
+                self._tabs.pop(group, None)
+            return self._acquire_pane_unlocked(spec, worktree, environment)
+
+    def _acquire_pane_unlocked(
+        self,
+        spec: LaunchSpec,
+        worktree: Path,
+        environment: Mapping[str, str],
+    ) -> Tuple[str, _TabLayout, bool]:
+        """Create a scratch-bound role pane lazily inside its lane tab."""
         role_flags = pane_env_flags_for_role(worktree, environment)
         for recovery in range(2):
             layout = self._tab_for(spec, worktree, role_flags, environment)
@@ -4400,54 +4103,102 @@ class HerdrLauncher:
                 role = str(spec.pane_role or "")
                 replace_pane = ""
                 try:
-                    held = (
-                        str(layout.role_panes.get(role) or "")
-                        if role and role not in layout.refresh_roles
-                        else ""
-                    )
+                    held = str(layout.role_panes.get(role) or "") if role else ""
                     if held:
-                        # A reuse is proven live, never taken from the
-                        # in-memory grid alone: the pane may have been
-                        # closed, or its child workspace with it, since it
-                        # was adopted.
+                        # A reuse is proven live and still bound to this exact
+                        # actor, never taken from the in-memory grid alone.
                         try:
-                            self._herdr("pane", "get", held, env=environment)
+                            current = self._herdr("pane", "get", held, env=environment)
                         except HerdrCallError as exc:
                             if _herdr_error_code_of(exc) != PANE_NOT_FOUND:
                                 raise
                             layout.forget(held)
+                            held = ""
+                            layout.refresh_roles.discard(role)
                             if layout.empty():
                                 raise _WorkspaceGone(
-                                    layout.child_workspace_id
-                                    or workspace_of(layout.tab_id)
+                                    workspace_of(layout.tab_id)
                                 ) from exc
-                    if role and role in layout.refresh_roles:
-                        replace_pane = str(layout.role_panes.get(role) or "")
-                        if not replace_pane:
-                            raise LaunchRefused(
-                                LaunchRefusal.BINDING_MISMATCH,
-                                "STALE_ROLE_PANE_MISSING:{}".format(role),
-                                pane_created=False,
+                        else:
+                            pane = _extract(current, "pane")
+                            tokens = (
+                                _herdr_tokens(pane) if isinstance(pane, Mapping) else {}
                             )
-                        try:
-                            index = layout.panes.index(replace_pane)
-                        except ValueError as exc:
-                            raise LaunchRefused(
-                                LaunchRefusal.BINDING_MISMATCH,
-                                "STALE_ROLE_PANE_UNBOUND:{}".format(role),
-                                pane_created=True,
-                            ) from exc
-                        parent_id = replace_pane
-                        direction = "right"
+                            expected = self._pane_identity_tokens(
+                                str(
+                                    layout.lane_label
+                                    or spec.lane_label
+                                    or spec.lane_key
+                                    or ""
+                                ),
+                                str(spec.pane_role or ""),
+                                layout.parent_workspace_id or self._parent_workspace_id,
+                            )
+                            actual_cwd = (
+                                Path(str(pane.get("cwd"))).resolve()
+                                if isinstance(pane, Mapping) and pane.get("cwd")
+                                else None
+                            )
+                            if (
+                                not _tokens_match(tokens, expected)
+                                or actual_cwd != worktree
+                            ):
+                                raise LaunchRefused(
+                                    LaunchRefusal.BINDING_MISMATCH,
+                                    "HELD_ROLE_PANE_IDENTITY_MISMATCH:{}".format(held),
+                                    pane_created=False,
+                                )
+                    if role and role in layout.refresh_roles:
+                        layout.refresh_roles.discard(role)
+                        if held:
+                            self._label_pane(held, spec, environment)
+                            seed = str(layout.seed_pane_id or "")
+                            if seed and seed != held:
+                                if not self._reap_pane(seed, environment):
+                                    raise LaunchRefused(
+                                        LaunchRefusal.BINDING_MISMATCH,
+                                        "AUTHENTICATED_SEED_CLOSE_REFUSED:{}".format(
+                                            seed
+                                        ),
+                                        pane_created=True,
+                                    )
+                                layout.forget(seed)
+                            return held, layout, True
                     elif role and layout.role_panes.get(role):
-                        return str(layout.role_panes[role]), layout, True
+                        held = str(layout.role_panes[role])
+                        pane = _extract(
+                            self._herdr(
+                                "pane", "get", held, env=environment
+                            ),
+                            "pane",
+                        )
+                        self._prove_live_placement(spec, pane, environment)
+                        seed = str(layout.seed_pane_id or "")
+                        if seed and seed != held:
+                            if not self._reap_pane(seed, environment):
+                                raise LaunchRefused(
+                                    LaunchRefusal.BINDING_MISMATCH,
+                                    "AUTHENTICATED_SEED_CLOSE_REFUSED:{}".format(
+                                        seed
+                                    ),
+                                    pane_created=True,
+                                )
+                            layout.forget(seed)
+                        return held, layout, True
                     elif layout.claimed == 0:
-                        if not layout.panes or not layout.panes[0]:
+                        seed = str(layout.seed_pane_id or "")
+                        root_pane = (
+                            seed
+                            if seed and seed in layout.panes
+                            else str(layout.panes[0] or "")
+                            if layout.panes
+                            else ""
+                        )
+                        if not root_pane:
                             raise LaunchRefused(
                                 LaunchRefusal.TAB_UNRESOLVED, "NO_ROOT_PANE"
                             )
-                        root_pane = str(layout.panes[0])
-                        index = 0
+                        index = layout.panes.index(root_pane)
                         parent_id = root_pane
                         direction = "right"
                         replace_pane = root_pane
@@ -4485,7 +4236,7 @@ class HerdrLauncher:
                         env=environment,
                     )
                 except _WorkspaceGone as exc:
-                    vanished = str(exc) or layout.child_workspace_id
+                    vanished = str(exc) or workspace_of(layout.tab_id)
                 except HerdrCallError as exc:
                     code = _herdr_error_code_of(exc)
                     if code not in (WORKSPACE_NOT_FOUND, PANE_NOT_FOUND):
@@ -4493,68 +4244,47 @@ class HerdrLauncher:
                     # The split parent pane, or its workspace, went away
                     # between discovery and adoption. The lane layout is
                     # re-read once from Herdr rather than trusted.
-                    vanished = layout.child_workspace_id or workspace_of(
-                        layout.tab_id
-                    ) or layout.parent_workspace_id
+                    vanished = (
+                        workspace_of(layout.tab_id)
+                        or layout.parent_workspace_id
+                    )
                 else:
                     pane = _extract(split, "pane")
                     if not isinstance(pane, dict) or not pane.get("pane_id"):
-                        raise LaunchRefused(
-                            LaunchRefusal.NO_PANE, pane_created=True
-                        )
+                        raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
                     pane_id = str(pane["pane_id"])
                     landed = (
                         str(pane.get("workspace_id") or "")
                         or workspace_of(str(pane.get("tab_id") or ""))
                         or workspace_of(pane_id)
                     )
-                    if (
-                        layout.child_workspace_id
-                        and landed
-                        and landed != layout.child_workspace_id
-                    ):
+                    placement_workspace = layout.parent_workspace_id
+                    if placement_workspace and landed and landed != placement_workspace:
                         closed = self._reap_pane(pane_id, environment)
                         raise LaunchRefused(
                             LaunchRefusal.WORKSPACE_DRIFT,
-                            "{}!={}".format(landed, layout.child_workspace_id),
+                            "{}!={}".format(landed, placement_workspace),
                             pane_created=not closed,
                         )
-                    # The pane this split replaces goes first; then, inside
-                    # a lane child, every pane that is no role's: the root
-                    # pane `worktree open` seeded and any split whose process
-                    # stopped before it was labelled. Each is unconfigured
-                    # (no scratch contract) and at a cwd that is not this
-                    # role's; leaving one behind is the orphan a later role
-                    # would otherwise be handed by grid position.
+                    # Establish durable lane/role identity before reaping the
+                    # tab's authenticated seed. A failed label/tag operation
+                    # then leaves either the seed or a tagged replacement for
+                    # restart discovery, never an identity-empty lane tab.
+                    try:
+                        self._label_pane(pane_id, spec, environment)
+                    except LaunchRefused as exc:
+                        closed = self._reap_pane(pane_id, environment)
+                        raise LaunchRefused(
+                            exc.refusal,
+                            exc.detail,
+                            pane_created=not closed,
+                        ) from exc
+                    # Close only the authenticated lane-tab seed this new role
+                    # replaces. Tokenless panes are operator-owned regardless
+                    # of cwd; path coincidence is never ownership proof.
                     unconfigured: List[str] = []
-                    if replace_pane and replace_pane in layout.role_panes.values():
-                        # A stale role pane is this role's by label; it is
-                        # replaced whatever its cwd says.
+                    if replace_pane and replace_pane == layout.seed_pane_id:
                         unconfigured.append(replace_pane)
-                    if layout.child_workspace_id:
-                        owned = set(layout.role_panes.values())
-                        scope = self._role_stage_worktree_scope(spec)
-                        for stray in layout.panes:
-                            if (
-                                not stray
-                                or stray == pane_id
-                                or stray in owned
-                                or stray in unconfigured
-                            ):
-                                continue
-                            # An unlabelled pane is closed only when its cwd
-                            # is inside this role's own checkout scope: the
-                            # root pane the first role's open seeded, or this
-                            # role's split that stopped before labelling. A
-                            # pane at another role's cwd may be that role's
-                            # split in flight in another process and is that
-                            # role's to reap; a pane at a foreign or missing
-                            # cwd is not Maestro's at all and is left alone.
-                            if self._pane_cwd_within(str(stray), scope, environment) or (
-                                stray == replace_pane and spec.child_anchor is not None
-                                and self._pane_cwd_within(str(stray), spec.child_anchor, environment)
-                            ):
-                                unconfigured.append(str(stray))
                     if (
                         replace_pane
                         and replace_pane not in unconfigured
@@ -4567,13 +4297,13 @@ class HerdrLauncher:
                     for stale in unconfigured:
                         if self._reap_pane(stale, environment):
                             continue
-                        replacement_closed = self._reap_pane(pane_id, environment)
+                        self._reap_pane(pane_id, environment)
                         raise LaunchRefused(
                             LaunchRefusal.BINDING_MISMATCH,
                             "UNCONFIGURED_ROLE_PANE_NOT_CLOSED:{}".format(
                                 role or stale
                             ),
-                            pane_created=not replacement_closed,
+                            pane_created=True,
                         )
                     while len(layout.panes) <= index:
                         layout.panes.append(None)
@@ -4607,19 +4337,21 @@ class HerdrLauncher:
             label = "-".join(part for part in (role, attempt) if part)
         if not label:
             return
+        parent_id = self._parent_workspace_id
+        lane_id = str(spec.lane_label or spec.lane_key or "")
         try:
-            self._herdr("pane", "rename", pane_id, label, env=environment)
-            payload = self._herdr("pane", "get", pane_id, env=environment)
-            pane = _extract(payload, "pane")
-            if not isinstance(pane, dict) or _herdr_label(pane) != label:
-                raise RuntimeError("PANE_LABEL_UNCONFIRMED:{}".format(pane_id))
-            parent_id = self._parent_workspace_id
-            lane_id = str(spec.lane_label or spec.lane_key or "")
+            # Metadata is the restart authority; establish it before the
+            # display label so a rename failure cannot orphan the lane.
             self._tag_pane(
                 pane_id,
                 self._pane_identity_tokens(lane_id, role, parent_id),
                 environment,
             )
+            self._herdr("pane", "rename", pane_id, label, env=environment)
+            payload = self._herdr("pane", "get", pane_id, env=environment)
+            pane = _extract(payload, "pane")
+            if not isinstance(pane, dict) or _herdr_label(pane) != label:
+                raise RuntimeError("PANE_LABEL_UNCONFIRMED:{}".format(pane_id))
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
@@ -4628,7 +4360,6 @@ class HerdrLauncher:
                 "pane rename {0}: {1}: {2}".format(pane_id, type(exc).__name__, exc),
                 pane_created=True,
             ) from exc
-
 
     def _forget_pane(self, pane_id: str) -> None:
         """Drop a closed pane from its tab's grid.
@@ -4641,6 +4372,7 @@ class HerdrLauncher:
             for layout in self._tabs.values():
                 if layout.forget(pane_id):
                     return
+
 
     def _reap_pane(self, pane_id: str, environment: Mapping[str, str]) -> bool:
         """Close one pane a failed launch is about to abandon; say if it went.
@@ -4667,9 +4399,7 @@ class HerdrLauncher:
         self._forget_pane(pane_id)
         return True
 
-    def _bind_handle_transcript(
-        self, handle: LaunchHandle, transcript: Path
-    ) -> None:
+    def _bind_handle_transcript(self, handle: LaunchHandle, transcript: Path) -> None:
         """Attach a discovered transcript and its tailer to an owned handle."""
         path = Path(transcript)
         object.__setattr__(handle, "transcript_path", path)
@@ -4686,9 +4416,7 @@ class HerdrLauncher:
 
         def holds() -> Optional[bool]:
             return composer_holds_offer(
-                lambda *args, **kwargs: self._herdr(
-                    *args, env=environment, **kwargs
-                ),
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 pane_id,
                 prompt_path,
             )
@@ -4742,7 +4470,6 @@ class HerdrLauncher:
         prepare_route_prompt(spec)
         preflight_launch_prompt(spec)
         if spec.route == "omp":
-
             try:
                 route_argv = build_omp_argv(self.omp_path, spec)
             except ValueError as exc:
@@ -4771,6 +4498,7 @@ class HerdrLauncher:
         # raised before herdr is called *at all*. Resolving the parent first
         # would make one herdr call before that refusal and falsify it.
         pane_env_flags(environment)
+
         def resubmit_adopted(adopted: LaunchHandle) -> LaunchHandle:
             if spec.prepare_adopted_cwd is not None:
                 self._verified_handle_binding(adopted)
@@ -4790,8 +4518,8 @@ class HerdrLauncher:
             existing = self._reconnect_live_agent(spec, environment)
         if existing is not None:
             return resubmit_adopted(existing)
-        # Placement: the operator's (or Maestro-created) parent Space, a
-        # linked lane child under it, a lazy role pane inside the child.
+        # Placement: one lane tab in the operator-visible repository
+        # workspace, with one lazily created pane per role.
         pane_id, layout, reused_role_pane = self._acquire_pane(
             spec, worktree, environment
         )
@@ -4807,8 +4535,9 @@ class HerdrLauncher:
         with layout.lock:
             pane_is_in_layout = pane_id in layout.panes
             placement_tab_id = layout.tab_id
-            child_workspace_id = layout.child_workspace_id
-            parent_workspace_id = layout.parent_workspace_id or self._parent_workspace_id
+            parent_workspace_id = (
+                layout.parent_workspace_id or self._parent_workspace_id
+            )
         if not pane_is_in_layout:
             closed = self._reap_pane(pane_id, environment)
             raise LaunchRefused(
@@ -4817,7 +4546,7 @@ class HerdrLauncher:
                 pane_created=not closed,
             )
         placement_workspace_id = (
-            child_workspace_id
+            parent_workspace_id
             or workspace_of(placement_tab_id)
             or workspace_of(pane_id)
         )
@@ -4830,7 +4559,6 @@ class HerdrLauncher:
                 pane_created=not closed,
             )
 
-        self._label_pane(pane_id, spec, environment)
         name = _agent_name(spec.correlation_token)
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
@@ -4972,8 +4700,6 @@ class HerdrLauncher:
             workspace_id=placement_workspace_id,
             tab_id=placement_tab_id,
             lane_key=spec.lane_key,
-            parent_workspace_id=parent_workspace_id,
-            child_workspace_id=child_workspace_id or placement_workspace_id,
             pane_role=str(spec.pane_role or ""),
             lane_label=str(spec.lane_label or spec.lane_key or ""),
         )
@@ -4984,8 +4710,6 @@ class HerdrLauncher:
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
         self._register_role_handle(spec, handle)
-        # Present the verified live role once, not on readiness or poll retries.
-        self._herdr("agent", "focus", name, env=environment)
         try:
             # Every coding route receives the complete node instruction only
             # after its composer is ready. Startup delivery can race agent
@@ -5050,6 +4774,12 @@ class HerdrLauncher:
             # that is already long.
             return handle
         except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # Process death and operator interrupts are not launch
+                # outcomes. Nothing after the interrupted external call may
+                # run: in particular, keep the pane identity available for a
+                # later controller to reconstruct.
+                raise
             # Submission proof is only an observation of the launch path. The
             # attempt's own terminal declaration outranks it, exactly as it
             # outranks stale pane status in `poll`. A fast agent can accept,
@@ -5062,8 +4792,6 @@ class HerdrLauncher:
             # execution. Cancel it before returning a launch refusal;
             # cancellation failure remains a quiescence error.
             self.cancel(handle, time.monotonic() + 5.0)
-            if not isinstance(exc, Exception):
-                raise
             raise LaunchRefused(
                 LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
                 "{0}: {1}".format(type(exc).__name__, exc),
@@ -5112,10 +4840,10 @@ class HerdrLauncher:
             or workspace_of(str(pane.get("tab_id") or ""))
             or workspace_of(handle.pane_id)
         )
-        if handle.child_workspace_id and landed and landed != handle.child_workspace_id:
+        if handle.workspace_id and landed and landed != handle.workspace_id:
             raise LaunchRefused(
                 LaunchRefusal.WORKSPACE_DRIFT,
-                "{}!={}".format(landed, handle.child_workspace_id),
+                "{}!={}".format(landed, handle.workspace_id),
             )
         if handle.tab_id:
             bound_tab = str(pane.get("tab_id") or "")
@@ -5178,7 +4906,6 @@ class HerdrLauncher:
         if envelope_path is not None:
             object.__setattr__(handle, "envelope_path", Path(envelope_path))
         self._verified_handle_binding(handle)
-        self._herdr("agent", "focus", handle.agent_name, env=handle.environment)
         try:
             wait_for_interactive_agent(
                 lambda *args, **kwargs: self._herdr(
@@ -5234,14 +4961,11 @@ class HerdrLauncher:
             # A correction cycle is the same lane path as the first launch and
             # gets the same answer: offered, unproven, adjudicated downstream.
             refuse_unproven=False,
-            submission_recorded=self._runtime_submission_recorded(
-                handle, prompt
-            ),
+            submission_recorded=self._runtime_submission_recorded(handle, prompt),
             composer_holds=self._composer_holds(
                 handle.pane_id, prompt, handle.environment
             ),
         )
-
 
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
         """Wait for a completed turn to return to its retained composer.
@@ -5636,9 +5360,7 @@ class HerdrLauncher:
                 raise
             raise LaunchRefused(
                 LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                "{0}: {1}: {2}".format(
-                    handle.pane_id, type(exc).__name__, exc
-                ),
+                "{0}: {1}: {2}".format(handle.pane_id, type(exc).__name__, exc),
                 pane_created=True,
             ) from exc
         deadline = time.monotonic() + max(1.0, float(timeout_s))
@@ -5655,39 +5377,17 @@ class HerdrLauncher:
                 )
             time.sleep(SESSION_RENAME_POLL_S)
 
-
-    def _close_workspace_absent_ok(
-        self, workspace_id: str, environment: Mapping[str, str]
-    ) -> None:
-        if not workspace_id or workspace_id in self._cleaned_absent:
-            return
-        try:
-            self._herdr("workspace", "close", workspace_id, env=environment)
-        except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                self._cleaned_absent.add(workspace_id)
-                self._invalidate_workspace_layout(workspace_id)
-                return
-            raise
-        self._cleaned_absent.add(workspace_id)
-        self._invalidate_workspace_layout(workspace_id)
-
     def close_run_panes(self, run_id: str) -> Tuple[str, ...]:
         """Close every pane Herdr reports for `run_id`, by token, not by handle.
 
-        `complete_run` closes what *this process* launched: it reads
-        `self._roles`, which a fresh `maestro.py` invocation starts empty. The
-        panes of a run whose scheduler has exited are therefore unreachable
-        through it, and nothing else ever closed them -- a run that parked and
-        was amended left one pane per role alive, and the amended scheduler
-        opened a second set beside them.
-
-        The selector is `tools/cleanup.py`'s, deliberately and identically:
-        Maestro's own `kind=lane` token *and* a `run_id` token naming this run.
-        Two readers that close panes must not disagree about which panes are
-        closeable, and the operator's own Space on the repository carries
-        neither token. Panes that vanish between the listing and the close are
-        already the outcome being asked for.
+        Used after publication reaches COMPLETE, after an amendment is
+        applied, or by explicit cleanup. The selector is
+        `tools/cleanup.py`'s, deliberately and identically: Maestro's own
+        `kind=lane` token and a `run_id` token naming this run. Two readers
+        that close panes must not disagree about which panes are closeable,
+        and the operator's own repository workspace carries neither token.
+        Panes that vanish between listing and close are already the requested
+        outcome.
         """
         run = str(run_id or "")
         if not run:
@@ -5711,9 +5411,11 @@ class HerdrLauncher:
             except HerdrCallError as exc:
                 if exc.code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
                     self._cleaned_absent.add(pane_id)
+                    self._forget_pane(pane_id)
                     continue
                 raise
             self._cleaned_absent.add(pane_id)
+            self._forget_pane(pane_id)
             closed.append(pane_id)
         return tuple(closed)
 
@@ -5724,13 +5426,11 @@ class HerdrLauncher:
         project_identity: str = "",
         timeout_s: float = 60.0,
     ) -> None:
-        """Rename idle role sessions, then close the lane children.
+        """Rename every available role session, then close all run-owned panes.
 
-        The parent Space is never closed: it is the operator's own Space when
-        one was open on the repository, and even a Maestro-created one is
-        shared by every run on that repository. Cancel is not this path. A
-        rename that is not confirmed leaves every affected pane and lane
-        workspace open.
+        The scheduler invokes this only after successful publication reaches
+        COMPLETE. Every rename is proved before any close begins. The
+        repository workspace remains operator-owned and is never closed.
         """
         ordered: List[LaunchHandle] = []
         seen: set[str] = set()
@@ -5740,73 +5440,57 @@ class HerdrLauncher:
                 continue
             seen.add(token)
             ordered.append(handle)
-        confirmed: List[LaunchHandle] = []
         for handle in ordered:
             if handle.pane_id in self._cleaned_absent:
                 continue
             try:
                 self.wait_for_idle(handle, timeout_s=timeout_s)
-            except HerdrCallError as exc:
-                if exc.code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND, AGENT_NOT_FOUND):
+            except (HerdrCallError, LaunchRefused) as exc:
+                code = _herdr_error_code_of(exc)
+                if code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
                     self._cleaned_absent.add(handle.pane_id)
+                    self._forget_pane(handle.pane_id)
                     continue
+                if code == AGENT_NOT_FOUND:
+                    # The composer is gone, but its authenticated pane remains
+                    # run-owned and is closed with the other panes below.
+                    continue
+                if isinstance(exc, LaunchRefused):
+                    raise
                 raise LaunchRefused(
                     LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
                     "{0}: {1}".format(type(exc).__name__, exc),
                     pane_created=True,
                 ) from exc
-            except LaunchRefused:
-                raise
             except AgentNotInteractive as exc:
-                # Same outcome as any other unconfirmed rename, said in the
-                # type this path already declares. Untyped, it escaped every
-                # caller and ended the run at cleanup.
                 raise LaunchRefused(
                     LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
                     "{0}: {1}".format(type(exc).__name__, exc),
                     pane_created=True,
                 ) from exc
             name = self._session_name(handle, project_identity)
-            self._confirm_session_rename(handle, name, timeout_s)
-            confirmed.append(handle)
-        children: List[str] = []
-        environments: Dict[str, Mapping[str, str]] = {}
-        for handle in confirmed:
-            child = handle.child_workspace_id or handle.workspace_id
-            if child and child not in children:
-                children.append(child)
-                environments[child] = handle.environment
-            self._forget_pane(handle.pane_id)
-            self._cleaned_absent.add(handle.pane_id)
-        for layout in self._tabs.values():
-            child = layout.child_workspace_id
-            if child and child != self._parent_workspace_id and child not in children:
-                children.append(child)
-        # Restored shells may never dispatch (the native gate can decide the
-        # outcome first). They belong to the same whole-run cleanup boundary.
-        for child in children:
-            if child == self._parent_workspace_id:
-                continue
             try:
-                listed = self._herdr("pane", "list", "--workspace", child)
-            except HerdrCallError as exc:
-                if exc.code == WORKSPACE_NOT_FOUND:
+                self._confirm_session_rename(handle, name, timeout_s)
+            except (HerdrCallError, LaunchRefused) as exc:
+                code = _herdr_error_code_of(exc)
+                if code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
+                    self._cleaned_absent.add(handle.pane_id)
+                    self._forget_pane(handle.pane_id)
                     continue
+                try:
+                    self._verified_handle_binding(handle)
+                except (HerdrCallError, LaunchRefused) as binding_exc:
+                    binding_code = _herdr_error_code_of(binding_exc)
+                    if binding_code == AGENT_NOT_FOUND:
+                        continue
+                    if binding_code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
+                        self._cleaned_absent.add(handle.pane_id)
+                        self._forget_pane(handle.pane_id)
+                        continue
+                    raise
                 raise
-            for pane in _herdr_list(listed, "panes"):
-                tokens = _herdr_tokens(pane)
-                if tokens.get(METADATA_TOKEN_RUN) != self._run_id:
-                    raise LaunchRefused(
-                        LaunchRefusal.BINDING_MISMATCH,
-                        "FOREIGN_PANE_IN_LANE:{}".format(pane.get("pane_id")),
-                        pane_created=True,
-                    )
-        for child in children:
-            if child == self._parent_workspace_id:
-                # A handle without a child id names the parent by fallback;
-                # the parent is never closed.
-                continue
-            self._close_workspace_absent_ok(child, environments.get(child, {}))
+
+        self.close_run_panes(self._run_id)
 
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)
@@ -5836,8 +5520,6 @@ class FakeLauncher:
             _agent_name(spec.correlation_token),
             spec.worktree.resolve(),
             envelope_path=spec.envelope_path,
-            parent_workspace_id="",
-            child_workspace_id="",
             pane_role=str(spec.pane_role or ""),
             lane_key=spec.lane_key,
             lane_label=str(spec.lane_label or spec.lane_key or ""),
@@ -5914,9 +5596,7 @@ class FakeLauncher:
         for token, handle in list(self._handles.items()):
             if self._runs.get(token) != run:
                 continue
-            self._states[token] = PollResult(
-                PollState.GONE, detail="RUN_PANES_CLOSED"
-            )
+            self._states[token] = PollResult(PollState.GONE, detail="RUN_PANES_CLOSED")
             if handle.pane_id:
                 closed.append(handle.pane_id)
         return tuple(closed)
@@ -5950,7 +5630,6 @@ class FakeLauncher:
 
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)
-
 
 
 #: Herdr `error.code`s naming a condition another attempt can survive.

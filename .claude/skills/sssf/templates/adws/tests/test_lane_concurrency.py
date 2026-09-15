@@ -2,11 +2,12 @@
 
 `MAESTRO_architecture.md` §10: "Independent ready lanes may execute
 author/review/build stages concurrently. Integration merges are serialized."
-and "Concurrent first launches resolve exactly one parent and create exactly
-one child per lane." Every case here observes real threads against the real
-scheduler, store and launcher: a rendezvous that only two lanes executing at
-the same time can satisfy, an overlap counter, a real SIGINT to the main
-thread, and a fake Herdr whose creating verbs are slowed to widen the race.
+and "Concurrent first launches resolve exactly one repository workspace and
+create exactly one tab per lane." Every case here observes real threads against
+the real scheduler, store and launcher: a rendezvous that only two lanes
+executing at the same time can satisfy, an overlap counter, a real SIGINT to
+the main thread, and a fake Herdr whose creating verbs are slowed to widen the
+race.
 """
 
 from __future__ import annotations
@@ -305,18 +306,17 @@ class InterruptPausesEveryInFlightLane(_Run):
         self.assertIsNone(scheduler._pool)
 
 
-class ConcurrentFirstLaunchesCreateOneChildPerLane(unittest.TestCase):
-    def test_four_lanes_racing_creation_get_one_parent_and_one_child_each(self) -> None:
+class ConcurrentFirstLaunchesCreateOneTabPerLane(unittest.TestCase):
+    def test_four_lanes_racing_creation_get_one_parent_and_one_tab_each(self) -> None:
         lanes = ["lane-wp{}-build".format(n) for n in range(1, 5)]
         with tempfile.TemporaryDirectory() as tmp:
             run = topo._RunFixture(tmp)
             call_lock = threading.Lock()
 
             def slow_creating_verbs(*args: str, **kw: object) -> dict:
-                # Widen the window between "no child yet" and the child
-                # existing, so an unguarded launcher would open two children
-                # for one lane. The fake's own bookkeeping stays serialized.
-                if args[:2] in (topo.CREATE, topo.OPEN):
+                # Widen the window between "no tab yet" and the tab existing,
+                # so an unguarded launcher would create duplicates.
+                if args[:2] in (topo.CREATE, ("tab", "create")):
                     time.sleep(0.02)
                 with call_lock:
                     return run.herdr(*args, **kw)
@@ -348,22 +348,26 @@ class ConcurrentFirstLaunchesCreateOneChildPerLane(unittest.TestCase):
                 assert isinstance(outcome, lch.LaunchHandle)
                 handles[lane] = outcome
             self.assertEqual(topo._calls_after(run.herdr, 0, topo.CREATE), [])
-            opens = topo._calls_after(run.herdr, 0, topo.OPEN)
-            self.assertEqual(len(opens), len(lanes))
-            self.assertEqual(
-                sorted(str(topo._flag(call, "--label")) for call in opens), sorted(lanes)
+            self.assertEqual(topo._calls_after(run.herdr, 0, topo.OPEN), [])
+            creates = topo._calls_after(run.herdr, 0, ("tab", "create"))
+            self.assertEqual(len(creates), len(lanes))
+            provisional_labels = [str(topo._flag(call, "--label")) for call in creates]
+            self.assertEqual(len(set(provisional_labels)), len(lanes))
+            self.assertTrue(
+                all(label.startswith("maestro-pending-") for label in provisional_labels),
+                provisional_labels,
             )
             parent_id = topo._assert_converged(
                 self, run.herdr, run.launcher(),
                 {lane: {"builder": specs[lane]} for lane in lanes},
             )
-            for call in opens:
+            for call in creates:
                 self.assertEqual(topo._flag(call, "--workspace"), parent_id)
             self.assertEqual(
-                {handles[lane].parent_workspace_id for lane in lanes}, {parent_id}
+                {handles[lane].workspace_id for lane in lanes}, {parent_id}
             )
             self.assertEqual(
-                len({handles[lane].child_workspace_id for lane in lanes}), len(lanes)
+                len({handles[lane].tab_id for lane in lanes}), len(lanes)
             )
 
 

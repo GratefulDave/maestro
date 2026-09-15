@@ -343,6 +343,12 @@ fails. `kill_reviewer` does not reliably close panes. Reviewer panes are not nam
 `maestro-*`; identify them by agent kind, repo cwd, and title. Pane liveness is not
 lane stage.
 
+**Lane panes live in the repository workspace, one tab per lane, one pane per role.**
+The workspace is the one open on the repository `uv run adws/maestro.py` runs against,
+found by a live pane whose `cwd` is the repository root. There is no linked child Space
+per lane: the child-Space topology (#173/#237) put lane panes outside the operator's
+workspace, where they could not be seen.
+
 **A Space's repository binding is `herdr worktree list`, never `WorkspaceInfo.worktree`.**
 Herdr fills that record field in only for a Space it binds when it creates it — a
 `workspace create --cwd <repo>` on a repository that has no source Space yet, or a

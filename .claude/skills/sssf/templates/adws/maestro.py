@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import hashlib
 import json
 import os
 import sqlite3
@@ -15,7 +14,6 @@ import subprocess
 import sys
 import time
 import uuid
-from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
@@ -86,7 +84,6 @@ from adw_modules.plan_model import PlanCompileError
 
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
 _MAESTRO_SCHEMA = "maestro-config.v1"
-_INVOCATION_WORKSPACE: ContextVar[str] = ContextVar("invocation_workspace", default="")
 
 
 class _MaestroConfigurationError(ValueError):
@@ -107,7 +104,7 @@ class _RunRefused(RuntimeError):
 
 
 class CleanupRefused(RuntimeError):
-    """COMPLETE space cleanup failed after publication; panes/cwds remain."""
+    """COMPLETE pane cleanup failed after publication; pane cwds remain."""
 
     code = "CLEANUP_REFUSED"
 
@@ -1698,25 +1695,6 @@ class HerdrStageActor:
             path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _lane_child_anchor(self, ctx: LaneContext, cwd: Path) -> Path | None:
-        return self._child_anchor(ctx.run_id, ctx.lane.lane_id, cwd)
-
-    def _child_anchor(self, run_id: str, lane_id: str, cwd: Path) -> Path | None:
-        invoking = self.launcher.invoking_repository(os.environ)
-        if invoking is None:
-            # Without an invoking Space, retain the target repository's
-            # source-workspace lookup, but never anchor a private role tree.
-            invoking = Path(self.target.target_repository_root)
-        git = gitpub.BoundGit(invoking)
-        owner = hashlib.sha256(str(git.git_common_dir()).encode()).hexdigest()[:16]
-        anchor = self.state_root / "ui-worktrees" / run_id / owner / lane_id
-        if (anchor / ".git").exists():
-            if gitpub.BoundGit(anchor).git_common_dir() != git.git_common_dir():
-                raise FactoryRefused("UI_ANCHOR_GIT_BINDING_MISMATCH")
-        else:
-            self._add_worktree(anchor, "HEAD", repo=invoking, no_checkout=True)
-        return anchor
-
     def restore_layout(self, run_id: str, lanes: Sequence[st.LaneProjection]) -> None:
         """Reopen role shells before native gates, never replay role work."""
         try:
@@ -1743,7 +1721,6 @@ class HerdrStageActor:
                         repository_root=Path(self.target.target_repository_root),
                         workspace_label=str(getattr(self.launcher, "workspace_label", "") or lch.workspace_label_for(self.project_identity, run_id)),
                         pane_group_size=len(lch.LANE_PANE_ROLES), role_cwds=role_cwds,
-                        child_anchor=self._child_anchor(run_id, lane.lane_id, cwd),
                     ))
         except lch.LaunchRefused as exc:
             raise self._launch_failed(exc) from exc
@@ -2088,7 +2065,6 @@ class HerdrStageActor:
             workspace_label=self._workspace_label(ctx),
             pane_group_size=len(lch.LANE_PANE_ROLES),
             role_cwds=self._role_cwds(ctx),
-            child_anchor=self._lane_child_anchor(ctx, cwd),
             prepare_adopted_cwd=prepare_adopted_cwd,
         )
         try:
@@ -2511,22 +2487,16 @@ class HerdrStageActor:
             return token.split(":", 1)[0]
         return ""
 
-    def _handle_space_absent(self, handle: object | None) -> bool:
+    def _handle_pane_absent(self, handle: object | None) -> bool:
         if handle is None:
             return True
         cleaned = getattr(self.launcher, "_cleaned_absent", None)
         pane_id = str(getattr(handle, "pane_id", "") or "")
         workspace_id = str(getattr(handle, "workspace_id", "") or "")
-        parent = str(getattr(handle, "parent_workspace_id", "") or "")
-        child = str(getattr(handle, "child_workspace_id", "") or "")
         if isinstance(cleaned, set):
             if pane_id and pane_id in cleaned:
                 return True
-            if child and child in cleaned:
-                return True
             if workspace_id and workspace_id in cleaned:
-                return True
-            if parent and parent in cleaned and pane_id in cleaned:
                 return True
         poll = getattr(self.launcher, "poll", None)
         if poll is None:
@@ -2583,21 +2553,15 @@ class HerdrStageActor:
             refused = exc
         except BaseException as exc:
             refused = exc
-        success = refused is None
-        for key, stored in sessions:
-            if success or self._handle_space_absent(stored.handle):
+        if refused is None:
+            for key, stored in sessions:
                 self._roles.pop(key, None)
                 self._safe_remove_attempt(stored.attempt, stored.checkout)
-        if refused is None:
-            anchors = self.state_root / "ui-worktrees" / run_id
-            if anchors.is_dir():
-                for anchor in anchors.glob("*/*"):
-                    if (anchor / ".git").is_file():
-                        subprocess.check_call(
-                            ["git", "-C", str(anchor), "worktree", "remove", "--force", str(anchor)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        )
             return
+        for key, stored in sessions:
+            if self._handle_pane_absent(stored.handle):
+                self._roles.pop(key, None)
+                self._safe_remove_attempt(stored.attempt, stored.checkout)
         if isinstance(refused, lch.LaunchRefused):
             raise CleanupRefused(
                 "{}:{}".format(refused.refusal.code, refused.detail)
@@ -2669,7 +2633,6 @@ def _actor_for(
         provision_timeout_s=layout.get("provision_timeout_s")
         or lch.PROVISION_TIMEOUT_S,
         workspace_label=lch.workspace_label_for(_project_identity(target), run_id),
-        parent_workspace_id=_INVOCATION_WORKSPACE.get(),
     )
     plan = json.loads(compiled.plan_bytes)
     lane_specs = {
@@ -3894,7 +3857,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if plan_name is not None:
             parser.error("--plan is the whole invocation; it takes no verb")
         handler = args.handler
-    invocation = _INVOCATION_WORKSPACE.set(os.environ.get("HERDR_WORKSPACE_ID", ""))
     try:
         return int(handler(args))
     except _RunRefused as exc:
@@ -3940,8 +3902,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if detail is None:
             raise
         return _RunRefused(cr.SEALED_ENVIRONMENT_OUTCOME, detail).emit()
-    finally:
-        _INVOCATION_WORKSPACE.reset(invocation)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Persistent role panes, project+run workspaces, resume reconnect."""
+"""Persistent role panes in direct lane tabs, with resume reconnect."""
 
 from __future__ import annotations
 
@@ -21,8 +21,7 @@ PROJECT = "FDAdb"
 RUN_HASH = "e892fe8df79046ca8ea6504934e912c6"
 RUN_PREFIXED = "run-9f20c17fabcdef0123456789"
 REPO = "repo-fdadb"
-PARENT_ID = "wP"
-CHILD_ID = "w9"
+PARENT_ID = "w9"
 LANE = "lane-a"
 
 
@@ -46,10 +45,7 @@ def _bare_launcher(
     launcher._tailers = {}
     launcher._quiescent_since = {}
     launcher._proven_absent = {}
-    launcher._split_parent_id = None
     launcher._parent_workspace_id = ""
-    launcher._invocation_workspace_id = ""
-    launcher._workspace_id = ""
     launcher._run_id = run_id
     launcher._repository_fingerprint = fingerprint
     #: The primary checkout the hand-rolled `_parent_record` binds to.
@@ -73,12 +69,6 @@ def _attempt_checkout(
     return path
 
 
-def _parent_tokens() -> dict[str, str]:
-    return {
-        lch.METADATA_TOKEN_KIND: lch.METADATA_KIND_RUN,
-        lch.METADATA_TOKEN_RUN: RUN_HASH,
-        lch.METADATA_TOKEN_REPO: REPO,
-    }
 
 
 def _lane_tokens(parent_id: str = PARENT_ID, lane: str = LANE) -> dict[str, str]:
@@ -89,6 +79,7 @@ def _lane_tokens(parent_id: str = PARENT_ID, lane: str = LANE) -> dict[str, str]
         lch.METADATA_TOKEN_RUN: RUN_HASH,
         lch.METADATA_TOKEN_REPO: REPO,
     }
+
 
 def _pane_tokens(
     role: str, parent_id: str = PARENT_ID, lane: str = LANE
@@ -103,24 +94,10 @@ def _parent_record(workspace_id: str = PARENT_ID) -> dict:
     return _workspace_info(
         workspace_id,
         lch.workspace_label_for(PROJECT, RUN_HASH),
-        tokens=_parent_tokens(),
-        checkout="/repo/product",
-        linked=False,
+        tokens=None,
     )
 
 
-def _child_record(
-    workspace_id: str = CHILD_ID,
-    parent_id: str = PARENT_ID,
-    lane: str = LANE,
-) -> dict:
-    return _workspace_info(
-        workspace_id,
-        lane,
-        tokens=_lane_tokens(parent_id, lane),
-        checkout="/repo/product-{}".format(lane),
-        linked=True,
-    )
 
 
 def _workspace_info(
@@ -128,10 +105,8 @@ def _workspace_info(
     label: str,
     *,
     tokens: dict[str, str] | None,
-    checkout: str,
-    linked: bool,
 ) -> dict:
-    """A real-shaped `WorkspaceInfo` (herdr 0.8.2); `tokens` only when tagged."""
+    """A real-shaped `WorkspaceInfo`; `tokens` is present only when tagged."""
     record = {
         "workspace_id": workspace_id,
         "number": 1,
@@ -141,13 +116,6 @@ def _workspace_info(
         "tab_count": 1,
         "active_tab_id": "{}:t1".format(workspace_id),
         "agent_status": "unknown",
-        "worktree": {
-            "repo_key": "repo:/repo/product",
-            "repo_name": "product",
-            "repo_root": "/repo/product",
-            "checkout_path": checkout,
-            "is_linked_worktree": linked,
-        },
     }
     if tokens:
         record["tokens"] = dict(tokens)
@@ -160,45 +128,12 @@ def _topology_reply(
     panes: list[dict] | None = None,
     tab_id: str = "w9:t1",
 ) -> dict | None:
+    """Common direct-tab topology replies for hand-rolled Herdr fixtures."""
     verb = args[:2]
     if verb == ("workspace", "list"):
-        return {"result": {"workspaces": [_parent_record(), _child_record()]}}
-    if verb == ("workspace", "get"):
-        workspace_id = args[2]
-        if workspace_id == PARENT_ID:
-            return {"result": {"workspace": _parent_record()}}
-        if workspace_id == CHILD_ID:
-            return {"result": {"workspace": _child_record()}}
-        return None
-    if verb == ("worktree", "list"):
-        # The repository's whole worktree set, as Herdr answers it: the
-        # source checkout first, carrying the Space open on it, then the
-        # linked lane children. This is where a Space's binding is read
-        # from -- `WorkspaceInfo.worktree` is not it.
-        return {
-            "result": {
-                "source": {
-                    "repo_key": "repo:/repo/product",
-                    "repo_name": "product",
-                    "repo_root": "/repo/product",
-                    "source_checkout_path": "/repo/product",
-                    "source_workspace_id": PARENT_ID,
-                },
-                "worktrees": [
-                    {
-                        "path": "/repo/product",
-                        "open_workspace_id": PARENT_ID,
-                        "is_linked_worktree": False,
-                        "label": "product",
-                    },
-                    {
-                        "open_workspace_id": CHILD_ID,
-                        "is_linked_worktree": True,
-                        "label": LANE,
-                    },
-                ],
-            }
-        }
+        return {"result": {"workspaces": [_parent_record()]}}
+    if verb == ("workspace", "get") and args[2] == PARENT_ID:
+        return {"result": {"workspace": _parent_record()}}
     if verb == ("tab", "list"):
         return {
             "result": {
@@ -206,14 +141,27 @@ def _topology_reply(
                     {
                         "tab_id": tab_id,
                         "label": LANE,
-                        "workspace_id": CHILD_ID,
+                        "workspace_id": PARENT_ID,
                     }
                 ]
             }
         }
-    if verb == ("pane", "list") and panes is not None:
-        return {"result": {"panes": list(panes)}}
-    if verb in (("workspace", "report-metadata"), ("pane", "report-metadata")):
+    if verb == ("pane", "list"):
+        listed = (
+            list(panes)
+            if panes is not None
+            else [
+                {
+                    "pane_id": "w9:p0",
+                    "tab_id": "w9:t0",
+                    "workspace_id": PARENT_ID,
+                    "cwd": "/repo/product",
+                    "label": "",
+                }
+            ]
+        )
+        return {"result": {"panes": listed}}
+    if verb == ("pane", "report-metadata"):
         return {}
     return None
 
@@ -252,7 +200,7 @@ class WorkspaceLabelTest(unittest.TestCase):
 
 
 class WorkspaceAdoptTest(unittest.TestCase):
-    def test_run_workspace_adopts_matching_metadata(self) -> None:
+    def test_run_workspace_adopts_matching_pane_cwd(self) -> None:
         launcher = _bare_launcher("FDAdb-e892")
         calls: list[tuple[str, ...]] = []
 
@@ -266,54 +214,39 @@ class WorkspaceAdoptTest(unittest.TestCase):
 
         launcher._herdr = fake_herdr  # type: ignore[method-assign]
         self.assertEqual(launcher._run_workspace({}), PARENT_ID)
-        # The parent is resolved from the repository's worktree listing --
-        # once, keyed on the checkout -- and not from `workspace list`, whose
-        # records carry no binding to match on.
-        listings = [call for call in calls if call[:2] == ("worktree", "list")]
-        self.assertEqual(len(listings), 1)
-        self.assertIn("--cwd", listings[0])
-        self.assertFalse(any(call[:2] == ("workspace", "list") for call in calls))
+        # The repository workspace is selected from its actual pane cwd, not
+        # from labels or Maestro metadata.
+        self.assertEqual(
+            [call[:2] for call in calls],
+            [("workspace", "list"), ("pane", "list")],
+        )
         self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
 
-    def test_untagged_space_on_the_repo_is_the_parent_and_is_not_tagged(self) -> None:
-        """The operator's own Space -- the one Herdr names as the source
-        checkout, carrying no Maestro tokens and no `worktree` field of its
-        own -- is the parent. It is adopted by binding and never tagged."""
+    def test_untagged_workspace_on_repo_is_parent_and_not_tagged(self) -> None:
+        """The operator's untagged repository workspace is selected by pane cwd."""
         launcher = _bare_launcher("FDAdb-e892")
         calls: list[tuple[str, ...]] = []
-        # Exactly the shape Herdr reports for a Space the operator opened:
-        # no `worktree` key at all, while `worktree list` names it the source.
-        operator = _workspace_info(
-            "wOP", "product", tokens=None, checkout="/repo/product", linked=False
-        )
-        operator.pop("worktree")
+        operator = _workspace_info("wOP", "product", tokens=None)
 
         def fake_herdr(*args: str, **kwargs: object) -> dict:
             del kwargs
             calls.append(args)
-            if args[:2] == ("worktree", "list"):
+            if args[:2] == ("workspace", "list"):
+                return {"result": {"workspaces": [operator]}}
+            if args[:2] == ("pane", "list"):
                 return {
                     "result": {
-                        "type": "worktree_list",
-                        "source": {
-                            "repo_key": "repo:/repo/product",
-                            "repo_name": "product",
-                            "repo_root": "/repo/product",
-                            "source_checkout_path": "/repo/product",
-                            "source_workspace_id": "wOP",
-                        },
-                        "worktrees": [
+                        "panes": [
                             {
-                                "path": "/repo/product",
-                                "open_workspace_id": "wOP",
-                                "is_linked_worktree": False,
-                                "label": "product",
+                                "pane_id": "wOP:p1",
+                                "tab_id": "wOP:t1",
+                                "workspace_id": "wOP",
+                                "cwd": "/repo/product",
+                                "label": "",
                             }
-                        ],
+                        ]
                     }
                 }
-            if args[:2] == ("workspace", "get") and args[2] == "wOP":
-                return {"result": {"type": "workspace_info", "workspace": operator}}
             raise AssertionError(args)
 
         launcher._herdr = fake_herdr  # type: ignore[method-assign]
@@ -327,20 +260,18 @@ class WorkspaceAdoptTest(unittest.TestCase):
     def test_acquire_pane_reuses_role_without_split(self) -> None:
         launcher = _bare_launcher("product run-1")
         launcher._parent_workspace_id = PARENT_ID
-        launcher._workspace_id = PARENT_ID
         layout = lch._TabLayout(
             tab_id="w9:t1",
             panes=["w9:p1"],
             claimed=1,
             parent_workspace_id=PARENT_ID,
-            child_workspace_id=CHILD_ID,
             lane_key=LANE,
             lane_label=LANE,
         )
         layout.role_panes["tester"] = "w9:p1"
         launcher._tabs[LANE] = layout
         with tempfile.TemporaryDirectory() as tmp:
-            worktree = Path(tmp)
+            worktree = Path(tmp).resolve()
             spec = lch.LaunchSpec(
                 correlation_token=lch.role_session_token(RUN_HASH, LANE, "tester"),
                 worktree=worktree,
@@ -358,26 +289,30 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 workspace_label="product run-1",
             )
 
+            pane = {
+                "pane_id": "w9:p1",
+                "tab_id": "w9:t1",
+                "workspace_id": PARENT_ID,
+                "cwd": str(worktree),
+                "label": "tester",
+                "agent_status": "idle",
+                "tokens": _pane_tokens("tester"),
+            }
             calls: list[tuple[str, ...]] = []
 
             def fake_herdr(*args: str, **kwargs: object) -> dict:
                 del kwargs
                 calls.append(args)
                 if args[:2] == ("pane", "get") and args[2] == "w9:p1":
-                    # A reuse is proven live with one `pane get`.
                     return {
                         "result": {
                             "type": "pane_info",
-                            "pane": {
-                                "pane_id": "w9:p1",
-                                "tab_id": "w9:t1",
-                                "workspace_id": "w9",
-                                "cwd": str(worktree),
-                                "label": "tester",
-                                "agent_status": "idle",
-                            },
+                            "pane": dict(pane),
                         }
                     }
+                placed = _topology_reply(args, panes=[pane])
+                if placed is not None:
+                    return placed
                 raise AssertionError(args)
 
             launcher._herdr = fake_herdr  # type: ignore[method-assign]
@@ -385,15 +320,31 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 spec, worktree, _role_environment(worktree)
             )
         self.assertEqual(pane_id, "w9:p1")
-        self.assertIs(found, layout)
+        self.assertEqual(found.tab_id, layout.tab_id)
+        self.assertIs(launcher._tabs[LANE], found)
         self.assertTrue(reused)
-        self.assertEqual(layout.role_panes, {"tester": "w9:p1"})
-        self.assertEqual([call[:2] for call in calls], [("pane", "get")])
+        self.assertEqual(found.role_panes, {"tester": "w9:p1"})
+        observed = [call[:2] for call in calls]
+        self.assertIn(("pane", "list"), observed)
+        self.assertIn(("tab", "list"), observed)
+        self.assertIn(("workspace", "get"), observed)
+        self.assertNotIn(("worktree", "list"), observed)
+        self.assertFalse(
+            any(
+                call[:2]
+                in {
+                    ("worktree", "open"),
+                    ("workspace", "create"),
+                    ("tab", "create"),
+                    ("pane", "split"),
+                }
+                for call in calls
+            )
+        )
 
-    def test_adoption_replaces_agentless_shells_without_closing_live_role(self) -> None:
+    def test_adoption_reuses_authenticated_agentless_role_shell(self) -> None:
         launcher = _bare_launcher("product run-1")
         launcher._parent_workspace_id = PARENT_ID
-        launcher._workspace_id = PARENT_ID
         tester_pane = "w9:p1"
         stale_builder = "w9:p3"
         payload = {
@@ -402,31 +353,25 @@ class WorkspaceAdoptTest(unittest.TestCase):
                     {
                         "pane_id": tester_pane,
                         "tab_id": "w9:t1",
-                        "workspace_id": CHILD_ID,
+                        "workspace_id": PARENT_ID,
                         "label": "tester",
                         "agent_status": "working",
+                        "tokens": _pane_tokens("tester"),
                     },
                     {
                         "pane_id": stale_builder,
                         "tab_id": "w9:t1",
-                        "workspace_id": CHILD_ID,
+                        "workspace_id": PARENT_ID,
                         "label": "builder",
                         "agent_status": "unknown",
+                        "tokens": _pane_tokens("builder"),
                     },
                 ]
             }
         }
-        layout = launcher._validated_role_layout(
-            "w9:t1",
-            payload,
-            parent_workspace_id=PARENT_ID,
-            child_workspace_id=CHILD_ID,
-            lane_key=LANE,
-            lane_label=LANE,
-        )
-        launcher._tabs[LANE] = layout
         closed: list[str] = []
         split_calls: list[tuple[str, ...]] = []
+        renamed: dict[str, str] = {}
 
         def fake_herdr(*args: str, **kwargs: object) -> dict:
             del kwargs
@@ -439,12 +384,32 @@ class WorkspaceAdoptTest(unittest.TestCase):
                     "result": {
                         "pane": {
                             "pane_id": "w9:p6",
-                            "workspace_id": CHILD_ID,
+                            "workspace_id": PARENT_ID,
                             "tab_id": "w9:t1",
                         }
                     }
                 }
-            placed = _topology_reply(args)
+            if args[:2] == ("pane", "rename"):
+                renamed[args[2]] = args[3]
+                return {"result": {"renamed": True}}
+            if args[:2] == ("pane", "get"):
+                if args[2] == "w9:p6":
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": "w9:p6",
+                                "workspace_id": PARENT_ID,
+                                "tab_id": "w9:t1",
+                                "label": renamed.get("w9:p6", ""),
+                            }
+                        }
+                    }
+                for pane in payload["result"]["panes"]:
+                    if pane["pane_id"] == args[2]:
+                        current = dict(pane)
+                        current["label"] = renamed.get(args[2], current["label"])
+                        return {"result": {"pane": current}}
+            placed = _topology_reply(args, panes=payload["result"]["panes"])
             if placed is not None:
                 return placed
             raise AssertionError(args)
@@ -452,8 +417,20 @@ class WorkspaceAdoptTest(unittest.TestCase):
         launcher._herdr = fake_herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            builder = root / "builder"
+            tester = (root / "tester").resolve()
+            builder = (root / "builder").resolve()
+            tester.mkdir()
             builder.mkdir()
+            payload["result"]["panes"][0]["cwd"] = str(tester)
+            payload["result"]["panes"][1]["cwd"] = str(builder)
+            layout = launcher._validated_role_layout(
+                "w9:t1",
+                payload,
+                parent_workspace_id=PARENT_ID,
+                lane_key=LANE,
+                lane_label=LANE,
+            )
+            launcher._tabs[LANE] = layout
             environment = _role_environment(builder)
             spec = lch.LaunchSpec(
                 correlation_token=lch.role_session_token(RUN_HASH, LANE, "builder"),
@@ -473,25 +450,21 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 repository_fingerprint=REPO,
                 workspace_label="product run-1",
             )
-            pane_id, found, reused = launcher._acquire_pane(
-                spec, builder, environment
-            )
+            pane_id, found, reused = launcher._acquire_pane(spec, builder, environment)
 
-        self.assertIs(found, layout)
-        self.assertFalse(reused)
-        self.assertEqual(layout.role_panes["tester"], tester_pane)
-        self.assertEqual(closed, [stale_builder])
-        self.assertEqual(pane_id, "w9:p6")
-        self.assertEqual(layout.role_panes["builder"], "w9:p6")
-        self.assertEqual(len(split_calls), 1)
-        self.assertTrue(
-            _env_from_herdr_args(split_calls[0])["TMPDIR"].startswith(
-                str(builder.resolve())
-            )
-        )
+        self.assertEqual(found.tab_id, layout.tab_id)
+        self.assertIs(launcher._tabs[LANE], found)
+        self.assertTrue(reused)
+        self.assertEqual(found.role_panes["tester"], tester_pane)
+        self.assertEqual(closed, [])
+        self.assertEqual(pane_id, stale_builder)
+        self.assertEqual(found.role_panes["builder"], stale_builder)
+        self.assertEqual(split_calls, [])
+        self.assertEqual(renamed, {stale_builder: "builder"})
 
     def test_reconnect_live_agent_does_not_create_workspace(self) -> None:
         launcher = _bare_launcher("product run-1")
+        launcher._parent_workspace_id = PARENT_ID
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
             token = lch.role_session_token("run-1", "lane-a", "tester")
@@ -508,8 +481,13 @@ class WorkspaceAdoptTest(unittest.TestCase):
                     return {
                         "result": {
                             "agent": {
+                                "name": name,
                                 "pane_id": "w9:p1",
+                                "workspace_id": PARENT_ID,
+                                "tab_id": "w9:t1",
+                                "cwd": str(worktree),
                                 "agent_status": "idle",
+                                "interactive_ready": True,
                                 "agent_session": {
                                     "kind": "path",
                                     "value": str(transcript),
@@ -523,9 +501,10 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             "pane": {
                                 "pane_id": "w9:p1",
                                 "tab_id": "w9:t1",
-                                "workspace_id": CHILD_ID,
+                                "workspace_id": PARENT_ID,
                                 "cwd": str(worktree),
                                 "label": "tester",
+                                "agent_status": "idle",
                                 "tokens": _pane_tokens("tester"),
                             }
                         }
@@ -537,28 +516,12 @@ class WorkspaceAdoptTest(unittest.TestCase):
                                 {
                                     "pane_id": "w9:p1",
                                     "tab_id": "w9:t1",
+                                    "workspace_id": PARENT_ID,
+                                    "cwd": str(worktree),
                                     "label": "tester",
-                                },
-                                {
-                                    "pane_id": "w9:p2",
-                                    "tab_id": "w9:t1",
-                                    "label": "test-reviewer",
-                                },
-                                {
-                                    "pane_id": "w9:p3",
-                                    "tab_id": "w9:t1",
-                                    "label": "builder",
-                                },
-                                {
-                                    "pane_id": "w9:p4",
-                                    "tab_id": "w9:t1",
-                                    "label": "code-reviewer",
-                                },
-                                {
-                                    "pane_id": "w9:p5",
-                                    "tab_id": "w9:t1",
-                                    "label": "integration-reviewer",
-                                },
+                                    "agent_status": "idle",
+                                    "tokens": _pane_tokens("tester"),
+                                }
                             ]
                         }
                     }
@@ -589,6 +552,8 @@ class WorkspaceAdoptTest(unittest.TestCase):
             self.assertEqual(handle.agent_name, name)
             self.assertEqual(handle.transcript_path, transcript)
             self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
+            self.assertFalse(any(call[:2] == ("worktree", "open") for call in calls))
+            self.assertFalse(any(call[:2] == ("tab", "create") for call in calls))
             self.assertFalse(any(call[:2] == ("pane", "split") for call in calls))
             self.assertFalse(any(call[:2] == ("agent", "start") for call in calls))
             self.assertIn(("lane-a", "tester"), launcher._role_handles)
@@ -602,18 +567,28 @@ class WorkspaceAdoptTest(unittest.TestCase):
             transcript = worktree / "omp.jsonl"
             transcript.write_text("{}\n", encoding="utf-8")
 
+            calls: list[tuple[str, ...]] = []
+
             def fake_herdr(*args: str, **kwargs: object) -> dict:
                 del kwargs
+                calls.append(args)
                 if args[:2] == ("agent", "get"):
                     self.assertEqual(args[2], name)
                     return {
                         "result": {
-                            "pane_id": "w9:p4",
-                            "agent_status": "idle",
-                            "agent_session": {
-                                "kind": "path",
-                                "value": str(transcript),
-                            },
+                            "agent": {
+                                "name": name,
+                                "pane_id": "w9:p4",
+                                "workspace_id": PARENT_ID,
+                                "tab_id": "w9:t1",
+                                "cwd": str(worktree),
+                                "agent_status": "idle",
+                                "interactive_ready": True,
+                                "agent_session": {
+                                    "kind": "path",
+                                    "value": str(transcript),
+                                },
+                            }
                         }
                     }
                 if args[:2] == ("pane", "get"):
@@ -622,9 +597,10 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             "pane": {
                                 "pane_id": "w9:p4",
                                 "tab_id": "w9:t1",
-                                "workspace_id": CHILD_ID,
+                                "workspace_id": PARENT_ID,
                                 "cwd": str(worktree),
                                 "label": "builder",
+                                "agent_status": "idle",
                                 "tokens": _pane_tokens("builder"),
                             }
                         }
@@ -634,30 +610,14 @@ class WorkspaceAdoptTest(unittest.TestCase):
                         "result": {
                             "panes": [
                                 {
-                                    "pane_id": "w9:p1",
-                                    "tab_id": "w9:t1",
-                                    "label": "tester",
-                                },
-                                {
-                                    "pane_id": "w9:p2",
-                                    "tab_id": "w9:t1",
-                                    "label": "test-reviewer",
-                                },
-                                {
                                     "pane_id": "w9:p4",
                                     "tab_id": "w9:t1",
+                                    "workspace_id": PARENT_ID,
+                                    "cwd": str(worktree),
                                     "label": "builder",
-                                },
-                                {
-                                    "pane_id": "w9:p5",
-                                    "tab_id": "w9:t1",
-                                    "label": "code-reviewer",
-                                },
-                                {
-                                    "pane_id": "w9:p6",
-                                    "tab_id": "w9:t1",
-                                    "label": "integration-reviewer",
-                                },
+                                    "agent_status": "idle",
+                                    "tokens": _pane_tokens("builder"),
+                                }
                             ]
                         }
                     }
@@ -681,8 +641,10 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 workspace_label="product run-1",
             )
             first = _bare_launcher("product run-1")
+            first._parent_workspace_id = PARENT_ID
             first._herdr = fake_herdr  # type: ignore[method-assign]
             second = _bare_launcher("product run-1")
+            second._parent_workspace_id = PARENT_ID
             second._herdr = fake_herdr  # type: ignore[method-assign]
             handle = first._reconnect_live_agent(spec, {})
             adopted = second._reconnect_live_agent(spec, {})
@@ -699,6 +661,11 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 first._role_handles[("lane-a", "builder")],
                 second._role_handles[("lane-a", "builder")],
             )
+            self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
+            self.assertFalse(any(call[:2] == ("worktree", "open") for call in calls))
+            self.assertFalse(any(call[:2] == ("tab", "create") for call in calls))
+            self.assertFalse(any(call[:2] == ("pane", "split") for call in calls))
+            self.assertFalse(any(call[:2] == ("agent", "start") for call in calls))
 
     def test_stable_reconnect_prior_digest_cwd_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -737,7 +704,7 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             "pane": {
                                 "pane_id": "w9:p1",
                                 "tab_id": "w9:t1",
-                                "workspace_id": "w9",
+                                "workspace_id": PARENT_ID,
                                 "label": "tester",
                                 "cwd": str(prior),
                                 "tokens": _pane_tokens("tester"),
@@ -860,6 +827,7 @@ class WorkspaceAdoptTest(unittest.TestCase):
 
     def test_label_pane_uses_exact_persistent_role(self) -> None:
         launcher = _bare_launcher("product run-1")
+        launcher._parent_workspace_id = PARENT_ID
         renamed: list[str] = []
 
         def fake_herdr(*args: str, **kwargs: object) -> dict:
@@ -991,7 +959,7 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 "w9:p4",
                 lch.agent_name_for(token),
                 old,
-                workspace_id="w9",
+                workspace_id=PARENT_ID,
                 tab_id="w9:t1",
                 lane_key="lane-a",
             )
@@ -1012,16 +980,21 @@ class WorkspaceAdoptTest(unittest.TestCase):
                 prepare_adopted_cwd=lambda cwd: events.append("prepare:" + str(cwd)),
             )
             agent = {
-                "pane_id": "w9:p4",
-                "agent_status": "idle",
                 "name": handle.agent_name,
+                "pane_id": "w9:p4",
+                "workspace_id": PARENT_ID,
+                "tab_id": "w9:t1",
+                "cwd": str(old),
+                "agent_status": "idle",
+                "interactive_ready": True,
             }
             pane = {
                 "pane_id": "w9:p4",
                 "tab_id": "w9:t1",
-                "workspace_id": "w9",
+                "workspace_id": PARENT_ID,
                 "cwd": str(old),
                 "label": "builder",
+                "agent_status": "idle",
                 "tokens": _pane_tokens("builder"),
             }
             with (
@@ -1225,7 +1198,11 @@ class WorkspaceAdoptTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
+                if args[:2] in (
+                    ("agent", "start"),
+                    ("agent", "get"),
+                    ("agent", "focus"),
+                ):
                     return agent_record()
                 raise AssertionError(args)
 
@@ -1294,99 +1271,8 @@ class BuilderFindingsRoutingTest(unittest.TestCase):
         )
 
 
-class TabAdoptTest(unittest.TestCase):
-    def test_adopt_existing_lane_maps_role_labels(self) -> None:
-        launcher = _bare_launcher("product run-1")
-        launcher._parent_workspace_id = PARENT_ID
-        panes = [
-            {
-                "pane_id": "w9:p5",
-                "tab_id": "w9:t2",
-                "workspace_id": CHILD_ID,
-                "label": "integration-reviewer",
-            },
-            {
-                "pane_id": "w9:p3",
-                "tab_id": "w9:t2",
-                "workspace_id": CHILD_ID,
-                "label": "tester",
-            },
-            {
-                "pane_id": "w9:p4",
-                "tab_id": "w9:t2",
-                "workspace_id": CHILD_ID,
-                "label": "builder",
-            },
-            {
-                "pane_id": "w9:p2",
-                "tab_id": "w9:t2",
-                "workspace_id": CHILD_ID,
-                "label": "test-reviewer",
-            },
-            {
-                "pane_id": "w9:p6",
-                "tab_id": "w9:t2",
-                "workspace_id": CHILD_ID,
-                "label": "code-reviewer",
-            },
-        ]
-
-        def fake_herdr(*args: str, **kwargs: object) -> dict:
-            del kwargs
-            if args[:2] == ("pane", "list"):
-                return {"result": {"panes": panes}}
-            placed = _topology_reply(args, tab_id="w9:t2")
-            if placed is not None:
-                return placed
-            raise AssertionError(args)
-
-        launcher._herdr = fake_herdr  # type: ignore[method-assign]
-        layout = launcher._adopt_existing_lane(PARENT_ID, LANE, LANE, Path("/repo/product-lane-a"), {})
-        self.assertIsNotNone(layout)
-        assert layout is not None
-        self.assertEqual(layout.tab_id, "w9:t2")
-        self.assertEqual(layout.parent_workspace_id, PARENT_ID)
-        self.assertEqual(layout.child_workspace_id, CHILD_ID)
-        self.assertEqual(layout.role_panes["tester"], "w9:p3")
-        self.assertEqual(layout.role_panes["test-reviewer"], "w9:p2")
-        self.assertEqual(layout.role_panes["builder"], "w9:p4")
-        self.assertEqual(layout.role_panes["code-reviewer"], "w9:p6")
-        self.assertEqual(layout.role_panes["integration-reviewer"], "w9:p5")
-        self.assertEqual(layout.panes, ["w9:p5", "w9:p3", "w9:p4", "w9:p2", "w9:p6"])
-
-    def test_adopt_existing_lane_refuses_unknown_pane_label(self) -> None:
-        launcher = _bare_launcher("product run-1")
-        launcher._parent_workspace_id = PARENT_ID
-
-        def fake_herdr(*args: str, **kwargs: object) -> dict:
-            del kwargs
-            if args[:2] == ("pane", "list"):
-                return {
-                    "result": {
-                        "panes": [
-                            {
-                                "pane_id": "w9:p3",
-                                "tab_id": "w9:t2",
-                                "workspace_id": CHILD_ID,
-                                "label": "builder-a2",
-                            }
-                        ]
-                    }
-                }
-            placed = _topology_reply(args, tab_id="w9:t2")
-            if placed is not None:
-                return placed
-            raise AssertionError(args)
-
-        launcher._herdr = fake_herdr  # type: ignore[method-assign]
-        with self.assertRaises(lch.LaunchRefused) as raised:
-            launcher._adopt_existing_lane(PARENT_ID, LANE, LANE, Path("/repo/product-lane-a"), {})
-        self.assertEqual(raised.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH)
-        self.assertIn("UNMIGRATED_PANE_LABEL", raised.exception.detail)
-
-
-class FivePaneTopologyTest(unittest.TestCase):
-    def test_first_role_opens_linked_child_without_eager_splits(self) -> None:
+class LaneTabTopologyTest(unittest.TestCase):
+    def test_first_role_creates_lane_tab_without_eager_role_splits(self) -> None:
         herdr = FakeHerdr()
         launcher = _bare_launcher("product run-1")
         launcher._herdr = herdr  # type: ignore[method-assign]
@@ -1419,31 +1305,33 @@ class FivePaneTopologyTest(unittest.TestCase):
                 spec, tester, _role_environment(tester)
             )
             self.assertFalse(reused)
-            creates = [call for call in herdr.calls if call[:2] == ("workspace", "create")]
+            creates = [
+                call for call in herdr.calls if call[:2] == ("workspace", "create")
+            ]
             opens = [call for call in herdr.calls if call[:2] == ("worktree", "open")]
+            tabs = [call for call in herdr.calls if call[:2] == ("tab", "create")]
             splits = [call for call in herdr.calls if call[:2] == ("pane", "split")]
             self.assertEqual(creates, [])
-            self.assertEqual(len(opens), 1)
+            self.assertEqual(opens, [])
+            self.assertEqual(len(tabs), 1)
             self.assertEqual(len(splits), 1)
             first_env = _env_from_herdr_args(splits[0])
             for key in lch.PANE_ENV_KEYS:
-                self.assertEqual(
-                    first_env[key], _role_environment(tester)[key]
-                )
+                self.assertEqual(first_env[key], _role_environment(tester)[key])
             self.assertIn(splits[0][2], herdr.closed_panes)
             self.assertEqual(layout.role_panes, {"tester": pane_id})
             self.assertNotIn("builder", layout.role_panes)
             self.assertEqual(layout.parent_workspace_id, launcher._parent_workspace_id)
             parent = herdr.workspaces[layout.parent_workspace_id]
-            child = herdr.workspaces[layout.child_workspace_id]
-            # The parent is the operator's own Space, so it carries no
-            # tokens of Maestro's; the lane child it hangs under does.
             self.assertNotIn("tokens", parent)
-            self.assertEqual(child["tokens"][lch.METADATA_TOKEN_LANE], LANE)
+            lane_tab = herdr.tabs[layout.tab_id]
+            self.assertEqual(lane_tab["workspace_id"], layout.parent_workspace_id)
+            self.assertEqual(lane_tab["label"], LANE)
+            role_pane = herdr.panes[pane_id]
+            self.assertEqual(role_pane["workspace_id"], layout.parent_workspace_id)
             self.assertEqual(
-                child["tokens"][lch.METADATA_TOKEN_PARENT], layout.parent_workspace_id
+                role_pane["tokens"][lch.METADATA_TOKEN_ROLE], "tester"
             )
-            self.assertTrue(child["worktree"]["is_linked_worktree"])
             reviewer_spec = lch.LaunchSpec(
                 correlation_token=lch.role_session_token(
                     RUN_HASH, LANE, "integration-reviewer"
@@ -1466,17 +1354,22 @@ class FivePaneTopologyTest(unittest.TestCase):
             second, found, second_reused = launcher._acquire_pane(
                 reviewer_spec, reviewer, _role_environment(reviewer)
             )
-            self.assertIs(found, layout)
+            # `_acquire_pane` re-discovers Herdr's authoritative layout after
+            # taking its cross-process lock, so the second layout is a fresh
+            # value object rather than the first in-memory snapshot.
             self.assertFalse(second_reused)
             self.assertNotEqual(second, pane_id)
-            self.assertEqual(found.child_workspace_id, layout.child_workspace_id)
+            self.assertEqual(found.parent_workspace_id, layout.parent_workspace_id)
             self.assertEqual(
                 sum(1 for call in herdr.calls if call[:2] == ("pane", "split")),
                 2,
             )
-            self.assertEqual(len(layout.role_panes), 2)
+            self.assertEqual(
+                found.role_panes,
+                {"tester": pane_id, "integration-reviewer": second},
+            )
 
-    def test_non_tester_first_launch_opens_child_at_that_role_cwd(self) -> None:
+    def test_non_tester_first_launch_creates_lane_tab_at_role_cwd(self) -> None:
         herdr = FakeHerdr()
         launcher = _bare_launcher("product run-1")
         launcher._herdr = herdr  # type: ignore[method-assign]
@@ -1505,25 +1398,22 @@ class FivePaneTopologyTest(unittest.TestCase):
                 repository_fingerprint=REPO,
                 workspace_label="product run-1",
             )
-            pane_id, layout, reused = launcher._acquire_pane(
-                spec, builder, builder_env
-            )
+            pane_id, layout, reused = launcher._acquire_pane(spec, builder, builder_env)
             self.assertEqual(pane_id, layout.role_panes["builder"])
             self.assertFalse(reused)
             self.assertEqual(layout.role_panes, {"builder": pane_id})
             opens = [call for call in herdr.calls if call[:2] == ("worktree", "open")]
-            self.assertEqual(len(opens), 1)
-            self.assertEqual(opens[0][opens[0].index("--path") + 1], str(builder))
+            self.assertEqual(opens, [])
+            tabs = [call for call in herdr.calls if call[:2] == ("tab", "create")]
+            self.assertEqual(len(tabs), 1)
+            self.assertEqual(tabs[0][tabs[0].index("--cwd") + 1], str(builder))
             splits = [call for call in herdr.calls if call[:2] == ("pane", "split")]
             self.assertEqual(len(splits), 1)
             split_env = _env_from_herdr_args(splits[0])
             for key in lch.PANE_ENV_KEYS:
                 self.assertEqual(split_env[key], builder_env[key])
-            self.assertFalse(
-                any(call[:2] == ("tab", "create") for call in herdr.calls)
-            )
 
-    def test_second_role_split_stays_in_child_workspace(self) -> None:
+    def test_second_role_split_stays_in_lane_tab(self) -> None:
         herdr = FakeHerdr()
         launcher = _bare_launcher("product run-1")
         launcher._herdr = herdr  # type: ignore[method-assign]
@@ -1577,7 +1467,6 @@ class FivePaneTopologyTest(unittest.TestCase):
             second, found, reused = launcher._acquire_pane(
                 builder_spec, builder, builder_env
             )
-            self.assertIs(found, layout)
             self.assertFalse(reused)
             splits = [call for call in herdr.calls if call[:2] == ("pane", "split")]
             self.assertEqual(len(splits), 2)
@@ -1588,48 +1477,12 @@ class FivePaneTopologyTest(unittest.TestCase):
                     str(builder.resolve())
                 )
             )
-            self.assertEqual(lch.workspace_of(second), layout.child_workspace_id)
-            self.assertNotEqual(builder_env["TMPDIR"], _role_environment(tester)["TMPDIR"])
-
-
-class NoLegacyAdoptionTest(unittest.TestCase):
-    def test_legacy_stage_agent_is_not_adopted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            worktree = Path(tmp) / "run-1" / "lane-a" / "tester" / "checkout"
-            worktree.mkdir(parents=True)
-            token = lch.role_session_token("run-1", "lane-a", "tester")
-            calls: list[tuple[str, ...]] = []
-
-            def fake_herdr(*args: str, **kwargs: object) -> dict:
-                del kwargs
-                calls.append(args)
-                if args[:2] == ("agent", "get"):
-                    raise lch.HerdrCallError("missing", lch.AGENT_NOT_FOUND)
-                raise AssertionError(args)
-
-            spec = lch.LaunchSpec(
-                correlation_token=token,
-                worktree=worktree,
-                prompt_path=worktree / "prompt.json",
-                envelope_path=worktree / "envelope.json",
-                route="omp",
-                model="",
-                effort="",
-                profile="grok-maestro",
-                session_dir=worktree / "session",
-                lane_key="lane-a",
-                pane_role="tester",
-                run_id="run-1",
-                stage="WRITING_TESTS",
-                input_digest="aabbccddeeff00112233445566778899",
-                workspace_label="product run-1",
+            self.assertEqual(lch.workspace_of(second), layout.parent_workspace_id)
+            self.assertNotEqual(
+                builder_env["TMPDIR"], _role_environment(tester)["TMPDIR"]
             )
-            launcher = _bare_launcher("product run-1")
-            launcher._herdr = fake_herdr  # type: ignore[method-assign]
-            self.assertIsNone(launcher._reconnect_live_agent(spec, {}))
-            self.assertEqual(calls, [("agent", "get", lch.agent_name_for(token))])
-            self.assertFalse(any(call[1] == "rename" for call in calls))
-            self.assertFalse(any(call[:2] == ("agent", "start") for call in calls))
+
+
 
 
 class RenameFailClosedTest(unittest.TestCase):
@@ -1697,29 +1550,39 @@ class RestartRediscoverTest(unittest.TestCase):
             )
             self.assertIsNone(launcher._reconnect_live_agent(spec, {}))
 
-    def test_stable_missing_pane_label_refuses(self) -> None:
+    def test_foreign_role_pane_cannot_authenticate_matching_lane_tab(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
             token = lch.role_session_token("run-1", "lane-a", "tester")
             name = lch.agent_name_for(token)
             calls: list[tuple[str, ...]] = []
+            mismatched_pane = {
+                "pane_id": "w9:p1",
+                "tab_id": "w9:t1",
+                "workspace_id": PARENT_ID,
+                "cwd": str(worktree.resolve()),
+                "label": "tester",
+                "agent_status": "idle",
+                # A fully-authenticated pane belongs to another lane. Its
+                # stable agent name must not let this lane adopt it.
+                "tokens": _pane_tokens("tester", lane="lane-other"),
+            }
 
             def fake_herdr(*args: str, **kwargs: object) -> dict:
                 del kwargs
                 calls.append(args)
                 if args[:2] == ("agent", "get"):
                     self.assertEqual(args[2], name)
-                    return {"result": {"agent": {"pane_id": "w9:p1", "agent_status": "idle"}}}
-                if args[:2] == ("pane", "get"):
                     return {
                         "result": {
-                            "pane": {
-                                "pane_id": "w9:p1",
-                                "tab_id": "w9:t1",
-                                "cwd": str(worktree),
-                            }
+                            "agent": {"pane_id": "w9:p1", "agent_status": "idle"}
                         }
                     }
+                if args[:2] == ("pane", "get"):
+                    return {"result": {"pane": dict(mismatched_pane)}}
+                placed = _topology_reply(args, panes=[mismatched_pane])
+                if placed is not None:
+                    return placed
                 raise AssertionError(args)
 
             spec = lch.LaunchSpec(
@@ -1734,18 +1597,36 @@ class RestartRediscoverTest(unittest.TestCase):
                 session_dir=worktree / "session",
                 lane_key="lane-a",
                 pane_role="tester",
+                run_id=RUN_HASH,
+                repository_fingerprint=REPO,
                 workspace_label="product run-1",
             )
             launcher = _bare_launcher("product run-1")
+            launcher._parent_workspace_id = PARENT_ID
             launcher._herdr = fake_herdr  # type: ignore[method-assign]
-            with self.assertRaises(lch.LaunchRefused) as raised:
+            with self.assertRaises(lch.LaunchRefused) as refused:
                 launcher._reconnect_live_agent(spec, {})
-            self.assertEqual(
-                raised.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH
-            )
-            self.assertFalse(raised.exception.pane_created)
+            self.assertIs(refused.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH)
+            self.assertIn("UNOWNED_LANE_TAB_LABEL_COLLISION:lane-a", refused.exception.detail)
+            self.assertNotIn(token, launcher._handles)
+            observed = [call[:2] for call in calls]
+            self.assertIn(("pane", "get"), observed)
+            self.assertIn(("pane", "list"), observed)
             self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
             self.assertFalse(any(call[:2] == ("agent", "start") for call in calls))
+            self.assertFalse(
+                any(
+                    call[:2]
+                    in {
+                        ("pane", "close"),
+                        ("pane", "move"),
+                        ("pane", "rename"),
+                        ("pane", "report-metadata"),
+                        ("pane", "split"),
+                    }
+                    for call in calls
+                )
+            )
 
 
 class NoTranscriptLaneOfferTest(unittest.TestCase):
@@ -1782,7 +1663,9 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
             mock.patch.object(launcher, "_label_pane"),
             mock.patch.object(lch, "_wait_for_available_shell"),
             mock.patch.object(
-                lch, "_start_agent_when_free", side_effect=lambda start, **kwargs: start()
+                lch,
+                "_start_agent_when_free",
+                side_effect=lambda start, **kwargs: start(),
             ),
             mock.patch.object(lch, "wait_for_interactive_agent"),
             mock.patch.object(lch, "submit_agent_prompt", side_effect=submit),
@@ -1822,7 +1705,11 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
+                if args[:2] in (
+                    ("agent", "start"),
+                    ("agent", "get"),
+                    ("agent", "focus"),
+                ):
                     return {
                         "result": {
                             "agent": {
@@ -1857,14 +1744,14 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
             handle = self._launch_omp(launcher, spec, submit)
             self.assertIsNone(handle.transcript_path)
             self.assertEqual(handle.pane_id, "w9:p4")
-            self.assertEqual(handle.agent_name, lch.agent_name_for(spec.correlation_token))
+            self.assertEqual(
+                handle.agent_name, lch.agent_name_for(spec.correlation_token)
+            )
             self.assertEqual(handle.correlation_token, spec.correlation_token)
             self.assertEqual(len(offers), 1)
             self.assertEqual(offers[0]["refuse_unproven"], False)
             self.assertEqual(offers[0]["working_proves"], True)
-            self.assertEqual(
-                offers[0]["text"], "@{0} ".format(prompt.resolve())
-            )
+            self.assertEqual(offers[0]["text"], "@{0} ".format(prompt.resolve()))
             self.assertNotIn(handle.correlation_token, launcher._tailers)
             spec.envelope_path.write_text('{"success": true}', encoding="utf-8")
             result = launcher.poll(handle)
@@ -1874,6 +1761,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
 
     def test_adopted_resubmit_without_transcript_offers_once(self) -> None:
         launcher = _bare_launcher("product run-1")
+        launcher._parent_workspace_id = PARENT_ID
         launcher.admitted_routes = type(
             "Routes", (), {"admits": lambda self, route: route == "omp"}
         )()
@@ -1891,7 +1779,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                 lch.agent_name_for(spec.correlation_token),
                 worktree,
                 envelope_path=spec.envelope_path,
-                workspace_id="w9",
+                workspace_id=PARENT_ID,
                 tab_id="w9:t1",
                 lane_key="lane-a",
             )
@@ -1906,7 +1794,11 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             "agent": {
                                 "name": handle.agent_name,
                                 "pane_id": "w9:p4",
+                                "workspace_id": PARENT_ID,
+                                "tab_id": "w9:t1",
+                                "cwd": str(worktree),
                                 "agent_status": "idle",
+                                "interactive_ready": True,
                             }
                         }
                     }
@@ -1916,7 +1808,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             "pane": {
                                 "pane_id": "w9:p4",
                                 "tab_id": "w9:t1",
-                                "workspace_id": "w9",
+                                "workspace_id": PARENT_ID,
                                 "cwd": str(worktree),
                                 "label": "builder",
                                 "tokens": _pane_tokens("builder"),
@@ -1924,9 +1816,13 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                         }
                     }
                 if args[:2] == ("pane", "list"):
-                    return {"result": {"panes": [
-                        fake_herdr("pane", "get", "w9:p4")["result"]["pane"]
-                    ]}}
+                    return {
+                        "result": {
+                            "panes": [
+                                fake_herdr("pane", "get", "w9:p4")["result"]["pane"]
+                            ]
+                        }
+                    }
                 placed = _topology_reply(args)
                 if placed is not None:
                     return placed
@@ -1945,6 +1841,7 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                 self.assertFalse(kwargs.get("refuse_unproven"))
                 self.assertTrue(kwargs.get("working_proves"))
                 self.assertFalse(kwargs["submission_recorded"]())
+                self.assertIsNone(handle.transcript_path)
 
             launcher._herdr = fake_herdr  # type: ignore[method-assign]
             with (
@@ -1999,7 +1896,11 @@ class NoTranscriptLaneOfferTest(unittest.TestCase):
                             }
                         }
                     }
-                if args[:2] in (("agent", "start"), ("agent", "get"), ("agent", "focus")):
+                if args[:2] in (
+                    ("agent", "start"),
+                    ("agent", "get"),
+                    ("agent", "focus"),
+                ):
                     agent: dict[str, object] = {
                         "pane_id": "w9:p4",
                         "agent_status": "idle",
@@ -2221,9 +2122,7 @@ class ComposerHoldsOfferTests(unittest.TestCase):
             del kwargs
             raise lch.HerdrCallError("pane gone", code="pane_not_found")
 
-        self.assertIsNone(
-            lch.composer_holds_offer(herdr, self.PANE, self.PROMPT)
-        )
+        self.assertIsNone(lch.composer_holds_offer(herdr, self.PANE, self.PROMPT))
 
     def test_enter_frees_the_composer_and_the_mark_lands(self) -> None:
         """The paste lands, the first Enter is swallowed, a later one takes."""
