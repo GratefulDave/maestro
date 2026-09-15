@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **`herdr-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). A display-only sidebar
+  daemon for macOS; the Maestro runtime is unchanged. Under metadata source `lanes` it writes these
+  pane tokens:
+  - `logo`: a vendor glyph from the Herdr Agent Icons Max font.
+  - `mark`: a spinner while the agent works, a `✓` held until the pane is focused, and a `?` held
+    until work resumes.
+  - `name`: the lane id, or the workspace label for other panes.
+  - `title`: the terminal title, on non-lane panes only.
+  - `stage`, `round` and `verdict`: on lane panes and lane Spaces.
+
+  Everything specific to Maestro sits in `lib/adapters/maestro.js`: the `kind=lane` token
+  convention, ledger discovery, a read-only per-tick ledger query, and the stage and role colour
+  rules. The daemon holds an exclusive lock and signals a pid only when that pid's command line is
+  the daemon. The plugin swaps the hand-written `[ui.sidebar.*]` tables for one fenced managed block,
+  saving the removed tables only after `herdr config check` passes. It wires the icon font into
+  the detected terminal: WezTerm `font_with_fallback`, or a Ghostty codepoint map. Every edit is
+  recorded and exactly reversible. It migrates once from its first name, `maestro-lanes`. Icon
+  font and socket approach come from herdr-radar (MIT); mark licences are in `THIRD_PARTY_NOTICES.md`.
+
 ### Changed
 - **Contract change: a lane is a child Space again, nested under the repository's
   Space.** Reverts #276 (lane = tab). Herdr 0.9.0's Spaces sidebar nests only

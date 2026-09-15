@@ -1,0 +1,45 @@
+id = "herdr-lanes"
+name = "Herdr lanes"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Sidebar vendor logos, held activity marks, and lane stage / review round / verdict from a lane adapter."
+platforms = ["macos"]
+
+# Startup hooks are one-shot: this spawns the detached daemon and exits.
+[[startup]]
+command = ["/bin/sh", "bin/run.sh"]
+
+# Watchdog: a crashed daemon comes back the next time an agent is detected.
+[[events]]
+on = "pane.agent_detected"
+command = ["/bin/sh", "bin/run.sh"]
+
+[[actions]]
+id = "start"
+title = "Lanes: start daemon"
+command = ["/bin/sh", "bin/run.sh"]
+
+[[actions]]
+id = "stop"
+title = "Lanes: stop daemon and clear its tokens"
+command = ["/bin/sh", "bin/run.sh", "--stop"]
+
+[[actions]]
+id = "configure"
+title = "Lanes: write the managed sidebar block"
+command = ["/bin/sh", "bin/run.sh", "--configure"]
+
+[[actions]]
+id = "unconfigure"
+title = "Lanes: remove the managed sidebar block"
+command = ["/bin/sh", "bin/run.sh", "--unconfigure"]
+
+[[actions]]
+id = "install-font"
+title = "Lanes: install icon font and wire it into the detected terminal"
+command = ["/bin/sh", "bin/run.sh", "--install-font"]
+
+[[actions]]
+id = "uninstall-font"
+title = "Lanes: remove the icon font and terminal edit it recorded"
+command = ["/bin/sh", "bin/run.sh", "--uninstall-font"]
