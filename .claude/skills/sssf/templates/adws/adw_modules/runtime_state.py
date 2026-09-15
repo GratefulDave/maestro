@@ -122,9 +122,7 @@ class RuntimeStateRoot:
             _require_owned_mode(info)
             self.device = info.st_dev
             self.inode = info.st_ino
-            self.fingerprint = runtime_state_fingerprint(
-                str(self.path), self.device, self.inode
-            )
+            self.fingerprint = runtime_state_fingerprint(str(self.path), self.inode)
         except Exception:
             os.close(self._fd)
             raise
@@ -144,7 +142,7 @@ class RuntimeStateRoot:
     def revalidate(self, expected_fingerprint: str) -> None:
         info = os.fstat(self._fd)
         _require_owned_mode(info)
-        current = runtime_state_fingerprint(str(self.path), info.st_dev, info.st_ino)
+        current = runtime_state_fingerprint(str(self.path), info.st_ino)
         if (
             current != expected_fingerprint
             or info.st_dev != self.device

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -344,6 +345,9 @@ class ArtifactStore:
             version = st.LEDGER_SCHEMA_VERSION_V2
         if version == st.LEDGER_SCHEMA_VERSION_V2:
             self._migrate_v2_to_v3()
+            version = st.LEDGER_SCHEMA_VERSION_V3
+        if version == st.LEDGER_SCHEMA_VERSION_V3:
+            self._migrate_v3_to_v4()
             return
         self._refuse_schema()
 
@@ -435,7 +439,7 @@ class ArtifactStore:
         sql = _table_create_sql(self.conn, "lane_artifacts")
         if sql is None or _normalize_sql(sql) != _normalize_sql(LANE_ARTIFACTS_SQL):
             raise ArtifactStoreError("lane_artifacts ddl")
-        if expected is st.LEDGER_SCHEMA_VERSION:
+        if expected in (st.LEDGER_SCHEMA_VERSION_V3, st.LEDGER_SCHEMA_VERSION):
             run_sql = _table_create_sql(self.conn, "run_artifacts")
             if run_sql is None or _normalize_sql(run_sql) != _normalize_sql(
                 RUN_ARTIFACTS_SQL
@@ -557,7 +561,48 @@ class ArtifactStore:
                 self._rebuild_run_artifacts_current_check()
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V2),
+                (st.LEDGER_SCHEMA_VERSION_V3, st.LEDGER_SCHEMA_VERSION_V2),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V3)
+            self.conn.execute("COMMIT")
+            self._end_migration()
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Re-stamp runs under the device-free runtime-state fingerprint.
+
+        A v3 run's fingerprint hashed the state directory's st_dev, which macOS
+        reassigns at every mount, so a reboot refused every existing run with
+        `fingerprint mismatch`. The ledger lives inside its runtime state root,
+        so a run bound to that root is re-stamped from the directory that holds
+        this file. A run bound to any other root is left as it is and keeps
+        refusing, because nothing here has opened that root.
+        """
+        # Normalized exactly as RuntimeStateRoot stores a run's root: abspath,
+        # not realpath, or the WHERE below matches nothing under /var -> /private/var.
+        root = os.path.abspath(os.path.dirname(self.db_path))
+        fingerprint = st.runtime_state_fingerprint(root, os.stat(root).st_ino)
+        self._begin_migration()
+        try:
+            self.conn.execute(
+                "UPDATE runs SET runtime_state_fingerprint=? "
+                "WHERE runtime_state_root=?",
+                (fingerprint, root),
+            )
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V3),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
