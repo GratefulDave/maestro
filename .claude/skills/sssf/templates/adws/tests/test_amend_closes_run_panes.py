@@ -16,7 +16,6 @@ Both sit in the same `herdr pane list` reply as the panes this is for.
 from __future__ import annotations
 
 import sys
-import threading
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -83,9 +82,6 @@ def _launcher(herdr: _Herdr) -> lch.HerdrLauncher:
     launcher = lch.HerdrLauncher.__new__(lch.HerdrLauncher)
     launcher._herdr = herdr  # type: ignore[method-assign]
     launcher._cleaned_absent = set()
-    # A closed pane is also dropped from its lane tab's grid.
-    launcher._handles_lock = threading.RLock()
-    launcher._tabs = {}
     return launcher
 
 

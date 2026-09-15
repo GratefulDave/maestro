@@ -1,9 +1,9 @@
 """`cleanup.py` closes this repository's finished lane panes and nothing else.
 
 The cases are about what it cannot close. An operator's own pane, another
-repository's lane pane, and a `kind=run` pane that is not a lane's all sit in
-the same `herdr pane list` reply as the panes this tool is for, so the selector
-is the whole safety property: Maestro's `kind=lane` token, plus a `run_id` token
+repository's lane pane, and the parent Space Maestro never closes all sit in the
+same `herdr pane list` reply as the panes this tool is for, so the selector is
+the whole safety property: Maestro's `kind=lane` token, plus a `run_id` token
 naming a run in *this* installation's ledger.
 
 The other refusal is liveness. A lane pane belonging to a run that is still
@@ -112,7 +112,7 @@ PANE_LIST = {
                 role="tester",
                 repo="fingerprint",
             ),
-            # Not a lane pane: tagged `kind=run`, and never closed.
+            # The parent Space: tagged `kind=run`, and never closed.
             _pane("w0:p1", "w0", kind="run", run_id=OURS, repo="fingerprint"),
             # Another repository's run, in the same Herdr.
             _pane(

@@ -199,9 +199,7 @@ class TheRenameIsConfirmedByReadingThePane(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         pane = herdr._new_pane("w1", "w1:t1", tmp)
-        handle = _handle(str(pane["pane_id"]), Path(tmp))
-        herdr._register_agent(handle.agent_name, handle.pane_id, "idle")
-        return herdr, launcher, handle
+        return herdr, launcher, _handle(str(pane["pane_id"]), Path(tmp))
 
     def test_a_wrapped_confirmation_is_accepted(self) -> None:
         herdr, launcher, handle = self._bound()

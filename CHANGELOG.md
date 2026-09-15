@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Contract change: a lane is a child Space again, nested under the repository's
+  Space.** Reverts #276 (lane = tab). Herdr 0.9.0's Spaces sidebar nests only
+  linked-worktree Spaces under their source Space and never lists tabs, so a
+  lane tab was invisible there. Verified on the real binary: `worktree open
+  --workspace <source> --path <linked worktree>` renders indented and
+  collapsible under the source Space. #277's tab-workspace binding goes with
+  the tab code it lived in.
 - **A bound run is not re-judged for `OBLIGATION_UNOBSERVABLE` either.**
   `bound_run=True` now skips both authoring obligations when `_bind_existing_run`
   re-reads a revision a run already holds, so a run bound before the seam check
