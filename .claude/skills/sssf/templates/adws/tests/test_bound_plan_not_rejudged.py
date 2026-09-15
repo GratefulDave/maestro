@@ -1,9 +1,10 @@
-"""OBLIGATION_UNDECIDED is judged at ship/start/amend, never against a bound run.
+"""Authoring obligations are judged at ship/start/amend, never against a bound run.
 
 `_bind_existing_run` re-compiles the revision a run holds on every `run resume`,
 `run status`, `run attend`, and on the previous revision under `run amend`. A
-run bound before a gating obligation had to state `decided_by` examples must
-keep resuming; only a plan entering a run is refused.
+run bound before a gating obligation had to name its `observation_seam` or
+state `decided_by` examples must keep resuming; only a plan entering a run is
+refused, and it is refused for both.
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ def _undecided_plan_bytes() -> bytes:
                     {
                         "criterion": "claim-a (positive): a.txt holds provenance",
                         "gating": True,
-                        "observation_seam": "a.txt is the recorded effect",
                     }
                 ],
             }
@@ -69,7 +69,7 @@ class BoundPlanIsNotRejudgedTest(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.plan = self.root / "plan.json"
         self.plan.write_bytes(_undecided_plan_bytes())
-        # The run was bound before the obligation existed.
+        # The run was bound before either obligation existed: no seam, no examples.
         compiled = plan_compiler.compile_plan(
             _undecided_plan_bytes(),
             plan_revision=1,
@@ -89,8 +89,9 @@ class BoundPlanIsNotRejudgedTest(unittest.TestCase):
     def test_the_plan_would_be_refused_entering_a_run(self) -> None:
         with self.assertRaises(PlanCompileError) as caught:
             maestro._compile_plan(self.plan, revision=2, ref=str(self.plan))
-        self.assertIn(
-            pv.OBLIGATION_UNDECIDED, {item.code for item in caught.exception.refusals}
+        self.assertEqual(
+            {pv.OBLIGATION_UNOBSERVABLE, pv.OBLIGATION_UNDECIDED},
+            {item.code for item in caught.exception.refusals},
         )
 
     def test_binding_the_existing_run_does_not_rejudge_it(self) -> None:
@@ -135,8 +136,10 @@ class BoundPlanIsNotRejudgedTest(unittest.TestCase):
         because status fails somewhere earlier.
         """
         control = self._status_payload(strict_bind=True)
+        self.assertIn(pv.OBLIGATION_UNOBSERVABLE, json.dumps(control))
         self.assertIn(pv.OBLIGATION_UNDECIDED, json.dumps(control))
         payload = self._status_payload(strict_bind=False)
+        self.assertNotIn(pv.OBLIGATION_UNOBSERVABLE, json.dumps(payload))
         self.assertNotIn(pv.OBLIGATION_UNDECIDED, json.dumps(payload))
         self.assertNotIn("PLAN", str(payload.get("outcome", "")))
 

@@ -34,10 +34,11 @@ def validate_objective_plan(
 
     ``bound_run`` is true only when re-reading the plan revision a run is
     already bound to (``run resume``/``status``/``attend`` and the previous
-    revision under ``run amend``). ``OBLIGATION_UNDECIDED`` is an authoring
-    obligation judged when a plan is shipped, started, or amended into a run;
-    it is never re-judged against a revision a run already holds, so a run
-    bound before the check existed is never refused mid-run.
+    revision under ``run amend``). ``OBLIGATION_UNOBSERVABLE`` and
+    ``OBLIGATION_UNDECIDED`` are authoring obligations judged when a plan is
+    shipped, started, or amended into a run; neither is re-judged against a
+    revision a run already holds, so a run bound before either check existed
+    is never refused mid-run. Every strict path keeps both.
     """
     refusals: List[PlanRefusal] = []
     if set(data) - PLAN_KEYS:
@@ -244,6 +245,8 @@ def _validate_acceptance(
                 )
             )
             continue
+        if bound_run:
+            continue
         if parsed.gating and not parsed.observation_seam:
             refusals.append(
                 PlanRefusal(
@@ -254,7 +257,7 @@ def _validate_acceptance(
                     "no test can observe is advisory, not gating",
                 )
             )
-        if bound_run or not (parsed.gating or parsed.decided_by is not None):
+        if not (parsed.gating or parsed.decided_by is not None):
             continue
         for problem in decided_by_problems(
             parsed.decided_by, refusal_required=parsed.refusal_required

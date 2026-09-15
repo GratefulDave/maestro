@@ -658,6 +658,20 @@ class DecidedByTests(unittest.TestCase):
             _lane_of(bound, "lane-a").public_acceptance,
         )
 
+    def test_a_pre_seam_plan_bound_to_a_run_is_not_re_judged_either(self):
+        """Both authoring obligations: strict refuses both, bound refuses neither."""
+        pre_seam = {"criterion": "claim-a (positive): a.txt holds provenance", "gating": True}
+        with self.assertRaises(PlanCompileError) as caught:
+            self._compile(pre_seam)
+        self.assertEqual(
+            {pv.OBLIGATION_UNOBSERVABLE, pv.OBLIGATION_UNDECIDED},
+            set(_codes(caught.exception)),
+        )
+        bound = self._compile(pre_seam, bound_run=True)
+        self.assertEqual(
+            (pre_seam["criterion"],), _lane_of(bound, "lane-a").public_acceptance
+        )
+
     def test_examples_are_part_of_the_plan_identity(self):
         one = self._compile(self._criterion(decided_by=[self._EXPECT]))
         other = self._compile(

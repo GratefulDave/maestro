@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **A bound run is not re-judged for `OBLIGATION_UNOBSERVABLE` either.**
+  `bound_run=True` now skips both authoring obligations when `_bind_existing_run`
+  re-reads a revision a run already holds, so a run bound before the seam check
+  existed resumes instead of refusing mid-run. This narrows a check only for
+  runs already bound; ship, `run start` and every new amendment are unchanged.
 - **Contract change: a gating obligation states its expected answers or does not
   ship.** Every gating acceptance criterion now carries `decided_by` worked
   examples: an exact `input` with exactly one exact `expect` or `refuses`. There
