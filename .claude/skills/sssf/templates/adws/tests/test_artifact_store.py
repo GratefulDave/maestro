@@ -30,6 +30,7 @@ from adw_modules.lifecycle import (  # noqa: E402
     StaleStageInput,
     V1_LANE_ARTIFACTS_SQL,
     V1_SCHEMA,
+    V2_RUN_ARTIFACTS_SQL,
 )
 
 
@@ -2003,6 +2004,88 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
             self.assertNotIn("lane_artifacts__v1_backup", names)
         finally:
             probe.close()
+
+    def test_v2_ledger_with_an_amendment_migrates_keeping_its_references(
+        self,
+    ) -> None:
+        # `plan_revisions` references `run_artifacts`, so rebuilding that table
+        # by rename must not rewrite the reference onto the dropped backup.
+        # FDAdb run be064e58 refused its v2->v3 migration with 31 dangling
+        # foreign_key_check rows until it stopped doing so.
+        fx = self._fx
+        amended = make_plan(
+            make_lane("A", spec=digest_label("spec:A:v2")),
+            fx.lane_b,
+            revision=2,
+            stamp="v2",
+        )
+        resets = (
+            st.LaneReset("A", st.LaneStage.PLANNED, st.LaneStage.PLANNED),
+            st.LaneReset("B", st.LaneStage.PLANNED, st.LaneStage.PLANNED),
+        )
+        amendment = run_artifact(
+            st.ArtifactKind.PLAN_AMENDMENT,
+            digest_label("amend-v2-migration"),
+            {
+                "final_review_artifact_id": st.NO_FINAL_REVIEW,
+                "integration_head": git_sha("main"),
+                "invalidated_inputs": [],
+                "new_plan_artifact_ref": amended.plan_artifact_ref,
+                "new_plan_digest": amended.plan_digest,
+                "new_plan_revision": 2,
+                "prior_plan_digest": fx.plan.plan_digest,
+                "prior_plan_revision": 1,
+                "projection": ["A", "B"],
+                "resets": [
+                    {
+                        "from_stage": item.from_stage.value,
+                        "lane_id": item.lane_id,
+                        "to_stage": item.to_stage.value,
+                    }
+                    for item in resets
+                ],
+                "retained_inputs": [],
+            },
+            revision=2,
+        )
+        self.store.apply_amendment(RUN_ID, 1, amended, amendment, resets)
+
+        dest = Path(self._tmp.name) / "v2-amended.sqlite3"
+        target = sqlite3.connect(dest, isolation_level=None)
+        try:
+            self.store.conn.backup(target)
+            target.execute("PRAGMA foreign_keys=OFF")
+            target.execute("PRAGMA legacy_alter_table=ON")
+            target.execute("BEGIN")
+            target.execute("ALTER TABLE run_artifacts RENAME TO run_artifacts_v3")
+            target.execute(V2_RUN_ARTIFACTS_SQL)
+            target.execute("INSERT INTO run_artifacts SELECT * FROM run_artifacts_v3")
+            target.execute("DROP TABLE run_artifacts_v3")
+            target.execute(
+                "UPDATE ledger_meta SET schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION_V2,),
+            )
+            target.execute("COMMIT")
+            self.assertEqual(list(target.execute("PRAGMA foreign_key_check")), [])
+            linked = target.execute(
+                "SELECT COUNT(*) FROM plan_revisions "
+                "WHERE amendment_artifact_id IS NOT NULL"
+            ).fetchone()[0]
+            self.assertEqual(linked, 1)
+        finally:
+            target.close()
+
+        migrated = ArtifactStore(dest)
+        self.addCleanup(migrated.close)
+        self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
+        self.assertEqual(list(migrated.conn.execute("PRAGMA foreign_key_check")), [])
+        plan_revisions_sql = migrated.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='plan_revisions'"
+        ).fetchone()[0]
+        self.assertIn("REFERENCES run_artifacts(", plan_revisions_sql)
+        self.assertEqual(
+            migrated.conn.execute("PRAGMA foreign_keys").fetchone()[0], 1
+        )
 
 
 if __name__ == "__main__":
