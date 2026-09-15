@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **`herdr-lanes` sidebar colours and WezTerm font order**
+  (`.claude/skills/sssf/apps/herdr-lanes/`). `$name` renders in the foreground colour instead of
+  dimmed. `$logo` is coloured per vendor from a new neutral `lib/brands.js` (colours from herdr-radar
+  `lib/palette.js`, MIT). Herdr caps a token at 16 rules, so 16 of the font's 23 marks are coloured
+  and mastracode, maki, hermes, agy, kiro, devin and qodercli keep the default. The WezTerm edit now
+  puts the user's font first and the icon font second, so the user's font keeps the cell metrics.
+  `install-font` reorders a line that 0.1.0 wrapped, and the recorded original line is kept, so
+  `uninstall-font` still restores it exactly.
+
 ### Added
 - **`herdr-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). A display-only sidebar
   daemon for macOS; the Maestro runtime is unchanged. Under metadata source `lanes` it writes these

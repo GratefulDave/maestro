@@ -12,6 +12,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const { configDir } = require('./herdr');
+const { logoRules } = require('./brands');
 
 const FENCE = { start: '# >>> herdr-lanes sidebar', end: '# <<< herdr-lanes sidebar' };
 const SAVED = 'replaced-sidebar-tables.toml';
@@ -61,13 +62,15 @@ function block(adapter) {
   const mark = styled('$mark', [['✓', 'green'], ['?', 'red'], ...SPINNER.map((f) => [f, 'amber'])]);
   const stage = styled('$stage', adapter.rules.stage);
   const verdict = styled('$verdict', adapter.rules.verdict);
+  const logo = styled('$logo', logoRules());
+  const name = '{ token = "$name", fg = "#c0caf5", dim = false }';
   return [
     FENCE.start,
     '# One agent layout for lane and non-lane panes; unreported tokens hide.',
     '[ui.sidebar.agents]',
     'row_gap = 0',
     'rows = [',
-    `  ["state_icon", "$logo", "$name", ${role}],`,
+    `  ["state_icon", ${logo}, ${name}, ${role}],`,
     `  [${mark}, ${state}, ${stage}, { token = "$round", dim = true }, ${verdict}, { token = "$title", dim = true }],`,
     ']',
     '',
