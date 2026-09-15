@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import hashlib
 import sqlite3
 import sys
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ADWS))
 from adw_modules import git_publication as gitpub
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
+from adw_modules.runtime_state import RuntimeStateRefused, RuntimeStateRoot  # noqa: E402
 from adw_modules.lifecycle import (  # noqa: E402
     AmendmentRefused,
     ArtifactCollision,
@@ -1897,7 +1899,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
 
         migrated = ArtifactStore(dest)
         self.addCleanup(migrated.close)
-        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v3")
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v4")
         self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
         # v3 widened the run-artifact kind check the same way v2 widened the
         # lane one. A migration that stops at the stamp leaves an ATTEND_SESSION
@@ -2032,6 +2034,64 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
             self.assertNotIn("lane_artifacts__v1_backup", names)
         finally:
             probe.close()
+
+    def test_v3_run_bound_before_a_reboot_revalidates_after_migration(
+        self,
+    ) -> None:
+        # FDAdb run be064e58 was bound under st_dev 16777230; after a reboot
+        # macOS mounted the same volume as 16777233 and every command refused
+        # `RUNTIME_STATE_REFUSED:fingerprint mismatch` on an unchanged directory.
+        state = Path(self._tmp.name) / "state"
+        state.mkdir(mode=0o700)
+        os.chmod(state, 0o700)
+        dest = state / "lifecycle.sqlite3"
+        copy = sqlite3.connect(dest)
+        self.store.conn.backup(copy)
+        info = os.stat(state)
+        legacy = st.digest_canonical(
+            {
+                "device": info.st_dev + 3,
+                "inode": info.st_ino,
+                "realpath": str(state),
+                "schema_version": st.CANONICAL_SCHEMA_VERSION,
+            }
+        )
+        copy.execute("UPDATE ledger_meta SET schema_version=?", (st.LEDGER_SCHEMA_VERSION_V3,))
+        copy.execute(
+            "UPDATE runs SET runtime_state_root=?, runtime_state_fingerprint=?",
+            (str(state), legacy),
+        )
+        columns = [row[1] for row in copy.execute("PRAGMA table_info(plan_revisions)")]
+        copy.execute(
+            f"INSERT INTO plan_revisions SELECT "
+            + ", ".join("'elsewhere'" if c == "run_id" else c for c in columns)
+            + " FROM plan_revisions WHERE run_id=? AND plan_revision=("
+            "SELECT plan_revision FROM runs WHERE run_id=?)",
+            (RUN_ID, RUN_ID),
+        )
+        copy.execute(
+            "INSERT INTO runs SELECT 'elsewhere', '/elsewhere', 'ab', "
+            "plan_digest, plan_revision, 'refs/heads/elsewhere', "
+            "integration_initial_sha, target_repository_root, "
+            "target_git_common_dir, target_worktree_git_dir, "
+            "target_object_format, target_repository_fingerprint, "
+            "target_sync_journal_fingerprint, target_initial_main_sha, "
+            "target_main_ref, created_at, updated_at FROM runs WHERE run_id=?",
+            (RUN_ID,),
+        )
+        copy.commit()
+        copy.close()
+
+        migrated = ArtifactStore(dest)
+        self.addCleanup(migrated.close)
+        self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
+        with RuntimeStateRoot(state) as runtime:
+            with self.assertRaises(RuntimeStateRefused):
+                runtime.revalidate(legacy)
+            runtime.revalidate(migrated._run(RUN_ID)["runtime_state_fingerprint"])
+        self.assertEqual(
+            migrated._run("elsewhere")["runtime_state_fingerprint"], "ab"
+        )
 
     def test_v2_ledger_with_an_amendment_migrates_keeping_its_references(
         self,

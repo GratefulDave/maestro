@@ -12,7 +12,8 @@ from typing import Any, Collection, Mapping, Optional, Sequence, Tuple
 CANONICAL_SCHEMA_VERSION = 1
 LEDGER_SCHEMA_VERSION_V1 = "artifact-factory.v1"
 LEDGER_SCHEMA_VERSION_V2 = "artifact-factory.v2"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v3"
+LEDGER_SCHEMA_VERSION_V3 = "artifact-factory.v3"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v4"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
@@ -842,10 +843,13 @@ def final_review_input_fingerprint(
     )
 
 
-def runtime_state_fingerprint(realpath: str, device: int, inode: int) -> str:
+def runtime_state_fingerprint(realpath: str, inode: int) -> str:
+    # No device number: macOS assigns a volume's st_dev at mount, so the same
+    # directory reads a different device after every reboot (16777230 ->
+    # 16777233 on 2026-09-15) and every earlier run refused itself. A
+    # replaced directory is still refused: it has a new inode.
     return digest_canonical(
         {
-            "device": device,
             "inode": inode,
             "realpath": realpath,
             "schema_version": CANONICAL_SCHEMA_VERSION,

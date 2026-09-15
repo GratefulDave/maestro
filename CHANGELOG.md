@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Contract change: the runtime-state fingerprint no longer binds the device
+  number.** It is SHA-256 over the root's absolute path and inode. macOS
+  assigns a volume's `st_dev` at mount, so after a reboot (16777230 ->
+  16777233 on 2026-09-15) every run bound earlier refused
+  `RUNTIME_STATE_REFUSED:fingerprint mismatch` against an unchanged directory.
+  A replaced state directory is still refused, because it has a new inode.
+  Ledger schema `artifact-factory.v4`: the v3->v4 migration re-stamps only runs
+  bound to the directory that holds the ledger; runs bound to any other root
+  keep their old fingerprint and keep refusing.
+
 ### Fixed
 - **A reviewer asked again is told which citation was rejected.** A REVISE
   finding whose `violated_requirement` did not quote the public contract was

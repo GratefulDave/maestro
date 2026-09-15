@@ -43,7 +43,7 @@ class RuntimeStateRootTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
             self.assertEqual(
                 opened.fingerprint,
-                runtime_state_fingerprint(str(state), info.st_dev, info.st_ino),
+                runtime_state_fingerprint(str(state), info.st_ino),
             )
             self.assertEqual(opened.ledger_path(), state / LEDGER_FILENAME)
             opened.ensure_layout()
