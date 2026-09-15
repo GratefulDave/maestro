@@ -1338,7 +1338,8 @@ class HerdrStageActor:
                 "lane gate table, and the reviews. Write the revised IR at "
                 "revision_out_path and return that exact path plus the "
                 "rationale. Change only lanes in allowed_lane_ids. Run no "
-                "maestro verb, no git command, and no planctl."
+                "maestro verb, no git command, and no planctl. "
+                + att.TWO_IMPLEMENTATIONS_QUESTION
             )
         if role in ("tester", "test-reviewer", "builder"):
             instructions += " " + self._PUBLIC_INTERFACE_RULE
@@ -2451,6 +2452,9 @@ class HerdrStageActor:
                 (cwd / self._OPERATOR_INPUTS / "reviews.json").resolve()
             ),
             "revision_out_path": request.revision_out_path,
+            "review_findings_out_path": str(
+                att.findings_path_for(Path(request.revision_out_path))
+            ),
             "round": request.round_number,
             "sealed_suite_dir": str((cwd / self._OPERATOR_SEALED).resolve()),
             "sealed_suite_files": sorted(request.sealed_files),
@@ -2648,8 +2652,14 @@ def _actor_for(
     )
 
 
-def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
+def _compile_plan(
+    path: Path, *, revision: int, ref: str, bound_run: bool = False
+) -> st.CompiledPlan:
     """Read and compile one plan artifact.
+
+    ``bound_run`` is true only for a revision a run already holds, so an
+    authoring obligation added after that run was bound (``OBLIGATION_UNDECIDED``)
+    never refuses it mid-run. Start and amend compile strictly.
 
     Reading it is the only place a missing or unreadable *plan file* is a
     configuration fact, so the mapping belongs here rather than in `main`:
@@ -2665,7 +2675,7 @@ def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
             "cannot read plan artifact {0}: {1}".format(path, exc)
         ) from exc
     return plan_compiler.compile_plan(
-        stored, plan_revision=revision, plan_artifact_ref=ref
+        stored, plan_revision=revision, plan_artifact_ref=ref, bound_run=bound_run
     )
 
 
@@ -2818,7 +2828,11 @@ def _run_plan(args: argparse.Namespace) -> int:
         locks = OrderedLocks(runtime, _worktree_git_dir(repo))
         locks.acquire(1)
         try:
-            compiled = _compile_plan(plan_path, revision=1, ref=str(plan_path))
+            # Read as bound first: this plan may already be a run's revision,
+            # and resuming it must not re-judge authoring obligations.
+            compiled = _compile_plan(
+                plan_path, revision=1, ref=str(plan_path), bound_run=True
+            )
             target = gitpub.bind_target_worktree(repo, main_ref)
             store = _open_store(runtime)
             try:
@@ -2830,6 +2844,9 @@ def _run_plan(args: argparse.Namespace) -> int:
                 if matches:
                     resume_id = matches[0]
                 else:
+                    compiled = _compile_plan(
+                        plan_path, revision=1, ref=str(plan_path)
+                    )
                     start_id = uuid.uuid4().hex
                     create_factory_run(
                         store=store,
@@ -3057,6 +3074,7 @@ def _bind_existing_run(
             pinned if pinned.is_file() else plan_ref,
             revision=revision,
             ref=str(plan_ref),
+            bound_run=True,
         )
         if compiled.plan_digest != row["plan_digest"]:
             raise FactoryRefused("PLAN_ARTIFACT_MISMATCH")
@@ -3464,10 +3482,16 @@ def _attend_project(
     rendered = plans_dir / (stem + ".html")
     receipt = plans_dir / (stem + ".receipt.json")
     plan_out = plans_dir / (stem + ".plan.json")
-    for stale in (rendered, receipt, plan_out):
+    findings = plans_dir / (stem + ".review-findings.json")
+    for stale in (rendered, receipt, plan_out, findings):
         if stale.exists():
             stale.unlink()
     shutil.copyfile(revision_ir, ir)
+    # The operator's two-implementations answer. Absent, planctl refuses
+    # `review.findings_missing` and the revision is refused by exit status.
+    authored_findings = att.findings_path_for(revision_ir)
+    if authored_findings.is_file():
+        shutil.copyfile(authored_findings, findings)
     root = ["--repo-root", str(repo)]
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
@@ -3483,6 +3507,8 @@ def _attend_project(
             policy.reviewer_id,
             "--reviewer-vendor",
             policy.reviewer_vendor,
+            "--findings",
+            str(findings),
             *root,
         ],
         key=key,

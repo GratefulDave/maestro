@@ -9,6 +9,7 @@ from .plan_model import (
     PLAN_KEYS,
     SCHEMA_VERSION,
     PlanRefusal,
+    decided_by_problems,
     normalize_declared_output,
     outputs_conflict,
     parse_acceptance_item,
@@ -23,10 +24,21 @@ ACCEPTANCE_MISSING = "ACCEPTANCE_MISSING"
 REVIEW_NODE_FORBIDDEN = "REVIEW_NODE_FORBIDDEN"
 BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
 OBLIGATION_UNOBSERVABLE = "OBLIGATION_UNOBSERVABLE"
+OBLIGATION_UNDECIDED = "OBLIGATION_UNDECIDED"
 
 
-def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
-    """Return every objective refusal. Empty means the mapping is admissible."""
+def validate_objective_plan(
+    data: Mapping[str, Any], *, bound_run: bool = False
+) -> Tuple[PlanRefusal, ...]:
+    """Return every objective refusal. Empty means the mapping is admissible.
+
+    ``bound_run`` is true only when re-reading the plan revision a run is
+    already bound to (``run resume``/``status``/``attend`` and the previous
+    revision under ``run amend``). ``OBLIGATION_UNDECIDED`` is an authoring
+    obligation judged when a plan is shipped, started, or amended into a run;
+    it is never re-judged against a revision a run already holds, so a run
+    bound before the check existed is never refused mid-run.
+    """
     refusals: List[PlanRefusal] = []
     if set(data) - PLAN_KEYS:
         extra = ", ".join(sorted(set(data) - PLAN_KEYS))
@@ -167,7 +179,7 @@ def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
                 )
             seen_needs.add(need)
         _validate_outputs(pointer, outputs, refusals)
-        _validate_acceptance(pointer, acceptance, refusals)
+        _validate_acceptance(pointer, acceptance, refusals, bound_run=bound_run)
 
     _validate_ownership(parsed, refusals)
     _validate_build_lane_needs(parsed, kinds, refusals)
@@ -204,7 +216,11 @@ def _validate_outputs(
 
 
 def _validate_acceptance(
-    pointer: str, acceptance: Sequence[Any], refusals: List[PlanRefusal]
+    pointer: str,
+    acceptance: Sequence[Any],
+    refusals: List[PlanRefusal],
+    *,
+    bound_run: bool = False,
 ) -> None:
     if not acceptance:
         refusals.append(
@@ -236,6 +252,21 @@ def _validate_acceptance(
                     "a gating obligation must declare the observation_seam a "
                     "case can assert on from the public contract; an obligation "
                     "no test can observe is advisory, not gating",
+                )
+            )
+        if bound_run or not (parsed.gating or parsed.decided_by is not None):
+            continue
+        for problem in decided_by_problems(
+            parsed.decided_by, refusal_required=parsed.refusal_required
+        ):
+            refusals.append(
+                PlanRefusal(
+                    OBLIGATION_UNDECIDED,
+                    item_pointer + "/decided_by",
+                    "obligation {0!r} {1}; a gating obligation states its "
+                    "expected answers as exact worked examples".format(
+                        parsed.criterion, problem
+                    ),
                 )
             )
 

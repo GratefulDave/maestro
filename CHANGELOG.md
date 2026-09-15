@@ -7,6 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Contract change: a gating obligation states its expected answers or does not
+  ship.** Every gating acceptance criterion now carries `decided_by` worked
+  examples: an exact `input` with exactly one exact `expect` or `refuses`. There
+  must be at least one `expect`, and at least one `refuses` when the claim is
+  negative or has `exception_ids`/`preconditions`. Anything less refuses
+  `OBLIGATION_UNDECIDED` (`adw_modules/plan_validate.py`) at ship, `run start`,
+  `run amend` and `run attend`. **Plans without examples that previously
+  shipped now refuse when re-shipped or amended.** A run already bound to such
+  a plan keeps resuming: `_bind_existing_run` compiles with `bound_run=True`.
+  The examples project verbatim into the lane's public acceptance and the tests
+  lane's `spec.obligations.claims`, and the ingress totality check verifies
+  both. `run attend` now passes the operator's two-implementations findings to
+  `planctl review --findings`. That needs the-library's matching `planctl` with
+  `decided_by` and `--findings`. Why: in FDAdb's five amended runs about 16 of 36
+  `NO_PROGRESS` parks came from contracts that named where to observe but not
+  what value is correct.
 - **Contract change: lane panes open as a tab in the repository workspace.**
   Each lane used to get a linked child Space (`herdr worktree open`, #173/#237),
   which put its panes outside the operator's FDAdb workspace, where they could
@@ -46,6 +62,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the target checkout, its git dirs, the source repository or the runtime's
   own checkout. The test asserting the reviewer's tree has no `.git` now
   asserts it is a one-commit, one-ref directory repository.
+||||||| parent of 2739128 (Contract change: a gating obligation states its expected answers or does not ship)
 - **Contract change: the runtime-state fingerprint no longer binds the device
   number.** It is SHA-256 over the root's absolute path and inode. macOS
   assigns a volume's `st_dev` at mount, so after a reboot (16777230 ->

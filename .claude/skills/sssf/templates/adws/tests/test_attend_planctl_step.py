@@ -135,6 +135,67 @@ class ReceiptHandshake(unittest.TestCase):
         self.assertIn("RECEIPT_NOT_PASS", str(caught.exception))
 
 
+class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
+    """`planctl review` refuses without `--findings`; attend always passes one.
+
+    The operator agent writes its answer beside the revision it authored
+    (`attend.findings_path_for`). `_attend_project` copies it next to the IR it
+    reviews and names it on the review argv. When the operator wrote none, the
+    path is still passed and planctl refuses `review.findings_missing`.
+    """
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+        self.revision = self.tmp / "out" / "r2.ir.json"
+        self.revision.parent.mkdir()
+        self.revision.write_text("{}", encoding="utf-8")
+        self.plans = self.tmp / "plans"
+
+    def _review_argv(self) -> list:
+        from unittest import mock
+
+        calls = []
+        policy = att.AttendPolicy(max_amendments_per_lane=1, planctl=self.tmp / "p")
+        with (
+            mock.patch.object(maestro, "_planctl_binary", return_value=Path("planctl")),
+            mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
+            mock.patch.object(
+                maestro, "_run_planctl", side_effect=lambda b, argv, **k: calls.append(argv)
+            ),
+            mock.patch.object(
+                ingress, "author_from_plan_contract", side_effect=RuntimeError("stop")
+            ),
+        ):
+            with self.assertRaises(att.AttendRefused):
+                maestro._attend_project(
+                    policy, _Runtime(self.tmp), self.tmp, self.plans, "run", self.revision, 2
+                )
+        (review,) = [argv for argv in calls if argv[0] == "review"]
+        return review
+
+    def test_the_operator_findings_are_copied_and_passed(self) -> None:
+        self.assertEqual(
+            self.tmp / "out" / "r2.review-findings.json",
+            att.findings_path_for(self.revision),
+        )
+        att.findings_path_for(self.revision).write_text('{"findings": []}', encoding="utf-8")
+        review = self._review_argv()
+        passed = Path(review[review.index("--findings") + 1])
+        self.assertEqual(self.plans / "run.r2.review-findings.json", passed)
+        self.assertEqual('{"findings": []}', passed.read_text(encoding="utf-8"))
+
+    def test_absent_findings_are_still_named_so_planctl_refuses(self) -> None:
+        review = self._review_argv()
+        self.assertIn("--findings", review)
+        self.assertFalse(Path(review[review.index("--findings") + 1]).exists())
+
+    def test_the_operator_is_asked_the_question(self) -> None:
+        self.assertIn("two implementations", att.TWO_IMPLEMENTATIONS_QUESTION)
+        self.assertIn("divergent_input", att.TWO_IMPLEMENTATIONS_QUESTION)
+
+
 class RealValidatorInvocation(unittest.TestCase):
     """`_run_planctl` against the binary, not against a stubbed subprocess."""
 
@@ -181,6 +242,21 @@ class RealValidatorInvocation(unittest.TestCase):
         self.assertEqual(
             os.environ[admission.REVIEWER_HMAC_KEY_ENV], "leaked-from-the-shell"
         )
+
+
+    def test_the_binary_accepts_the_findings_argument_attend_passes(self) -> None:
+        """A stubbed subprocess cannot observe the argv parser; ask the binary."""
+        import subprocess
+        import sys
+
+        usage = subprocess.run(
+            [sys.executable, str(self.binary), "review", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+        self.assertIn("--findings", usage.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

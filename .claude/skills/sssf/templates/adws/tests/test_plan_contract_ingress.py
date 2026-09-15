@@ -304,6 +304,83 @@ class PlanAuthorCliTests(unittest.TestCase):
             self.assertIn("OBLIGATION_UNOBSERVABLE", payload["detail"])
             self.assertFalse(out.exists())
 
+    def test_cli_refuses_a_tests_claim_with_no_decided_by(self) -> None:
+        """Ship and amendment ingress refuse an obligation with no worked examples.
+
+        `run attend` and a hand-authored `run amend` revision both pass through
+        this projection and the objective compiler, so an amendment that leaves a
+        gating obligation without examples is refused here too.
+        """
+        ir = _ir()
+        for claim in ir["claims"]:
+            if claim["claim_id"] == "claim-t":
+                claim.pop("decided_by")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out, ir)
+            self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("OBLIGATION_UNDECIDED", payload["detail"])
+            self.assertIn("claim-t", payload["detail"])
+            self.assertFalse(out.exists())
+
+    def test_cli_requires_a_refusal_example_for_a_restricted_claim(self) -> None:
+        refusal = {"input": {"module": "missing"}, "refuses": {"error": "ImportError"}}
+        for field, value in (
+            ("polarity", "negative"),
+            ("preconditions", ["the module is on sys.path"]),
+            ("exception_ids", ["claim-b1"]),
+        ):
+            with self.subTest(field=field):
+                ir = _ir()
+                claim = next(c for c in ir["claims"] if c["claim_id"] == "claim-t")
+                claim[field] = value
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "repo").mkdir()
+                    result = self._author(root, root / "plan", ir)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("no refuses example", json.loads(result.stdout)["detail"])
+                claim["decided_by"] = claim["decided_by"] + [refusal]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "repo").mkdir()
+                    result = self._author(root, root / "plan", ir)
+                    detail = result.stdout + result.stderr
+                    self.assertNotIn("OBLIGATION_UNDECIDED", detail)
+
+    def test_cli_projects_the_examples_verbatim_into_the_public_contract(self) -> None:
+        from adw_modules.plan_compiler import compile_plan
+
+        examples = [{"input": {"module": "src.b"}, "expect": {"importable": True}}]
+        rendered = json.dumps(
+            examples, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        ir = _ir()
+        claim_b1 = next(c for c in ir["claims"] if c["claim_id"] == "claim-b1")
+        claim_b1["decided_by"] = examples
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out, ir)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            stored = json.loads(out.read_bytes())
+            lanes = {lane.lane_id: lane for lane in compile_plan(out.read_bytes()).lanes}
+        tests_lane = next(lane for lane in stored["lanes"] if lane["id"] == "lane-t")
+        self.assertEqual(
+            [examples],
+            [c.get("decided_by") for c in tests_lane["spec"]["obligations"]["claims"]],
+        )
+        for lane_id in ("lane-t", "lane-b"):
+            self.assertTrue(
+                any("[decided by: {0}]".format(rendered) in item
+                    for item in lanes[lane_id].public_acceptance),
+                lanes[lane_id].public_acceptance,
+            )
+
     def test_cli_carries_the_declared_seam_onto_the_acceptance(self) -> None:
         from adw_modules.plan_compiler import compile_plan
 

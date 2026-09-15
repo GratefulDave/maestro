@@ -415,10 +415,13 @@ class ObservationSeamTests(unittest.TestCase):
         "of it is the observable"
     )
 
+    _EXAMPLES = [{"input": {"path": "/faq"}, "expect": {"producer_imported": False}}]
+
     def _gating(self, **overrides) -> dict:
         criterion = {
             "criterion": "serving never calls the FAQ producer",
             "gating": True,
+            "decided_by": self._EXAMPLES,
         }
         criterion.update(overrides)
         return criterion
@@ -461,9 +464,9 @@ class ObservationSeamTests(unittest.TestCase):
         )
         self.assertEqual(
             (
-                "serving never calls the FAQ producer [observable: {0}]".format(
-                    self._SEAM
-                ),
+                "serving never calls the FAQ producer [observable: {0}] "
+                '[decided by: [{{"expect":{{"producer_imported":false}},'
+                '"input":{{"path":"/faq"}}}}]]'.format(self._SEAM),
             ),
             _lane_of(compiled, "lane-a").public_acceptance,
         )
@@ -544,6 +547,123 @@ class ObservationSeamTests(unittest.TestCase):
                 with self.assertRaises(PlanCompileError) as caught:
                     compile_plan(_dump(_plan(_lane("lane-a", acceptance=[item]))))
                 self.assertIn(pv.ACCEPTANCE_MISSING, _codes(caught.exception))
+
+
+class DecidedByTests(unittest.TestCase):
+    """A gating obligation states its expected answers or does not ship.
+
+    FDAdb's amended runs parked NO_PROGRESS on contracts that named where to
+    observe but not what value is correct: onset-tests declared provenance only
+    as a Mapping, so whether `{}` is valid was left to a tester/reviewer
+    argument that ran three and four rounds before a human amended the plan.
+    """
+
+    _SEAM = "ObservationStore.record is the public export a case calls"
+    _EXPECT = {"input": {"provenance": {"source": "spl"}}, "expect": {"recorded": True}}
+    _REFUSES = {
+        "input": {"provenance": {}},
+        "refuses": {"error": "ValueError", "message": "provenance is empty"},
+    }
+
+    def _criterion(self, **fields) -> dict:
+        payload = {
+            "criterion": "claim-onset-provenance (positive): every observation carries provenance",
+            "gating": True,
+            "observation_seam": self._SEAM,
+        }
+        payload.update(fields)
+        return payload
+
+    def _compile(self, *acceptance, bound_run=False):
+        return compile_plan(
+            _dump(_plan(_lane("lane-a", lane_kind="tests", acceptance=list(acceptance)))),
+            bound_run=bound_run,
+        )
+
+    def _refusal(self, *acceptance):
+        with self.assertRaises(PlanCompileError) as caught:
+            self._compile(*acceptance)
+        undecided = [
+            item for item in caught.exception.refusals
+            if item.code == pv.OBLIGATION_UNDECIDED
+        ]
+        self.assertTrue(undecided, _codes(caught.exception))
+        return undecided[0]
+
+    def test_a_gating_obligation_without_examples_is_refused_by_name(self):
+        refusal = self._refusal(self._criterion())
+        self.assertEqual("/lanes/0/acceptance/0/decided_by", refusal.pointer)
+        self.assertIn("claim-onset-provenance", refusal.message)
+        self.assertIn("no decided_by", refusal.message)
+
+    def test_examples_that_only_refuse_are_refused(self):
+        refusal = self._refusal(self._criterion(decided_by=[self._REFUSES]))
+        self.assertIn("no expect example", refusal.message)
+
+    def test_expect_and_refuses_are_accepted(self):
+        compiled = self._compile(
+            self._criterion(decided_by=[self._EXPECT, self._REFUSES], refusal_required=True)
+        )
+        self.assertEqual(1, len(_lane_of(compiled, "lane-a").public_acceptance))
+
+    def test_a_restricted_obligation_with_only_expect_is_refused(self):
+        refusal = self._refusal(
+            self._criterion(decided_by=[self._EXPECT], refusal_required=True)
+        )
+        self.assertIn("no refuses example", refusal.message)
+
+    def test_a_malformed_example_names_the_missing_part(self):
+        for example, part in (
+            ({"expect": 1}, "exact input"),
+            ({"input": 1, "expect": 1, "refuses": {"error": "E"}}, "exactly one"),
+            ({"input": 1}, "exactly one"),
+            ({"input": 1, "refuses": {"message": "m"}}, "exact error"),
+        ):
+            with self.subTest(example=example):
+                refusal = self._refusal(
+                    self._criterion(decided_by=[self._EXPECT, example])
+                )
+                self.assertIn(part, refusal.message)
+
+    def test_an_advisory_obligation_needs_no_examples(self):
+        compiled = self._compile("serving is fast enough", {"criterion": "p99 under 200ms"})
+        self.assertEqual(
+            ("serving is fast enough", "p99 under 200ms"),
+            _lane_of(compiled, "lane-a").public_acceptance,
+        )
+
+    def test_examples_reach_the_public_contract_verbatim(self):
+        compiled = self._compile(
+            self._criterion(decided_by=[self._EXPECT, self._REFUSES], refusal_required=True)
+        )
+        (text,) = _lane_of(compiled, "lane-a").public_acceptance
+        self.assertIn(
+            json.dumps(
+                [self._EXPECT, self._REFUSES],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            text,
+        )
+
+    def test_a_plan_a_run_is_already_bound_to_is_not_re_judged(self):
+        """resume/status/attend re-read the bound revision with bound_run=True."""
+        undecided = self._criterion()
+        with self.assertRaises(PlanCompileError):
+            self._compile(undecided)
+        bound = self._compile(undecided, bound_run=True)
+        self.assertEqual(
+            ("{0} [observable: {1}]".format(undecided["criterion"], self._SEAM),),
+            _lane_of(bound, "lane-a").public_acceptance,
+        )
+
+    def test_examples_are_part_of_the_plan_identity(self):
+        one = self._compile(self._criterion(decided_by=[self._EXPECT]))
+        other = self._compile(
+            self._criterion(decided_by=[self._EXPECT, {"input": 2, "expect": 3}])
+        )
+        self.assertNotEqual(one.plan_digest, other.plan_digest)
 
 
 if __name__ == "__main__":

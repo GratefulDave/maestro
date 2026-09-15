@@ -41,6 +41,7 @@
       "predicate": "covers",
       "object": "the public contract",
       "observation_seam": "src/b.py is imported by its public module path; the contract it exports is what a case asserts on.",
+      "decided_by": [{"input": {"module": "src.b"}, "expect": {"importable": true}}],
       "polarity": "positive",
       "source_requirement_ids": ["req-t"],
       "source_ids": ["src-a"],

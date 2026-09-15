@@ -12,7 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
 from . import scheduler_types as st
-from .plan_model import LANE_KEYS, SCHEMA_VERSION
+from .plan_model import LANE_KEYS, SCHEMA_VERSION, AcceptanceCriterion
 
 
 EXECUTABLE_KINDS = frozenset({"implementation", "brownfield", "prd", "workflow"})
@@ -327,6 +327,7 @@ _CLAIM_FIELDS = (
     "antecedent_claim_id",
     "claim_id",
     "compression",
+    "decided_by",
     "domain",
     "exception_ids",
     "identifier_pattern",
@@ -363,8 +364,12 @@ _CLAIM_PROJECTION: Dict[str, Optional[str]] = {
     "polarity": "acceptance",
     "value": "acceptance",
     "unit": "acceptance",
+    # Worked examples are public by construction: the builder reads the same
+    # expected answers the tester's cases assert.
+    "decided_by": "acceptance",
     **{name: None for name in _CLAIM_FIELDS if name not in {
         "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+        "decided_by",
     }},
 }
 _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
@@ -372,6 +377,7 @@ _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
     for name in _CLAIM_FIELDS
     if name not in {
         "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+        "decided_by",
     }
 }
 _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
@@ -379,6 +385,9 @@ _CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
     # A tests lane's claim is a gating obligation, so its declared seam is
     # carried onto the acceptance criterion the compiler refuses without.
     "observation_seam": "acceptance, spec.obligations.claims",
+    # ...and so are its worked examples, which the compiler refuses without
+    # (OBLIGATION_UNDECIDED).
+    "decided_by": "acceptance, spec.obligations.claims",
 }
 _CLAIM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
@@ -627,6 +636,27 @@ def _observation_seam(claim: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _refusal_required(claim: Mapping[str, Any]) -> bool:
+    """The claim declares an input restriction, so it owes a `refuses` example.
+
+    Structural only: negative polarity, or a non-empty `exception_ids` or
+    `preconditions`.
+    """
+    return (
+        claim.get("polarity") == "negative"
+        or bool(claim.get("exception_ids"))
+        or bool(claim.get("preconditions"))
+    )
+
+
+def _build_criterion(claim: Mapping[str, Any]) -> str:
+    """A build lane's advisory criterion, carrying the claim's worked examples."""
+    sentence = _claim_sentence(claim)
+    if "decided_by" not in claim:
+        return sentence
+    return AcceptanceCriterion(sentence, decided_by=claim["decided_by"]).public_text
+
+
 def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]],
                 gating: bool) -> list:
     """The lane's public acceptance: the verifier oracle, then one per claim.
@@ -636,7 +666,10 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
     declared `observation_seam`. A claim that declares none projects a gating
     criterion with no seam, and the objective compiler refuses the plan
     (`OBLIGATION_UNOBSERVABLE`) rather than shipping an obligation no case can
-    observe. Nothing here reads the claim's prose.
+    observe. Its `decided_by` worked examples are carried the same way, with
+    `refusal_required` when the claim declares an input restriction; a gating
+    criterion without them is refused `OBLIGATION_UNDECIDED`. Nothing here
+    reads the claim's prose.
     """
     verifier_id = _require_text(
         verifier.get("verifier_id"), "UNMAPPABLE_VERIFIERS", "verifier_id")
@@ -645,7 +678,7 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
         "{}.oracle".format(verifier_id))
     head = ["{}: {}".format(verifier_id, oracle)]
     if not gating:
-        return head + [_claim_sentence(claim) for claim in claims]
+        return head + [_build_criterion(claim) for claim in claims]
     projected = []
     for claim in claims:
         criterion: dict = {
@@ -655,6 +688,10 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
         seam = _observation_seam(claim)
         if seam is not None:
             criterion["observation_seam"] = seam
+        if "decided_by" in claim:
+            criterion["decided_by"] = claim["decided_by"]
+        if _refusal_required(claim):
+            criterion["refusal_required"] = True
         projected.append(criterion)
     return head + projected
 
@@ -1023,6 +1060,24 @@ def _assert_ingress_projection_is_total(
                 _fail(
                     "acceptance[{0}].observation_seam".format(offset + 1),
                     declared, carried)
+            item = item if isinstance(item, dict) else {}
+            if claim.get("decided_by") != item.get("decided_by"):
+                _fail(
+                    "acceptance[{0}].decided_by".format(offset + 1),
+                    claim.get("decided_by"), item.get("decided_by"))
+            if _refusal_required(claim) != bool(item.get("refusal_required")):
+                _fail(
+                    "acceptance[{0}].refusal_required".format(offset + 1),
+                    _refusal_required(claim), item.get("refusal_required"))
+    else:
+        for offset, claim in enumerate(
+                _bound_records(ir, lane, "claim_ids", "claims", "claim_id")):
+            if claim.get("decided_by") is None:
+                continue
+            expected = _build_criterion(claim)
+            if acceptance[offset + 1] != expected:
+                _fail("acceptance[{0}].decided_by".format(offset + 1),
+                      expected, acceptance[offset + 1])
     branch = maestro.get("integration_branch")
     if spec.get("integration", {}).get("integration_branch") != branch:
         _fail("spec.integration.integration_branch", branch,

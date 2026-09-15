@@ -70,6 +70,41 @@ class IngressTotalityTests(unittest.TestCase):
                 self.ingress.project_draft(self.ir, self.repo)
         self.assertIn("private key", str(caught.exception))
 
+    def test_dropped_decided_by_examples_are_named(self) -> None:
+        real = self.ingress._acceptance
+
+        def drop(*args, **kwargs):
+            items = real(*args, **kwargs)
+            return [
+                {k: v for k, v in item.items() if k != "decided_by"}
+                if isinstance(item, dict) else item
+                for item in items
+            ]
+
+        with mock.patch.object(self.ingress, "_acceptance", drop):
+            with self.assertRaises(self.ingress.IngressProjectionIncomplete) as caught:
+                self.ingress.project_draft(self.ir, self.repo)
+        self.assertIn("decided_by", str(caught.exception))
+
+    def test_dropped_refusal_obligation_is_named(self) -> None:
+        ir = copy.deepcopy(self.ir)
+        claim = next(c for c in ir["claims"] if c["claim_id"] == "claim-t")
+        claim["polarity"] = "negative"
+        real = self.ingress._acceptance
+
+        def drop(*args, **kwargs):
+            items = real(*args, **kwargs)
+            return [
+                {k: v for k, v in item.items() if k != "refusal_required"}
+                if isinstance(item, dict) else item
+                for item in items
+            ]
+
+        with mock.patch.object(self.ingress, "_acceptance", drop):
+            with self.assertRaises(self.ingress.IngressProjectionIncomplete) as caught:
+                self.ingress.project_draft(ir, self.repo)
+        self.assertIn("refusal_required", str(caught.exception))
+
     def test_empty_table_reason_is_refused(self) -> None:
         with mock.patch.dict(
             self.ingress._LANE_PROJECTION_EXEMPT, {"fixture_ids": " "}

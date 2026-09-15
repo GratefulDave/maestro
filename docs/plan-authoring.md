@@ -49,6 +49,7 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - No duplicate, equal, ancestor, or descendant ownership conflicts exist across lanes.
 - Each lane declares public acceptance criteria.
 - Every gating acceptance criterion declares an `observation_seam`.
+- Every gating acceptance criterion states its expected answers as `decided_by` worked examples.
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -405,6 +406,61 @@ can fail. Two rules for writing one:
   requirement and leave the tester to discover it is undecidable. Either move the boundary so the
   behaviour is observable — that is usually a lane-shape change, see the section above — or write
   the obligation as advisory and gate on something a case can see.
+
+## A gating obligation states its expected answers
+
+A seam says where a case looks. It does not say what value is correct there, and a tester and a
+reviewer who disagree about that value argue it round after round. Every gating obligation therefore
+also states its expected answers as **worked examples**: the claim's `decided_by` field, a nonempty
+list in which each example has an exact `input` and exactly one of `expect` (the exact output) or
+`refuses` (the exact refusal: its `error` type or code and, where the contract has one, its
+`message`). The compiler refuses a gating obligation that has no examples, has no `expect`
+example, or has a malformed example (`OBLIGATION_UNDECIDED`, naming the obligation and the
+missing part). A claim that restricts its input needs at least one `refuses` example too. Ingress
+reads that restriction off the claim's structure: `polarity: negative`, a non-empty
+`exception_ids`, or non-empty `preconditions`. It projects the restriction as `refusal_required`.
+
+Bad — FDAdb's onset provenance obligation, which parked three runs:
+
+```
+claim-onset-provenance: every observation carries provenance
+  observation_seam: ObservationStore.record(observation, provenance) is the public export
+  (provenance declared only as Mapping)
+```
+
+Is `{}` provenance? One tester wrote a case that records it; the reviewer refused, reading
+"carries provenance" as non-empty. Another tester refused it; a different reviewer called that an
+invented restriction. Both implementations satisfy the sentence and the seam, so no round could
+settle it, and each park cost a human amendment.
+
+Good — the same obligation with the answer written down:
+
+```
+claim-onset-provenance: every observation carries provenance
+  observation_seam: ObservationStore.record(observation, provenance) is the public export
+  preconditions: [provenance names its source]
+  decided_by:
+    - input:   {"provenance": {"source": "spl", "release_id": "r1"}}
+      expect:  {"recorded": true, "provenance": {"source": "spl", "release_id": "r1"}}
+    - input:   {"provenance": {}}
+      refuses: {"error": "ValueError", "message": "provenance must name its source"}
+```
+
+Three rules for writing them:
+
+- **Examples are public.** They reach the tester, the builder and every reviewer verbatim, in the
+  lane's acceptance text. State the contract's answers there, never a sealed case's fixtures or selectors.
+- **Exact, not described.** `input` and `expect` are literals a case can compare with `==`. "A
+  sorted mapping" is a description; `{"a": 1, "b": 2}` serialized as `'{"a":1,"b":2}'` is an answer.
+- **An example decides a question someone would ask.** Plan review asks, once per gating obligation,
+  for two implementations that satisfy every example and the seam yet produce different observable
+  results. Each such pair is a structured finding bound to the claim. `planctl review --findings`
+  will not sign the receipt until the claim has an example whose `input` is the finding's
+  `divergent_input`. Add that example; the same findings file then signs, and nobody is asked again.
+
+A run already bound to a plan is not re-judged. `run resume`, `run status`, `run attend` and the
+previous revision under `run amend` re-read the bound revision without this check, so only a plan
+being shipped, started, or amended into a run needs examples.
 
 ## What a review rejection costs
 

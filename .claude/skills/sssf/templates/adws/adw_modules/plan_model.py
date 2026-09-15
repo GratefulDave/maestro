@@ -12,7 +12,11 @@ NO_PLAN_ARTIFACT_REF = "NO_PLAN_ARTIFACT_REF"
 
 PLAN_KEYS = frozenset({"schema_version", "lanes"})
 LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance", "lane_kind"})
-ACCEPTANCE_KEYS = frozenset({"criterion", "gating", "observation_seam"})
+ACCEPTANCE_KEYS = frozenset(
+    {"criterion", "gating", "observation_seam", "decided_by", "refusal_required"}
+)
+DECIDED_BY_EXAMPLE_KEYS = frozenset({"input", "expect", "refuses"})
+REFUSAL_KEYS = frozenset({"error", "message"})
 
 
 @dataclass(frozen=True)
@@ -24,34 +28,117 @@ class AcceptanceCriterion:
     ``gating: true``, which makes it an obligation a tests lane must discharge,
     and a gating obligation must name the ``observation_seam`` a case can assert
     on from the public contract. Gating is declared, never read out of the prose.
+
+    A gating obligation also states its expected answers as ``decided_by``:
+    worked examples, each an exact ``input`` with exactly one exact ``expect``
+    or ``refuses``. ``refusal_required`` is the declared input restriction that
+    obliges at least one ``refuses`` example. The examples are public by
+    construction and reach every actor verbatim through ``public_text``.
     """
 
     criterion: str
     gating: bool = False
     observation_seam: Optional[str] = None
+    decided_by: Any = None
+    refusal_required: bool = False
 
     @property
     def public_text(self) -> str:
         """What reaches the tester, builder, and reviewer as acceptance."""
-        if not self.observation_seam:
-            return self.criterion
-        return "{0} [observable: {1}]".format(self.criterion, self.observation_seam)
+        text = self.criterion
+        if self.observation_seam:
+            text = "{0} [observable: {1}]".format(text, self.observation_seam)
+        if self.decided_by is not None:
+            text = "{0} [decided by: {1}]".format(
+                text,
+                json.dumps(
+                    self.decided_by,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        return text
 
     def canonical(self) -> Any:
         """The authored form, normalized: a plain string stays a plain string."""
-        if not self.gating and self.observation_seam is None:
+        if (
+            not self.gating
+            and self.observation_seam is None
+            and self.decided_by is None
+            and not self.refusal_required
+        ):
             return self.criterion
         payload: dict = {"criterion": self.criterion, "gating": self.gating}
         if self.observation_seam is not None:
             payload["observation_seam"] = self.observation_seam
+        if self.decided_by is not None:
+            payload["decided_by"] = self.decided_by
+        if self.refusal_required:
+            payload["refusal_required"] = True
         return payload
+
+
+def decided_by_problems(value: Any, *, refusal_required: bool) -> Tuple[str, ...]:
+    """What a gating obligation's worked examples leave undecided; empty if none.
+
+    Structural only: an exact input and exactly one exact answer per example,
+    at least one ``expect``, and at least one ``refuses`` when the obligation
+    declares an input restriction. No prose is inspected.
+    """
+    if not isinstance(value, list) or not value:
+        return ("declares no decided_by worked examples",)
+    problems = []
+    expects = refuses = 0
+    for index, example in enumerate(value):
+        if (
+            not isinstance(example, dict)
+            or set(example) - DECIDED_BY_EXAMPLE_KEYS
+            or "input" not in example
+            or ("expect" in example) == ("refuses" in example)
+        ):
+            problems.append(
+                "decided_by[{0}] must be an exact input with exactly one of "
+                "expect or refuses".format(index)
+            )
+            continue
+        if "expect" in example:
+            expects += 1
+            continue
+        refusal = example["refuses"]
+        if (
+            not isinstance(refusal, dict)
+            or set(refusal) - REFUSAL_KEYS
+            or not isinstance(refusal.get("error"), str)
+            or not refusal["error"].strip()
+            or (
+                "message" in refusal
+                and (not isinstance(refusal["message"], str) or not refusal["message"].strip())
+            )
+        ):
+            problems.append(
+                "decided_by[{0}].refuses must name the exact error and, where "
+                "the contract has one, its message".format(index)
+            )
+            continue
+        refuses += 1
+    if not problems and not expects:
+        problems.append("has no expect example stating an exact correct output")
+    if not problems and refusal_required and not refuses:
+        problems.append(
+            "declares an input restriction (refusal_required) but no refuses "
+            "example stating the exact refusal"
+        )
+    return tuple(problems)
 
 
 def parse_acceptance_item(raw: Any) -> Optional[AcceptanceCriterion]:
     """One acceptance criterion, or None if the authored item is inadmissible.
 
     Accepts the historical plain-string form and the object form carrying the
-    declared ``gating`` flag and ``observation_seam``. No prose is inspected.
+    declared ``gating`` flag, ``observation_seam``, ``decided_by`` examples
+    and ``refusal_required`` flag. Example shape is judged by the compiler,
+    which names what is missing (``OBLIGATION_UNDECIDED``). No prose is inspected.
     """
     if isinstance(raw, str):
         return AcceptanceCriterion(raw) if raw.strip() else None
@@ -68,7 +155,12 @@ def parse_acceptance_item(raw: Any) -> Optional[AcceptanceCriterion]:
     seam = raw.get("observation_seam")
     if seam is not None and (not isinstance(seam, str) or not seam.strip()):
         return None
-    return AcceptanceCriterion(criterion, gating, seam)
+    refusal_required = raw.get("refusal_required", False)
+    if not isinstance(refusal_required, bool):
+        return None
+    return AcceptanceCriterion(
+        criterion, gating, seam, raw.get("decided_by"), refusal_required
+    )
 
 
 class PlanParseError(ValueError):
