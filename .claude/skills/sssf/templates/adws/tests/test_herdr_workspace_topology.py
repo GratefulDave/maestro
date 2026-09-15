@@ -425,6 +425,69 @@ class RepositoryLaneTabTest(unittest.TestCase):
                 )
             )
 
+    def test_repository_pane_in_space_bound_elsewhere_does_not_compete(self) -> None:
+        # Run be064e58: an operator session opened on FDAdb from the maestro
+        # Space refused every launch AMBIGUOUS_REPOSITORY_PANE. Worktree shapes
+        # are the real binary's `herdr workspace list` records.
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            elsewhere = _checkout(Path(tmp), "maestro")
+            other = run.herdr.add_workspace("maestro", elsewhere)
+            other_tab = str(run.herdr.workspaces[other]["active_tab_id"])
+            session = run.herdr._new_pane(other, other_tab, str(run.root))
+            run.herdr.start_agent("operator-session", session["pane_id"], status="working")
+            run.herdr.workspaces[other]["worktree"] = {
+                "checkout_path": str(elsewhere),
+                "is_linked_worktree": False,
+                "repo_root": str(elsewhere),
+            }
+            run.herdr.workspaces[run.operator]["worktree"] = {
+                "checkout_path": str(run.root),
+                "is_linked_worktree": False,
+                "repo_root": str(run.root),
+            }
+
+            handle = _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
+
+            self.assertEqual(handle.workspace_id, run.operator)
+            self.assertEqual(run.herdr.tabs[handle.tab_id]["workspace_id"], run.operator)
+
+    def test_unbound_space_pane_does_not_compete_with_bound_repository_space(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            stray = run.herdr.add_workspace("scratch", run.root)
+            run.herdr.workspaces[run.operator]["worktree"] = {
+                "checkout_path": str(run.root),
+                "is_linked_worktree": False,
+                "repo_root": str(run.root),
+            }
+
+            handle = _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
+
+            self.assertEqual(handle.workspace_id, run.operator)
+            self.assertNotEqual(handle.workspace_id, stray)
+
+    def test_two_spaces_bound_to_repository_root_refuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            second = run.herdr.add_workspace("FDAdb-2", run.root)
+            for workspace_id in (run.operator, second):
+                run.herdr.workspaces[workspace_id]["worktree"] = {
+                    "checkout_path": str(run.root),
+                    "is_linked_worktree": False,
+                    "repo_root": str(run.root),
+                }
+            mark = len(run.herdr.calls)
+
+            with self.assertRaises(lch.LaunchRefused) as raised:
+                _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
+
+            self.assertIs(raised.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH)
+            self.assertIn("AMBIGUOUS_REPOSITORY_WORKSPACE:", raised.exception.detail)
+            self.assertFalse(
+                _calls_after(run.herdr, mark, ("tab", "create"), ("agent", "start"))
+            )
+
     def test_roles_in_one_lane_share_tab_and_keep_distinct_checkouts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = _RunFixture(tmp)
