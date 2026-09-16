@@ -97,6 +97,19 @@ class DraftCollectionRefused(FactoryRefused):
     code = "DRAFT_COLLECTION_REFUSED"
 
 
+class ParentOutcomesRefused(DraftCollectionRefused):
+    """The draft collected, and then could not be adjudicated case by case.
+
+    Its own type because the two say different things to a tester. "Your draft
+    could not be listed" is about import time; this is about a suite that
+    listed cleanly and then produced no per-case verdict at the parent, which
+    is what `gate.declared_cases` is compared against. A subclass of
+    `DraftCollectionRefused` so every existing caller that already contains a
+    draft-shaped refusal keeps containing this one.
+    """
+
+    code = "PARENT_OUTCOMES_REFUSED"
+
 
 class TypedTestOutputsRefused(FactoryRefused):
     code = "TYPED_TEST_OUTPUTS"
@@ -1296,12 +1309,33 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     required = tuple(str(item) for item in required if str(item).strip())
     if len(required) > int(min_cases):
         raise DraftCollectionRefused("required_cases exceeds min_cases")
+    # Which cases the plan says must be RED at the parent, and which must
+    # already hold there. `plan_validate.CASE_FALSIFICATION_UNDECLARED` judged
+    # the shape before the run started; this only reads it. Absent is the
+    # shipped-plan case and means the parent is not measured per case.
+    declared = gate.get("declared_cases")
+    if declared is None:
+        declared_cases = ()
+    elif not isinstance(declared, (list, tuple)):
+        raise DraftCollectionRefused("declared_cases")
+    else:
+        rows = []
+        for item in declared:
+            if not isinstance(item, Mapping):
+                raise DraftCollectionRefused("declared_cases")
+            name = str(item.get("case") or "").strip()
+            red = item.get("red_at_parent")
+            if not name or not isinstance(red, bool):
+                raise DraftCollectionRefused("declared_cases")
+            rows.append((name, red))
+        declared_cases = tuple(rows)
     return SimpleNamespace(
         runner=str(runner),
         argv=tuple(str(item) for item in argv),
         cwd=cwd,
         min_cases=int(min_cases),
         required_cases=required,
+        declared_cases=declared_cases,
     )
 
 
@@ -1315,6 +1349,7 @@ def _collect_gate(
         cwd=gate.cwd,
         min_cases=gate.min_cases,
         required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
+        declared_cases=tuple(getattr(gate, "declared_cases", ()) or ()),
     )
 
 
@@ -1394,6 +1429,105 @@ def _draft_required_cases_findings(
     )
 
 
+def _red_at_parent_divergences(
+    declared: Sequence[tuple[str, bool]], outcomes: Mapping[str, bool]
+) -> tuple[str, ...]:
+    """Where the parent measurement disagrees with what the plan declared.
+
+    Matched as a substring of the runner's own case identifier, the same
+    convention `_missing_required_cases` uses and for the same reason: a runner
+    prints `path::name` (pytest) or `path > title` (vitest) and the plan names
+    the case, not the file it landed in.
+
+    Three divergences, and only three, because these are the ones a case
+    identifier can carry without reading failure prose:
+
+      * a declared case no case at the parent names -- the plan and the suite
+        disagree about what exists;
+      * declared red, observed green -- the case does not depend on the lane's
+        outputs, so it will pass no matter what the builder writes;
+      * declared green, observed red -- the case is red for a reason the plan
+        did not claim. This is the FDAdb be064e58 shape, and it is the whole
+        point: a case red at the parent for a reason other than the behaviour
+        it claims to test has not been falsified, and sealing it seals a suite
+        that can never go green.
+
+    Deliberately NOT compared: the failure's text, its traceback, or the module
+    it names. Matching a declared reason against a runner's failure prose is
+    fuzzy in both directions, and a false refusal on a good suite costs more
+    rounds than the gap it closes. Which CASES are red is the strongest
+    comparison that stays mechanical.
+    """
+    problems: list[str] = []
+    for name, want_red in declared:
+        matched = [cid for cid in outcomes if name in cid]
+        if not matched:
+            problems.append(
+                "{0!r}: declared, but the parent ran no case naming it".format(name)
+            )
+            continue
+        got_red = any(outcomes[cid] for cid in matched)
+        if want_red and not got_red:
+            problems.append(
+                "{0!r}: declared red at the parent, observed green -- it does "
+                "not depend on this lane's declared outputs".format(name)
+            )
+        elif got_red and not want_red:
+            problems.append(
+                "{0!r}: declared green at the parent, observed red -- it is "
+                "red for a reason this plan does not claim".format(name)
+            )
+    return tuple(problems)
+
+
+def _red_at_parent_findings(
+    problems: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": (
+                    "run against the parent commit, the draft's cases did not "
+                    "match the outcomes this lane's plan declares: {0}".format(
+                        "; ".join(problems)
+                    )
+                ),
+                "required_behavior": (
+                    "a case the plan declares red at the parent must fail "
+                    "there because the lane's declared outputs do not exist "
+                    "yet, and a case the plan declares green must already "
+                    "hold. Rewrite the named cases so each one's outcome at "
+                    "the parent is the one the plan states, asserting only on "
+                    "the seam this lane owns"
+                ),
+                "violated_requirement": "gate.declared_cases",
+            },
+        )
+    )
+
+
+def _red_at_parent_unreadable_findings(detail: str) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": (
+                    "the draft could not be measured case by case against the "
+                    "parent commit. The runner reported: {0}".format(detail)
+                ),
+                "required_behavior": (
+                    "every case must run to a per-case verdict at the parent "
+                    "commit, so the plan's declared red and green outcomes can "
+                    "be compared against it. A suite whose cases cannot be "
+                    "individually adjudicated cannot be sealed"
+                ),
+                "violated_requirement": "gate.declared_cases",
+            },
+        )
+    )
+
+
 def _draft_min_cases_findings(
     collected: int, min_cases: int
 ) -> tuple[dict[str, str], ...]:
@@ -1418,6 +1552,7 @@ HARNESS_VIOLATED_REQUIREMENTS = frozenset(
         "gate collection",
         "gate.required_cases",
         "gate.min_cases",
+        "gate.declared_cases",
         cr._RUNNER_REVISE["violated_requirement"],
         cr._COLLECTION_REVISE["violated_requirement"],
         cr._INTEGRATION_GATE_REVISE["violated_requirement"],
@@ -2323,7 +2458,9 @@ class FactoryScheduler:
             return None, None
         files = self._draft_private_files(draft)
         try:
-            collected = self._collect_private_draft(ctx, gate, files)
+            collected, outcomes = self._collect_private_draft(ctx, gate, files)
+        except ParentOutcomesRefused as refused:
+            return _red_at_parent_unreadable_findings(str(refused)), None
         except DraftCollectionRefused as refused:
             return _draft_collection_findings(str(refused)), None
         # Names before count: a suite missing a required case is wrong in a way
@@ -2336,6 +2473,14 @@ class FactoryScheduler:
             return _draft_required_cases_findings(missing), len(collected)
         if len(collected) < gate.min_cases:
             return _draft_min_cases_findings(len(collected), gate.min_cases), len(collected)
+        # Last, because it is the only check that ran the cases: a draft that
+        # does not collect, or is short of its floor, has nothing to adjudicate
+        # against the parent and would be told two things at once.
+        divergent = _red_at_parent_divergences(
+            tuple(getattr(gate, "declared_cases", ()) or ()), outcomes
+        )
+        if divergent:
+            return _red_at_parent_findings(divergent), len(collected)
         return None, len(collected)
 
     def _assert_runners_usable(self) -> None:
@@ -2433,7 +2578,7 @@ class FactoryScheduler:
         ctx: LaneContext,
         gate: SimpleNamespace,
         files: Mapping[str, str],
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], Mapping[str, bool]]:
         run_repo = Path(self.target.target_repository_root)
         vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
         base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
@@ -2477,13 +2622,23 @@ class FactoryScheduler:
                 (),
             )
             prv.write_files(dest, files)
-            ids = rr.collect_cases(
-                resolved,
-                _collect_gate(gate, files, Path(dest)),
-                dest,
-            )
-            return tuple(ids)
-        except (rr.CollectFailed, rr.RunnerUnusable) as extra:
+            measured = _collect_gate(gate, files, Path(dest))
+            ids = rr.collect_cases(resolved, measured, dest)
+            # The tree this collected in IS the parent commit -- `base` is the
+            # integration seed with only the draft's private files written on
+            # top -- so the red-at-parent measurement belongs here and nowhere
+            # else. A second tree would provision twice and, worse, would let
+            # the two measurements disagree about which commit they were made
+            # against.
+            outcomes: Mapping[str, bool] = {}
+            if getattr(gate, "declared_cases", ()):
+                outcomes = rr.execute_case_outcomes(resolved, measured, dest)
+            return tuple(ids), outcomes
+        except (
+            rr.CollectFailed,
+            rr.RunnerUnusable,
+            rr.CaseOutcomesUnreadable,
+        ) as extra:
             detail = getattr(extra, "detail", None) or extra.__class__.__name__
             tokens = prv.collect_private_tokens(
                 files=files,
@@ -2514,6 +2669,8 @@ class FactoryScheduler:
                 raise RunnerPreflightRefused(
                     "{0}; measured in {1}, which is kept".format(redacted, dest)
                 ) from extra
+            if isinstance(extra, rr.CaseOutcomesUnreadable):
+                raise ParentOutcomesRefused(redacted) from extra
             raise DraftCollectionRefused(redacted) from extra
         finally:
             if not keep:
