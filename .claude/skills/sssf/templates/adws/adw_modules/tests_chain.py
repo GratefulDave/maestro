@@ -846,8 +846,37 @@ def run_private_suite(
             bound.runner, Path(tree), bound.cwd, paths=selectors
         )
     except rr.RunnerUnusable as extra:
+        # The measurement travels with the refusal. `SEALED_SUITE_RUNNER_UNUSABLE:
+        # vitest` alone cannot tell UNRESOLVED (the runner was never installed --
+        # repair `provision_argv`) from INCAPABLE (it is installed and cannot
+        # resolve this project's config -- repair the config or its deps), and
+        # those have opposite repairs. `detail` names the reason, the candidates
+        # tried, the resolved binary, the probe exit and the probe's own words.
+        # Redacted, because the probe output can quote sealed test source, and
+        # the tree path names the vault checkout.
+        # Bodies, not just paths. `collect_private_tokens(files=...)` takes a
+        # path -> body mapping and tokenises the source itself -- every quoted
+        # literal and every line of it -- where `extra=` would redact the file
+        # names alone. A collect error quotes the source that failed to import,
+        # and `code_review._run_sealed_suite` puts `str(exc)` into the run's
+        # `output`, so an unredacted probe output carries sealed source out of
+        # this boundary. The caller has the bodies and drops them at the
+        # signature (`tuple(files)`), so read them back from the tree they were
+        # materialised into; unreadable is not fatal here, since a token that
+        # cannot be built is one this refusal simply never had.
+        bodies: dict[str, str] = {}
+        for path in files:
+            try:
+                bodies[path] = (Path(tree) / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+        tokens = pr.collect_private_tokens(
+            files=bodies,
+            extra=tuple(files) + (str(tree), str(Path(tree).resolve())),
+        )
+        detail = pr.redact_text(getattr(extra, "detail", "") or str(extra), tokens)
         raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_RUNNER_UNUSABLE:{0}".format(bound.runner)
+            "SEALED_SUITE_RUNNER_UNUSABLE:{0}: {1}".format(bound.runner, detail)
         ) from extra
     _assert_declared_python(resolved, Path(tree), Path(tree), bound.cwd, files)
     exec_gate = SimpleNamespace(
