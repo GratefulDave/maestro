@@ -898,7 +898,7 @@ def run_private_suite(
             "and is not a defect in the candidate under test.".format(bound.runner)
         )
     evaluated = counts["passed"] + counts["failed"] + counts["errored"]
-    if returncode == 0 and executed > 0 and evaluated == 0:
+    if executed > 0 and evaluated == 0:
         # Cases were counted and not one of them ran an assertion. `it.skip` or
         # `@pytest.mark.skip` across the board proves exactly what an empty
         # suite proves, and `executed` — which counts skips — would otherwise
@@ -914,9 +914,23 @@ def run_private_suite(
         # Measured, on real binaries: a fully skipped suite exits 0 in both
         # runners — pytest prints `1 skipped in 0.00s`, vitest prints
         # `Tests  2 skipped (2)` — so this is reachable and silent, which is
-        # what makes it worth a refusal rather than a count adjustment. The
-        # `returncode == 0` guard keeps a genuinely failing run on the failure
-        # path, where blaming the candidate is correct.
+        # what makes it worth a refusal rather than a count adjustment.
+        #
+        # This used to carry a `returncode == 0` guard, which claimed to keep
+        # "a genuinely failing run on the failure path, where blaming the
+        # candidate is correct". That branch is not reachable: a genuinely
+        # failing run has `failed` or `errored` above zero, so `evaluated > 0`
+        # and this condition is already false. The guard covered nothing and
+        # exempted the one shape that matters — a suite whose fixture cannot
+        # start exits non-zero with every case skipped, and was billed to the
+        # builder. Measured on vitest 3.2.7: a `beforeAll` that throws exits 1
+        # with `Tests  2 skipped (2)`, evaluating nothing. FDAdb run
+        # be064e58 `lane-wp3-adapter-build` spent three REVISE rounds and a
+        # NO_PROGRESS park on exactly that, because the sealed suite spawned
+        # `python3` off PATH and the interpreter it found had no `uvicorn`.
+        #
+        # Whether the runner exited 0 or 1 while evaluating nothing says
+        # nothing about the candidate; `evaluated == 0` is the whole question.
         raise pr.SealedEnvironmentError(
             "SEALED_SUITE_ALL_CASES_SKIPPED:{0}: every one of the {1} counted "
             "cases was skipped, so the sealed suite evaluated nothing. A suite "
