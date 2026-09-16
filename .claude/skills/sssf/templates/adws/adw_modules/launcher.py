@@ -993,9 +993,14 @@ def run_harness_process(
     """Run one bounded, cancellable harness context in its own process group."""
     if cancel_requested is not None and cancel_requested():
         raise HarnessCancelled("HARNESS_CONTEXT_CANCELLED")
-    merged = dict(os.environ)
-    if env:
-        merged.update(env)
+    # A given `env` is the child's whole environment, not an overlay on the
+    # operator's. Merging made it impossible to REMOVE a variable -- and the
+    # variables that matter here are the ambient toolchain ones (`VIRTUAL_ENV`,
+    # `PYTHONPATH`, `NODE_PATH`), which decide which interpreter and module set
+    # a provisioning command installs into. `uv sync` under an inherited
+    # `VIRTUAL_ENV` installs the tree's dependencies somewhere else and reports
+    # success. Callers wanting the operator's environment pass nothing.
+    merged = dict(os.environ) if env is None else dict(env)
     process = subprocess.Popen(
         list(argv),
         cwd=str(cwd),

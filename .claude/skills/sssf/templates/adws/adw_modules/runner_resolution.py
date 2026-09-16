@@ -91,6 +91,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from . import tree_env as te
+
 #: The collection flags each runner needs, without its binary. This is the old
 #: `plan_validate.COLLECT_ARGV` with `argv[0]` removed — the binary is what
 #: this module exists to decide, so a table that carries one is the defect.
@@ -490,6 +492,10 @@ def resolve(
     """
     repo = Path(repo)
     working = (repo / cwd).resolve()
+    # Probe in the environment the gate will collect and execute in, or
+    # capability is established against a different interpreter than the one
+    # that runs the suite.
+    env = te.tree_environment(repo) if env is None else env
     if not _measured(runner):
         # No measured probe means capability cannot be established, and an
         # unproven runner is refused rather than trusted.
@@ -879,7 +885,7 @@ def collect_cases(
             detail="the gate's working directory does not exist: {0}".format(cwd),
         )
     argv = resolved.collect_argv(gate)
-    merged = dict(os.environ)
+    merged = te.tree_environment(Path(tree))
     if env is not None:
         merged.update(env)
     merged["PYTEST_ADDOPTS"] = ""
@@ -958,7 +964,13 @@ def execute_cases(
             "returncode": -1,
         }
     argv = resolved.execute_argv(tuple(getattr(gate, "argv", ()) or ()))
-    merged = dict(os.environ)
+    # The tree's environment, not the operator's. A suite that spawns a bare
+    # `python3`, `pytest`, or `vitest` must get the one provisioning installed
+    # in this tree; inheriting `os.environ` let whoever started the scheduler
+    # decide, and a suite whose fixture then could not start was billed to the
+    # builder (FDAdb run be064e58 `lane-wp3-adapter-build`, `uvicorn`; run
+    # d246ae95, `bcrypt`). See `tree_env`.
+    merged = te.tree_environment(Path(tree))
     if env is not None:
         merged.update(env)
     # `PYTEST_ADDOPTS` is the operator's, so it is cleared: a gate must not

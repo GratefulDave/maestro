@@ -7,6 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **A command the factory runs inside a provisioned tree runs in that tree's
+  environment** (`adw_modules/tree_env.py`, wired into `runner_resolution.resolve`,
+  `collect_cases`, `execute_cases` and `provisioning.provision_tree`). The module and
+  its test were written in the FDAdb deployment on 2026-09-10, after run `d246ae95`
+  spent three review rounds on `ModuleNotFoundError: No module named 'bcrypt'` — the
+  package was installed in the review tree's `.venv`, and the child resolved the
+  *scheduler's* interpreter because `uv run` exports `VIRTUAL_ENV` and the whole of
+  `os.environ` was copied into every measurement. They were never in the template, so
+  the 2026-09-15 mirror overwrote the three call sites with versions that had never
+  heard of them: `runtime_sync` does not delete, so the module survived, imported by
+  nothing. Twenty-two hours later FDAdb `lane-wp3-adapter-build` failed three rounds on
+  `ModuleNotFoundError: No module named 'uvicorn'` — the same defect by a different
+  name. Proven in that lane's own review tree: `python3 -c "import uvicorn"` exits 1
+  under the inherited environment and 0 under `tree_environment`, resolving the tree's
+  `.venv/bin/python3`.
+- **`launcher.run_harness_process` treats a given `env` as the child's whole
+  environment** rather than an overlay on `os.environ`. Merging made it impossible to
+  *remove* a variable, and the variables that matter are the ambient toolchain ones:
+  `uv sync` under an inherited `VIRTUAL_ENV` installs the tree's dependencies
+  elsewhere and exits 0. Callers wanting the operator's environment pass nothing;
+  `provision_tree` was the only production caller.
 - **A sealed suite that evaluated nothing refuses whatever the runner's exit
   code was** (`adw_modules/tests_chain.py`). `SEALED_SUITE_ALL_CASES_SKIPPED`
   carried a `returncode == 0` guard, so the refusal fired for a deliberately
