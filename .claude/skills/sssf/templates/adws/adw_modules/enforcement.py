@@ -102,12 +102,33 @@ def _names(node: ast.AST) -> Tuple[str, ...]:
 
 
 def _imports(tree: ast.AST) -> Tuple[str, ...]:
+    """Every module name an import statement in ``tree`` binds.
+
+    ``from adw_modules import agents`` names the module ``adw_modules.agents``
+    just as surely as ``import adw_modules.agents`` does, so the alias is
+    recorded beside the ``from`` target. Reading only ``node.module`` made both
+    import-boundary detectors blind to the most common spelling in this
+    runtime: ``base-execution-import`` returned zero findings against its own
+    planted violation (``violations_b.py:agents``), which is what the detector
+    is supposed to catch, and ``digest-import-boundary`` would have missed
+    ``from adw_modules import plan_model`` the same way. Neither had a test, so
+    neither was ever run against its fixture.
+    """
     names: List[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.append(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.append(node.module)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                names.append(
+                    "{}.{}".format(node.module, alias.name)
+                    if node.module
+                    else alias.name
+                )
     return tuple(names)
 
 

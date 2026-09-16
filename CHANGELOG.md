@@ -58,6 +58,87 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `uninstall-font` still restores it exactly.
 
 ### Added
+- **A module in the runtime that nothing imports is a test failure**
+  (`.claude/skills/sssf/templates/adws/tests/test_every_module_has_an_importer.py`).
+  `adw_modules/tree_env.py` was written in the FDAdb deployment on 2026-09-10 and never
+  brought into the template, so the 2026-09-15 mirror overwrote its three importers with
+  versions that had never heard of it. `runtime_sync` does not delete files, so the module
+  survived, imported by nothing, and **nothing failed** — no import error, no refusal, no
+  red test. Twenty-two hours later `lane-wp3-adapter-build` spent three review rounds and
+  a `NO_PROGRESS` park on `ModuleNotFoundError: No module named 'uvicorn'`, billed to the
+  builder. The check resolves every import in the copy statically with `ast` — absolute,
+  relative, aliased, and `importlib` path-loading — and names each module no other file
+  reaches, telling the reader to wire it up or delete it. `MAESTRO_architecture.md` §3.6
+  B15 already says a check whose field has zero readers is a build failure; this is the
+  same rule one level up, at the module. A module imported only by a test counts as
+  imported: the defect being caught is total disconnection, and the weaker reading is
+  chosen deliberately so the check does not acquire an allowlist in its first week. It
+  ships with the runtime and runs in a deployment from whichever copy it sits in.
+  Falsified by removing `tree_env`'s importers from a scratch copy of the template:
+  untouched, the check does not list it; with `runner_resolution.py` and `provisioning.py`
+  stripped it still does not, because `tests/test_tree_environment.py` imports it; with
+  that stripped too, `adw_modules/tree_env.py` appears in the failure.
+
+  **The check was red on this branch and is now green with no allowlist.** Five modules in
+  the template were imported by nothing: `adw_modules/deliver.py`, `enforcement.py`,
+  `gate_capture.py`, `participant.py`, `workspace_digest.py`. FDAdb's copy has the same
+  five and no others, and none of them has ever been compiled there — no `__pycache__`
+  entry exists for any of the five. The `__pycache__` reading is what it says and no more:
+  it dates the disconnection, it does not establish that the work was never wired. All five
+  were orphaned by one commit, the artifact-factory cutover `e7b477e` (2026-08-29), which
+  deleted `tests/test_deliver.py`, `tests/test_gate_capture.py`,
+  `tests/test_gate_capture_runner_dispatch.py`, `tests/test_min_cases_enforcement.py`,
+  `tests/test_participant.py` and `tests/test_step9_enforcement.py` in the same diff that
+  froze the operator surface — and left every module they exercised on disk. The five split
+  three-two, and the evidence is per module:
+
+  - **`enforcement.py` — wired.** The same cutover *rewrote* its obligation ledger for the
+    new surface: it dropped the workspace, coordinator, participant and publication
+    obligations and narrowed `REQUIRED_VERBS` from sixteen pre-cutover verbs to the run
+    verbs, which `run attend` was later added to. It describes today's invariants; only its
+    reader was gone. `tests/test_enforcement_detectors.py` now executes all nine
+    obligations and asserts the two-sided verdict each `Obligation` record declares — the
+    planted-violation fixture is convicted, and `adw_modules/` is clean.
+  - **A detector nothing ran did not work.** `base-execution-import` returned **zero
+    findings against its own planted violation**, `violations_b.py:agents`. `_imports` read
+    only `ImportFrom.module`, so `from adw_modules import agents` — the spelling the whole
+    runtime uses — was invisible to it, and `digest-import-boundary` was blind the same way
+    to `from adw_modules import plan_model`. `_imports` now records the alias beside the
+    `from` target. With that fixed, all seven source detectors convict their fixture and
+    find nothing in `adw_modules/`; `assert_verbs` passes against `maestro.parser_verbs`
+    and `assert_installed_bytes` against the runtime root. This is the check's own thesis
+    measured: a safeguard with no reader is not a safeguard.
+  - **`gate_capture.py` — wired.** Its subject is still live: `code_review.py` adjudicates a
+    sealed run on `run["executed"] < min_cases`, a count the runner reports and the code
+    under test runs inside, which is the defect class the module's first line names.
+    `tests/test_gate_capture.py` executes all three capture routes (`unexpected_cases` on an
+    undefined name, a repeated node id, a bracketed id), both fail-closed refusals, the
+    `unsatisfiable_min_cases` shortfall, and the duck-typed runner dispatch. It is not wired
+    into adjudication: making a verdict depend on it is a decision about a running factory
+    and is not this repair's to take. One stale pointer is recorded rather than repaired —
+    `_reader`'s docstring names `tests_chain.CaseRunner`, which no longer exists anywhere in
+    the copy.
+  - **`deliver.py` — deleted (900 lines).** It is the library behind `maestro deliver`, a
+    CLI verb `e7b477e` removed along with its only importer, `tests/test_deliver.py`.
+    `docs/plan-authoring.md` §"Historical `plan gate` / `review` / `ship`" already records
+    the surface it drives in the past tense. What the bytes carried: the authoring and
+    repair prompts, `Package`/`derived_edges`/`order_packages` dependency ordering, the
+    `MAX_ATTEMPTS`-bounded repair loop, the `Delivery` driver, and `AUTHORING_RULES`, a
+    thirteen-rule prose block used as lane prompt text. Four of those rules name refusals
+    that no longer exist in the runtime (`GATE_EXECUTABLE`, `GATE_CORE_UNSHARED`,
+    `_selector_groups`, `maestro.lane_gate`) and the rest are either in
+    `docs/plan-authoring.md` or, for the `-o addopts=` counting note, in `CLAUDE.md`.
+    Recoverable in full at `e231433:.claude/skills/sssf/templates/adws/adw_modules/deliver.py`.
+    `docs/architecture/40-mind-modules.html` promised it in a legend and now does not.
+  - **`participant.py` — deleted (387 lines).** The strict subprocess protocol for one
+    workspace participant repository, under a coordinator. `e7b477e` deleted the whole
+    surface around it — `coordinator.py`, `coordinator_store.py`, `workspace_runtime.py`,
+    `workspace_model.py`, `workspace_author.py`, `workspace_canonical.py` — and its
+    `participant-independence-boundary` obligation out of `enforcement.py`, and
+    `CLAUDE.md` states there is no coordinator or workspace verb. No doc referenced it.
+  - **`workspace_digest.py` — deleted (19 lines).** Byte-only workspace identity from the
+    same deleted subsystem, and `adw_modules/plan_digest.py` is its live, near-identical
+    twin. No doc referenced it.
 - **`herdr-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). A display-only sidebar
   daemon for macOS; the Maestro runtime is unchanged. Under metadata source `lanes` it writes these
   pane tokens:
