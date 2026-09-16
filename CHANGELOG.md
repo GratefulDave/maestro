@@ -58,6 +58,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `uninstall-font` still restores it exactly.
 
 ### Added
+- **A module in the runtime that nothing imports is a test failure**
+  (`.claude/skills/sssf/templates/adws/tests/test_every_module_has_an_importer.py`).
+  `adw_modules/tree_env.py` was written in the FDAdb deployment on 2026-09-10 and never
+  brought into the template, so the 2026-09-15 mirror overwrote its three importers with
+  versions that had never heard of it. `runtime_sync` does not delete files, so the module
+  survived, imported by nothing, and **nothing failed** — no import error, no refusal, no
+  red test. Twenty-two hours later `lane-wp3-adapter-build` spent three review rounds and
+  a `NO_PROGRESS` park on `ModuleNotFoundError: No module named 'uvicorn'`, billed to the
+  builder. The check resolves every import in the copy statically with `ast` — absolute,
+  relative, aliased, and `importlib` path-loading — and names each module no other file
+  reaches, telling the reader to wire it up or delete it. `MAESTRO_architecture.md` §3.6
+  B15 already says a check whose field has zero readers is a build failure; this is the
+  same rule one level up, at the module. A module imported only by a test counts as
+  imported: the defect being caught is total disconnection, and the weaker reading is
+  chosen deliberately so the check does not acquire an allowlist in its first week. It
+  ships with the runtime and runs in a deployment from whichever copy it sits in.
+  Falsified by removing `tree_env`'s importers from a scratch copy of the template:
+  untouched, the check does not list it; with `runner_resolution.py` and `provisioning.py`
+  stripped it still does not, because `tests/test_tree_environment.py` imports it; with
+  that stripped too, `adw_modules/tree_env.py` appears in the failure.
+
+  **The check is red on this branch and is not being silenced.** Five modules in the
+  template are imported by nothing: `adw_modules/deliver.py`, `enforcement.py`,
+  `gate_capture.py`, `participant.py`, `workspace_digest.py`. FDAdb's copy has the same
+  five and no others, and none of them has ever been compiled there — no `__pycache__`
+  entry exists for any of the five, in a cache whose newest entry is from today — so these
+  read as work that was never wired rather than work a mirror disconnected. Each needs a
+  decision to wire or delete; an allowlist added on day one is how this check dies.
 - **`herdr-lanes` Herdr plugin** (`.claude/skills/sssf/apps/herdr-lanes/`). A display-only sidebar
   daemon for macOS; the Maestro runtime is unchanged. Under metadata source `lanes` it writes these
   pane tokens:
