@@ -3042,6 +3042,26 @@ class FactoryScheduler:
             candidate_sha=candidate_sha,
             changed=changed,
             declared_outputs=lane.declared_outputs,
+            # The suite this lane is graded against, named by the plan. The
+            # launch already removes these paths from the builder's working
+            # tree and subtracts them from the commit pathspec; this refuses a
+            # candidate that reached them anyway, before any reviewer reads it.
+            #
+            # Typed build lanes only, and that is the whole point of the
+            # condition. A typed lane's protected set is its predecessor tests
+            # lane's declared outputs, which it may never own. An untyped
+            # lane's is its OWN hidden meta-tests, sitting at paths of the
+            # tester's choosing -- and a candidate landing on one of those is
+            # not a violation at all. It is the collision §11 already answers,
+            # with `PRIVATE_PATH_COLLISION` at review, a durable
+            # `TEST_INVALIDATION`, and a reset to `WRITING_TESTS` so the tester
+            # moves. Refusing it here would replace that recovery with a dead
+            # run.
+            protected_paths=(
+                ctx.sealed_private_paths
+                if lane.lane_kind == st.LANE_KIND_BUILD
+                else ()
+            ),
         )
         builder_payload = {
             "builder_base_sha": admitted["builder_base_sha"],

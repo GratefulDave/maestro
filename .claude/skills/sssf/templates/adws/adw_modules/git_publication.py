@@ -92,6 +92,22 @@ class TreeDeltaEntry:
             paths.append(self.new_path)
         return tuple(paths)
 
+    def content_paths(self) -> tuple[str, ...]:
+        """Every path whose content this entry reads or writes.
+
+        `represented_paths` minus its one exemption: a copy's SOURCE is back.
+        The two questions differ. "Which paths does this lane own?" must not
+        name a copy source -- the blob is unchanged, the lane did not write it,
+        and counting it refused a builder for a path it never touched
+        (`test_copy_source_is_not_an_owned_path`). "Which accepted bytes did
+        this candidate get hold of?" must, because `C<score> <suite> <output>`
+        says the lane's own file now HOLDS the suite's content.
+        """
+        paths = list(self.represented_paths())
+        if self.status == "C" and self.old_path:
+            paths.insert(0, self.old_path)
+        return tuple(paths)
+
 
 @dataclass(frozen=True)
 class MergeDecision:
@@ -516,8 +532,27 @@ def validate_declared_ownership(
     declared_outputs: Sequence[str],
     *,
     changed: bool,
+    protected_paths: Collection[str] = (),
 ) -> None:
+    """Refuse a candidate that writes outside its outputs, or into its grader.
+
+    `protected_paths` is the accepted suite this lane is graded against -- the
+    pair `_sealed_for` resolves, named by the plan and never guessed from a
+    path shape. A delta entry that names one of them is refused
+    `CANDIDATE_TEST_PATH_REFUSED` before any reviewer reads the candidate,
+    including the rename cases, where the path being moved away from is the
+    one that disappears from the tree, and including a copy's source, which
+    ownership deliberately ignores. The two checks read different views for
+    that reason: protection reads `content_paths`, ownership `represented_paths`.
+
+    It is checked ahead of declared ownership deliberately. A plan can declare
+    an output that covers a sealed path -- `OUTPUT_OVERLAPS_TEST_SUITE` refuses
+    that at authoring time, and an already-shipped plan predates that check --
+    so `allowed` cannot be trusted to exclude it. Empty by default: every
+    existing caller keeps exactly the check it had.
+    """
     allowed = set(declared_outputs)
+    protected = set(protected_paths)
     if changed and not delta:
         raise GitPublicationRefused(
             "CANDIDATE_OUTPUT_OWNERSHIP_REFUSED", "changed=true empty delta"
@@ -529,6 +564,9 @@ def validate_declared_ownership(
     for entry in delta:
         if entry.old_mode == "160000" or entry.new_mode == "160000":
             raise GitPublicationRefused("CANDIDATE_OUTPUT_OWNERSHIP_REFUSED", "gitlink")
+        for path in entry.content_paths():
+            if path in protected:
+                raise GitPublicationRefused("CANDIDATE_TEST_PATH_REFUSED", path)
         for path in entry.represented_paths():
             if path not in allowed:
                 raise GitPublicationRefused("CANDIDATE_OUTPUT_OWNERSHIP_REFUSED", path)
@@ -574,6 +612,7 @@ def admit_candidate(
     candidate_sha: str,
     changed: bool,
     declared_outputs: Sequence[str],
+    protected_paths: Collection[str] = (),
 ) -> dict[str, Any]:
     revalidate_binding(binding)
     git = binding.git()
@@ -590,7 +629,9 @@ def admit_candidate(
                 "CANDIDATE_WRONG_FIRST_PARENT", ",".join(parents)
             )
     delta = measure_tree_delta(binding, base, sha)
-    validate_declared_ownership(delta, declared_outputs, changed=changed)
+    validate_declared_ownership(
+        delta, declared_outputs, changed=changed, protected_paths=protected_paths
+    )
     pin = pin_candidate_ref(
         binding,
         run_id=run_id,
@@ -618,6 +659,16 @@ def reconcile_candidate_ref(
     changed: bool,
     declared_outputs: Sequence[str],
 ) -> dict[str, Any]:
+    """Re-derive an admitted candidate's payload from its already-pinned ref.
+
+    No `protected_paths`, deliberately. Nothing in the runtime calls this --
+    the scheduler admits through `admit_candidate` and has no replay path
+    through here -- so the argument would be a parameter with zero readers, and
+    a check nothing invokes reads as coverage it does not provide. If a replay
+    path is ever wired, it passes the lane's protected set on the same
+    typed-build-lane condition as the admit call, and this docstring is what
+    says so.
+    """
     revalidate_binding(binding)
     ref = candidate_ref_name(run_id, lane_id, input_digest)
     git = binding.git()
