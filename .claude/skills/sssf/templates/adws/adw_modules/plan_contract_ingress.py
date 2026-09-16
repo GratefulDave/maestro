@@ -288,6 +288,7 @@ _VERIFIER_PROJECTION: Dict[str, Optional[str]] = {
     "lane_ids": "spec.gate",
     "command": "spec.gate",
     "min_executed": "spec.gate",
+    "declared_cases": None,
     "source_ids": "spec.sources",
     "falsifiability": None,
     "independent": None,
@@ -298,6 +299,11 @@ _VERIFIER_PROJECTION: Dict[str, Optional[str]] = {
     "claim_ids": None,
 }
 _VERIFIER_PROJECTION_EXEMPT: Dict[str, str] = {
+    "declared_cases": (
+        "refused on a build verifier as UNMAPPABLE_VERIFIERS:<lane>.declared_cases; "
+        "a build lane's gate runs the SEALED suite against a candidate, where "
+        "every case is expected green, so a per-case expectation at the parent "
+        "has no reader there"),
     "falsifiability": _VERIFIER_TEST_FACING,
     "independent": _VERIFIER_TEST_FACING,
     "test_strength": (
@@ -311,6 +317,7 @@ _VERIFIER_PROJECTION_TESTS: Dict[str, Optional[str]] = {
     "lane_ids": "spec.gate",
     "command": "spec.gate",
     "min_executed": "spec.gate",
+    "declared_cases": "spec.gate",
     "source_ids": "spec.sources",
     "falsifiability": "spec.obligations.verifier",
     "independent": "spec.obligations.verifier",
@@ -585,13 +592,60 @@ def _lane_kind(lane: Mapping[str, Any], lane_id: str) -> str:
     return kind
 
 
-def _gate(verifier: Mapping[str, Any], cwd: str, lane_id: str) -> dict:
+def _declared_cases(verifier: Mapping[str, Any], lane_kind: str,
+                    lane_id: str) -> Optional[list]:
+    """The verifier's per-case expected outcome at the parent, or `None`.
+
+    A tests verifier may declare `declared_cases`: `{case, red_at_parent}` per
+    case the suite must contain. It is the plan author's statement, written
+    before any tester runs, of which cases fail until this lane's outputs exist
+    and which already hold -- never an agent's claim about its own draft.
+
+    Optional on purpose. Shipped plans in deployments carry no such field, and
+    making it required would refuse them at run start. A build verifier that
+    carries it is refused rather than dropped: a build lane's gate runs the
+    sealed suite against a candidate, where every case is expected green, so
+    the field would have no reader and `_VERIFIER_PROJECTION` says so.
+    """
+    raw = verifier.get("declared_cases")
+    if raw is None:
+        return None
+    if lane_kind != "tests":
+        raise IngressError(
+            "UNMAPPABLE_VERIFIERS:{}.declared_cases".format(lane_id))
+    if not isinstance(raw, list) or not raw:
+        raise IngressError(
+            "UNMAPPABLE_VERIFIERS:{}.declared_cases".format(lane_id))
+    rows = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise IngressError(
+                "UNMAPPABLE_VERIFIERS:{}.declared_cases".format(lane_id))
+        case = item.get("case")
+        red = item.get("red_at_parent")
+        if not isinstance(case, str) or not case.strip():
+            raise IngressError(
+                "UNMAPPABLE_VERIFIERS:{}.declared_cases".format(lane_id))
+        if not isinstance(red, bool):
+            raise IngressError(
+                "UNMAPPABLE_VERIFIERS:{}.declared_cases".format(lane_id))
+        rows.append({"case": case.strip(), "red_at_parent": red})
+    return rows
+
+
+def _gate(verifier: Mapping[str, Any], cwd: str, lane_id: str,
+          lane_kind: str = "build") -> dict:
     runner, argv = _parse_verifier_command(verifier.get("command"))
     if not argv:
         raise IngressError("BROAD_GATE:{}".format(verifier.get("verifier_id")))
     min_cases = _require_count(
         verifier.get("min_executed"), "UNMAPPABLE_VERIFIERS", lane_id)
-    return {"runner": runner, "argv": list(argv), "cwd": cwd, "min_cases": min_cases}
+    gate = {"runner": runner, "argv": list(argv), "cwd": cwd,
+            "min_cases": min_cases}
+    cases = _declared_cases(verifier, lane_kind, lane_id)
+    if cases is not None:
+        gate["declared_cases"] = cases
+    return gate
 
 
 def _sources_for(ir: Mapping[str, Any], ids: Sequence[str]) -> list:
@@ -1024,6 +1078,16 @@ def _assert_ingress_projection_is_total(
     if spec.get("gate", {}).get("min_cases") != verifier.get("min_executed"):
         _fail("spec.gate.min_cases", verifier.get("min_executed"),
               spec.get("gate", {}).get("min_cases"))
+    declared_cases = verifier.get("declared_cases")
+    if declared_cases is not None:
+        expected_cases = [
+            {"case": str(item.get("case")).strip(),
+             "red_at_parent": item.get("red_at_parent")}
+            for item in declared_cases if isinstance(item, Mapping)
+        ]
+        if spec.get("gate", {}).get("declared_cases") != expected_cases:
+            _fail("spec.gate.declared_cases", expected_cases,
+                  spec.get("gate", {}).get("declared_cases"))
     title = lane.get("title")
     instruction = spec.get("instruction") or ""
     if spec.get("goal") != title:
@@ -1257,7 +1321,7 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
                 "{}.title".format(lane_id)),
             "instruction": instruction,
             "integration": {"integration_branch": branch},
-            "gate": _gate(verifier, cwd, lane_id),
+            "gate": _gate(verifier, cwd, lane_id, lane_kind),
             "effects": _node_effects(ir, lane, lane_id),
             "sources": _sources_for(
                 ir, _lane_source_reads(ir, lane, verifier, lane_id)),

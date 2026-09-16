@@ -26,6 +26,7 @@ REVIEW_NODE_FORBIDDEN = "REVIEW_NODE_FORBIDDEN"
 BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
 OBLIGATION_UNOBSERVABLE = "OBLIGATION_UNOBSERVABLE"
 OBLIGATION_UNDECIDED = "OBLIGATION_UNDECIDED"
+CASE_FALSIFICATION_UNDECLARED = "CASE_FALSIFICATION_UNDECLARED"
 
 
 def validate_objective_plan(
@@ -182,6 +183,9 @@ def validate_objective_plan(
             seen_needs.add(need)
         _validate_outputs(pointer, outputs, refusals)
         _validate_acceptance(pointer, acceptance, refusals, bound_run=bound_run)
+        _validate_declared_cases(
+            pointer, spec, kinds.get(lane_id), refusals, bound_run=bound_run
+        )
 
     _validate_ownership(parsed, refusals)
     _validate_build_lane_needs(parsed, kinds, refusals)
@@ -274,6 +278,128 @@ def _validate_acceptance(
                     ),
                 )
             )
+
+
+def _validate_declared_cases(
+    pointer: str,
+    spec: Mapping[str, Any],
+    lane_kind: Any,
+    refusals: List[PlanRefusal],
+    *,
+    bound_run: bool = False,
+) -> None:
+    """A tests lane's declared cases, and which of them must be red.
+
+    "The suite is red at the parent" is not falsification. FDAdb run be064e58
+    `lane-wp3-adapter-build` burned three code-review rounds and parked
+    `NO_PROGRESS` on a sealed suite reading `executed=6 passed=5 failed=1`,
+    identically, from three different candidates. The red case asserted a
+    non-regression property -- it should have been GREEN at the parent -- and
+    its final assertion called a shipped module the lane did not own, with a
+    key that module does not recognise. No change the builder was allowed to
+    make could ever have moved it, and "red at the parent" was satisfied the
+    whole time.
+
+    So the plan states the outcome it expects from each case BEFORE any builder
+    exists, and the harness compares the parent measurement against that
+    statement rather than against a count. `red_at_parent: true` says the case
+    fails until the lane's outputs are written; `false` says it holds already
+    and must keep holding.
+
+    Optional, and deliberately: shipped plans in deployments carry no
+    `declared_cases`, and a required field would refuse them at run start the
+    way `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE` refuses a `maestro-plan.v1` plan.
+    Absent means the lane is checked on `min_cases` alone, exactly as before.
+    Present means every rule below binds -- a half-declared list is the shape
+    that would let the check pass by naming one easy case.
+
+    Not re-judged on a `bound_run`, for the same reason
+    `OBLIGATION_UNOBSERVABLE` is not: an authoring obligation is judged when a
+    plan is shipped, started or amended, never against a revision a run
+    already holds.
+    """
+    if bound_run or lane_kind != "tests":
+        return
+    gate = spec.get("gate")
+    if not isinstance(gate, Mapping):
+        return
+    declared = gate.get("declared_cases")
+    if declared is None:
+        return
+    gate_ptr = pointer + "/spec/gate/declared_cases"
+    if not isinstance(declared, list) or not declared:
+        refusals.append(
+            PlanRefusal(
+                CASE_FALSIFICATION_UNDECLARED,
+                gate_ptr,
+                "declared_cases must be a nonempty array of "
+                "{case, red_at_parent} objects",
+            )
+        )
+        return
+    names: List[str] = []
+    reds = 0
+    for index, item in enumerate(declared):
+        item_ptr = gate_ptr + "/{0}".format(index)
+        case = item.get("case") if isinstance(item, Mapping) else None
+        red = item.get("red_at_parent") if isinstance(item, Mapping) else None
+        if not isinstance(case, str) or not case.strip():
+            refusals.append(
+                PlanRefusal(
+                    CASE_FALSIFICATION_UNDECLARED,
+                    item_ptr + "/case",
+                    "each declared case names the case identifier a runner "
+                    "prints for it",
+                )
+            )
+            continue
+        if not isinstance(red, bool):
+            refusals.append(
+                PlanRefusal(
+                    CASE_FALSIFICATION_UNDECLARED,
+                    item_ptr + "/red_at_parent",
+                    "case {0!r} must declare red_at_parent as a boolean; a "
+                    "case whose expected outcome at the parent is unstated "
+                    "cannot be falsified, only observed".format(case),
+                )
+            )
+            continue
+        if case.strip() in names:
+            refusals.append(
+                PlanRefusal(
+                    CASE_FALSIFICATION_UNDECLARED,
+                    item_ptr + "/case",
+                    "duplicate declared case {0!r}".format(case),
+                )
+            )
+            continue
+        names.append(case.strip())
+        reds += 1 if red else 0
+    min_cases = gate.get("min_cases")
+    floor = min_cases if isinstance(min_cases, int) and not isinstance(
+        min_cases, bool
+    ) else 1
+    if len(names) < floor:
+        refusals.append(
+            PlanRefusal(
+                CASE_FALSIFICATION_UNDECLARED,
+                gate_ptr,
+                "declared_cases names {0} case(s) against gate.min_cases {1}; "
+                "a case the plan does not name has no declared outcome at the "
+                "parent, so the suite's redness is a count again".format(
+                    len(names), floor
+                ),
+            )
+        )
+    if names and reds == 0:
+        refusals.append(
+            PlanRefusal(
+                CASE_FALSIFICATION_UNDECLARED,
+                gate_ptr,
+                "no declared case is red_at_parent; a suite that is green "
+                "before the lane's outputs exist proves nothing about them",
+            )
+        )
 
 
 def _validate_ownership(

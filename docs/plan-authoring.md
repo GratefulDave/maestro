@@ -50,6 +50,9 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - Each lane declares public acceptance criteria.
 - Every gating acceptance criterion declares an `observation_seam`.
 - Every gating acceptance criterion states its expected answers as `decided_by` worked examples.
+- A tests verifier that declares `declared_cases` declares one entry per case its gate's
+  `min_cases` floor requires, each with a boolean `red_at_parent`, and at least one of them red
+  (`CASE_FALSIFICATION_UNDECLARED`).
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -606,6 +609,33 @@ factory operator surface. Factory execution uses `run start|resume|amend|status`
 
 `planctl` calls carried `--repo-root .` because IR lived in `.maestro/` while `source_artifacts`
 were repo-relative. Maestro refused `..` escapes.
+
+### `declared_cases`: which cases are red at the parent, and which already hold
+
+A tests verifier may carry `declared_cases`, a list of `{case, red_at_parent}`. `case` is the
+substring a runner prints for that case (`path::name` under pytest, `path > title` under vitest);
+`red_at_parent` says whether it fails at the commit the lane branches from. Ingress projects it
+onto `spec.gate.declared_cases` and refuses it on a build verifier
+(`UNMAPPABLE_VERIFIERS:<lane>.declared_cases`) — a build gate runs the sealed suite against a
+candidate, where every case is expected green.
+
+The harness measures it once, in the draft-collect tree, which is the parent commit with the
+draft's private files written on top. Three divergences are `REVISE` findings against the tester,
+citing `gate.declared_cases`: a declared case the parent ran nothing named, a case declared red
+that was green, and a case declared green that was red. The third is what this field exists for.
+
+The field is **optional**, and a plan that omits it is checked on `min_cases` alone exactly as
+before, so plans already shipped into deployments stay runnable. What is not optional is a partial
+declaration: once present, the compiler requires an entry per `min_cases`, a boolean on each, and
+at least one red case.
+
+Why a case-identifier comparison and not a comparison of the failure itself: matching a declared
+reason against a runner's failure text is fuzzy in both directions, and a false refusal on a good
+suite costs rounds that the gap does not. Which cases are red is mechanical, is the same question
+under both runners, and is what FDAdb run be064e58 got wrong — a case asserting a non-regression
+property, which should have held at the parent, was red there because its assertion called a
+shipped module the lane did not own with a key that module does not recognise. The suite read
+`executed=6 passed=5 failed=1` on three consecutive candidates and the lane parked `NO_PROGRESS`.
 
 ### Historical verifier commands, and `test_strength`, which is not historical
 
