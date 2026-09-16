@@ -4,9 +4,9 @@ A lane parks `NO_PROGRESS` when its reviewed rounds stop moving. Clearing that
 park is not a retry -- a retry would run the same lane against the same
 contract and stall again in the same place. What clears it is a plan
 amendment, and on FDAdb run `d246ae95` a human wrote two of them by hand: read
-the gate table and the latest `CODE_REVIEW` findings, read the sealed suite out
-of the vault, edit one seam contract, validate, mint the receipt, project,
-`run amend`. Both converged in one round.
+the gate table and the latest `CODE_REVIEW` findings, read the accepted suite,
+edit one seam contract, validate, mint the receipt, project, `run amend`.
+Both converged in one round.
 
 `run attend` is that loop, with an agent holding the pen. What it does not
 change is what a transition keys on. The operator agent's prose reaches the
@@ -14,11 +14,10 @@ ledger only as an `AMENDMENT_RATIONALE` record that nothing reads; the lane
 moves because `apply_amendment` accepted a `PLAN_AMENDMENT` whose projection
 digests changed, exactly as it does when a human runs `run amend`.
 
-One privilege is deliberate and is stated in the operator agent's own prompt:
-it reads the sealed suite. Builders and reviewers still do not, and nothing
-here relaxes that -- the operator agent is a plan author, and the trade the
-operator accepted is that an amendment it writes may state in a contract an
-expectation the suite was asserting privately.
+The operator agent reads the accepted suite, as the builder and every
+reviewer do in their own checkouts; the operator agent is a plan author, and
+what it writes is a contract clause stating an expectation the suite asserts,
+never a test edit.
 """
 
 from __future__ import annotations
@@ -85,8 +84,8 @@ class AttendPolicy:
 class OperatorRequest:
     """Everything the operator agent is given, and nothing it is not.
 
-    `sealed_files` is the privilege. It is present because the human this verb
-    replaces read the same bytes, and because the contract gap that parks a
+    `suite_files` is the accepted suite, the same bytes the builder and every
+    reviewer have in their checkouts, because the contract gap that parks a
     lane is usually only visible by comparing what the suite asserts with what
     the contract says. Every other field is what a reviewer or a builder on
     this lane already had.
@@ -100,11 +99,11 @@ class OperatorRequest:
     next_plan_revision: int
     public_contract: Mapping[str, Any]
     reviews: Tuple[Mapping[str, Any], ...]
-    redacted_failures: Tuple[str, ...]
+    failure_output: Tuple[str, ...]
     lane_gates: str
     ir_path: str
     revision_out_path: str
-    sealed_files: Mapping[str, str]
+    suite_files: Mapping[str, str]
     amendment_rules: str
     allowed_lane_ids: Tuple[str, ...]
 

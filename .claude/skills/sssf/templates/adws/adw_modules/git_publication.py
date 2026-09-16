@@ -14,7 +14,6 @@ from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Iterator, Literal
 from . import scheduler_types as st
 from . import workspace_receipt as wr
@@ -537,7 +536,7 @@ def validate_declared_ownership(
     """Refuse a candidate that writes outside its outputs, or into its grader.
 
     `protected_paths` is the accepted suite this lane is graded against -- the
-    pair `_sealed_for` resolves, named by the plan and never guessed from a
+    pair `_accepted_suite_for` resolves, named by the plan and never guessed from a
     path shape. A delta entry that names one of them is refused
     `CANDIDATE_TEST_PATH_REFUSED` before any reviewer reads the candidate,
     including the rename cases, where the path being moved away from is the
@@ -546,7 +545,7 @@ def validate_declared_ownership(
     that reason: protection reads `content_paths`, ownership `represented_paths`.
 
     It is checked ahead of declared ownership deliberately. A plan can declare
-    an output that covers a sealed path -- `OUTPUT_OVERLAPS_TEST_SUITE` refuses
+    an output that covers a test path -- `OUTPUT_OVERLAPS_TEST_SUITE` refuses
     that at authoring time, and an already-shipped plan predates that check --
     so `allowed` cannot be trusted to exclude it. Empty by default: every
     existing caller keeps exactly the check it had.
@@ -693,19 +692,28 @@ def decide_merge_action(
     builder_base_sha: str,
     candidate_sha: str,
     integration_head: str,
-    sealed_present: bool = True,
+    base_head: str | None = None,
 ) -> MergeDecision:
     """Which of the three READY_TO_MERGE edges this candidate takes.
 
-    `sealed_present` is whether the integration HEAD already carries the
-    accepted suite this merge releases (`sealed_files_present`). A zero-delta
-    candidate is revalidated only when it does: a merge changes the
-    integration tree by exactly the suite otherwise, and that is a merge
-    with a commit, not a revalidation that creates none. A stale base is
-    `BASE_INVALIDATION` first regardless -- the suite is released against the
-    head the builder actually read, never against one it has not seen.
+    `base_head` is the integration head the builder's base was cut from. For
+    a typed build lane that is the base itself: it builds on the integration
+    head, which already carries its predecessor tests lane's merged suite. An
+    untyped lane builds on a commit one step above the head -- the head plus
+    its own accepted suite (`FactoryScheduler._untyped_builder_base`) -- so
+    its `base_head` is that commit's parent. Staleness is measured against the
+    head, not against the base: a zero-delta candidate whose head moved is
+    `BASE_INVALIDATION`, whatever its base was.
+
+    A zero-delta candidate that IS the integration head is revalidated,
+    creating no commit. A zero-delta candidate that is not -- the untyped
+    lane's, which is the head plus a suite -- is merged, because the
+    integration tree changes by exactly that suite and that is a merge with a
+    commit, not a revalidation that creates none.
     """
-    if not changed and builder_base_sha != integration_head:
+    if base_head is None:
+        base_head = builder_base_sha
+    if not changed and base_head != integration_head:
         return MergeDecision(
             action="BASE_INVALIDATION",
             before_sha=integration_head,
@@ -714,12 +722,12 @@ def decide_merge_action(
             builder_base_sha=builder_base_sha,
         )
     if not changed:
-        if candidate_sha != integration_head:
+        if candidate_sha != builder_base_sha:
             raise GitPublicationRefused(
                 "CANDIDATE_OUTPUT_OWNERSHIP_REFUSED",
-                "zero-delta candidate must equal integration HEAD",
+                "zero-delta candidate must equal its builder base",
             )
-        if not sealed_present:
+        if candidate_sha != integration_head:
             return MergeDecision(
                 action="MERGE",
                 before_sha=integration_head,
@@ -826,13 +834,32 @@ def _merge_parents(before_sha: str, candidate_sha: str) -> tuple[str, ...]:
     return (before_sha, candidate_sha)
 
 
-def sealed_files_present(binding: TargetBinding, sha: str, files: Mapping[str, bytes]) -> bool:
-    """Whether the tree at `sha` carries every file in `files` byte-for-byte."""
+def commit_files_on_base(
+    binding: TargetBinding,
+    *,
+    base_sha: str,
+    files: Mapping[str, bytes],
+    message: bytes,
+) -> str:
+    """One commit of `base_sha`'s tree with `files` written over it.
+
+    Content-addressed: the tree is derived in a throwaway index
+    (`BoundGit.overlay_tree`) and the commit is made with a fixed identity and
+    epoch, so the same bytes on the same base name the same sha on every
+    call. That is what makes a test draft a candidate that can be admitted,
+    re-derived after a crash, and compared, rather than a wall-clock
+    observation. Nothing here touches the bound worktree or its index.
+    """
+    revalidate_binding(binding)
     git = binding.git()
-    for path, data in files.items():
-        if git.tree_blob(sha, path) != git.hash_object(data, write=False):
-            return False
-    return True
+    base = require_oid(base_sha, object_format=binding.target_object_format)
+    if not files:
+        raise GitPublicationRefused("CANDIDATE_OUTPUT_OWNERSHIP_REFUSED", "no files")
+    try:
+        tree = git.overlay_tree(git.commit_tree_oid(base), files)
+        return git.commit_tree(tree, (base,), message, epoch_seconds=0)
+    except GitError as exc:
+        raise GitPublicationRefused(exc.code, exc.detail) from exc
 
 
 def _expected_merge_commit(
@@ -845,16 +872,9 @@ def _expected_merge_commit(
     candidate_sha: str,
     before_sha: str,
     epoch_seconds: int,
-    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> tuple[str, str, bytes]:
     try:
         tree = git.merge_tree_write_tree(before_sha, candidate_sha)
-        # The accepted suite rides in the same commit as the code it judged.
-        # Until here it lived only in the vault so the builder could not
-        # shape the candidate to its assertions; that builder is done, its
-        # candidate is reviewed, and the integration reviewer and every
-        # later reader get code and tests together.
-        tree = git.overlay_tree(tree, sealed_files)
     except GitError as exc:
         raise GitPublicationRefused(exc.code, exc.detail) from exc
     message = canonical_merge_message(
@@ -889,7 +909,6 @@ def execute_exact_sha_merge(
     before_sha: str,
     epoch_seconds: int,
     input_digest: str,
-    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> dict[str, Any]:
     revalidate_binding(binding)
     git = binding.git()
@@ -913,7 +932,6 @@ def execute_exact_sha_merge(
         candidate_sha=candidate_sha,
         before_sha=before_sha,
         epoch_seconds=epoch_seconds,
-        sealed_files=sealed_files,
     )
     try:
         git.update_ref(ref, after, before_sha)
@@ -986,7 +1004,6 @@ def reconcile_integration_merge(
     before_sha: str,
     epoch_seconds: int,
     input_digest: str,
-    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> dict[str, Any]:
     revalidate_binding(binding)
     git = binding.git()
@@ -1015,7 +1032,6 @@ def reconcile_integration_merge(
             before_sha=before_sha,
             epoch_seconds=epoch_seconds,
             input_digest=input_digest,
-            sealed_files=sealed_files,
         )
     expected, tree, message = _expected_merge_commit(
         git,
@@ -1026,7 +1042,6 @@ def reconcile_integration_merge(
         candidate_sha=candidate_sha,
         before_sha=before_sha,
         epoch_seconds=epoch_seconds,
-        sealed_files=sealed_files,
     )
     parents = git.commit_parents(head)
     if (

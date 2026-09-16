@@ -84,11 +84,11 @@ class TestDoubleBoundaryInRoleContract(unittest.TestCase):
         self.assertIn("Where a test double belongs", contract)
         self.assertIn("Author files exactly at declared_outputs", contract)
 
-    def test_a_hidden_validator_tester_is_told_the_same(self) -> None:
+    def test_an_untyped_validator_tester_is_told_the_same(self) -> None:
         """The seam does not depend on which kind of tester draws it."""
         contract = self._contract("tester", "omp", None)
         self.assertIn("Where a test double belongs", contract)
-        self.assertIn("byte-identical hidden files", contract)
+        self.assertIn("apply revise_findings to those validators", contract)
 
     def test_the_wp7_shape_is_named_not_merely_implied(self) -> None:
         """A whitelist dispatcher is the thing that cost the run."""

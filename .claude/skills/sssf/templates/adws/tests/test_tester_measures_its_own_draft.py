@@ -10,7 +10,7 @@ cost nothing to avoid -- the contract simply never asked for it.
 
 These pin the obligation and the named anti-measurement in the materialized role
 contract, for BOTH tester rules: a tests-lane draft and a hidden-validator draft
-go through the same preflight (`scheduler._collect_private_draft`), so a rule
+go through the same preflight (`scheduler._collect_draft`), so a rule
 that lands on one lane kind only leaves the other blind.
 """
 

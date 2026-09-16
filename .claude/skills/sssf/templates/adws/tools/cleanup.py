@@ -10,7 +10,7 @@ next run splits its lanes beside the last run's corpses.
 
 This tool is that reclaimer. It is transport only: it closes panes and nothing
 else. It never reads or writes the ledger's lane state, never touches
-artifacts, the vault, receipts, locks, worktrees or the target repository, and
+artifacts, receipts, locks, worktrees or the target repository, and
 it cannot advance, block, or fail a lane. A pane is not workflow authority, so
 closing one decides nothing.
 

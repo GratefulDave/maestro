@@ -315,7 +315,7 @@ class ArtifactStoreTests(unittest.TestCase):
             st.LaneStage.TESTS_SEALED,
             digest,
             lane_artifact(
-                st.ArtifactKind.SEALED_TEST_BUNDLE,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE,
                 projection,
                 digest,
                 {
@@ -342,7 +342,7 @@ class ArtifactStoreTests(unittest.TestCase):
             RUN_ID, projection.lane_id, st.ArtifactKind.LANE_PLAN
         )
         sealed = self.store._latest_lane_artifact(
-            RUN_ID, projection.lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
+            RUN_ID, projection.lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
         )
         assert plan is not None and sealed is not None
         ids = [plan["artifact_id"], sealed["artifact_id"], *receipt_ids]
@@ -404,7 +404,7 @@ class ArtifactStoreTests(unittest.TestCase):
             "declared_output_proof": list(projection.declared_outputs),
             "entry_kind": entry.value,
             "input_artifact_ids": ids,
-            "sealed_test_digest": sealed["output_digest"],
+            "test_suite_digest": sealed["output_digest"],
         }
         record = self.store.complete_stage(
             RUN_ID,
@@ -430,7 +430,7 @@ class ArtifactStoreTests(unittest.TestCase):
             RUN_ID, projection.lane_id, st.ArtifactKind.LANE_PLAN
         )
         sealed = self.store._latest_lane_artifact(
-            RUN_ID, projection.lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
+            RUN_ID, projection.lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
         )
         builder = self.store._latest_lane_artifact(
             RUN_ID, projection.lane_id, st.ArtifactKind.BUILDER_OUTPUT
@@ -446,7 +446,7 @@ class ArtifactStoreTests(unittest.TestCase):
             spec_digest=projection.spec_digest,
             projection_digest=projection.lane_projection_digest,
             lane_plan_id=plan["artifact_id"],
-            sealed_bundle_id=sealed["artifact_id"],
+            accepted_suite_id=sealed["artifact_id"],
             builder_output_id=builder["artifact_id"],
             builder_base_sha=loaded["builder_base_sha"],
             candidate_ref=loaded["candidate_ref"],
@@ -1501,7 +1501,7 @@ class ArtifactStoreTests(unittest.TestCase):
         self.store.apply_amendment(RUN_ID, 1, amended, amendment, resets)
         plan = self.store._latest_lane_artifact(RUN_ID, "A", st.ArtifactKind.LANE_PLAN)
         sealed = self.store._latest_lane_artifact(
-            RUN_ID, "A", st.ArtifactKind.SEALED_TEST_BUNDLE
+            RUN_ID, "A", st.ArtifactKind.ACCEPTED_TEST_SUITE
         )
         assert plan is not None and sealed is not None
         ids = [plan["artifact_id"], sealed["artifact_id"]]
@@ -1537,7 +1537,7 @@ class ArtifactStoreTests(unittest.TestCase):
                         "declared_output_proof": ["A.py"],
                         "entry_kind": "INITIAL",
                         "input_artifact_ids": ids,
-                        "sealed_test_digest": sealed["output_digest"],
+                        "test_suite_digest": sealed["output_digest"],
                     },
                     revision=1,
                 ),
@@ -1739,6 +1739,23 @@ def _lane_artifact_rows(conn: sqlite3.Connection) -> list[tuple]:
     ]
 
 
+#: A ledger written before accepted tests became visible holds the accepted
+#: suite under its old kind. Copying a current run into a v1 schema has to
+#: write that kind, because it is the only one v1's CHECK admits, and the
+#: rows read back after the migration still carry it: the migration widens the
+#: check and rewrites nothing.
+_HISTORICAL_KIND = {"ACCEPTED_TEST_SUITE": "SEALED_TEST_BUNDLE"}
+
+
+def _as_historical(rows: list[tuple]) -> list[tuple]:
+    kind_at = LANE_ARTIFACT_COLUMNS.index("artifact_kind")
+    return [
+        tuple(_HISTORICAL_KIND.get(value, value) if index == kind_at else value
+              for index, value in enumerate(row))
+        for row in rows
+    ]
+
+
 def _copy_into_v1(src_conn: sqlite3.Connection, dest_path: Path) -> None:
     dest = sqlite3.connect(dest_path, isolation_level=None)
     try:
@@ -1760,6 +1777,8 @@ def _copy_into_v1(src_conn: sqlite3.Connection, dest_path: Path) -> None:
             "transitions",
         ):
             rows = [tuple(row) for row in src_conn.execute(f"SELECT * FROM {table}")]
+            if table == "lane_artifacts":
+                rows = _as_historical(rows)
             if not rows:
                 continue
             placeholders = ",".join("?" * len(rows[0]))
@@ -1793,71 +1812,11 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
             stamp="cand-1",
         )
 
-    def _complete_test_invalidation(self, store: ArtifactStore) -> None:
-        run = store._run(RUN_ID)
-        plan = store._latest_lane_artifact(RUN_ID, "A", st.ArtifactKind.LANE_PLAN)
-        sealed = store._latest_lane_artifact(
-            RUN_ID, "A", st.ArtifactKind.SEALED_TEST_BUNDLE
-        )
-        builder = store._latest_lane_artifact(
-            RUN_ID, "A", st.ArtifactKind.BUILDER_OUTPUT
-        )
-        assert plan is not None and sealed is not None and builder is not None
-        loaded = json.loads(builder["payload_json"])
-        digest = st.reviewing_code_input_digest(
-            run_id=RUN_ID,
-            lane_id="A",
-            plan_revision=run["plan_revision"],
-            plan_digest=run["plan_digest"],
-            spec_digest=self.lane_a.spec_digest,
-            projection_digest=self.lane_a.lane_projection_digest,
-            lane_plan_id=plan["artifact_id"],
-            sealed_bundle_id=sealed["artifact_id"],
-            builder_output_id=builder["artifact_id"],
-            builder_base_sha=loaded["builder_base_sha"],
-            candidate_ref=loaded["candidate_ref"],
-            candidate_sha=loaded["candidate_sha"],
-        )
-        payload = {
-            "code": "PRIVATE_PATH_COLLISION",
-            "input_artifact_ids": [
-                plan["artifact_id"],
-                sealed["artifact_id"],
-                builder["artifact_id"],
-            ],
-            "kind": st.ArtifactKind.TEST_INVALIDATION.value,
-            "reason": {
-                "implementation_area": "private test suite",
-                "observed_behavior": (
-                    "sealed private path collides with candidate: A.py"
-                ),
-                "required_behavior": "private tests must be hidden",
-                "violated_requirement": "private tester paths must not collide",
-            },
-            "schema_version": st.CANONICAL_SCHEMA_VERSION,
-        }
-        record = store.complete_stage(
-            RUN_ID,
-            "A",
-            st.LaneStage.REVIEWING_CODE,
-            digest,
-            lane_artifact(
-                st.ArtifactKind.TEST_INVALIDATION,
-                self.lane_a,
-                digest,
-                payload,
-                revision=run["plan_revision"],
-            ),
-            st.LaneStage.WRITING_TESTS,
-        )
-        self.assertFalse(record.replayed)
-        self.assertEqual(store.lane_stage(RUN_ID, "A"), st.LaneStage.WRITING_TESTS)
-
     def test_v1_ledger_migrates_to_current_preserving_rows_then_accepts_new_kinds(
         self,
     ) -> None:
         self._advance_a_to_reviewing_code()
-        before = _lane_artifact_rows(self.store.conn)
+        before = _as_historical(_lane_artifact_rows(self.store.conn))
         self.assertGreaterEqual(len(before), 5)
         dest = Path(self._tmp.name) / "v1.sqlite3"
         _copy_into_v1(self.store.conn, dest)
@@ -1899,7 +1858,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
 
         migrated = ArtifactStore(dest)
         self.addCleanup(migrated.close)
-        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v4")
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v5")
         self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
         # v3 widened the run-artifact kind check the same way v2 widened the
         # lane one. A migration that stops at the stamp leaves an ATTEND_SESSION
@@ -1912,6 +1871,10 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
         after_sql = migrated.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
         ).fetchone()[0]
+        # v5 admits the accepted-suite kind and keeps the two historical kinds
+        # readable, so a v4 ledger's rows survive the rebuild.
+        self.assertIn("ACCEPTED_TEST_SUITE", after_sql)
+        self.assertIn("SEALED_TEST_BUNDLE", after_sql)
         self.assertIn("TEST_INVALIDATION", after_sql)
         self.assertEqual(
             _normalize_sql(after_sql), _normalize_sql(LANE_ARTIFACTS_SQL)
@@ -1921,14 +1884,10 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
         self.assertEqual(
             migrated.conn.execute("PRAGMA integrity_check").fetchone()[0], "ok"
         )
-        self._complete_test_invalidation(migrated)
-        invalidations = list(
-            migrated.conn.execute(
-                "SELECT artifact_kind FROM lane_artifacts "
-                "WHERE artifact_kind='TEST_INVALIDATION'"
-            )
-        )
-        self.assertEqual(len(invalidations), 1)
+        # A historical kind is readable but never produced: the enum has no
+        # member for it, so no LaneArtifact can be built of that kind.
+        self.assertNotIn("TEST_INVALIDATION", {kind.value for kind in st.ArtifactKind})
+        self.assertNotIn("SEALED_TEST_BUNDLE", {kind.value for kind in st.ArtifactKind})
 
     def test_migrated_v2_reopen_is_idempotent(self) -> None:
         self._advance_a_to_reviewing_code()
@@ -2005,7 +1964,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
         probe.close()
 
         class ExplodingStore(ArtifactStore):
-            def _rebuild_lane_artifacts_current_check(self) -> None:
+            def _rebuild_lane_artifacts_current_check(self, *args, **kwargs) -> None:
                 self.conn.execute(
                     "ALTER TABLE lane_artifacts RENAME TO lane_artifacts__v1_backup"
                 )

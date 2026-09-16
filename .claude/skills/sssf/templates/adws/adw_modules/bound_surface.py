@@ -1,8 +1,8 @@
-"""The names a sealed suite binds to, with none of the values it asserts.
+"""The names a accepted suite binds to, with none of the values it asserts.
 
 Maestro seals acceptance tests so the builder cannot read them, and then never
-tells the builder which API the sealed cases actually call. On the WP7 run the
-sealed vitest suite calls `paidDpa.buildEntityDpaSurface()` and reads an
+tells the builder which API the accepted cases actually call. On the WP7 run the
+accepted vitest suite calls `paidDpa.buildEntityDpaSurface()` and reads an
 `available` key off the result; neither name occurs anywhere in the plan, so the
 builder guessed nineteen times and shipped six aliases of the same function in
 one file without moving the pass count.
@@ -20,9 +20,9 @@ handed to a builder without unsealing the suite.
 A route is admitted by *where it sits*, never by what it looks like: the path
 argument of an HTTP-verb call, of `fetch`, `URL` or `Request`, or of a helper
 in the same file that provably forwards its parameter to one of those. The same
-path spelled as the expected value of an assertion is a value and stays sealed.
+path spelled as the expected value of an assertion is a value and stays out of the surface.
 A key is admitted because it is in key position of a dict or object literal,
-wherever that literal sits. On the WP7 gateway run the sealed suite named
+wherever that literal sits. On the WP7 gateway run the accepted suite named
 `query_hash` and `manifest_sha256` only as keys of the upstream body its source
 double answered with, so a builder that was never shown them returned the same
 five failures for eleven rounds.
@@ -49,7 +49,7 @@ from typing import Any, Iterable, Mapping, NamedTuple
 __all__ = ["derive_bound_surface"]
 
 
-#: Which language a sealed file is read as. This mirrors the runner convention
+#: Which language a accepted file is read as. This mirrors the runner convention
 #: in `tests_chain._file_runner` (`.py` is pytest; the JavaScript family is
 #: vitest) but is deliberately *broader* on the JavaScript side: a `.ts` helper
 #: sealed beside a `.test.ts` suite does not get a vote on the runner, yet the
@@ -91,7 +91,7 @@ _HTTP_VERBS = frozenset(
 
 
 def derive_bound_surface(files: Mapping[str, str]) -> dict:
-    """The bound surface of a sealed file set: names only, never values.
+    """The bound surface of a accepted file set: names only, never values.
 
     `files` maps a sealed test path to that file's content. The return value is
 
@@ -194,13 +194,13 @@ def _is_route(value: Any) -> bool:
 # Result shape
 # ---------------------------------------------------------------------------
 #
-# The keys a sealed case reads off a value it got back from the code under
+# The keys a accepted case reads off a value it got back from the code under
 # construction are the return contract, and they are the half of the surface an
 # import list cannot carry: the WP7 suite calls `buildEntityDpaSurface(...)` and
 # then reads `.publicCharts`, `.paidPanel` and `.publicBand` off the result,
 # none of which is an imported name.
 #
-# Tracking is seeded only from a *first-party* symbol — one the sealed file
+# Tracking is seeded only from a *first-party* symbol — one the accepted file
 # imports from a module inside the repository rather than from a package — so a
 # fixture parsed out of JSON with `json.loads` never contributes its schema, and
 # `readFileSync` never contributes `String.prototype`. It follows one value at a
@@ -303,7 +303,7 @@ def _python_calls_symbol(node: ast.expr, symbols: set[str]) -> bool:
 def _python_surface(
     source: str,
 ) -> tuple[dict[str, set[str]], set[str], set[str]]:
-    """Modules, symbols, dict keys and routes from one Python sealed file."""
+    """Modules, symbols, dict keys and routes from one Python accepted file."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError):
@@ -354,7 +354,7 @@ def _python_from_specifier(node: ast.ImportFrom) -> str | None:
 
     A relative import keeps its leading dots rather than being resolved into a
     package path: which directory is the package root is not knowable from the
-    sealed file set, and a wrong absolute module name is worse than a relative
+    accepted file set, and a wrong absolute module name is worse than a relative
     one that is exactly what the source says.
     """
     if node.level:
@@ -387,7 +387,7 @@ def _python_dict_keys(tree: ast.AST) -> set[str]:
     a token from: each is a shape the implementation has to produce or consume,
     and the key position of a literal can hold nothing but a name. Reading only
     the dicts a comparison touched is what left `query_hash` and
-    `manifest_sha256` sealed on the WP7 gateway run -- the suite named them
+    `manifest_sha256` accepted on the WP7 gateway run -- the suite named them
     solely as keys of the upstream fixture. Values are never read: the walk
     visits `ast.Dict` nodes and their keys, nothing else.
     """
@@ -1061,7 +1061,7 @@ def _read_named_import_clause(
 def _javascript_loader_helpers(tokens: list[_Token]) -> set[str]:
     """Functions declared in this file whose body performs a dynamic `import()`.
 
-    A sealed suite that must stay red at the parent commit cannot import an
+    A accepted suite that must stay red at the parent commit cannot import an
     unwritten module statically — the collector would fail instead of the
     assertion — so it routes the import through a helper that builds the
     specifier at runtime. That helper's literal argument names a module just as
@@ -1180,7 +1180,7 @@ def _read_module_binding(
 def _resolve_specifier(raw: str, directory: str, from_loader: bool) -> str | None:
     """A module specifier as a repository path where that is knowable.
 
-    A relative specifier is resolved against the directory of the sealed file,
+    A relative specifier is resolved against the directory of the accepted file,
     so `../api/bff` in `src/lib/seo/paid-dpa.test.ts` becomes `src/lib/api/bff`
     and names a file the builder can go and write. A package specifier
     (`vitest`, `node:fs`, `astro`) is left exactly as written.

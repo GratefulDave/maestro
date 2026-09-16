@@ -25,7 +25,7 @@ sys.path.insert(0, str(ADWS))
 import maestro
 from adw_modules import git_publication as gitpub
 from adw_modules import launcher as lch
-from adw_modules import private_review as prv
+from adw_modules import review_contract as rcv
 from adw_modules import tests_chain as tchain
 from adw_modules.scheduler import FactoryRefused, LaneContext
 from adw_modules.scheduler_types import (
@@ -126,14 +126,6 @@ def _lane(
         lane_kind=lane_kind,
     )
 
-
-
-def _materialize_hidden(_vault: object, _sha: object, dest: Path, **_kw: object) -> None:
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    hidden = dest / "tests" / "hidden.py"
-    hidden.parent.mkdir(parents=True, exist_ok=True)
-    hidden.write_text("assert True\n", encoding="utf-8")
 
 
 def _assert_prompt_under_agent_dir(
@@ -432,10 +424,10 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 system_text,
             )
             self.assertIn(
-                "Private paths must not collide with declared product outputs",
+                "Test paths must not collide with declared product outputs",
                 system_text,
             )
-            self.assertIn("hidden validator/meta-test files", system_text)
+            self.assertIn("Write validator/meta-test files", system_text)
             claude_bound = "Claude-only bound: review only this assigned worktree"
             if launch_spec.route == "claude":
                 self.assertIn(claude_bound, system_text)
@@ -563,7 +555,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 recorder.launches[0]["prompt"]["instructions"],
             )
             self.assertIn(
-                "byte-identical hidden files",
+                "byte-identical files",
                 recorder.launches[0]["system_prompt"],
             )
             actor.write_tests(revise)
@@ -573,11 +565,11 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(cwd, resubmit_cwd)
             self.assertNotEqual(first.resolve(), second.resolve())
             self.assertIn(
-                "Apply revise_findings to hidden validators",
+                "Apply revise_findings to those validators",
                 recorder.resubmits[0]["prompt"]["instructions"],
             )
             self.assertIn(
-                "byte-identical hidden files",
+                "byte-identical files",
                 recorder.resubmits[0]["prompt"]["instructions"],
             )
 
@@ -790,7 +782,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 target,
                 _ROLE_ROUTES,
             )
-            return set(actor.write_tests(ctx)["private_files"])
+            return set(actor.write_tests(ctx)["test_files"])
 
     def test_a_tests_lane_drops_an_undeclared_toolchain_byproduct(self) -> None:
         """A tests lane returns its declared outputs, not toolchain leavings.
@@ -858,8 +850,8 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 lane_specs={"lane-a": lane_spec},
             )
             extra = actor.write_tests(ctx)
-            self.assertEqual(set(extra), {"private_files"})
-            self.assertIn("tests/hidden.py", extra["private_files"])
+            self.assertEqual(set(extra), {"test_files"})
+            self.assertIn("tests/hidden.py", extra["test_files"])
             tracked = _git(product, "ls-files")
             self.assertNotIn("tests/hidden.py", tracked)
             prompt = recorder.launches[0]["prompt"]
@@ -874,7 +866,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             # directly is what a reader can catch half-written.
             self.assertIn(".part", prompt["instructions"])
             self.assertIn("then rename it to", prompt["instructions"])
-            self.assertIn("hidden meta-tests", prompt["instructions"])
+            self.assertIn("Test paths must be validator/meta-test", prompt["instructions"])
             self.assertIn("never declared_outputs", prompt["instructions"])
             self.assertNotIn("Only sandboxed Bash", prompt["instructions"])
 
@@ -903,7 +895,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     "acceptance_criteria": ["a.txt is written"],
                     "declared_outputs": ["a.txt"],
                 },
-                sealed_digest="33" * 32,
+                test_suite_digest="test-suite.v1:" + "33" * 32,
             )
             recorder = RecordingLauncher(
                 files={"a.txt": "a\n"},
@@ -922,13 +914,13 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             prompt = recorder.launches[0]["prompt"]
             self.assertEqual(prompt["role"], "builder")
             self.assertNotIn("private_files", prompt)
-            self.assertNotIn("private_draft_overlay", prompt)
+            self.assertNotIn("test_files", prompt)
             self.assertNotIn("vault_path", prompt)
             dumped = json.dumps(prompt, sort_keys=True)
             self.assertNotIn("tests/hidden.py", dumped)
             self.assertNotIn("vaults/", dumped)
             self.assertEqual(prompt["declared_outputs"], ["a.txt"])
-            self.assertEqual(prompt["sealed_digest"], "33" * 32)
+            self.assertEqual(prompt["test_suite_digest"], "test-suite.v1:" + "33" * 32)
             cwd = Path(recorder.launches[0]["worktree"])
             self.assertTrue((state / "worktrees").resolve() in cwd.resolve().parents)
             launch_spec = recorder.specs[0]
@@ -976,13 +968,13 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 plan_artifact_ref="plan:x",
                 input_digest="22" * 32,
                 stage=LaneStage.BUILDING,
-                artifacts={"SEALED_TEST_BUNDLE": sealed},
+                artifacts={"ACCEPTED_TEST_SUITE": sealed},
                 builder_base_sha=head,
                 public_contract={
                     "acceptance_criteria": ["product.py is written"],
                     "declared_outputs": ["product.py"],
                 },
-                sealed_digest="33" * 32,
+                test_suite_digest="test-suite.v1:" + "33" * 32,
             )
             recorder = RecordingLauncher(
                 files={"product.py": "ok\n"},
@@ -1004,9 +996,8 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             dumped = json.dumps(prompt, sort_keys=True)
             self.assertNotIn(private_path, dumped)
             self.assertEqual(prompt["declared_outputs"], ["product.py"])
-            self.assertEqual(prompt["sealed_digest"], "33" * 32)
-            self.assertEqual(prompt["predecessor_bundle_id"], "bundle-abc")
-            self.assertEqual(prompt["predecessor_bundle_digest"], "33" * 32)
+            self.assertEqual(prompt["test_suite_digest"], "test-suite.v1:" + "33" * 32)
+            self.assertEqual(prompt["accepted_suite_id"], "bundle-abc")
             review_ctx = LaneContext(
                 run_id="run-typed-build",
                 lane=lane,
@@ -1015,11 +1006,11 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 plan_artifact_ref="plan:x",
                 input_digest="55" * 32,
                 stage=LaneStage.REVIEWING_CODE,
-                artifacts={"SEALED_TEST_BUNDLE": sealed},
+                artifacts={"ACCEPTED_TEST_SUITE": sealed},
                 builder_base_sha=head,
                 candidate_sha=head,
                 public_contract=ctx.public_contract,
-                sealed_digest="33" * 32,
+                test_suite_digest="test-suite.v1:" + "33" * 32,
             )
             reviewer = RecordingLauncher(
                 envelope={"verdict": "PASS", "findings": []}
@@ -1037,7 +1028,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(review_prompt["lane_spec"], product_spec)
             self.assertNotIn(private_path, json.dumps(review_prompt, sort_keys=True))
 
-    def test_test_reviewer_runs_in_private_materialization(self) -> None:
+    def test_test_reviewer_runs_in_a_checkout_of_the_draft_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             product = root / "product"
@@ -1048,7 +1039,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             lane = _lane()
             digest = "44" * 32
             draft = tchain.write_test_draft(
-                request=prv.VaultLaneRequest(
+                request=rcv.LaneRequest(
                     run_id="run-rev",
                     lane_id=lane.lane_id,
                     plan_revision=1,
@@ -1056,15 +1047,13 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     lane_projection_digest=lane.lane_projection_digest,
                     input_digest=digest,
                 ),
-                state_root=state,
-                run_repo=product,
-                integration_ref="refs/heads/main",
+                binding=target,
+                integration_head=_git(product, "rev-parse", "refs/heads/main"),
                 files={"tests/hidden.py": "assert True\n"},
                 public_contract={
                     "acceptance_criteria": ["a.txt is written"],
                     "declared_outputs": ["tests/hidden.py"],
                 },
-                worktrees_root=state / "worktrees",
             )
             review_ctx = LaneContext(
                 run_id="run-rev",
@@ -1082,10 +1071,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 cast(lch.LauncherAdapter, reviewer), state, target, _ROLE_ROUTES
             )
             del head
-            with mock.patch.object(
-                maestro.hv, "materialize_commit", _materialize_hidden
-            ):
-                verdict, findings = actor.review_tests(review_ctx)
+            verdict, findings = actor.review_tests(review_ctx)
             self.assertEqual(verdict, ReviewerVerdict.PASS)
             self.assertEqual(list(findings), [])
             record = reviewer.launches[0]
@@ -1098,16 +1084,16 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             cwd = Path(record["worktree"])
             self.assertTrue(record["hidden_test_at_launch"])
-            # Contract change: the private tree is a repository, so repository
-            # tests that ask git about it run. It is its own one-commit
-            # repository -- a directory, not a gitfile into the vault -- and
-            # carries no ref but its branch.
+            # Contract change: the reviewer's checkout is an ordinary checkout
+            # of the draft candidate -- the integration head plus the draft's
+            # files -- not a private one-commit repository. Its HEAD is the
+            # candidate the draft artifact names, so repository tests that ask
+            # git about it read the same commit the ledger admitted.
             self.assertTrue(record["has_git_at_launch"])
-            self.assertTrue((cwd / ".git").is_dir())
-            self.assertEqual(_git(cwd, "rev-list", "--all", "--count"), "1")
+            self.assertEqual(record["head"], draft.payload["candidate_sha"])
             self.assertEqual(
-                _git(cwd, "for-each-ref", "--format=%(refname)"),
-                "refs/heads/materialized",
+                (cwd / "tests" / "hidden.py").read_text(encoding="utf-8"),
+                "assert True\n",
             )
             self.assertFalse(record["dirty_at_launch"])
             self.assertNotEqual(cwd.resolve(), product.resolve())
@@ -1140,7 +1126,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             extra = actor.write_tests(tester_ctx)
             draft = tchain.write_test_draft(
-                request=prv.VaultLaneRequest(
+                request=rcv.LaneRequest(
                     run_id="run-sib",
                     lane_id=lane.lane_id,
                     plan_revision=1,
@@ -1148,15 +1134,13 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     lane_projection_digest=lane.lane_projection_digest,
                     input_digest="77" * 32,
                 ),
-                state_root=state,
-                run_repo=product,
-                integration_ref="refs/heads/main",
-                files=extra["private_files"],
+                binding=target,
+                integration_head=_git(product, "rev-parse", "refs/heads/main"),
+                files=extra["test_files"],
                 public_contract={
                     "acceptance_criteria": ["a.txt is written"],
                     "declared_outputs": ["tests/hidden.py"],
                 },
-                worktrees_root=state / "worktrees",
             )
             review_ctx = LaneContext(
                 run_id="run-sib",
@@ -1170,10 +1154,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 public_contract={"acceptance_criteria": ["a.txt is written"]},
             )
             recorder.envelope = {"verdict": "REVISE", "findings": [{"x": "y"}]}
-            with mock.patch.object(
-                maestro.hv, "materialize_commit", _materialize_hidden
-            ):
-                actor.review_tests(review_ctx)
+            actor.review_tests(review_ctx)
             self.assertEqual(len(recorder.launches), 2)
             tester_handle = recorder._live[("lane-a", "tester")]
             reviewer_handle = recorder._live[("lane-a", "test-reviewer")]
@@ -1197,7 +1178,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
 
             def draft(input_digest: str, body: str) -> object:
                 return tchain.write_test_draft(
-                    request=prv.VaultLaneRequest(
+                    request=rcv.LaneRequest(
                         run_id="run-private-refresh",
                         lane_id=lane.lane_id,
                         plan_revision=1,
@@ -1205,12 +1186,10 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                         lane_projection_digest=lane.lane_projection_digest,
                         input_digest=input_digest,
                     ),
-                    state_root=state,
-                    run_repo=product,
-                    integration_ref="refs/heads/main",
+                    binding=target,
+                    integration_head=_git(product, "rev-parse", "refs/heads/main"),
                     files={"tests/hidden.py": body},
                     public_contract=contract,
-                    worktrees_root=state / "worktrees",
                 )
 
             first_draft = draft("10" * 32, "assert True\n")
@@ -1276,7 +1255,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
 
             def draft(input_digest: str, body: str) -> object:
                 return tchain.write_test_draft(
-                    request=prv.VaultLaneRequest(
+                    request=rcv.LaneRequest(
                         run_id="run-overlay-scope",
                         lane_id=lane.lane_id,
                         plan_revision=1,
@@ -1284,12 +1263,10 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                         lane_projection_digest=lane.lane_projection_digest,
                         input_digest=input_digest,
                     ),
-                    state_root=state,
-                    run_repo=product,
-                    integration_ref="refs/heads/main",
+                    binding=target,
+                    integration_head=_git(product, "rev-parse", "refs/heads/main"),
                     files={overlay: body},
                     public_contract=contract,
-                    worktrees_root=state / "worktrees",
                 )
 
             first_draft = draft("10" * 32, "assert False\n")
@@ -1325,14 +1302,14 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             first_prompt = recorder.specs[0].prompt_path
             _assert_prompt_under_agent_dir(self, first_prompt, cwd, "prompt-1.json")
             prompt = recorder.launches[0]["prompt"]
-            self.assertEqual(prompt["private_draft_overlay"], [overlay])
+            self.assertEqual(prompt["test_files"], [overlay])
             self.assertNotIn(
                 "src/lib/seo/geo-entity-page.test.ts",
-                prompt["private_draft_overlay"],
+                prompt["test_files"],
             )
-            self.assertNotIn("seed.txt", prompt["private_draft_overlay"])
-            self.assertNotIn("a.txt", prompt["private_draft_overlay"])
-            self.assertIn("private_draft_overlay", prompt["instructions"])
+            self.assertNotIn("seed.txt", prompt["test_files"])
+            self.assertNotIn("a.txt", prompt["test_files"])
+            self.assertIn("test_files", prompt["instructions"])
             self.assertIn("out of scope", prompt["instructions"])
             self.assertIn("red-at-base", prompt["instructions"])
             self.assertIn(
@@ -1341,7 +1318,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             self.assertIn("red-at-base", recorder.launches[0]["system_prompt"])
             self.assertIn(
-                "private_draft_overlay files listed in the per-turn JSON",
+                "Review only the test_files",
                 recorder.launches[0]["system_prompt"],
             )
             actor.review_tests(second_ctx)
@@ -1352,7 +1329,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             self.assertEqual(cwd, resubmit_cwd)
             self.assertEqual(
-                recorder.resubmits[0]["prompt"]["private_draft_overlay"],
+                recorder.resubmits[0]["prompt"]["test_files"],
                 [overlay],
             )
             self.assertIn(
@@ -1384,7 +1361,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 artifacts={},
                 builder_base_sha=first_base,
                 public_contract=contract,
-                sealed_digest="60" * 32,
+                test_suite_digest="test-suite.v1:" + "60" * 32,
             )
             recorder = RecordingLauncher(files={"a.txt": "first\n"})
             first_actor = maestro.HerdrStageActor(
@@ -1411,7 +1388,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 builder_base_sha=second_base,
                 candidate_sha=str(first_result["candidate_sha"]),
                 public_contract=contract,
-                sealed_digest="60" * 32,
+                test_suite_digest="test-suite.v1:" + "60" * 32,
             )
             second_actor = maestro.HerdrStageActor(
                 cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
@@ -1770,7 +1747,7 @@ class RoleRouteBindingTest(unittest.TestCase):
             self.assertIn("Maestro test-reviewer role contract", test_text)
             self.assertIn("## Test-reviewer obligations", test_text)
             self.assertIn(
-                "private TEST_DRAFT tests against lane-plan obligations",
+                "Review the TEST_DRAFT tests against lane-plan obligations",
                 test_text,
             )
             self.assertIn("behavior coverage", test_text)
@@ -1781,10 +1758,9 @@ class RoleRouteBindingTest(unittest.TestCase):
                 "Never review or prescribe product implementation",
                 test_text,
             )
-            self.assertIn(
-                "Never expose private tests to builder or product outputs",
-                test_text,
-            )
+            # Contract change: the obligation to keep the draft from the builder
+            # became its inverse -- the accepted suite is the builder's to read.
+            self.assertIn("the builder will read it", test_text)
             self.assertNotIn("actionable findings for the builder", test_text)
             self.assertNotIn("product candidate", test_text)
             self.assertIn("Maestro code-reviewer role contract", code_text)
@@ -1800,11 +1776,14 @@ class RoleRouteBindingTest(unittest.TestCase):
             self.assertIn("actionable findings for the builder", code_text)
             self.assertIn("each resolvable by editing declared outputs only", code_text)
             self.assertIn("Never prescribe changes to files outside", code_text)
-            self.assertIn("external test contradicts the lane's public contract", code_text)
+            # Contract change: the suite is in the code reviewer's checkout, and
+            # the reviewer still grades against the contract, not the suite.
             self.assertIn(
-                "Private tests are absent and must not be inferred, requested, or cited",
+                "An assertion that contradicts the public contract is a finding",
                 code_text,
             )
+            self.assertIn("The accepted test suite is in this checkout", code_text)
+            self.assertIn("not against the suite", code_text)
             self.assertNotIn("TEST_DRAFT", code_text)
             self.assertNotIn("actionable findings for the tester", code_text)
             for role in ("test-reviewer", "code-reviewer"):

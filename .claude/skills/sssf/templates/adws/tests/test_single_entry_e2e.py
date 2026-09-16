@@ -569,7 +569,7 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
             "LANE_PLAN",
             "TEST_DRAFT",
             "TEST_REVIEW",
-            "SEALED_TEST_BUNDLE",
+            "ACCEPTED_TEST_SUITE",
             "BUILDER_OUTPUT",
             "CODE_REVIEW",
             "INTEGRATION_MERGE",

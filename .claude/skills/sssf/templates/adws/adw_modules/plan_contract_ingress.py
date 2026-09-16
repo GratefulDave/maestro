@@ -604,7 +604,7 @@ def _declared_cases(verifier: Mapping[str, Any], lane_kind: str,
     Optional on purpose. Shipped plans in deployments carry no such field, and
     making it required would refuse them at run start. A build verifier that
     carries it is refused rather than dropped: a build lane's gate runs the
-    sealed suite against a candidate, where every case is expected green, so
+    accepted suite against a candidate, where every case is expected green, so
     the field would have no reader and `_VERIFIER_PROJECTION` says so.
     """
     raw = verifier.get("declared_cases")
@@ -726,7 +726,7 @@ def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]
                 gating: bool) -> list:
     """The lane's public acceptance: the verifier oracle, then one per claim.
 
-    On a tests lane every claim is an obligation the sealed suite must
+    On a tests lane every claim is an obligation the accepted suite must
     discharge, so it is projected as a gating criterion carrying the claim's
     declared `observation_seam`. A claim that declares none projects a gating
     criterion with no seam, and the objective compiler refuses the plan

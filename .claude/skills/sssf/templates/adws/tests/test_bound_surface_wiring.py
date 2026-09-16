@@ -35,7 +35,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 import maestro  # noqa: E402
-from adw_modules import private_review as prv  # noqa: E402
+from adw_modules import review_contract as rcv  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
@@ -106,15 +106,18 @@ def _scheduler(actor=None):
     )
     sealed = SimpleNamespace(
         artifact_id="art-sealed",
-        kind=st.ArtifactKind.SEALED_TEST_BUNDLE,
+        kind=st.ArtifactKind.ACCEPTED_TEST_SUITE,
         plan_revision=1,
         input_digest=_digest("sealed-in"),
         output_digest=_digest("sealed-out"),
         artifact_ref="sealed:ref",
-        payload={"sealed_digest": "3" * 64},
+        payload={
+            "files": {"tests/dpa.test.ts": "blob-0"},
+            "test_suite_digest": "test-suite.v1:" + "3" * 64,
+        },
     )
     scheduler._common = lambda lane_id: (row, lane)
-    scheduler._sealed_for = lambda lane_arg: sealed
+    scheduler._accepted_suite_for = lambda lane_arg: sealed
     scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
     scheduler._integration_head = lambda: "1" * 40
     scheduler._dep_receipts = lambda needs: ()
@@ -122,10 +125,9 @@ def _scheduler(actor=None):
 
 
 def _drive_building(scheduler, plan, *, surface=SURFACE, files=None):
-    """Run `_building` with the vault and the extractor stubbed out."""
+    """Run `_building` with the suite reader and the extractor stubbed out."""
     sealed_files = files if files is not None else {"tests/dpa.test.ts": SEALED_SOURCE}
     blobs = {path: "blob-{0}".format(index) for index, path in enumerate(sealed_files)}
-    by_blob = {blobs[path]: body for path, body in sealed_files.items()}
 
     def _latest(_store, _run, _lane, kind, **_kwargs):
         return plan if kind is st.ArtifactKind.LANE_PLAN else None
@@ -133,11 +135,9 @@ def _drive_building(scheduler, plan, *, surface=SURFACE, files=None):
     with mock.patch.object(sch, "_latest", side_effect=_latest), mock.patch.object(
         sch, "_record_as_lane_artifact", return_value=None
     ), mock.patch.object(
-        sch.hv, "ensure_vault", return_value=Path("/state/vaults/run1")
+        sch.tc, "suite_files", return_value=blobs
     ), mock.patch.object(
-        sch.tc, "sealed_private_files", return_value=blobs
-    ), mock.patch.object(
-        sch.hv, "cat_blob", side_effect=lambda _vault, blob: by_blob[blob].encode()
+        sch.tc, "read_suite", return_value=dict(sealed_files)
     ), mock.patch.object(
         sch.bsf, "derive_bound_surface", return_value=surface
     ) as derive, mock.patch.object(
@@ -151,7 +151,7 @@ def _drive_building(scheduler, plan, *, surface=SURFACE, files=None):
             "tree_delta": [],
         },
     ), mock.patch.object(
-        sch.prv, "make_lane_artifact", return_value=None
+        sch.rc, "make_lane_artifact", return_value=None
     ) as artifact, mock.patch.object(
         sch, "_complete"
     ) as complete:
@@ -279,12 +279,12 @@ class TheActorPutsTheSurfaceInExtra(unittest.TestCase):
         actor.lane_specs = {}
         actor._roles = {}
         actor._base_sha = lambda ctx, role, *rest: "1" * 40
-        actor._prepare = lambda ctx, role, *, sha, private_tree: (
+        actor._prepare = lambda ctx, role, *, sha: (
             Path("/tmp/attempt"),
             Path("/tmp/attempt/checkout"),
         )
         actor._bind_checkout = lambda key, attempt, checkout, used: used
-        actor._commit_declared = lambda cwd, outputs, sha, *, strip=(): (
+        actor._commit_declared = lambda cwd, outputs, sha: (
             "2" * 40,
             True,
         )
@@ -306,14 +306,10 @@ class TheActorPutsTheSurfaceInExtra(unittest.TestCase):
             run_id="run1",
             stage=st.LaneStage.BUILDING,
             public_contract={"acceptance_criteria": []},
-            sealed_digest="3" * 64,
+            test_suite_digest="test-suite.v1:" + "3" * 64,
             artifacts={},
             bound_surface=surface,
-            # These cases are about the prompt, not the checkout. The strip
-            # guard is stubbed out above; a real `LaneContext` always carries
-            # this field, so a fake that omits it fails loudly rather than
-            # silently launching a builder over its own sealed suite.
-            sealed_private_paths=(),
+            protected_test_paths=(),
         )
 
     def _extra(self, surface):
@@ -376,38 +372,11 @@ class TheRolesHaveSeparateCheckouts(unittest.TestCase):
         self.assertNotEqual(cwds["builder"], cwds["code-reviewer"])
 
 
-class TheLeakGuardAllowsNamesAndStillHidesValues(unittest.TestCase):
-    """The trap: a bound name that is also a quoted literal in the test.
-
-    `collect_private_tokens` makes a token of every quoted literal of eight
-    characters or more in a sealed file. `result['available']` puts the
-    nine-character literal `available` in that set -- so the key the builder
-    must implement is, by that measure, a private token.
-
-    It reaches the builder anyway, and these cases pin exactly why, so that a
-    later change to either guard shows up here rather than in a lane that
-    starts guessing again:
-
-      * `_prompt`'s builder guard is key-based, not token-based. It deletes
-        forbidden private keys and refuses a vault path; it never compares the
-        body against the sealed file's tokens.
-      * `_building`'s `refuse_private_leak` checks the BUILDER_OUTPUT payload,
-        not the prompt, and against only the tokens the builder itself
-        returned -- so a name in the prompt is out of its scope by
-        construction.
-
-    Neither guard is weakened here. The values stay hidden: the same sealed
-    file yields tokens for `'entitled by seat count'` and the whole assertion
-    line, and none of those appear in the surface or the prompt.
+class TheBoundSurfaceIsAnIndexIntoAVisibleSuite(unittest.TestCase):
+    """The names reach the builder prompt as an index; the suite itself is in
+    the builder's checkout, so nothing about values is hidden any more. The
+    surface still renders names only, because it is a summary and not a copy.
     """
-
-    def _tokens(self):
-        return prv.collect_private_tokens(files={"tests/dpa.test.ts": SEALED_SOURCE})
-
-    def test_the_bound_key_really_is_a_private_token(self):
-        # If this stops being true the trap is gone and so is the reason for
-        # the cases below.
-        self.assertIn("available", self._tokens())
 
     def test_the_bound_key_still_reaches_the_builder_prompt(self):
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
@@ -442,23 +411,6 @@ class TheLeakGuardAllowsNamesAndStillHidesValues(unittest.TestCase):
         self.assertNotIn("enterprise", rendered)
         self.assertNotIn("toBe(true)", rendered)
 
-    def test_those_values_are_private_tokens_and_stay_that_way(self):
-        # The names are tokens too -- a module specifier is quoted in an import
-        # and a key is quoted in a subscript -- so the claim worth pinning is
-        # the exact one: the ONLY private tokens in the builder's instruction
-        # are the names the surface declares. Anything else appearing there is
-        # a value that escaped.
-        tokens = self._tokens()
-        self.assertIn("entitled by seat count", tokens)
-        rendered = maestro.HerdrStageActor._bound_surface_instruction(SURFACE)
-        names = set(SURFACE["object_keys"])
-        for entry in SURFACE["modules"]:
-            names.add(entry["specifier"])
-            names.update(entry["symbols"])
-        leaked = [
-            token for token in tokens if token not in names and token in rendered
-        ]
-        self.assertEqual(leaked, [])
 
 
 if __name__ == "__main__":

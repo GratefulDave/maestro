@@ -7,7 +7,7 @@ exactly that -- it had no command, so every plan was retyped by hand from an
 approved IR and then hand-repaired under fire.
 
 Authoring is not execution. This writes one plan file and touches no run, no
-ledger, no vault, and no ref, which is why it is a tool rather than a fifth
+ledger and no ref, which is why it is a tool rather than a fifth
 operator verb: the operator surface stays frozen at `run start`, `run resume`,
 `run amend`, and `run status`.
 

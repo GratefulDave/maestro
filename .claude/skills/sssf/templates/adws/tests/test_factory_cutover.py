@@ -14,7 +14,6 @@ from pathlib import Path
 
 import maestro
 from adw_modules import git_publication as gitpub
-from adw_modules import hidden_vault as hv
 from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
@@ -388,7 +387,12 @@ class FactoryCutoverTests(unittest.TestCase):
                 (run_id, "lane-a", st.ArtifactKind.INTEGRATION_MERGE.value),
             ).fetchone()[0]
         )
-        self.assertEqual(b_builders[0]["builder_base_sha"], a_merge["after_sha"])
+        # An untyped lane builds on the integration head plus its own accepted
+        # suite, one commit above the head: the head is that base's parent.
+        self.assertEqual(
+            _git(self.repo, "rev-parse", b_builders[0]["builder_base_sha"] + "^"),
+            a_merge["after_sha"],
+        )
         b_merge = json.loads(
             self.store.conn.execute(
                 "SELECT payload_json FROM lane_artifacts "
@@ -408,8 +412,8 @@ class FactoryCutoverTests(unittest.TestCase):
             a_entries,
             [st.BuildingEntryKind.INITIAL, st.BuildingEntryKind.CODE_REVISE],
         )
-        self._assert_private_tests_executed(run_id, "lane-a")
-        self._assert_private_tests_executed(run_id, "lane-b")
+        self._assert_accepted_tests_executed(run_id, "lane-a")
+        self._assert_accepted_tests_executed(run_id, "lane-b")
 
     def test_death_before_building_resumes_from_sealed_stage(self) -> None:
         compiled = plan_compiler.compile_plan(
@@ -513,28 +517,33 @@ class FactoryCutoverTests(unittest.TestCase):
             rows.append((artifact_id, digest, json.loads(payload)))
         return rows
 
-    def _assert_vault_isolated(self, run_id: str) -> Path:
-        vault = hv.vault_path(self.runtime.path, run_id)
-        self.assertTrue(vault.is_dir())
-        vault_res = vault.resolve()
-        state_res = self.runtime.path.resolve()
-        repo_res = self.repo.resolve()
-        self.assertTrue(str(vault_res).startswith(str(state_res) + "/"))
-        self.assertFalse(str(vault_res).startswith(str(repo_res) + "/"))
-        self.assertNotEqual(vault_res, repo_res)
-        return vault
-
-    def _assert_private_tests_executed(self, run_id: str, lane_id: str) -> None:
-        vault = self._assert_vault_isolated(run_id)
-        sealed_ref = self.store.conn.execute(
-            "SELECT artifact_ref FROM lane_artifacts "
+    def _assert_accepted_tests_executed(self, run_id: str, lane_id: str) -> None:
+        # The accepted suite is a candidate pinned in the run repository, and
+        # the build lane's base carries it: no vault, no overlay.
+        accepted = self.store.conn.execute(
+            "SELECT artifact_ref, payload_json FROM lane_artifacts "
             "WHERE run_id=? AND lane_id=? AND artifact_kind=? "
             "ORDER BY sequence DESC LIMIT 1",
-            (run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE.value),
+            (run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE.value),
         ).fetchone()
-        self.assertIsNotNone(sealed_ref)
-        commit = hv.rev_parse(vault, sealed_ref[0])
-        self.assertTrue(hv.object_is_absent(self.repo, commit))
+        self.assertIsNotNone(accepted)
+        payload = json.loads(accepted[1])
+        self.assertEqual(
+            _git(self.repo, "rev-parse", accepted[0]), payload["candidate_sha"]
+        )
+        builder = json.loads(
+            self.store.conn.execute(
+                "SELECT payload_json FROM lane_artifacts "
+                "WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT.value),
+            ).fetchone()[0]
+        )
+        for path, blob in payload["files"].items():
+            self.assertEqual(
+                _git(self.repo, "rev-parse", "{0}:{1}".format(builder["builder_base_sha"], path)),
+                blob,
+            )
         passing = [
             payload
             for _aid, _digest, payload in self._lane_rows(
@@ -548,7 +557,7 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertGreaterEqual(summary["passed"], 1)
         self.assertEqual(summary["failed"], 0)
         self.assertEqual(summary["errored"], 0)
-        self.assertNotIn("secret-selector", json.dumps(passing[-1]))
+        self.assertNotIn("redacted_failures", passing[-1])
 
     def test_create_run_replays_sqlite_before_ref(self) -> None:
         compiled = self._compile(revision=1, ref="plan:replay-sqlite")
@@ -1052,14 +1061,14 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(
             len(self._lane_rows(run_id, st.ArtifactKind.TEST_DRAFT, "lane-a")), 3
         )
-        sealed = self._lane_rows(run_id, st.ArtifactKind.SEALED_TEST_BUNDLE, "lane-a")
+        sealed = self._lane_rows(run_id, st.ArtifactKind.ACCEPTED_TEST_SUITE, "lane-a")
         self.assertEqual(len(sealed), 1)
-        self.assertNotIn("secret-selector", json.dumps(sealed[0][2]))
+        self.assertIn("test_suite_digest", sealed[0][2])
         a_code = self._lane_rows(run_id, st.ArtifactKind.CODE_REVIEW, "lane-a")
         self.assertEqual(len(a_code), 2)
         self.assertEqual(a_code[0][2]["verdict"], st.ReviewerVerdict.REVISE.value)
         self.assertEqual(a_code[-1][2]["verdict"], st.ReviewerVerdict.PASS.value)
-        self._assert_private_tests_executed(run_id, "lane-a")
+        self._assert_accepted_tests_executed(run_id, "lane-a")
         a_builders = self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-a")
         self.assertEqual(len(a_builders), 2)
         for _aid, _digest, payload in a_builders:
@@ -1075,7 +1084,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
         a_merges = self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-a")
         self.assertEqual(len(a_merges), 1)
-        self.assertNotIn("secret-selector", _git(self.repo, "log", "--all", "-p"))
+        # The accepted suite is in the run repository: it is a candidate.
+        self.assertIn("secret-selector", _git(self.repo, "log", "--all", "-p"))
 
         resumed = TwelveStepActor(
             self.repo, self.runtime.path / "worktrees", fail_b=False
@@ -1086,8 +1096,11 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
         b_builders = self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-b")
         self.assertEqual(len(b_builders), 1)
+        # An untyped lane builds on the integration head plus its own accepted
+        # suite, one commit: lane-b's base sits directly on lane-a's merge.
         self.assertEqual(
-            b_builders[0][2]["builder_base_sha"], a_merges[0][2]["after_sha"]
+            _git(self.repo, "rev-parse", b_builders[0][2]["builder_base_sha"] + "^"),
+            a_merges[0][2]["after_sha"],
         )
         b_merges = self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-b")
         self.assertEqual(len(b_merges), 1)
@@ -1120,7 +1133,7 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(
             len(self._run_rows(run_id, st.ArtifactKind.MAIN_PUBLICATION)), 1
         )
-        self._assert_private_tests_executed(run_id, "lane-b")
+        self._assert_accepted_tests_executed(run_id, "lane-b")
 
     def test_publication_refuses_external_same_sha_without_receipt(self) -> None:
         compiled = self._compile(revision=1, ref="plan:same-sha")

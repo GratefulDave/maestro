@@ -139,7 +139,7 @@ EXECUTE_ARGS: Dict[str, Tuple[str, ...]] = {
 #: sharing a basename with no `__init__.py` between them is enough: pytest
 #: derives one module name twice and interrupts collection at exit 2, which
 #: `CAPABLE_EXIT` reads as "this runner cannot collect". On FDAdb run
-#: 2489c772d7c04ad5a2f2bcaa2f4de11c the sealed suite for
+#: 2489c772d7c04ad5a2f2bcaa2f4de11c the accepted suite for
 #: `lane-wp4-release-build` was refused `SEALED_SUITE_RUNNER_UNUSABLE:pytest`
 #: because `services/device-substrates/tests/release/test_release_artifact.py`
 #: and `services/label-batch/tests/observations/test_release_artifact.py` — the
@@ -902,7 +902,7 @@ def collect_cases(
         # A runner that enumerated and then would not exit has answered the
         # only question collection asks. Refuse on an empty listing -- never
         # on the exit that did not come, and never by reporting the clock:
-        # forward what the runner itself printed, redacted through the same
+        # forward what the runner itself printed, through the same
         # helper the non-zero-exit branch below uses.
         ids = collected_identifiers(output)
         if ids:
@@ -976,11 +976,11 @@ def execute_cases(
     # `PYTEST_ADDOPTS` is the operator's, so it is cleared: a gate must not
     # read a flag from whoever started the run. A plugin in the suite's own
     # environment is the project's, declared in its own dependencies, and the
-    # sealed cases are written against it -- `collect_cases` loads those
+    # accepted cases are written against it -- `collect_cases` loads those
     # plugins, so executing without them measures a different environment than
     # the one the suite was collected and accepted in. An `async def` case then
     # fails with "async def functions are not natively supported" no matter
-    # what the candidate does, and the redacted failure lines name the sealed
+    # what the candidate does, and the failure lines name the accepted
     # tests, so the builder is told only how many failed.
     merged["PYTEST_ADDOPTS"] = ""
     try:

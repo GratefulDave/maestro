@@ -1,7 +1,7 @@
 """An empty listing is refused with what the runner printed, never the clock.
 
 `collect_cases` used to raise `"<runner> did not finish collecting in 120.0s"`.
-That string is a stopwatch reading, and `scheduler._collect_private_draft`
+That string is a stopwatch reading, and `scheduler._collect_draft`
 forwards it verbatim as the draft author's one correction -- so the author was
 told the harness took two minutes and asked to fix that. The repair it suggests
 is a bigger budget, and time was never the scarce thing.
@@ -123,7 +123,7 @@ class OutputWithoutCasesIsADifferentFailure(unittest.TestCase):
         self.assertNotIn("printed nothing at all", noisy)
 
     def test_the_tree_path_never_crosses_the_boundary(self) -> None:
-        # `_collect_private_draft` redacts private tokens on top of this, but
+        # `_collect_draft` redacts private tokens on top of this, but
         # the vault worktree path is this function's own to hide: the old
         # detail carried no output and so never had to.
         with TemporaryDirectory() as tmp:

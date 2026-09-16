@@ -15,7 +15,33 @@ from . import scheduler_types as st
 from .utils import now_iso
 
 LANE_STAGE_CHECK = ", ".join(f"'{stage.value}'" for stage in st.LaneStage)
-LANE_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.LANE_ARTIFACT_KINDS)
+# The current kinds plus the historical ones (`SEALED_TEST_BUNDLE`,
+# `TEST_INVALIDATION`): a v4 ledger's rows survive the v5 rebuild and stay
+# readable, while `LaneArtifact` refuses to produce either kind.
+LANE_KIND_CHECK = ", ".join(
+    f"'{kind}'"
+    for kind in (
+        *(kind.value for kind in st.LANE_ARTIFACT_KINDS),
+        *st.HISTORICAL_LANE_ARTIFACT_KINDS,
+    )
+)
+# The v4 lane-artifact kinds, kept verbatim rather than derived, so that
+# renaming a kind cannot silently redefine what a v4 ledger was. v5 renamed
+# SEALED_TEST_BUNDLE to ACCEPTED_TEST_SUITE and retired TEST_INVALIDATION.
+V4_LANE_ARTIFACT_KINDS = (
+    "LANE_PLAN",
+    "TEST_DRAFT",
+    "TEST_REVIEW",
+    "SEALED_TEST_BUNDLE",
+    "BUILDER_OUTPUT",
+    "CODE_REVIEW",
+    "INTEGRATION_MERGE",
+    "BASE_INVALIDATION",
+    "TEST_INVALIDATION",
+    "USER_WAIT",
+    "USER_DECISION",
+)
+V4_LANE_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V4_LANE_ARTIFACT_KINDS)
 RUN_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.RUN_ARTIFACT_KINDS)
 # The v2 run-artifact kinds, kept verbatim rather than derived, so that adding
 # a kind to `st.RUN_ARTIFACT_KINDS` cannot silently redefine what a v2 ledger
@@ -69,6 +95,7 @@ LANE_ARTIFACT_COLUMNS = (
     "created_at",
 )
 _LANE_ARTIFACTS_V1_BACKUP = "lane_artifacts__v1_backup"
+_LANE_ARTIFACTS_V4_BACKUP = "lane_artifacts__v4_backup"
 
 
 def _lane_artifacts_ddl(kind_check: str) -> str:
@@ -197,6 +224,7 @@ CREATE TABLE transitions (
 
 LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(LANE_KIND_CHECK)
 V1_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V1_LANE_KIND_CHECK)
+V4_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V4_LANE_KIND_CHECK)
 RUN_ARTIFACTS_SQL = _run_artifacts_ddl(RUN_KIND_CHECK)
 V2_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V2_RUN_KIND_CHECK)
 SCHEMA = _schema_script(LANE_KIND_CHECK, RUN_KIND_CHECK)
@@ -337,9 +365,10 @@ class ArtifactStore:
         version = versions[0]
         if version == st.LEDGER_SCHEMA_VERSION:
             return
-        # Chained, not branched: a v1 ledger reaches v4 through v2 and v3 rather than
-        # through a second one-off script, so there is one definition of what
-        # each version's tables are and no path that skips a rebuild.
+        # Chained, not branched: a v1 ledger reaches v5 through v2, v3 and v4
+        # rather than through a second one-off script, so there is one
+        # definition of what each version's tables are and no path that skips
+        # a rebuild.
         if version == st.LEDGER_SCHEMA_VERSION_V1:
             self._migrate_v1_to_v2()
             version = st.LEDGER_SCHEMA_VERSION_V2
@@ -348,6 +377,9 @@ class ArtifactStore:
             version = st.LEDGER_SCHEMA_VERSION_V3
         if version == st.LEDGER_SCHEMA_VERSION_V3:
             self._migrate_v3_to_v4()
+            version = st.LEDGER_SCHEMA_VERSION_V4
+        if version == st.LEDGER_SCHEMA_VERSION_V4:
+            self._migrate_v4_to_v5()
             return
         self._refuse_schema()
 
@@ -419,15 +451,77 @@ class ArtifactStore:
         finally:
             self.conn.execute("PRAGMA legacy_alter_table=OFF")
 
-    def _rebuild_lane_artifacts_current_check(self) -> None:
+    def _rebuild_lane_artifacts_current_check(
+        self, backup: str = _LANE_ARTIFACTS_V1_BACKUP, ddl: str = LANE_ARTIFACTS_SQL
+    ) -> None:
         cols = ", ".join(LANE_ARTIFACT_COLUMNS)
-        self._rename_for_rebuild("lane_artifacts", _LANE_ARTIFACTS_V1_BACKUP)
-        self.conn.execute(LANE_ARTIFACTS_SQL)
+        self._rename_for_rebuild("lane_artifacts", backup)
+        self.conn.execute(ddl)
         self.conn.execute(
-            f"INSERT INTO lane_artifacts ({cols}) "
-            f"SELECT {cols} FROM {_LANE_ARTIFACTS_V1_BACKUP}"
+            f"INSERT INTO lane_artifacts ({cols}) SELECT {cols} FROM {backup}"
         )
-        self.conn.execute(f"DROP TABLE {_LANE_ARTIFACTS_V1_BACKUP}")
+        self.conn.execute(f"DROP TABLE {backup}")
+
+    def _lane_artifacts_need_v5_rebuild(self) -> bool:
+        """True when lane_artifacts still carries the v4 kind check.
+
+        False when it already carries the current one -- a crash between the
+        rebuild and the version stamp leaves a correct table under a stale
+        stamp, and refusing it would strand a ledger that needs nothing done.
+        """
+        names = _tables(self.conn)
+        if "lane_artifacts" not in names or _LANE_ARTIFACTS_V4_BACKUP in names:
+            self._refuse_schema()
+        sql = _table_create_sql(self.conn, "lane_artifacts")
+        if sql is not None and _normalize_sql(sql) == _normalize_sql(
+            LANE_ARTIFACTS_SQL
+        ):
+            return False
+        if sql is None or _normalize_sql(sql) != _normalize_sql(V4_LANE_ARTIFACTS_SQL):
+            self._refuse_schema()
+        cols = tuple(
+            row[1] for row in self.conn.execute("PRAGMA table_info(lane_artifacts)")
+        )
+        if cols != LANE_ARTIFACT_COLUMNS:
+            self._refuse_schema()
+        return True
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Widen the lane-artifact kind check for the accepted test suite.
+
+        Accepted tests stopped being sealed in a vault and became a lane's
+        candidate: `SEALED_TEST_BUNDLE` was renamed `ACCEPTED_TEST_SUITE`, and
+        `TEST_INVALIDATION` -- the reset an untyped lane took when a candidate
+        landed on one of its hidden paths -- has no producer any more, because
+        the suite is in the candidate's base and such a candidate is refused
+        at admission. The CHECK constraint is baked into the table, so the
+        rename is a schema version exactly as adding a kind was; the rebuilt
+        check keeps both historical kinds so a v4 ledger's rows survive.
+        """
+        rebuild = self._lane_artifacts_need_v5_rebuild()
+        self._begin_migration()
+        try:
+            if rebuild:
+                self._rebuild_lane_artifacts_current_check(_LANE_ARTIFACTS_V4_BACKUP)
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V4),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION)
+            self.conn.execute("COMMIT")
+            self._end_migration()
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
 
     def _require_post_migration_integrity(self, expected: str) -> None:
         fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
@@ -437,9 +531,19 @@ class ArtifactStore:
         if integrity is None or integrity[0] != "ok":
             raise ArtifactStoreError("integrity_check")
         sql = _table_create_sql(self.conn, "lane_artifacts")
-        if sql is None or _normalize_sql(sql) != _normalize_sql(LANE_ARTIFACTS_SQL):
+        # A step below v5 leaves the v4 lane table; a crash between the v5
+        # rebuild and its stamp leaves the current one under an older stamp,
+        # which is a correct table and is not refused.
+        lane_ddls = {_normalize_sql(LANE_ARTIFACTS_SQL)}
+        if expected != st.LEDGER_SCHEMA_VERSION:
+            lane_ddls.add(_normalize_sql(V4_LANE_ARTIFACTS_SQL))
+        if sql is None or _normalize_sql(sql) not in lane_ddls:
             raise ArtifactStoreError("lane_artifacts ddl")
-        if expected in (st.LEDGER_SCHEMA_VERSION_V3, st.LEDGER_SCHEMA_VERSION):
+        if expected in (
+            st.LEDGER_SCHEMA_VERSION_V3,
+            st.LEDGER_SCHEMA_VERSION_V4,
+            st.LEDGER_SCHEMA_VERSION,
+        ):
             run_sql = _table_create_sql(self.conn, "run_artifacts")
             if run_sql is None or _normalize_sql(run_sql) != _normalize_sql(
                 RUN_ARTIFACTS_SQL
@@ -476,7 +580,9 @@ class ArtifactStore:
         self._require_supported_v1_lane_artifacts()
         self._begin_migration()
         try:
-            self._rebuild_lane_artifacts_current_check()
+            # The v2 lane table, so the chain v2 -> v3 -> v4 -> v5 finds what
+            # each step expects; v5 is what rebuilds it into the current shape.
+            self._rebuild_lane_artifacts_current_check(ddl=V4_LANE_ARTIFACTS_SQL)
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
                 (st.LEDGER_SCHEMA_VERSION_V2, st.LEDGER_SCHEMA_VERSION_V1),
@@ -602,11 +708,11 @@ class ArtifactStore:
             )
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V3),
+                (st.LEDGER_SCHEMA_VERSION_V4, st.LEDGER_SCHEMA_VERSION_V3),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
-            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION)
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V4)
             self.conn.execute("COMMIT")
             self._end_migration()
         except Exception:
@@ -934,27 +1040,27 @@ class ArtifactStore:
         except UnknownLane:
             return None
 
-    def _current_sealed_bundle(
+    def _current_accepted_suite(
         self, run_id: str, lane_id: str
     ) -> sqlite3.Row | None:
         revision = self._run(run_id)["plan_revision"]
         return self._latest_lane_artifact(
             run_id,
             lane_id,
-            st.ArtifactKind.SEALED_TEST_BUNDLE,
+            st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
 
 
-    def _sealed_bundle(self, run_id: str, lane_id: str) -> sqlite3.Row | None:
+    def _accepted_suite(self, run_id: str, lane_id: str) -> sqlite3.Row | None:
         revision = self._run(run_id)["plan_revision"]
         if self._lane_kind(run_id, lane_id) == st.LANE_KIND_BUILD:
             needs = self._needs(self._projection(run_id, revision, lane_id))
             for dep in needs:
                 if self._lane_kind(run_id, dep) == st.LANE_KIND_TESTS:
-                    return self._current_sealed_bundle(run_id, dep)
+                    return self._current_accepted_suite(run_id, dep)
             return None
-        return self._current_sealed_bundle(run_id, lane_id)
+        return self._current_accepted_suite(run_id, lane_id)
 
     def _dependency_receipts(
         self, run_id: str, needs: Sequence[str]
@@ -965,10 +1071,10 @@ class ArtifactStore:
             if self.lane_stage(run_id, dep) is not st.LaneStage.MERGED:
                 raise st.IllegalStageEdge(f"needs {dep} is not MERGED")
             if self._lane_kind(run_id, dep) == st.LANE_KIND_TESTS:
-                row = self._current_sealed_bundle(run_id, dep)
+                row = self._current_accepted_suite(run_id, dep)
                 if row is None:
                     raise st.IllegalStageEdge(
-                        f"needs {dep} has no SEALED_TEST_BUNDLE"
+                        f"needs {dep} has no ACCEPTED_TEST_SUITE"
                     )
             else:
                 row = self._latest_lane_artifact(
@@ -1032,21 +1138,6 @@ class ArtifactStore:
             review_id = (
                 review["artifact_id"] if review is not None else st.NO_TEST_REVIEW
             )
-            invalidation = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.TEST_INVALIDATION
-            )
-            draft = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.TEST_DRAFT
-            )
-            invalidation_id = st.active_test_invalidation_id(
-                invalidation_id=(
-                    invalidation["artifact_id"] if invalidation is not None else None
-                ),
-                invalidation_sequence=(
-                    int(invalidation["sequence"]) if invalidation is not None else None
-                ),
-                draft_sequence=int(draft["sequence"]) if draft is not None else None,
-            )
             merges = self.integration_merge_payloads(run_id)
             return st.writing_tests_input_digest(
                 **common,
@@ -1055,7 +1146,6 @@ class ArtifactStore:
                 integration_head=gitpub.durable_integration_tip(
                     run["integration_initial_sha"], merges
                 ),
-                test_invalidation_id=invalidation_id,
             )
 
         if stage is st.LaneStage.REVIEWING_TESTS:
@@ -1086,7 +1176,7 @@ class ArtifactStore:
                 verdict=st.ReviewerVerdict.PASS,
             )
             if plan is None or draft is None or review is None:
-                raise StaleStageInput("missing sealed-test inputs")
+                raise StaleStageInput("missing accepted-suite inputs")
             return st.tests_sealed_input_digest(
                 **common,
                 lane_plan_id=plan["artifact_id"],
@@ -1099,32 +1189,24 @@ class ArtifactStore:
             plan = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.LANE_PLAN
             )
-            sealed = self._sealed_bundle(run_id, lane_id)
+            suite = self._accepted_suite(run_id, lane_id)
             builder = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
             )
-            if plan is None or sealed is None or builder is None:
+            if plan is None or suite is None or builder is None:
                 raise StaleStageInput("missing REVIEWING_CODE inputs")
             builder_payload = _loads(builder["payload_json"])
             return st.reviewing_code_input_digest(
                 **common,
                 lane_plan_id=plan["artifact_id"],
-                sealed_bundle_id=sealed["artifact_id"],
+                accepted_suite_id=suite["artifact_id"],
                 builder_output_id=builder["artifact_id"],
                 builder_base_sha=builder_payload["builder_base_sha"],
                 candidate_ref=builder_payload["candidate_ref"],
                 candidate_sha=builder_payload["candidate_sha"],
             )
         if stage is st.LaneStage.READY_TO_MERGE:
-            builder = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
-            )
-            review = self._latest_lane_artifact(
-                run_id,
-                lane_id,
-                st.ArtifactKind.CODE_REVIEW,
-                verdict=st.ReviewerVerdict.PASS,
-            )
+            builder, review = self._merge_producers(run_id, lane_id)
             if builder is None or review is None:
                 raise StaleStageInput("missing READY_TO_MERGE inputs")
             builder_payload = _loads(builder["payload_json"])
@@ -1151,21 +1233,52 @@ class ArtifactStore:
             )
         raise st.IllegalStageEdge(f"no input reconstruction for {stage.value}")
 
+    def _merge_producers(
+        self, run_id: str, lane_id: str
+    ) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+        """The candidate and the passing review a READY_TO_MERGE lane merges.
+
+        A build lane merges its BUILDER_OUTPUT under its CODE_REVIEW PASS. A
+        tests lane merges its ACCEPTED_TEST_SUITE -- the candidate its test
+        reviewer accepted -- under that TEST_REVIEW PASS. Same edge, same
+        payload keys (`builder_base_sha`, `candidate_ref`, `candidate_sha`),
+        one producer pair per lane kind.
+        """
+        if self._lane_kind(run_id, lane_id) == st.LANE_KIND_TESTS:
+            return (
+                self._current_accepted_suite(run_id, lane_id),
+                self._latest_lane_artifact(
+                    run_id,
+                    lane_id,
+                    st.ArtifactKind.TEST_REVIEW,
+                    verdict=st.ReviewerVerdict.PASS,
+                ),
+            )
+        return (
+            self._latest_lane_artifact(run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT),
+            self._latest_lane_artifact(
+                run_id,
+                lane_id,
+                st.ArtifactKind.CODE_REVIEW,
+                verdict=st.ReviewerVerdict.PASS,
+            ),
+        )
+
     def _building_digest(
         self, run: sqlite3.Row, projection: sqlite3.Row, payload: Mapping[str, Any]
     ) -> str:
         run_id = run["run_id"]
         lane_id = projection["lane_id"]
         plan = self._latest_lane_artifact(run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = self._sealed_bundle(run_id, lane_id)
-        if plan is None or sealed is None:
-            raise StaleStageInput("missing BUILDING plan/sealed bundle")
+        suite = self._accepted_suite(run_id, lane_id)
+        if plan is None or suite is None:
+            raise StaleStageInput("missing BUILDING plan/accepted suite")
         receipts = self._dependency_receipts(run_id, self._needs(projection))
         entry = st.BuildingEntryKind(payload["entry_kind"])
         builder_base_sha = st.require_git_sha(
             payload["builder_base_sha"], name="builder_base_sha"
         )
-        ids = [plan["artifact_id"], sealed["artifact_id"]]
+        ids = [plan["artifact_id"], suite["artifact_id"]]
         ids.extend(
             row["artifact_id"]
             for row in receipts
@@ -1305,7 +1418,7 @@ class ArtifactStore:
                 run_id=run_id,
                 lane_id=lane_id,
                 sequence=existing["sequence"],
-                kind=st.ArtifactKind(existing["artifact_kind"]),
+                kind=st.stored_artifact_kind(existing["artifact_kind"], run_id=run_id),
                 plan_revision=existing["plan_revision"],
                 input_digest=existing["input_digest"],
                 output_digest=existing["output_digest"],
@@ -1371,7 +1484,7 @@ class ArtifactStore:
                 run_id=run_id,
                 lane_id=None,
                 sequence=existing["sequence"],
-                kind=st.ArtifactKind(existing["artifact_kind"]),
+                kind=st.stored_artifact_kind(existing["artifact_kind"], run_id=run_id),
                 plan_revision=existing["plan_revision"],
                 input_digest=existing["input_digest"],
                 output_digest=existing["output_digest"],
@@ -1598,7 +1711,7 @@ class ArtifactStore:
                     run_id=run_id,
                     lane_id=lane_id,
                     sequence=existing["sequence"],
-                    kind=st.ArtifactKind(existing["artifact_kind"]),
+                    kind=st.stored_artifact_kind(existing["artifact_kind"], run_id=run_id),
                     plan_revision=existing["plan_revision"],
                     input_digest=existing["input_digest"],
                     output_digest=existing["output_digest"],
@@ -1900,14 +2013,14 @@ class ArtifactStore:
             plan = self._latest_lane_artifact(
                 run["run_id"], lane["lane_id"], st.ArtifactKind.LANE_PLAN
             )
-            sealed = self._sealed_bundle(run["run_id"], lane["lane_id"])
-            if plan is None or sealed is None:
+            suite = self._accepted_suite(run["run_id"], lane["lane_id"])
+            if plan is None or suite is None:
                 raise st.IllegalStageEdge("final review missing contracts")
             rows.append(
                 {
                     "lane_id": lane["lane_id"],
                     "public_contract_artifact_id": plan["artifact_id"],
-                    "sealed_test_bundle_artifact_id": sealed["artifact_id"],
+                    "accepted_test_suite_artifact_id": suite["artifact_id"],
                     "spec_digest": lane["spec_digest"],
                 }
             )
@@ -2524,15 +2637,15 @@ class ArtifactStore:
             body,
         )
 
-    def sealed_bundle_artifact_id(self, run_id: str, lane_id: str) -> Optional[str]:
-        """The sealed bundle this lane is graded against, at the live revision.
+    def accepted_suite_artifact_id(self, run_id: str, lane_id: str) -> Optional[str]:
+        """The accepted suite this lane is graded against, at the live revision.
 
-        `_sealed_bundle` already resolves a build lane to its tests
-        predecessor's bundle, which is what makes this the same bundle the
+        `_accepted_suite` already resolves a build lane to its tests
+        predecessor's suite, which is what makes this the same suite the
         builder and the code reviewer were measured against rather than a
         second answer to the same question.
         """
-        row = self._sealed_bundle(run_id, lane_id)
+        row = self._accepted_suite(run_id, lane_id)
         return None if row is None else str(row["artifact_id"])
 
     def run_artifacts_of_kind(
@@ -2674,7 +2787,7 @@ class ArtifactStore:
             run_id=row["run_id"],
             lane_id=row["lane_id"],
             sequence=row["sequence"],
-            kind=st.ArtifactKind(row["artifact_kind"]),
+            kind=st.stored_artifact_kind(row["artifact_kind"], run_id=row["run_id"]),
             plan_revision=row["plan_revision"],
             input_digest=row["input_digest"],
             output_digest=row["output_digest"],

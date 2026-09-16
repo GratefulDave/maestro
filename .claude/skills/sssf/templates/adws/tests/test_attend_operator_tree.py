@@ -1,9 +1,9 @@
 """What the operator agent is handed, and where it is handed it.
 
-The operator agent's tree is the one place the sealed suite is written outside
-the vault and outside code review's scratch. Two things have to hold: the
-bytes land inside the tree the role contract confines the agent to, and the
-handoff is files rather than prompt text. B13's size check is made against the
+The operator agent's tree is not a git checkout, so the accepted suite is
+written into it as files. Two things have to hold: the bytes land inside the
+tree the role contract confines the agent to, and the handoff is files rather
+than prompt text. B13's size check is made against the
 route's window at launch, and four rounds of findings plus a suite is a prompt
 that can overflow -- an overflowing agent answers about a different lane.
 """
@@ -24,7 +24,7 @@ from adw_modules import attend as att  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
 
-def _request(tmp: Path, sealed: dict) -> att.OperatorRequest:
+def _request(tmp: Path, suite: dict) -> att.OperatorRequest:
     ir = tmp / "current.ir.json"
     ir.write_text(json.dumps({"plan_id": "p-1"}), encoding="utf-8")
     return att.OperatorRequest(
@@ -36,11 +36,11 @@ def _request(tmp: Path, sealed: dict) -> att.OperatorRequest:
         next_plan_revision=3,
         public_contract={"acceptance_criteria": ["emits FAQ records"]},
         reviews=({"kind": "CODE_REVIEW", "verdict": "REVISE"},),
-        redacted_failures=("1 failed",),
+        failure_output=("1 failed",),
         lane_gates="stage WAITING_FOR_USER",
         ir_path=str(ir),
         revision_out_path=str(tmp / "cwd" / "revisions" / "r3.ir.json"),
-        sealed_files=sealed,
+        suite_files=suite,
         amendment_rules="rules",
         allowed_lane_ids=("lane-faq-build", "lane-faq-tests"),
     )
@@ -55,8 +55,8 @@ class OperatorTree(unittest.TestCase):
         self.cwd.mkdir()
         self.actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
 
-    def _write(self, sealed: dict) -> None:
-        self.actor._write_operator_tree(self.cwd, _request(self.tmp, sealed))
+    def _write(self, suite: dict) -> None:
+        self.actor._write_operator_tree(self.cwd, _request(self.tmp, suite))
 
     def test_the_inputs_are_files_and_the_suite_is_on_disk(self) -> None:
         self._write({"tests/faq.spec.ts": "expect(record.disclaimer)"})
@@ -68,9 +68,9 @@ class OperatorTree(unittest.TestCase):
         self.assertEqual((inputs / "amendment_rules.md").read_text(), "rules")
         reviews = json.loads((inputs / "reviews.json").read_text())
         self.assertEqual(reviews["reviews"][0]["verdict"], "REVISE")
-        self.assertEqual(reviews["redacted_failures"], ["1 failed"])
+        self.assertEqual(reviews["failure_output"], ["1 failed"])
         self.assertEqual(
-            (self.cwd / "sealed" / "tests" / "faq.spec.ts").read_text(),
+            (self.cwd / "suite" / "tests" / "faq.spec.ts").read_text(),
             "expect(record.disclaimer)",
         )
         self.assertTrue((self.cwd / "revisions").is_dir())
@@ -78,10 +78,10 @@ class OperatorTree(unittest.TestCase):
     def test_a_second_dispatch_replaces_the_previous_round(self) -> None:
         self._write({"tests/old.spec.ts": "stale"})
         self._write({"tests/new.spec.ts": "current"})
-        self.assertFalse((self.cwd / "sealed" / "tests" / "old.spec.ts").exists())
-        self.assertTrue((self.cwd / "sealed" / "tests" / "new.spec.ts").exists())
+        self.assertFalse((self.cwd / "suite" / "tests" / "old.spec.ts").exists())
+        self.assertTrue((self.cwd / "suite" / "tests" / "new.spec.ts").exists())
 
-    def test_a_traversing_sealed_path_is_refused_rather_than_written(self) -> None:
+    def test_a_traversing_suite_path_is_refused_rather_than_written(self) -> None:
         outside = self.tmp / "escaped.ts"
         with self.assertRaises(maestro.FactoryRefused) as caught:
             self._write({"../../escaped.ts": "leaked"})
@@ -126,7 +126,7 @@ class OperatorPrompt(unittest.TestCase):
             Path(holder.name), "operator", "claude"
         )
         text = written.read_text()
-        self.assertIn("You may read the sealed acceptance suite", text)
+        self.assertIn("The accepted acceptance suite is in this checkout under", text)
         self.assertIn("allowed_lane_ids", text)
         self.assertIn("Do not run any `maestro` verb", text)
 

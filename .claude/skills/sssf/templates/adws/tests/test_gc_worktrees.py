@@ -127,23 +127,9 @@ def installation(tmp_path: Path):
         _age(tree, OLD + index)
         built[name] = tree
 
-    # A draft tree registered in the vault of the live run, and one whose vault
-    # is gone. Only the first is anchoring an unpinned commit.
-    vaults = state / "vaults"
-    live_reg = vaults / "{0}.git".format(LIVE_RUN) / "worktrees" / "draft-lane-a-c0ffee01"
-    live_reg.mkdir(parents=True)
-    live_draft = _write_tree(worktrees / "draft-lane-a-c0ffee01")
-    (live_draft / ".git").write_text("gitdir: {0}\n".format(live_reg), encoding="utf-8")
-    _age(live_draft, OLD)
-    built["live-draft"] = live_draft
-
+    # A draft-collect tree is scratch like any other: a draft is a candidate
+    # pinned at admission, so no scratch tree anchors an unpinned commit.
     dead_draft = _write_tree(worktrees / "draft-lane-z-deadbeef")
-    (dead_draft / ".git").write_text(
-        "gitdir: {0}/{1}.git/worktrees/draft-lane-z-deadbeef\n".format(
-            vaults, ORPHAN_RUN
-        ),
-        encoding="utf-8",
-    )
     _age(dead_draft, OLD)
     built["dead-draft"] = dead_draft
 
@@ -232,12 +218,6 @@ def test_scratch_trees_are_selected_and_strangers_are_not(installation):
         if name.startswith("review-lane-a-")
     )
     assert decisions["notes-i-left-here"] == gcw.KEEP
-
-
-def test_registered_draft_of_a_live_run_is_kept(installation):
-    inst, _ = installation
-    decisions = _decisions(_plan(inst, keep=0, take_all=True))
-    assert decisions["draft-lane-a-c0ffee01"] == gcw.KEEP
 
 
 def test_keep_window_is_honoured_and_all_overrides_it(installation):

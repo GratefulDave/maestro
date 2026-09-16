@@ -95,8 +95,7 @@ def test_ready_to_merge_consumes_exactly_what_a_merged_lane_already_has() -> Non
     # Every place that guards the stage looks up the same two artifacts first.
     for preceding in guards[:-1]:
         window = preceding[-900:]
-        assert "ArtifactKind.BUILDER_OUTPUT" in window
-        assert "ReviewerVerdict.PASS" in window
+        assert "_merge_producers(" in window
     # And it is a stage the scheduler can be resumed into at all.
     assert st.LaneStage.READY_TO_MERGE in st.PAUSEABLE_STAGES
 
@@ -124,7 +123,6 @@ def test_a_moved_base_is_still_caught_and_still_rebuilds() -> None:
         builder_base_sha="a" * 40,
         candidate_sha="a" * 40,
         integration_head="a" * 40,
-        sealed_present=True,
     )
     assert still.action != "BASE_INVALIDATION"
 

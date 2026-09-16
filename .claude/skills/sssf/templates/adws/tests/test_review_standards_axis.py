@@ -24,8 +24,8 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import code_review as cr  # noqa: E402
-from adw_modules import hidden_vault as hv  # noqa: E402
-from adw_modules import private_review as pr  # noqa: E402
+from adw_modules import git_publication as gitpub  # noqa: E402
+from adw_modules import review_contract as rc  # noqa: E402
 from adw_modules import review_standards as rvs  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
@@ -80,8 +80,8 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _request(*, run_id: str, lane_id: str, input_digest: str) -> pr.VaultLaneRequest:
-    return pr.VaultLaneRequest(
+def _request(*, run_id: str, lane_id: str, input_digest: str) -> rc.LaneRequest:
+    return rc.LaneRequest(
         run_id=run_id,
         lane_id=lane_id,
         plan_revision=1,
@@ -233,21 +233,20 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         self.tmp.cleanup()
 
     def _sealed(self) -> tuple[st.LaneArtifact, str]:
+        """Accept a suite and merge it, so the head carries it as a base does."""
+        binding = gitpub.bind_target_worktree(self.repo, INTEGRATION_REF)
+        head = _git(self.repo, "rev-parse", "HEAD")
         draft = tc.write_test_draft(
             request=_request(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
                 input_digest=_digest("standards-draft"),
             ),
-            state_root=self.state,
-            run_repo=self.repo,
-            integration_ref=INTEGRATION_REF,
+            binding=binding,
+            integration_head=head,
             files={TEST_PATH: TEST_SOURCE},
             public_contract=CONTRACT,
-            worktrees_root=self.worktrees / "standards-draft",
-        )
-        tokens = tc.draft_private_tokens(
-            state_root=self.state, run_id=self.run_id, draft=draft
+            declared_outputs=[TEST_PATH],
         )
         review = tc.review_test_draft(
             request=_request(
@@ -258,23 +257,20 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
             verdict=st.ReviewerVerdict.PASS,
             findings=(),
             test_draft=draft,
-            private_tokens=tokens,
         )
-        head = _git(self.repo, "rev-parse", "HEAD")
-        builder = hv.linked_worktree(self.repo, self.root / "builder", head)
-        sealed = tc.seal_accepted_tests(
+        accepted = tc.accept_tests(
             request=_request(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
-                input_digest=_digest("standards-seal"),
+                input_digest=_digest("standards-accept"),
             ),
-            state_root=self.state,
-            run_repo=self.repo,
-            builder_worktree=builder,
             test_draft=draft,
             test_review=review,
         )
-        return sealed, head
+        merged = str(accepted.payload["candidate_sha"])
+        _git(self.repo, "update-ref", INTEGRATION_REF, merged)
+        _git(self.repo, "reset", "-q", "--hard", "HEAD")
+        return accepted, merged
 
     def _candidate(self, source: str) -> tuple[str, str]:
         (self.repo / "refund.py").write_text(source)
@@ -300,7 +296,7 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
             candidate_sha=sha,
             candidate_ref=ref,
             builder_base_sha=base,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             verdict=verdict,
             findings=findings,
             scratch_root=self.state / ("scratch-" + label),

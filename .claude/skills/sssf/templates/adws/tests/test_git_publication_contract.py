@@ -947,7 +947,7 @@ class GitPublicationContract(unittest.TestCase):
             "scheduler",
             "coordinator_store",
             "coordinator",
-            "hidden_vault",
+            "tree_materialize",
             "plan_model",
         }
         for path in owned:

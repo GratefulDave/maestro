@@ -3,7 +3,7 @@
 
 This tool is strictly read-only. It opens `lifecycle.sqlite3` with SQLite's
 `mode=ro` URI, it never invokes `maestro.py`, it never starts, resumes, or
-amends a run, and it never writes to the ledger, the vault, or any worktree.
+amends a run, and it never writes to the ledger or any worktree.
 Its only side effect is what it prints.
 
 It exists because a `run start` / `run resume` line handed to an operator
@@ -32,7 +32,6 @@ if str(_RUNTIME_ROOT) not in sys.path:
 
 import yaml  # noqa: E402
 
-from adw_modules import hidden_vault as hv  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules.code_review import _COLLECTION_REVISE, _RUNNER_REVISE  # noqa: E402
 from adw_modules.reporting_registry import registry_path  # noqa: E402
@@ -367,17 +366,15 @@ def lane_table(
         )
 
     # The scheduler's own function, over the scheduler's own inputs: the kind
-    # of review this lane's argument is made of, the vault a tests history is
-    # read from, and the deployment's stall rule. Recomputing any of those
-    # here is how the tool came to print `stalled False` about a lane the
-    # scheduler had already parked.
+    # of review this lane's argument is made of and the deployment's stall
+    # rule. Recomputing either here is how the tool came to print
+    # `stalled False` about a lane the scheduler had already parked.
     try:
         history = _review_content_history(
             SimpleNamespace(conn=conn),
             run_id,
             lane_id,
             review_kind,
-            hv.vault_path(Path(runtime_state_root), run_id),
         )
         stalled = str(
             _stalled(
@@ -388,8 +385,8 @@ def lane_table(
         )
         attempts = str(len(history))
     except Exception as exc:  # noqa: BLE001 - a report never raises
-        # The type only: an exception message here can quote a vault path
-        # or a draft path, and this tool prints for an operator.
+        # The type only: a report never raises, and a message here is not
+        # what the operator is reading this table for.
         attempts = stalled = "UNREADABLE:{0}".format(type(exc).__name__)
     rows.append(("reviewed_attempts", attempts))
     rows.append(("stalled", stalled))
@@ -437,7 +434,7 @@ def run_table(
     last line -- so a handover satisfied the Stop hook and died anyway.
 
     Read-only, and it says so where it cannot answer: evaluating a run-level
-    sealed gate means provisioning a tree and executing a suite, which is not
+    accepted-suite gate means provisioning a tree and executing a suite, which is not
     something a reporting tool may do. It names the lanes that gate instead.
     """
     rows: list[tuple[str, str]] = []

@@ -7,18 +7,17 @@ A run leaves two kinds of directory under ``<runtime_state_root>/worktrees``.
 repository**. It holds the candidate a builder is working on and can carry
 uncommitted work, so it is durable for as long as its run is.
 
-``draft-<lane_id>-<nonce>``, ``review-<lane_id>-<digest>``,
-``review-base-<lane_id>-<digest>`` and ``integration-gate-<lane_id>-<digest>``
-are scratch. Each is rebuilt on demand from an immutable commit plus sealed
-blobs, so removing one costs a re-provision and never data.
+``draft-collect-<lane_id>-<nonce>``, ``runner-preflight-<runner>-<nonce>``,
+``review-<lane_id>-<digest>``, ``review-base-<lane_id>-<digest>`` and
+``integration-gate-<lane_id>-<digest>`` are scratch. Each is rebuilt on demand
+from an immutable commit, so removing one costs a re-provision and never data.
 Nothing removes them today -- not on merge, not on run completion, not on
 scheduler exit -- so one installation accumulates them for the life of a plan.
 
 This tool classifies every directory under that root and, only when told to,
 removes the ones that are provably derived or provably orphaned. It is a
-reclaimer, not a lifecycle actor: it never writes the ledger, the vault
-contents, receipts, artifacts, locks, plans, or the target repository's working
-tree. It does unregister a worktree it is about to delete, because leaving a
+reclaimer, not a lifecycle actor: it never writes the ledger, receipts,
+artifacts, locks, plans, or the target repository's working tree. It does unregister a worktree it is about to delete, because leaving a
 repository with a registration pointing at a missing directory is worse than
 leaving the directory.
 
@@ -120,10 +119,6 @@ class Installation:
     @property
     def worktrees(self) -> Path:
         return self.state / "worktrees"
-
-    @property
-    def vaults(self) -> Path:
-        return self.state / "vaults"
 
 
 def installation_for_state(state: Path, repository: Path | None = None) -> Installation:
@@ -358,39 +353,6 @@ def scratch_group(name: str) -> tuple[str, str] | None:
     return None
 
 
-def draft_vault_run_id(entry: Path, state: Path) -> str | None:
-    """The run whose vault a draft tree is still registered in, if any.
-
-    A draft worktree records its git directory as
-    ``<state>/vaults/<run_id>.git/worktrees/<name>``. That directory existing is
-    git's own registration record, so its presence answers both questions --
-    which run, and still registered -- without shelling out.
-    """
-    marker = Path(entry) / ".git"
-    try:
-        text = marker.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not text.startswith("gitdir:"):
-        return None
-    gitdir = Path(text[len("gitdir:") :].strip())
-    if not gitdir.is_absolute():
-        gitdir = (Path(entry) / gitdir).resolve(strict=False)
-    if not gitdir.is_dir():
-        return None
-    vaults = Path(state).resolve(strict=False) / "vaults"
-    try:
-        relative = gitdir.resolve(strict=False).relative_to(vaults)
-    except ValueError:
-        return None
-    if not relative.parts:
-        return None
-    vault_name = relative.parts[0]
-    if not vault_name.endswith(".git"):
-        return None
-    return vault_name[: -len(".git")]
-
-
 def classify(
     installation: Installation,
     runs: Mapping[str, RunRow],
@@ -501,25 +463,13 @@ def _scratch_entry(
     group: str,
     runs: Mapping[str, RunRow],
 ) -> Entry:
-    """A scratch tree is derived, except while it is anchoring an unpinned commit.
+    """A scratch tree is derived: an extract of one immutable commit.
 
-    ``write_test_draft`` keeps a draft worktree registered until the draft ref is
-    pinned, because the worktree's HEAD is the only thing referencing the commit
-    until then. A registered draft belonging to a run that is still going is
-    therefore not derived, and is kept under every flag.
+    A test draft used to be anchored by a scratch worktree until its ref was
+    pinned; a draft is a candidate commit pinned at admission now, and no
+    scratch tree anchors anything.
     """
-    if kind == "draft":
-        run_id = draft_vault_run_id(path, installation.state)
-        if run_id is not None:
-            row = runs.get(run_id)
-            if row is not None and not row.terminal:
-                return _entry(
-                    path,
-                    kind,
-                    group,
-                    KEEP,
-                    "registered in the vault of a live run",
-                )
+    del installation, runs
     return _entry(path, kind, group, RECLAIM, "derived scratch tree")
 
 
@@ -612,8 +562,7 @@ def registration_index(
 ) -> dict[Path, Path]:
     """Every worktree registration that could point into this state root.
 
-    Both owners are consulted: the target repository, which owns the per-role
-    checkouts, and each run's vault, which owns the draft trees.
+    The target repository owns every registration: the per-role checkouts.
     """
     index: dict[Path, Path] = {}
     repos: list[Path] = []
@@ -624,12 +573,6 @@ def registration_index(
             repos.append(row.repository)
     for repo in dict.fromkeys(Path(item) for item in repos):
         index.update(registered_worktrees(repo))
-    vaults = installation.vaults
-    if vaults.is_dir():
-        with os.scandir(vaults) as scan:
-            for child in scan:
-                if child.name.endswith(".git"):
-                    index.update(registered_worktrees(Path(child.path)))
     return index
 
 

@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from adw_modules import private_review as pr
+from adw_modules import review_contract as rc
 from adw_modules import runner_resolution as rr
 from adw_modules import scheduler
 from adw_modules import tests_chain as tc
@@ -63,29 +63,29 @@ class _Tree:
 
 class GateArgvSubstitution(unittest.TestCase):
     def test_option_keeps_its_own_value(self) -> None:
-        argv, _ = pr.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
+        argv, _ = rc.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
         self.assertEqual(
             _value_after(argv, "--config"), "tests/wp7-checkout/vitest.config.ts"
         )
 
     def test_option_value_is_never_a_test_file(self) -> None:
-        argv, _ = pr.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
+        argv, _ = rc.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
         self.assertFalse(_value_after(argv, "--config").endswith(".test.ts"))
 
     def test_a_planned_selector_the_draft_did_not_write_is_dropped(self) -> None:
-        argv, selectors = pr.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
+        argv, selectors = rc.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
         self.assertNotIn("tests/wp7-checkout", argv)
         self.assertNotIn("tests/wp7-checkout", selectors)
 
     def test_every_written_file_is_named_exactly_once(self) -> None:
-        argv, _ = pr.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
+        argv, _ = rc.substituted_gate_argv(COOKIE_ARGV, COOKIE_FILES)
         for path in COOKIE_FILES:
             self.assertEqual(list(argv).count(path), 1, path)
 
     def test_a_written_file_the_plan_did_not_name_is_appended(self) -> None:
         files = dict(COOKIE_FILES)
         files["tests/wp7-checkout/extra.test.ts"] = ""
-        argv, selectors = pr.substituted_gate_argv(COOKIE_ARGV, files)
+        argv, selectors = rc.substituted_gate_argv(COOKIE_ARGV, files)
         self.assertIn("tests/wp7-checkout/extra.test.ts", argv)
         self.assertIn("tests/wp7-checkout/extra.test.ts", selectors)
 
@@ -93,12 +93,12 @@ class GateArgvSubstitution(unittest.TestCase):
         planned = (
             "services/api-gateway/tests/test_faers_dpa_entitlement.py",
         )
-        argv, selectors = pr.substituted_gate_argv(planned, dict.fromkeys(planned, ""))
+        argv, selectors = rc.substituted_gate_argv(planned, dict.fromkeys(planned, ""))
         self.assertEqual(argv, planned)
         self.assertEqual(selectors, planned)
 
     def test_an_inline_option_value_is_not_read_as_a_selector(self) -> None:
-        argv, selectors = pr.substituted_gate_argv(
+        argv, selectors = rc.substituted_gate_argv(
             ("--config=vitest.config.ts",) + COOKIE_ARGV[2:], COOKIE_FILES
         )
         self.assertIn("--config=vitest.config.ts", argv)
@@ -126,7 +126,7 @@ class SuiteSelectorsArgv(unittest.TestCase):
         self.tree = _Tree()
         self.addCleanup(self.tree.close)
 
-    def test_sealed_suite_pairs_config_with_the_config(self) -> None:
+    def test_the_suite_pairs_config_with_the_config(self) -> None:
         gate = SimpleNamespace(
             runner="vitest", argv=COOKIE_ARGV, cwd=".", min_cases=6
         )
@@ -168,20 +168,20 @@ class AGateOperandAlreadyInTheTree(unittest.TestCase):
         self.addCleanup(self.tree.close)
 
     def test_an_unwritten_operand_present_in_the_tree_is_kept(self) -> None:
-        argv, selectors = pr.substituted_gate_argv(
+        argv, selectors = rc.substituted_gate_argv(
             FIXTURE_ARGV, FIXTURE_WRITTEN, self.tree.path
         )
         self.assertIn("src/lib/api/dpa.test.ts", argv)
         self.assertIn("src/lib/api/dpa.test.ts", selectors)
 
     def test_it_keeps_its_authored_position(self) -> None:
-        argv, _ = pr.substituted_gate_argv(
+        argv, _ = rc.substituted_gate_argv(
             FIXTURE_ARGV, FIXTURE_WRITTEN, self.tree.path
         )
         self.assertEqual(argv, FIXTURE_ARGV)
 
     def test_an_unwritten_operand_absent_from_the_tree_is_still_dropped(self) -> None:
-        argv, selectors = pr.substituted_gate_argv(
+        argv, selectors = rc.substituted_gate_argv(
             ("src/lib/api/never-written.test.ts",) + FIXTURE_ARGV[1:],
             FIXTURE_WRITTEN,
             self.tree.path,
@@ -190,13 +190,13 @@ class AGateOperandAlreadyInTheTree(unittest.TestCase):
         self.assertNotIn("src/lib/api/never-written.test.ts", selectors)
 
     def test_a_directory_operand_is_dropped_even_when_it_exists(self) -> None:
-        argv, _ = pr.substituted_gate_argv(
+        argv, _ = rc.substituted_gate_argv(
             ("src/lib/api",) + FIXTURE_ARGV[1:], FIXTURE_WRITTEN, self.tree.path
         )
         self.assertNotIn("src/lib/api", argv)
 
     def test_a_caller_with_no_tree_cannot_test_existence_and_drops(self) -> None:
-        argv, _ = pr.substituted_gate_argv(FIXTURE_ARGV, FIXTURE_WRITTEN)
+        argv, _ = rc.substituted_gate_argv(FIXTURE_ARGV, FIXTURE_WRITTEN)
         self.assertNotIn("src/lib/api/dpa.test.ts", argv)
 
     def test_collect_gate_carries_the_shipped_operand(self) -> None:
@@ -206,7 +206,7 @@ class AGateOperandAlreadyInTheTree(unittest.TestCase):
         collect = _collect_gate(gate, FIXTURE_WRITTEN, self.tree.path)
         self.assertIn("src/lib/api/dpa.test.ts", collect.argv)
 
-    def test_the_sealed_suite_carries_the_shipped_operand(self) -> None:
+    def test_the_suite_carries_the_shipped_operand(self) -> None:
         gate = SimpleNamespace(
             runner="vitest", argv=FIXTURE_ARGV, cwd=".", min_cases=16
         )
@@ -246,6 +246,7 @@ class PrivateDraftCollection(unittest.TestCase):
                 run_id="isolated-draft-collection",
                 _provision_argv=(),
                 _provision_timeout_s=30,
+                _integration_head=lambda: "isolated-base",
             )
             ctx = SimpleNamespace(
                 run_id=owner.run_id, lane=SimpleNamespace(lane_id="draft")
@@ -257,16 +258,14 @@ class PrivateDraftCollection(unittest.TestCase):
             # Only isolate checkout/provisioning and interpreter discovery.
             # The production writer, argv helper and collector remain real.
             with (
-                patch.object(scheduler.hv, "ensure_vault", return_value=root / "vault"),
-                patch.object(scheduler.hv, "seed", return_value="isolated-base"),
-                patch.object(scheduler.hv, "scratch_worktree_path", return_value=tree),
-                patch.object(scheduler.hv, "checkout_vault_worktree"),
+                patch.object(scheduler.tm, "scratch_tree_path", return_value=tree),
+                patch.object(scheduler.tm, "materialize_commit"),
                 patch.object(scheduler.prov, "provision_tree"),
                 patch.object(scheduler.rr, "resolve", return_value=resolved),
                 patch.object(scheduler, "_remove_collect_tree"),
                 patch.dict("os.environ", {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}),
             ):
-                cases = scheduler.FactoryScheduler._collect_private_draft(
+                cases = scheduler.FactoryScheduler._collect_draft(
                     owner, ctx, gate, files
                 )
             self.assertEqual(

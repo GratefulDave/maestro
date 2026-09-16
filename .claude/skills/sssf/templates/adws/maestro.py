@@ -28,7 +28,6 @@ import yaml
 
 from adw_modules import attend as att
 from adw_modules import git_publication as gitpub
-from adw_modules import hidden_vault as hv
 from adw_modules.handoff_budget import (
     OMP_CONTEXT_WINDOW_TOKENS,
     route_publishes_a_window,
@@ -39,12 +38,13 @@ from adw_modules import plan_approval
 from adw_modules import plan_compiler
 from adw_modules import plan_contract_ingress as ingress
 from adw_modules import route_admission as admission
-from adw_modules import private_review as prv
+from adw_modules import review_contract as rc
 from adw_modules import provisioning
 from adw_modules import review_standards as rvs
 from adw_modules import scheduler_types as st
 from adw_modules import step_log
 from adw_modules import tests_chain as tchain
+from adw_modules import tree_materialize as tm
 from adw_modules.lifecycle import (
     ArtifactStore,
     LedgerSchemaUnsupported,
@@ -57,6 +57,7 @@ from adw_modules.runtime_state import LEDGER_FILENAME, RuntimeStateRefused, Runt
 from adw_modules.utils import now_iso
 from adw_modules.scheduler import (
     FactoryRefused,
+    refuse_historical_artifacts,
     FactoryScheduler,
     LaneContext,
     LaunchFailed,
@@ -488,8 +489,8 @@ def _precreated_role_cwd(dest: Path) -> bool:
 def _resolved_under(root: Path, relative: str) -> Path:
     """A repository-relative path resolved inside `root`, or a refusal.
 
-    The sealed paths written into an operator tree come out of the vault, and
-    a `..` component in one of them would write outside the tree the role
+    The suite paths written into an operator tree come off an artifact, and a
+    `..` component in one of them would write outside the tree the role
     contract confines this agent to.
     """
     base = Path(root).resolve()
@@ -660,12 +661,12 @@ def _clear_precreated_role_cwd(dest: Path) -> bool:
     """Empty a precreated role cwd without replacing its process-bound inode."""
     if not _precreated_role_cwd(dest):
         return False
-    hv.clear_tree(dest)
+    tm.clear_tree(dest)
     return True
 
 
 #: Where a test double may stand, and where it may not. Appended to both tester
-#: rules, because a `tests` lane and a hidden-validator lane draw the same seam.
+#: rules, because a `tests` lane and an untyped validator lane draw the same seam.
 #:
 #: Authoring guidance, not a verdict axis: nothing reads this back and no
 #: transition keys on it. What it buys is a way for the tester to *report* an
@@ -794,7 +795,7 @@ class HerdrStageActor:
     def _base_sha(self, ctx: LaneContext, role: str, integration_sha: str = "") -> str:
         if role == "tester":
             return ctx.integration_head or self.target.integration_initial_sha
-        if role == "code-reviewer" and ctx.candidate_sha:
+        if role in ("code-reviewer", "test-reviewer") and ctx.candidate_sha:
             return ctx.candidate_sha
         if role == "integration-reviewer" and integration_sha:
             return integration_sha
@@ -891,7 +892,7 @@ class HerdrStageActor:
         # with it. The reviewer had done the work; only the shape was wrong.
         findings = [{key: "<{0}>".format(key) for key in st.REVISE_FINDING_KEYS}]
         if role == "tester":
-            return {"private_files": {"<path>": "<utf-8 contents>"}}
+            return {"test_files": {"<path>": "<utf-8 contents>"}}
         if role == "builder":
             return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
         if role == "code-reviewer":
@@ -929,7 +930,7 @@ class HerdrStageActor:
     #: cases, a `describe` body never invoked registers none, and a module that
     #: deadlocks at import greps identically to one that loads. Both tester
     #: rules carry this because both drafts go through the same preflight
-    #: (`scheduler._collect_private_draft`), whatever the lane kind.
+    #: (`scheduler._collect_draft`), whatever the lane kind.
     _PROHIBITION_RULE = (
         "When an obligation forbids a behaviour -- 'never orders among', "
         "'must not coalesce', 'is absent from' -- it names a FAMILY of wrong "
@@ -979,12 +980,14 @@ class HerdrStageActor:
         "argument and return shapes, and observable errors. A module path "
         "alone does not declare a callable. Tests must consume that public "
         "interface, not invent an unstated binding or require an alias chosen "
-        "only inside a private test. Test reviewers must report such a binding "
+        "only inside a test. Test reviewers must report such a binding "
         "or an ambiguous public interface through existing actionable REVISE "
         "findings about contract adequacy, not prescribe product implementation "
         "or pass a guessed binding. Builders implement the public interface; "
-        "do not guess unspecified exports from sealed-test observations or "
-        "spray aliases to satisfy an unknown name."
+        "do not spray aliases to satisfy a name the accepted suite happens to "
+        "use when the public contract does not declare it -- the reviewer "
+        "grades against the contract, and a suite that binds to an undeclared "
+        "name is a finding against the suite, not a licence."
     )
 
     def _materialize_role_instructions(
@@ -993,8 +996,8 @@ class HerdrStageActor:
         if role == "tester" and lane_kind == st.LANE_KIND_TESTS:
             tester_rule = (
                 "Inspect the product checkout without modifying product files. "
-                "Return private acceptance files only through the requested envelope. "
-                "Author files exactly at declared_outputs. Returned private_files "
+                "Return acceptance files only through the requested envelope. "
+                "Author files exactly at declared_outputs. Returned test_files "
                 "paths must equal declared_outputs. On correction turns, apply "
                 "revise_findings to those declared files; do not claim a finding "
                 "is fixed by resubmitting byte-identical files.\n"
@@ -1005,12 +1008,12 @@ class HerdrStageActor:
         else:
             tester_rule = (
                 "Inspect the product checkout without modifying product files. "
-                "Return private test files only through the requested envelope. "
-                "Private paths must not collide with declared product outputs. "
-                "Write hidden validator/meta-test files that exercise builder "
+                "Return test files only through the requested envelope. "
+                "Test paths must not collide with declared product outputs. "
+                "Write validator/meta-test files that exercise builder "
                 "outputs; never replace those outputs. On correction turns, "
-                "apply revise_findings to hidden validators; do not claim a "
-                "finding is fixed by resubmitting byte-identical hidden files.\n"
+                "apply revise_findings to those validators; do not claim a "
+                "finding is fixed by resubmitting byte-identical files.\n"
                 + self._TESTER_COLLECT_RULE
                 + "\n"
                 + self._PROHIBITION_RULE
@@ -1027,23 +1030,34 @@ class HerdrStageActor:
 
             "test-reviewer": (
                 "## Test-reviewer obligations\n"
-                "Review private TEST_DRAFT tests against lane-plan obligations. "
-                "Check behavior coverage, satisfiability/non-vacuity, and "
-                "deterministic isolation. Return PASS or REVISE with actionable "
-                "findings for the tester. Never review or prescribe product "
-                "implementation. Never expose private tests to builder or "
-                "product outputs. Review only the private_draft_overlay files "
-                "listed in the per-turn JSON. Integration-seed and product "
-                "files are context and out of scope. A private validator "
-                "failing against the base is expected when falsifiability "
-                "requires red-at-base.\n"
+                "Review the TEST_DRAFT tests against lane-plan obligations. "
+                "This checkout is the draft candidate: the integration head "
+                "plus the draft's files, which the per-turn JSON lists as "
+                "test_files. Check behavior coverage, satisfiability/non-vacuity, "
+                "and deterministic isolation. Return PASS or REVISE with "
+                "actionable findings for the tester. Never review or prescribe "
+                "product implementation. Review only the test_files; product "
+                "files are context and out of scope. A validator failing "
+                "against the base is expected when falsifiability requires "
+                "red-at-base. The suite you accept is carried, byte for byte, "
+                "into the builder's checkout and is what the builder's candidate "
+                "is measured against; the builder will read it.\n"
                 + self._PROHIBITION_REVIEW_RULE
                 + "\n"
                 + TEST_CRAFT_REVIEWER_QUESTION
             ),
             "builder": (
-                "Modify only the declared product outputs. Never read private "
-                "tests, fixtures, vault paths, or hidden test material."
+                "## Builder obligations\n"
+                "Modify only the declared product outputs. The accepted test "
+                "suite this lane is graded against is in this checkout at the "
+                "paths the per-turn JSON lists as test_paths: read it. You may "
+                "not create, edit, delete, rename or copy any of those paths; a "
+                "candidate whose delta names one is refused before any reviewer "
+                "reads it (CANDIDATE_TEST_PATH_REFUSED), and the review runs "
+                "the suite only after proving the bytes at those paths are the "
+                "accepted ones (TEST_SUITE_TAMPERED). The code reviewer grades "
+                "the candidate against the plan's acceptance criteria and the "
+                "public contract, not against the suite."
             ),
             "code-reviewer": (
                 "## Code-reviewer obligations\n"
@@ -1052,10 +1066,14 @@ class HerdrStageActor:
                 "security, and maintainability. Return PASS or REVISE with "
                 "actionable findings for the builder, each resolvable by editing "
                 "declared outputs only. Never prescribe changes to files outside "
-                "declared outputs. If an external test contradicts the lane's "
-                "public contract, assess the candidate against the contract "
-                "instead of demanding a test edit. Private tests are absent and "
-                "must not be inferred, requested, or cited. The "
+                "declared outputs. The accepted test suite is in this checkout "
+                "at the paths listed as test_paths, and the harness has already "
+                "run it against this exact candidate: suite_result_summary is "
+                "that measurement. Read the suite to locate a failure; grade "
+                "the candidate against public_contract and the lane plan's "
+                "acceptance criteria, not against the suite. An assertion that "
+                "contradicts the public contract is a finding you report, not a "
+                "test edit you demand. The "
                 "violated_requirement field is checked mechanically and must "
                 "quote the public contract verbatim; a finding that does not "
                 "quote it is sent back once, and a second miss stops the "
@@ -1081,17 +1099,16 @@ class HerdrStageActor:
                 "You are authoring a plan revision, not implementing a lane. "
                 "A lane has parked because its reviewed rounds stopped moving "
                 "against the contract it was given; your job is to name the "
-                "gap between what the sealed suite asserts and what the "
+                "gap between what the accepted suite asserts and what the "
                 "contract says, and to close it with the smallest edit that "
                 "reaches this lane's projection -- normally one seam contract "
                 "on the lane's own carrier.\n"
-                "You may read the sealed acceptance suite. It is in this "
-                "checkout under `sealed/`, and reading it is the privilege "
-                "this role exists to exercise: the builder and every reviewer "
-                "still cannot, and nothing you write may hand it to them as "
-                "test source. Stating an expectation the suite asserts, as a "
-                "contract clause in your own words, is exactly what you are "
-                "here to do; pasting the test file into the contract is not.\n"
+                "The accepted acceptance suite is in this checkout under "
+                "`suite/`; the builder and every reviewer read the same files "
+                "in their own checkouts. Stating an expectation the suite "
+                "asserts, as a contract clause in your own words, is exactly "
+                "what you are here to do; pasting the test file into the "
+                "contract is not.\n"
                 "Write the revision IR at the path the per-turn JSON names, "
                 "and nowhere else. Do not edit the current IR in place. Do not "
                 "run any `maestro` verb, any git command, or `planctl` -- the "
@@ -1106,14 +1123,13 @@ class HerdrStageActor:
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
                 "verdict, findings, and only genuinely affected lane IDs. "
-                "Each merged build lane's accepted test suite is in this "
-                "checkout beside the code it judged; read the two together. "
-                "The suite of a tests lane no build lane consumes is absent "
-                "by design, and its absence is never a finding: the harness "
-                "measures every run-level sealed gate itself, against this "
-                "same integration SHA with that suite overlaid, before you "
-                "are asked, and a gate that failed reaches you as a REVISE "
-                "you are not consulted about. Do not run or re-run a "
+                "Every tests lane's accepted suite is in this checkout: each "
+                "tests lane merged its suite into the integration ref before "
+                "the build lane that consumes it started, so read each suite "
+                "beside the code it judged. The harness measures every "
+                "run-level gate itself, against this same integration SHA, "
+                "before you are asked, and a gate that failed reaches you as "
+                "a REVISE you are not consulted about. Do not run or re-run a "
                 "declared gate command. Judge the code in this checkout "
                 "against the lane contracts.\n"
                 "You are the only reader who sees every lane's callers at "
@@ -1162,8 +1178,8 @@ class HerdrStageActor:
         return agent_root / ("CLAUDE.md" if route == "claude" else "AGENTS.md")
 
     @staticmethod
-    def _sealed_counts_red(counts: Mapping[str, Any]) -> bool:
-        """Whether the measured sealed suite disagrees with the candidate.
+    def _suite_counts_red(counts: Mapping[str, Any]) -> bool:
+        """Whether the measured suite disagrees with the candidate.
 
         Mirrors `code_review`'s own `runner_failed` on the public counts alone:
         anything failed, anything errored, or nothing executed. `min_cases` is
@@ -1181,18 +1197,17 @@ class HerdrStageActor:
     def _failure_instruction(lines: Sequence[str]) -> str:
         """Name the failures the builder is otherwise left to guess at.
 
-        These are the runner's own lines with every private token already
-        redacted upstream. They say which symbol or shape is wrong; they do not
-        say what any test expects.
+        These are the runner's own lines, verbatim. They name the case, the
+        error class and the assertion; the suite itself is in the checkout,
+        so the builder can open the case at the line the runner names.
         """
         shown = "\n".join("  {0}".format(line) for line in lines)
         return (
-            " The sealed suite reported these failures against your last "
-            "candidate, verbatim from the runner with private values "
-            "redacted:\n{0}\nFix the causes named here. They are the actual "
-            "errors, not a summary of them. A [redacted] marker had a "
-            "private value removed -- treat the surrounding text as the "
-            "signal. Do not guess at failures that are not listed.".format(shown)
+            " The accepted suite reported these failures against your last "
+            "candidate, verbatim from the runner:\n{0}\nFix the causes named "
+            "here. They are the actual errors, not a summary of them; open the "
+            "named case in the suite under test_paths to read the assertion in "
+            "full. Do not guess at failures that are not listed.".format(shown)
         )
 
     @staticmethod
@@ -1215,7 +1230,7 @@ class HerdrStageActor:
         if not modules and not keys:
             return ""
         text = (
-            " bound_surface records names observed in the sealed suite; it "
+            " bound_surface records names observed in the accepted suite; it "
             "does not define or override the public interface. Implement the "
             "names declared by the public lane spec and public_contract. "
             "An empty symbols list declares no callable, and an observed name "
@@ -1231,12 +1246,10 @@ class HerdrStageActor:
                 ", ".join(keys)
             )
         text += (
-            " The VALUES behind those names -- expected strings, numbers, "
-            "fixture data, and the specific results the assertions compare "
-            "against -- are deliberately withheld and cannot be recovered from "
-            "this list. Do not guess at one and do not hardcode one. Derive the "
-            "behavior from public_contract and implement it; a value that "
-            "happens to satisfy a case you imagined is not the contract."
+            " This is an index into the suite in your checkout, not a second "
+            "contract. Derive the behavior from public_contract and implement "
+            "it; a value hardcoded to satisfy one assertion is not the contract "
+            "and the reviewer grades against the contract."
         )
         return text
 
@@ -1268,8 +1281,8 @@ class HerdrStageActor:
         if role == "tester":
             if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
                 instructions += (
-                    " Author private acceptance files exactly at "
-                    "declared_outputs. Returned private_files paths must equal "
+                    " Author acceptance files exactly at "
+                    "declared_outputs. Returned test_files paths must equal "
                     "declared_outputs. Do not git commit. Do not write the "
                     "product repo."
                 )
@@ -1281,32 +1294,44 @@ class HerdrStageActor:
                     )
             else:
                 instructions += (
-                    " Create private tests here. Do not git commit. Do not write "
-                    "the product repo. Private paths must be hidden meta-tests, "
-                    "never declared_outputs."
+                    " Create tests here. Do not git commit. Do not write "
+                    "the product repo. Test paths must be validator/meta-test "
+                    "files, never declared_outputs."
                 )
                 if extra.get("revise_findings"):
                     instructions += (
-                        " Apply revise_findings to hidden validators. Do not claim "
-                        "a finding is fixed by resubmitting byte-identical hidden "
+                        " Apply revise_findings to those validators. Do not "
+                        "claim a finding is fixed by resubmitting byte-identical "
                         "files."
                     )
         elif role == "test-reviewer":
             instructions += (
-                " Review only the private TEST_DRAFT overlay files listed in "
-                "private_draft_overlay. Integration-seed and product files in "
-                "this checkout are context and out of scope. A private "
-                "validator failing against the base is expected when "
-                "falsifiability requires red-at-base; do not demand edits to "
-                "declared product outputs. Return PASS or REVISE findings. "
-                "No leaked literals."
+                " This checkout is the TEST_DRAFT candidate. Review only the "
+                "draft files listed in test_files. Product files in this "
+                "checkout are context and out of scope. A validator failing "
+                "against the base is expected when falsifiability requires "
+                "red-at-base; do not demand edits to declared product outputs. "
+                "Return PASS or REVISE findings."
             )
         elif role == "builder":
-            instructions += " Edit only declared_outputs. Do not git commit; the broker commits those files. No private tests, fixtures, or vault paths."
+            instructions += (
+                " Edit only declared_outputs. Do not git commit; the broker "
+                "commits those files."
+            )
+            paths = extra.get("test_paths")
+            if isinstance(paths, Sequence) and not isinstance(paths, str) and paths:
+                instructions += (
+                    " The accepted test suite you are graded against is in this "
+                    "checkout at: {0}. Read it. Do not create, edit, delete, "
+                    "rename or copy any of those paths: a candidate whose delta "
+                    "names one is refused before review (CANDIDATE_TEST_PATH_"
+                    "REFUSED). The code reviewer grades against public_contract "
+                    "and the plan's acceptance criteria, not against the suite."
+                ).format(", ".join(str(item) for item in paths))
             surface = extra.get("bound_surface")
             if isinstance(surface, Mapping):
                 instructions += self._bound_surface_instruction(surface)
-            failures = extra.get("redacted_failures")
+            failures = extra.get("failure_output")
             if isinstance(failures, Sequence) and not isinstance(failures, str):
                 lines = [str(item) for item in failures if str(item).strip()]
                 if lines:
@@ -1314,34 +1339,37 @@ class HerdrStageActor:
         elif role == "code-reviewer":
             instructions += (
                 " Inspect this candidate product checkout. Findings must be "
-                "resolvable within declared_outputs. Private tests are absent."
+                "resolvable within declared_outputs. The accepted test suite "
+                "is in this checkout at test_paths; the harness has already "
+                "measured it against this candidate. Grade against "
+                "public_contract, not against the suite."
             )
-            counts = extra.get("sealed_result_summary")
-            if isinstance(counts, Mapping) and self._sealed_counts_red(counts):
+            counts = extra.get("suite_result_summary")
+            if isinstance(counts, Mapping) and self._suite_counts_red(counts):
                 instructions += (
-                    " sealed_result_summary is the already-measured result of "
-                    "the sealed acceptance suite against THIS candidate: "
+                    " suite_result_summary is the already-measured result of "
+                    "the accepted suite against THIS candidate: "
                     "{0} executed, {1} passed, {2} failed, {3} errored. The "
                     "suite is red, so the correct verdict is REVISE and PASS "
-                    "will be overridden. You cannot see the tests. Your job is "
-                    "to read the candidate against public_contract and "
-                    "declared_outputs and say WHICH code is wrong and HOW to "
-                    "fix it. Every finding must name a file in "
-                    "declared_outputs and the specific behavior that is wrong "
-                    "-- a missing branch, an unhandled input, a contract clause "
-                    "the code does not satisfy. Do not restate that tests "
-                    "failed; the builder already knows that and cannot act on "
-                    "it. Do not guess at test names or assertion text."
+                    "will be overridden. Read the failing cases in the suite "
+                    "under test_paths, then read the candidate against "
+                    "public_contract and declared_outputs and say WHICH code "
+                    "is wrong and HOW to fix it. Every finding must name a "
+                    "file in declared_outputs and the specific behavior that "
+                    "is wrong -- a missing branch, an unhandled input, a "
+                    "contract clause the code does not satisfy. Do not restate "
+                    "that tests failed; the builder already knows that and "
+                    "cannot act on it."
                 ).format(
                     counts.get("executed", 0),
                     counts.get("passed", 0),
                     counts.get("failed", 0),
                     counts.get("errored", 0),
                 )
-            if extra.get("sealed_findings_required"):
+            if extra.get("suite_findings_required"):
                 instructions += (
                     " Your previous answer for this candidate carried no "
-                    "actionable finding while the sealed suite was red. That "
+                    "actionable finding while the suite was red. That "
                     "left the builder with nothing to change. Return REVISE "
                     "with at least one finding naming a file in "
                     "declared_outputs and the concrete change it needs."
@@ -1350,7 +1378,7 @@ class HerdrStageActor:
             instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
         elif role == "operator":
             instructions += (
-                " Read current_ir_path, the sealed suite under sealed/, the "
+                " Read current_ir_path, the accepted suite under suite/, the "
                 "lane gate table, and the reviews. Write the revised IR at "
                 "revision_out_path and return that exact path plus the "
                 "rationale. Change only lanes in allowed_lane_ids. Run no "
@@ -1391,18 +1419,6 @@ class HerdrStageActor:
             except KeyError as exc:
                 raise FactoryRefused("LANE_SPEC_MISSING") from exc
         body.update(extra)
-        if role in ("builder", "code-reviewer"):
-            for key in list(body):
-                if key in st.FORBIDDEN_PRIVATE_KEYS or key in (
-                    "private_files",
-                    "private_draft_overlay",
-                    "vault_path",
-                    "vault_ref",
-                ):
-                    del body[key]
-            text = json.dumps(body, sort_keys=True)
-            if "vaults/" in text or "private_files" in text:
-                raise FactoryRefused("PRIVATE_TEST_LEAK")
         return st.json_ready(body)
 
     def _deleted_tracked(self, checkout: Path, *pathspec: str) -> frozenset[str]:
@@ -1418,13 +1434,13 @@ class HerdrStageActor:
 
         Scoped to `outputs` when the caller passes them, the same way
         `_commit_declared` scopes the builder's pathspec. Only a tests lane
-        passes a scope: its private files must equal its declared outputs, so
+        passes a scope: its test files must equal its declared outputs, so
         an unscoped sweep read a toolchain byproduct the role never declared
         -- a package manager's lockfile, a stray `__pycache__` entry -- as
         role output and refused TYPED_TEST_OUTPUTS for a file no role wrote.
-        A build lane declares product paths its tester does not write to, and
-        the unscoped sweep is how that lane's private tests are delivered, so
-        it passes no scope and keeps the whole-tree behaviour.
+        An untyped lane declares product paths its tester does not write to,
+        and the unscoped sweep is how that lane's tests are delivered, so it
+        passes no scope and keeps the whole-tree behaviour.
         """
         requested = tuple(str(item) for item in outputs)
         pathspec = ("--",) + requested if requested else ()
@@ -1495,62 +1511,13 @@ class HerdrStageActor:
             kept.append(rel)
         return tuple(kept)
 
-    @staticmethod
-    def _exclude_pathspec(paths: Sequence[str]) -> tuple[str, ...]:
-        """`paths` as pathspec terms that subtract, matched literally.
-
-        `literal` because a sealed path is a git tree path and may hold a
-        glob character; without it `tests/[id].py` would subtract nothing.
-        """
-        return tuple(":(exclude,literal){0}".format(str(path)) for path in paths)
-
-    def _strip_paths(self, checkout: Path, paths: Sequence[str]) -> None:
-        """Remove `paths` from a working tree without recording a deletion.
-
-        The index is left alone, so nothing here can reach a candidate: the
-        removal is invisible to `git diff --cached base`, and callers subtract
-        the same paths from the commit pathspec so `git add -A` cannot stage
-        it either. `git reset --hard` puts every one of them back, which is
-        why this runs after each materialization rather than once.
-
-        `os.unlink` never follows a symlink, so a link planted at a sealed
-        path is removed rather than dereferenced. Emptied parents go too:
-        leaving `tests/acceptance/` behind names the suite's location, which
-        the builder is not told either.
-        """
-        root = checkout.resolve()
-        for raw in paths:
-            relative = PurePosixPath(str(raw))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise FactoryRefused("SEALED_STRIP_PATH_UNSAFE:{0}".format(raw))
-            target = checkout / Path(*relative.parts)
-            try:
-                os.unlink(target)
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-            except OSError as exc:
-                # Anything else -- a directory planted at a sealed path, an
-                # unwritable parent -- fails closed. A builder launched over
-                # its own suite is worse than a refused lane.
-                raise FactoryRefused("SEALED_STRIP_REFUSED:{0}".format(raw)) from exc
-            parent = target.parent
-            while parent != checkout and root in parent.resolve().parents:
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
-                parent = parent.parent
-
     def _commit_declared(
         self,
         checkout: Path,
         outputs: Sequence[str],
         base: str,
-        *,
-        strip: Sequence[str] = (),
     ) -> tuple[str, bool]:
         requested = tuple(str(item) for item in outputs)
-        excluded = self._exclude_pathspec(strip)
         pathspec: tuple[str, ...] = ()
         if requested:
             listed = self._git(
@@ -1562,12 +1529,11 @@ class HerdrStageActor:
                 "--exclude-standard",
                 "--",
                 *requested,
-                *excluded,
             )
             pathspec = self._safe_role_pathspec(
                 checkout,
                 tuple(item for item in listed.split("\0") if item),
-                self._deleted_tracked(checkout, *requested, *excluded),
+                self._deleted_tracked(checkout, *requested),
             )
         if pathspec:
             self._git(checkout, "add", "-A", "--", *pathspec)
@@ -1585,7 +1551,6 @@ class HerdrStageActor:
         self._git(checkout, "reset", "--hard", base)
         self._clean_checkout(checkout)
         if not patch:
-            self._strip_paths(checkout, strip)
             return base, False
         self._git_bytes(
             checkout,
@@ -1599,10 +1564,6 @@ class HerdrStageActor:
         self._git(checkout, "config", "user.name", "maestro-builder")
         self._git(checkout, "commit", "-m", "declared outputs")
         candidate = self._git(checkout, "rev-parse", "HEAD")
-        # `reset --hard` above put the suite back and the commit carries it.
-        # Take it out again before returning: the builder's session lives in
-        # this directory between turns.
-        self._strip_paths(checkout, strip)
         return candidate, True
 
     def _clean_checkout(self, checkout: Path) -> None:
@@ -1619,59 +1580,25 @@ class HerdrStageActor:
         checkout: Path,
         outputs: Sequence[str],
         base: str,
-        *,
-        strip: Sequence[str] = (),
     ) -> None:
-        """Put the builder's checkout at `base`, minus its own sealed suite.
+        """Put the builder's checkout at `base`.
 
-        `strip` is the lane's own acceptance suite. Its base may legitimately
-        carry it: a build lane's merge releases the predecessor suite into the
-        integration ref, so after an amendment the lane restarts at an
-        integration head holding the very tests it is graded against. The
-        merge cannot un-release it, and a builder that can read its
-        acceptance tests writes to the assertions instead of the requirement
-        -- this repository's `sealed_probe` recovered thirteen hidden literals
-        from one bit of feedback per query and shipped a candidate that looked
-        clean. The removal stays out of the index, so the candidate delta
-        never names the suite and `validate_declared_ownership` sees the same
-        delta it always did.
-
-        A stripped path is subtracted from the dirtiness measurement too:
-        absence here is the guard doing its job, not the builder's work.
+        `base` carries the lane's own accepted suite -- merged there by its
+        tests lane, or put there for an untyped lane by the scheduler -- and
+        it stays in the working tree for the whole turn: the builder reads
+        it. What keeps the builder off it is not this checkout but admission:
+        `admit_candidate` refuses a delta that names a protected test path,
+        and the review verifies the suite's bytes before running it.
         """
         if not (checkout / ".git").exists():
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         head = self._git(checkout, "rev-parse", "HEAD")
         parent = self._git(checkout, "rev-parse", "HEAD^", check=False)
-        scope = ("--", ".") + self._exclude_pathspec(strip) if strip else ()
-        dirty = bool(self._git(checkout, "status", "--porcelain", *scope))
+        dirty = bool(self._git(checkout, "status", "--porcelain"))
         if not dirty and (head == base or parent == base):
             self._clean_checkout(checkout)
-            self._strip_paths(checkout, strip)
             return
-        self._commit_declared(checkout, outputs, base, strip=strip)
-
-
-    def _refresh_private_tree(self, ctx: LaneContext, cwd: Path) -> None:
-        draft = ctx.artifacts.get("TEST_DRAFT")
-        if draft is None:
-            raise FactoryRefused("missing TEST_DRAFT")
-        vault = hv.ensure_vault(self.state_root, ctx.run_id)
-        hv.refresh_materialized_commit(
-            vault,
-            hv.rev_parse(vault, draft.artifact_ref),
-            cwd,
-            state_root=self.state_root,
-            forbidden=self._materialization_forbidden(),
-        )
-
-    def _materialization_forbidden(self) -> tuple[Path, ...]:
-        """The target checkout and its git dirs, never a materialization site."""
-        return (
-            Path(self.target.target_repository_root),
-            Path(self.target.target_git_common_dir),
-            Path(self.target.target_worktree_git_dir),
-        )
+        self._commit_declared(checkout, outputs, base)
 
     @staticmethod
     def _launch_environment(cwd: Path) -> dict[str, str]:
@@ -1719,7 +1646,7 @@ class HerdrStageActor:
         invoking = self.launcher.invoking_repository(os.environ)
         if invoking is None:
             # Without an invoking Space, retain the target repository's
-            # source-workspace lookup, but never anchor a private role tree.
+            # source-workspace lookup, but never anchor a role tree there.
             invoking = Path(self.target.target_repository_root)
         git = gitpub.BoundGit(invoking)
         owner = hashlib.sha256(str(git.git_common_dir()).encode()).hexdigest()[:16]
@@ -1780,13 +1707,13 @@ class HerdrStageActor:
             return None
         return list(findings)
 
-    def _redacted_failures(self, ctx: LaneContext) -> list[str]:
+    def _failure_output(self, ctx: LaneContext) -> list[str]:
         """Failure lines carried on the prior code review, if it left any."""
         record = ctx.artifacts.get("CODE_REVIEW")
         payload = getattr(record, "payload", None) or {}
         if not isinstance(payload, Mapping):
             return []
-        lines = payload.get("redacted_failures")
+        lines = payload.get("failure_output")
         if not isinstance(lines, Sequence) or isinstance(lines, str):
             return []
         return [str(item) for item in lines if str(item).strip()]
@@ -1951,7 +1878,7 @@ class HerdrStageActor:
 
         A tree is provisioned after its *final* materialization, never before
         one. Materializing is destructive by construction --
-        `hv.refresh_materialized_commit` unlinks every child of the tree, and a
+        `tm.refresh_materialized_commit` unlinks every child of the tree, and a
         git checkout resets it -- so anything installed before a later
         materialization is gone by the time the agent reads the tree.
 
@@ -2028,10 +1955,10 @@ class HerdrStageActor:
         # is every `run resume` and every `_retain_completed` that dropped the
         # key. On run a2ea7355 the test reviewer read the round-1 draft for
         # three consecutive rounds and reported round-1's defects each time,
-        # while the tester had fixed both in round 2. Nothing could notice: a
-        # private tree carries no sha, and the ledger records the input
-        # artifact id rather than the bytes the reader was given, so
-        # `input_digest` moved every round while the file did not.
+        # while the tester had fixed both in round 2. Nothing could notice:
+        # the ledger records the input artifact id rather than the bytes the
+        # reader was given, so `input_digest` moved every round while the
+        # file did not.
         try:
             self._prepared_cwd(cwd, prepare_cwd)
         except lch.LaunchRefused as refused:
@@ -2124,7 +2051,7 @@ class HerdrStageActor:
         return payload, handle, cwd_used
 
     def _prepare(
-        self, ctx: LaneContext, role: str, *, sha: str | None, private_tree: bool
+        self, ctx: LaneContext, role: str, *, sha: str | None
     ) -> tuple[Path, Path | None]:
         attempt = self._role_dir(ctx, role)
         cwd = attempt / "checkout"
@@ -2139,27 +2066,11 @@ class HerdrStageActor:
             # path and states nothing about its bytes. It used to refresh the
             # tester's, and only the tester's, which read as a reuse guard and
             # was really the one role that happened to be covered.
-            if private_tree:
-                return attempt, None
             return attempt, cwd
-        if private_tree:
-            draft = ctx.artifacts.get("TEST_DRAFT")
-            if draft is None:
-                raise FactoryRefused("missing TEST_DRAFT")
-            vault = hv.ensure_vault(self.state_root, ctx.run_id)
-            if precreated:
-                _clear_precreated_role_cwd(cwd)
-            hv.materialize_commit(
-                vault,
-                hv.rev_parse(vault, draft.artifact_ref),
-                cwd,
-                state_root=self.state_root,
-                forbidden=self._materialization_forbidden(),
-            )
-            lch.scratch_environment(cwd)
-            return attempt, None
         if not sha:
             raise FactoryRefused("missing checkout sha")
+        if precreated:
+            _clear_precreated_role_cwd(cwd)
         self._add_worktree(cwd, sha)
         return attempt, cwd
 
@@ -2193,9 +2104,7 @@ class HerdrStageActor:
                 self._refresh_git_checkout(path, sha)
 
         if stored is None:
-            attempt, checkout = self._prepare(
-                ctx, "tester", sha=sha, private_tree=False
-            )
+            attempt, checkout = self._prepare(ctx, "tester", sha=sha)
             cwd = checkout or attempt / "checkout"
         else:
             attempt, checkout, cwd = stored.attempt, stored.checkout, stored.cwd
@@ -2229,35 +2138,43 @@ class HerdrStageActor:
             prepare_cwd=prepare,
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
-        files = dict(payload.get("private_files") or {})
+        files = dict(payload.get("test_files") or payload.get("private_files") or {})
         if (cwd_used / ".git").exists():
             scope: Sequence[str] = ()
             if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
                 scope = ctx.lane.declared_outputs
             files.update(self._collect_uncommitted(cwd_used, scope))
-        return {"private_files": files}
+        return {"test_files": files}
 
     def review_tests(
         self, ctx: LaneContext
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]:
-        key = self._role_key(ctx, "test-reviewer")
-        stored = self._roles.get(key)
-        if stored is None:
-            attempt, checkout = self._prepare(
-                ctx, "test-reviewer", sha=None, private_tree=True
-            )
-            cwd = attempt / "checkout"
-        else:
-            attempt, checkout = stored.attempt, None
-            cwd = stored.cwd
+        # An ordinary checkout of the draft candidate: the integration head
+        # plus the draft's files, the same way the code reviewer gets the
+        # builder's candidate. The draft is a pinned commit in the run
+        # repository, so a linked worktree at its sha is the whole answer.
         draft = ctx.artifacts.get("TEST_DRAFT")
         if draft is None:
             raise FactoryRefused("missing TEST_DRAFT")
-        vault = hv.ensure_vault(self.state_root, ctx.run_id)
+        # The draft names its own candidate. Reading it off the context
+        # instead would fall back to the integration head when the context
+        # was built without one -- a tree that does not hold the draft, so
+        # the reviewer would grade files that are not there.
+        sha = str(draft.payload.get("candidate_sha") or "")
+        if not sha:
+            raise FactoryRefused("TEST_DRAFT carries no candidate_sha")
+        key = self._role_key(ctx, "test-reviewer")
+        stored = self._roles.get(key)
+        if stored is None:
+            attempt, checkout = self._prepare(ctx, "test-reviewer", sha=sha)
+            cwd = checkout or attempt / "checkout"
+        else:
+            attempt, checkout, cwd = stored.attempt, stored.checkout, stored.cwd
         extra = {
+            "candidate_sha": sha,
             "public_contract": ctx.public_contract,
-            "private_draft_overlay": list(
-                tchain.private_draft_overlay_paths(vault, draft)
+            "test_files": sorted(
+                str(path) for path in dict(draft.payload.get("files") or {})
             ),
         }
         payload, _handle, cwd_used = self._launch(
@@ -2265,31 +2182,29 @@ class HerdrStageActor:
             "test-reviewer",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_private_tree(ctx, path),
+            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
         return self._review_payload(payload)
 
     def build(self, ctx: LaneContext) -> Mapping[str, Any]:
         sha = self._base_sha(ctx, "builder")
-        # The lane's own acceptance suite, kept out of the checkout for the
-        # whole turn. Never in `extra` -- these are paths, and a path is a
-        # name the builder has no reason to hold.
-        strip = tuple(ctx.sealed_private_paths)
         extra: dict[str, Any] = {
             "builder_base_sha": sha,
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_contract": ctx.public_contract,
-            "sealed_digest": ctx.sealed_digest,
+            # The suite this lane is graded against, in the builder's own
+            # checkout at these paths. Read, never written: a candidate whose
+            # delta names one is refused at admission.
+            "test_paths": list(ctx.protected_test_paths),
+            "test_suite_digest": ctx.test_suite_digest,
         }
-        sealed = ctx.artifacts.get("SEALED_TEST_BUNDLE")
-        if sealed is not None:
-            extra["predecessor_bundle_id"] = sealed.artifact_id
-            extra["predecessor_bundle_digest"] = ctx.sealed_digest
+        suite = ctx.artifacts.get("ACCEPTED_TEST_SUITE")
+        if suite is not None:
+            extra["accepted_suite_id"] = suite.artifact_id
         if ctx.bound_surface is not None:
-            # Names only. Module specifiers, exported symbols, and result-object
-            # keys -- the identifiers the sealed assertions resolve against. No
-            # literal, number, selector, or fixture value moves here.
+            # An index into the suite: module specifiers, exported symbols,
+            # and result-object keys the assertions resolve against.
             extra["bound_surface"] = dict(ctx.bound_surface)
         findings = self._revise_findings(ctx, "CODE_REVIEW")
         if findings is not None:
@@ -2309,41 +2224,32 @@ class HerdrStageActor:
             if isinstance(summary, Mapping) and cr._summary_is_red(summary):
                 findings.insert(0, cr._FINDINGS_FRAMING)
             extra["revise_findings"] = findings
-        failures = self._redacted_failures(ctx)
+        failures = self._failure_output(ctx)
         if failures:
-            # The runner's own failure lines, already redacted against the
-            # sealed token set where they were produced. Without these the
+            # The runner's own failure lines, verbatim. Without these the
             # builder is told a count and has to guess which cases it names.
-            extra["redacted_failures"] = failures
+            extra["failure_output"] = failures
         key = self._role_key(ctx, "builder")
         stored = self._roles.get(key)
         if stored is None:
-            attempt, checkout = self._prepare(
-                ctx, "builder", sha=sha, private_tree=False
-            )
+            attempt, checkout = self._prepare(ctx, "builder", sha=sha)
         else:
             attempt, checkout = stored.attempt, stored.checkout
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
-        # The strip used to be repeated here because `_launch` skipped
-        # `prepare_cwd` on a first launch, and that is the turn an amended
-        # lane opens with, against an integration head carrying its own
-        # suite. `_launch` now prepares every tree it dispatches into, and
-        # `_refresh_builder_checkout` strips on both of its branches, so the
-        # guard holds for the same reason every other role's does.
         _payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
             cwd,
             extra,
             prepare_cwd=lambda path: self._refresh_builder_checkout(
-                path, ctx.lane.declared_outputs, sha, strip=strip
+                path, ctx.lane.declared_outputs, sha
             ),
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         candidate_sha, changed = self._commit_declared(
-            cwd_used, ctx.lane.declared_outputs, sha, strip=strip
+            cwd_used, ctx.lane.declared_outputs, sha
         )
         return {"candidate_sha": candidate_sha, "changed": changed}
 
@@ -2354,21 +2260,21 @@ class HerdrStageActor:
             "candidate_sha": ctx.candidate_sha,
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_contract": ctx.public_contract,
-            "sealed_digest": ctx.sealed_digest,
+            "test_paths": list(ctx.protected_test_paths),
+            "test_suite_digest": ctx.test_suite_digest,
         }
-        if ctx.sealed_result_summary is not None:
-            # Counts only. These are the same five integers the builder already
-            # receives as public_result_summary, so no sealed source, case name,
-            # or assertion text moves here.
-            extra["sealed_result_summary"] = dict(ctx.sealed_result_summary)
-        if ctx.sealed_findings_required:
-            extra["sealed_findings_required"] = True
+        if ctx.suite_result_summary is not None:
+            # The same five integers the builder receives as
+            # public_result_summary.
+            extra["suite_result_summary"] = dict(ctx.suite_result_summary)
+        if ctx.suite_findings_required:
+            extra["suite_findings_required"] = True
         sha = self._base_sha(ctx, "code-reviewer")
         key = self._role_key(ctx, "code-reviewer")
         stored = self._roles.get(key)
         if stored is None:
             attempt, checkout = self._prepare(
-                ctx, "code-reviewer", sha=sha, private_tree=False
+                ctx, "code-reviewer", sha=sha
             )
             cwd = checkout or attempt / "checkout"
         else:
@@ -2398,7 +2304,7 @@ class HerdrStageActor:
         stored = self._roles.get(key)
         if stored is None:
             attempt, checkout = self._prepare(
-                ctx, "integration-reviewer", sha=sha, private_tree=False
+                ctx, "integration-reviewer", sha=sha
             )
             cwd = checkout or attempt / "checkout"
         else:
@@ -2416,7 +2322,7 @@ class HerdrStageActor:
 
     #: Files the operator agent's tree carries, relative to its CWD.
     _OPERATOR_INPUTS = "inputs"
-    _OPERATOR_SEALED = "sealed"
+    _OPERATOR_SUITE = "suite"
     _OPERATOR_OUT = "revisions"
 
     def _write_operator_tree(
@@ -2424,15 +2330,15 @@ class HerdrStageActor:
     ) -> None:
         """Materialize everything the operator agent reads, on every dispatch.
 
-        On disk rather than in the prompt: the sealed suite and four rounds of
+        On disk rather than in the prompt: the accepted suite and four rounds of
         findings are the bulk of this handoff, and B13's size check is made
         against the route's window at launch. A prompt that carries them is a
         prompt that can overflow, and an overflowing agent answers about a
         different lane.
         """
         inputs = cwd / self._OPERATOR_INPUTS
-        sealed = cwd / self._OPERATOR_SEALED
-        for directory in (inputs, sealed, cwd / self._OPERATOR_OUT):
+        suite = cwd / self._OPERATOR_SUITE
+        for directory in (inputs, suite, cwd / self._OPERATOR_OUT):
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
@@ -2445,7 +2351,7 @@ class HerdrStageActor:
             json.dumps(
                 {
                     "public_contract": st.json_ready(request.public_contract),
-                    "redacted_failures": list(request.redacted_failures),
+                    "failure_output": list(request.failure_output),
                     "reviews": [st.json_ready(row) for row in request.reviews],
                 },
                 indent=2,
@@ -2453,8 +2359,8 @@ class HerdrStageActor:
             ),
             encoding="utf-8",
         )
-        for relative, text in sorted(request.sealed_files.items()):
-            destination = _resolved_under(sealed, relative)
+        for relative, text in sorted(request.suite_files.items()):
+            destination = _resolved_under(suite, relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(text, encoding="utf-8")
         lch.scratch_environment(cwd)
@@ -2493,8 +2399,8 @@ class HerdrStageActor:
                 att.findings_path_for(Path(request.revision_out_path))
             ),
             "round": request.round_number,
-            "sealed_suite_dir": str((cwd / self._OPERATOR_SEALED).resolve()),
-            "sealed_suite_files": sorted(request.sealed_files),
+            "suite_dir": str((cwd / self._OPERATOR_SUITE).resolve()),
+            "suite_files": sorted(request.suite_files),
         }
         payload, _handle, cwd_used = self._launch(
             ctx,
@@ -2714,7 +2620,7 @@ def _compile_plan(
     Reading it is the only place a missing or unreadable *plan file* is a
     configuration fact, so the mapping belongs here rather than in `main`:
     every other `FileNotFoundError` a run can raise -- a missing `git`, `omp`
-    or `claude` executable, a role checkout removed mid-turn, a vault path
+    or `claude` executable, a role checkout removed mid-turn, a state path
     gone -- is a failure of the run, not of its configuration, and must not
     be relabelled.
     """
@@ -3145,6 +3051,9 @@ def _bind_existing_run(
         row = run_row(store, run_id)
         if runtime.path.resolve() != Path(row["runtime_state_root"]).resolve():
             raise FactoryRefused("RUNTIME_STATE_MISMATCH")
+        # Before anything reads the run's artifacts: a run holding a pre-v5
+        # suite artifact is restarted, and every verb says so by name.
+        refuse_historical_artifacts(store, run_id)
         require_deployment(maestro_file, Path(row["target_repository_root"]))
         runtime.revalidate(row["runtime_state_fingerprint"])
         target = target_from_binding(binding_from_run(row))
@@ -3431,32 +3340,25 @@ def _attend_lane_gates(
         conn.close()
 
 
-def _attend_sealed_files(
+def _attend_suite_files(
     store: ArtifactStore,
-    runtime: RuntimeStateRoot,
+    repo: Path,
     run_id: str,
     lane: st.LaneProjection,
 ) -> dict[str, str]:
-    """The sealed suite, read out of the vault for the operator agent alone.
+    """The accepted suite, read off the run repository for the operator agent.
 
-    This is the one place outside code review that decrypts the private-test
-    boundary, and it is a deliberate trade the operator opted into by setting
-    `attend.max_amendments_per_lane`. Nothing downstream of here hands these
-    bytes to a builder or a reviewer: they are written into the operator's own
-    tree, which is not a git checkout and is never merged.
+    The same bytes the builder and every reviewer have in their checkouts,
+    written into the operator's own tree, which is not a git checkout and is
+    never merged.
     """
-    artifact_id = store.sealed_bundle_artifact_id(run_id, lane.lane_id)
+    artifact_id = store.accepted_suite_artifact_id(run_id, lane.lane_id)
     if artifact_id is None:
         return {}
     record = store.get_lane_artifact(artifact_id)
-    vault = hv.ensure_vault(runtime.path, run_id)
-    blobs = tchain.sealed_private_files(
-        vault, _record_as_lane_artifact(record, lane)
+    return tchain.read_suite(
+        repo, tchain.suite_files(_record_as_lane_artifact(record, lane))
     )
-    return {
-        path: hv.cat_blob(vault, blob).decode("utf-8", errors="replace")
-        for path, blob in blobs.items()
-    }
 
 
 def _attend_plan_ir(
@@ -3496,6 +3398,7 @@ def _attend_request(
     """Everything the operator agent reads, assembled from the ledger."""
     lane = next(item for item in compiled.lanes if item.lane_id == lane_id)
     stage = store.lane_stage(run_id, lane_id)
+    repo = Path(str(store._run(run_id)["target_repository_root"]))
     reviews: list[Mapping[str, Any]] = []
     for kind in (st.ArtifactKind.TEST_REVIEW, st.ArtifactKind.CODE_REVIEW):
         for payload in store.lane_artifact_payloads(run_id, lane_id, kind, 4):
@@ -3507,11 +3410,11 @@ def _attend_request(
     if isinstance(plan, Mapping):
         contract = dict(plan.get("public_contract") or {})
     failures: tuple[str, ...] = ()
-    builder = store.latest_lane_artifact_payload(
-        run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
+    latest_review = store.latest_lane_artifact_payload(
+        run_id, lane_id, st.ArtifactKind.CODE_REVIEW
     )
-    if isinstance(builder, Mapping):
-        raw = builder.get("redacted_failures")
+    if isinstance(latest_review, Mapping):
+        raw = latest_review.get("failure_output")
         if isinstance(raw, Sequence) and not isinstance(raw, str):
             failures = tuple(str(item) for item in raw)
     next_revision = compiled.plan_revision + 1
@@ -3524,7 +3427,7 @@ def _attend_request(
         next_plan_revision=next_revision,
         public_contract=contract,
         reviews=tuple(reviews),
-        redacted_failures=failures,
+        failure_output=failures,
         lane_gates=_attend_lane_gates(
             runtime,
             run_id,
@@ -3537,7 +3440,7 @@ def _attend_request(
             / HerdrStageActor._OPERATOR_OUT
             / "r{0}.ir.json".format(next_revision)
         ),
-        sealed_files=_attend_sealed_files(store, runtime, run_id, lane),
+        suite_files=_attend_suite_files(store, repo, run_id, lane),
         amendment_rules=ATTEND_AMENDMENT_RULES,
         allowed_lane_ids=att.paired_lane_ids(compiled.lanes, lane_id),
     )
@@ -4012,6 +3915,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _RunRefused("RUNTIME_STATE_REFUSED", str(exc)).emit()
     except FactoryRefused as exc:
         return _RunRefused(exc.code, str(exc)).emit()
+    except st.LiveRunCutoverRequired as exc:
+        return _RunRefused(exc.code, str(exc)).emit()
     except CleanupRefused as exc:
         return _RunRefused(exc.code, exc.detail).emit()
     except LaunchFailed as exc:
@@ -4031,18 +3936,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _RunRefused(exc.code, str(exc)).emit()
     except _MaestroConfigurationError as exc:
         return _RunRefused("RUN_CONFIGURATION_REQUIRED", str(exc)).emit()
-    except prv.PrivateReviewError as exc:
+    except rc.ReviewContractError as exc:
         # A review tree that cannot be provisioned, or a project no available
         # interpreter satisfies, is a fault of this machine. It is already kept
         # out of the builder's findings by being raised rather than recorded;
         # this keeps it out of a traceback too, so the frozen operator surface
         # answers with the same typed JSON it answers every other refusal with.
-        # Every other `PrivateReviewError` names a factory invariant, not an
+        # Every other `ReviewContractError` names a factory invariant, not an
         # environment, and is deliberately left to surface as it does today.
-        detail = cr.sealed_environment_detail(exc)
+        detail = cr.suite_environment_detail(exc)
         if detail is None:
             raise
-        return _RunRefused(cr.SEALED_ENVIRONMENT_OUTCOME, detail).emit()
+        return _RunRefused(cr.SUITE_ENVIRONMENT_OUTCOME, detail).emit()
     finally:
         _INVOCATION_WORKSPACE.reset(invocation)
 

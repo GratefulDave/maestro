@@ -1,8 +1,8 @@
 """The Standards axis of code review: a fixed hygiene baseline.
 
 Maestro's code reviewer judges one axis today -- Spec: does the candidate do
-what the lane plan asked, measured against the sealed suite. That axis is
-strong and it is the only one there is, so a candidate that passes its sealed
+what the lane plan asked, measured against the accepted suite. That axis is
+strong and it is the only one there is, so a candidate that passes its accepted
 suite with a duplicated forty-line block, a string standing in for a domain
 type, and a function named ``process`` merges without a word said.
 

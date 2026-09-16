@@ -64,7 +64,7 @@ class SubstantiveFingerprintTest(unittest.TestCase):
     def fingerprint(self, path, source):
         raw = source.encode()
         oid = hashlib.sha1(raw).hexdigest()
-        with mock.patch.object(sch.hv, "cat_blob", return_value=raw):
+        with mock.patch.object(sch.tm, "cat_blob", return_value=raw):
             return sch._substantive_blob(Path("."), path, oid)
 
     def test_python_docstrings_comments_and_formatting_are_not_progress(self):

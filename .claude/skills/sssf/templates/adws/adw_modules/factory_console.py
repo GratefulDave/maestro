@@ -52,7 +52,7 @@ class FactoryConsole:
         """One step inside a stage, printed as it happens.
 
         A stage is not an atomic act. REVIEWING_CODE provisions a tree, runs a
-        sealed suite, dispatches a reviewer, waits on its envelope, and may ask
+        accepted suite, dispatches a reviewer, waits on its envelope, and may ask
         it a second time -- minutes apart, and every one of them was silent
         between the stage's start line and its completion line. An operator
         watching that could not tell provisioning from a hung agent from a dead

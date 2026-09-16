@@ -1,11 +1,8 @@
-"""The code reviewer is told the sealed result before it votes.
+"""The code reviewer is told the suite's result before it votes.
 
-The reviewer agent cannot see the sealed tests and never will: an agent that
-could execute them could read them, and the builder's reviewer would then be
-judging against tests it had seen. But it was also not told the *outcome*, so
-on a red candidate it read a clean-looking diff, returned PASS with no
-findings, and the harness downgraded that to REVISE and substituted a canned
-sentence -- "sealed private tests failed, errored, or did not execute". The
+The reviewer agent used not to be told the *outcome* of the suite, so on a red
+candidate it read a clean-looking diff, returned PASS with no findings, and the
+harness downgraded that to REVISE and substituted a canned sentence. The
 builder learned that something was broken and nothing about what. A whole
 revise round bought it no information.
 
@@ -15,9 +12,8 @@ Observed on FDAdb run f50638ab, lane-wp7-gateway-build: 12 executed, 7 passed,
 These cases pin the repair:
 
   * the suite is measured BEFORE the reviewer votes, and exactly once;
-  * the reviewer is handed the five public counts -- the same integers that
-    already ship to the builder as `public_result_summary`, so nothing private
-    moves;
+  * the reviewer is handed the five counts -- the same integers that already
+    ship to the builder as `public_result_summary`;
   * a reviewer that still returns no actionable finding against a red suite is
     asked a second time, told that its previous answer was unusable;
   * the canned sentence survives only as the last resort after that second ask.
@@ -59,10 +55,9 @@ def _measurement(**overrides):
         min_cases=1,
         run={},
         files={},
-        vault=Path("/state/vault"),
     )
     base.update(overrides)
-    return sch.cr.SealedMeasurement(**base)
+    return sch.cr.SuiteMeasurement(**base)
 
 
 class _RecordingActor:
@@ -95,7 +90,7 @@ class _EmptyStore:
     def lane_stage(self, _run_id, _lane_id):
         # Where a build lane sits once its code REVISE is recorded, which is
         # where `_block_if_stalled` is called from. The guard reads the stage
-        # to select reviewed candidate content here, private draft content for
+        # to select reviewed candidate content here, draft content for
         # a tests lane.
         return st.LaneStage.BUILDING
 
@@ -125,13 +120,13 @@ def _scheduler(actor):
             "builder_base_sha": "1" * 40,
             "candidate_ref": st.candidate_ref("run1", "lane-a", _digest("b")),
             "candidate_sha": "2" * 40,
-            "sealed_digest": "3" * 64,
+            "test_suite_digest": "test-suite.v1:" + "3" * 64,
         },
     )
     scheduler._common = lambda lane_id: (row, lane)
-    scheduler._sealed_for = lambda lane_arg: artifact
+    scheduler._accepted_suite_for = lambda lane_arg: artifact
     scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
-    scheduler._sealed_suite_gate = lambda lane_arg: None
+    scheduler._suite_gate = lambda lane_arg: None
     return scheduler, artifact
 
 
@@ -177,7 +172,7 @@ LOCATED = {
 }
 
 
-class ReviewerSeesTheSealedResult(unittest.TestCase):
+class ReviewerSeesTheSuiteResult(unittest.TestCase):
     def test_the_reviewer_is_asked_after_the_suite_is_measured(self):
         actor = _RecordingActor([(st.ReviewerVerdict.PASS, ())])
         scheduler, artifact = _scheduler(actor)
@@ -189,7 +184,7 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
 
         self.assertEqual(len(actor.seen), 1)
         self.assertEqual(
-            dict(actor.seen[0].sealed_result_summary),
+            dict(actor.seen[0].suite_result_summary),
             {"errored": 0, "executed": 12, "failed": 0, "passed": 12, "skipped": 0},
         )
 
@@ -220,8 +215,8 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
         _, review = _drive(scheduler, artifact, _measurement())
 
         self.assertEqual(len(actor.seen), 2)
-        self.assertFalse(actor.seen[0].sealed_findings_required)
-        self.assertTrue(actor.seen[1].sealed_findings_required)
+        self.assertFalse(actor.seen[0].suite_findings_required)
+        self.assertTrue(actor.seen[1].suite_findings_required)
         self.assertEqual(review.call_args.kwargs["findings"], (located,))
 
     def test_a_reviewer_that_already_located_the_defect_is_not_re_asked(self):
@@ -306,9 +301,9 @@ class TheReviewerPromptCarriesTheCounts(unittest.TestCase):
             run_id="run1",
             stage=st.LaneStage.REVIEWING_CODE,
         )
-        extra = {"sealed_result_summary": summary}
+        extra = {"suite_result_summary": summary}
         if required:
-            extra["sealed_findings_required"] = True
+            extra["suite_findings_required"] = True
         body = maestro.HerdrStageActor._prompt(
             actor,
             ctx,
@@ -370,9 +365,9 @@ class TheReviewerPromptCarriesTheCounts(unittest.TestCase):
             "code-reviewer",
             Path("/tmp/envelope.json"),
             Path("/tmp/cwd"),
-            {"sealed_result_summary": summary},
+            {"suite_result_summary": summary},
         )
-        self.assertEqual(body["sealed_result_summary"], summary)
+        self.assertEqual(body["suite_result_summary"], summary)
 
 
 if __name__ == "__main__":
@@ -401,11 +396,11 @@ class StepsAreReported(unittest.TestCase):
         steps = self._steps(
             _measurement(), [(st.ReviewerVerdict.REVISE, (LOCATED,))]
         )
-        self.assertIn("provisioning review tree and running sealed suite", steps)
-        self.assertIn("sealed suite FAILED", steps)
+        self.assertIn("provisioning review tree and running the accepted suite", steps)
+        self.assertIn("accepted suite FAILED", steps)
         self.assertIn("asking code reviewer", steps)
         self.assertLess(
-            steps.index("provisioning review tree and running sealed suite"),
+            steps.index("provisioning review tree and running the accepted suite"),
             steps.index("asking code reviewer"),
         )
 
@@ -415,7 +410,7 @@ class StepsAreReported(unittest.TestCase):
         said = []
         scheduler.step = lambda lane, msg, detail="": said.append((lane, msg, detail))
         _drive(scheduler, artifact, _measurement())
-        detail = next(d for _l, m, d in said if m == "sealed suite FAILED")
+        detail = next(d for _l, m, d in said if m == "accepted suite FAILED")
         self.assertEqual(detail, "12 executed, 7 passed, 5 failed, 0 errored")
 
     def test_a_green_suite_says_passed(self):
@@ -432,7 +427,7 @@ class StepsAreReported(unittest.TestCase):
             ),
             [(st.ReviewerVerdict.PASS, ())],
         )
-        self.assertIn("sealed suite passed", steps)
+        self.assertIn("accepted suite passed", steps)
 
     def test_the_second_ask_is_announced(self):
         steps = self._steps(

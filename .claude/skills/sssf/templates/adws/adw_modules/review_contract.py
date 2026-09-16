@@ -1,12 +1,17 @@
-"""Vault-boundary helpers for private-review payloads.
+"""The public contract a lane is reviewed against, and the artifact shape.
 
 Does not write lane_state. Canonical identity lives in scheduler_types:
 LaneArtifact, ArtifactKind, ReviewerVerdict, canonical_bytes, digest_bytes.
+
+This module was `private_review`, which also owned the token collector and the
+redactor that scrubbed every review payload of anything the hidden test suite
+contained. Accepted tests are visible now, so nothing here redacts: what
+survives is the contract projection, the path normaliser, the gate argv
+substitution, and the artifact constructor every lane stage uses.
 """
 
 from __future__ import annotations
 
-import json
 import posixpath
 import re
 from dataclasses import dataclass
@@ -15,22 +20,15 @@ from typing import Any, Iterable, List, Mapping, Sequence, Set, Tuple
 
 from . import scheduler_types as st
 
-_REDACTED = "[redacted]"
 _ID = re.compile(r"^[A-Za-z0-9._-]+$")
-_QUOTED_LITERAL = re.compile(r"""(['"])(.*?)\1""")
-_SECRET_TOKEN_MIN = 8
 
 
-class PrivateReviewError(ValueError):
-    """A private-review payload could not be constructed."""
+class ReviewContractError(ValueError):
+    """A review payload could not be constructed."""
 
 
-class PrivateLeakError(PrivateReviewError):
-    """Public bytes contained private test or vault material."""
-
-
-class SealedEnvironmentError(PrivateReviewError):
-    """A sealed suite yielded no usable measurement. Never a candidate defect.
+class SuiteEnvironmentError(ReviewContractError):
+    """A test suite yielded no usable measurement. Never a candidate defect.
 
     The fault is the machine, the environment, or the suite itself — never the
     code under test. Two families qualify, and the operator's response to both is
@@ -38,7 +36,7 @@ class SealedEnvironmentError(PrivateReviewError):
 
     The suite could not run: the review tree would not provision, the resolved
     runner is unusable, its interpreter does not satisfy the project's declared
-    `requires-python`, or no runner can be derived from the sealed files.
+    `requires-python`, or no runner can be derived from the accepted files.
 
     The suite ran but measured nothing: the runner exited cleanly while reporting
     no readable count, or every counted case was skipped. Either way zero
@@ -53,31 +51,12 @@ class SealedEnvironmentError(PrivateReviewError):
     a sixth case must not silently fall through to a traceback.
     """
 
-    code = "SEALED_SUITE_ENVIRONMENT_REFUSED"
-
-
-class IsolationError(PrivateReviewError):
-    """Private objects were reachable from a run or builder repository."""
-
-    code = "ISOLATION"
-
-
-class PrivatePathCollisionError(IsolationError):
-    """A sealed private path would replace a candidate file."""
-
-    code = "PRIVATE_PATH_COLLISION"
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        super().__init__(
-            "sealed private path collides with candidate: {0}".format(path)
-        )
-
+    code = "SUITE_ENVIRONMENT_REFUSED"
 
 
 @dataclass(frozen=True)
-class VaultLaneRequest:
-    """Slice identity needed to name vault refs and fill LaneArtifact."""
+class LaneRequest:
+    """Slice identity needed to fill a LaneArtifact."""
 
     run_id: str
     lane_id: str
@@ -89,11 +68,11 @@ class VaultLaneRequest:
 
     def __post_init__(self) -> None:
         if not _ID.fullmatch(self.run_id):
-            raise PrivateReviewError("run_id is invalid")
+            raise ReviewContractError("run_id is invalid")
         if not _ID.fullmatch(self.lane_id):
-            raise PrivateReviewError("lane_id is invalid")
+            raise ReviewContractError("lane_id is invalid")
         if not isinstance(self.plan_revision, int) or self.plan_revision < 1:
-            raise PrivateReviewError("plan_revision must be a positive int")
+            raise ReviewContractError("plan_revision must be a positive int")
         st.require_hex_digest(self.spec_digest, name="spec_digest")
         st.require_hex_digest(
             self.lane_projection_digest, name="lane_projection_digest"
@@ -106,7 +85,7 @@ class VaultLaneRequest:
 def make_lane_artifact(
     *,
     kind: st.ArtifactKind,
-    request: VaultLaneRequest,
+    request: LaneRequest,
     payload: Mapping[str, Any],
     artifact_ref: str,
     verdict: st.ReviewerVerdict | None = None,
@@ -135,40 +114,22 @@ def public_contract(
     )
     outputs = tuple(normalize_repo_path(item) for item in declared_outputs)
     if not criteria:
-        raise PrivateReviewError("public_contract requires acceptance_criteria")
+        raise ReviewContractError("public_contract requires acceptance_criteria")
     if not outputs:
-        raise PrivateReviewError("public_contract requires declared_outputs")
+        raise ReviewContractError("public_contract requires declared_outputs")
     return {
         "acceptance_criteria": list(criteria),
         "declared_outputs": list(outputs),
     }
 
 
-def public_contract_allow(
-    contract: Mapping[str, object], extra: Iterable[str] = ()
-) -> tuple[str, ...]:
-    """Declared public-contract bytes plus caller extras. Not leak tokens."""
-    outputs = tuple(
-        normalize_repo_path(item)
-        for item in as_str_tuple(contract["declared_outputs"], "declared_outputs")
-    )
-    criteria = as_str_tuple(
-        contract["acceptance_criteria"], "acceptance_criteria"
-    )
-    allowed = [item for item in extra if item]
-    allowed.extend(criteria)
-    allowed.extend(outputs)
-    allowed.extend(posixpath.basename(path) for path in outputs)
-    return tuple(allowed)
-
-
 def normalize_repo_path(path: str) -> str:
     raw = path.replace("\\", "/")
     if not raw or raw.startswith("/") or raw.endswith("/"):
-        raise PrivateReviewError("path is not a repository-relative file")
+        raise ReviewContractError("path is not a repository-relative file")
     parts = raw.split("/")
     if any(part in ("", ".", "..") for part in parts):
-        raise PrivateReviewError("path is not a normalized POSIX file")
+        raise ReviewContractError("path is not a normalized POSIX file")
     return posixpath.normpath(raw)
 
 
@@ -176,7 +137,7 @@ def _maybe_repo_path(token: str) -> str:
     """`normalize_repo_path` where a non-path token is simply not one."""
     try:
         return normalize_repo_path(token)
-    except PrivateReviewError:
+    except ReviewContractError:
         return ""
 
 
@@ -216,13 +177,13 @@ def substituted_gate_argv(
     tree". That premise holds only for a selector naming a file the tester was
     supposed to write and did not; it is false for a gate operand naming a
     file the repository already ships, because both the draft-collection tree
-    and the sealed review tree are seeded from the integration ref and carry
-    it. Where a plan's floor counts pre-existing cases -- FDAdb
-    `lane-wp8r-fixture-tests`, min_cases 16 = 6 private + the 10 already in
+    and the review tree are seeded from the integration ref and carry it.
+    Where a plan's floor counts pre-existing cases -- FDAdb
+    `lane-wp8r-fixture-tests`, min_cases 16 = 6 authored + the 10 already in
     `src/lib/api/dpa.test.ts` -- dropping the shipped operand made the floor
     unreachable by anything the tester could write. It refused the run
     `DRAFT_MIN_CASES: collected 6, min_cases 16` one turn after the test
-    reviewer had correctly told the tester to stop padding the private file to
+    reviewer had correctly told the tester to stop padding the authored file to
     16 with `it.each`; its sibling `lane-wp8r-route-tests` reached its own
     floor of 26 only by generating 18 cases asserting that the other files'
     case titles appear as substrings (measured 2026-09-05, run a2ea7355).
@@ -274,130 +235,27 @@ def substituted_gate_argv(
 
 def _nonempty(value: str, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise PrivateReviewError("{0} must be a nonempty string".format(label))
+        raise ReviewContractError("{0} must be a nonempty string".format(label))
     return value.strip()
 
 
 def as_str_tuple(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
-        raise PrivateReviewError("{0} must be a list".format(label))
+        raise ReviewContractError("{0} must be a list".format(label))
     return tuple(str(item) for item in value)
-
-
-def collect_private_tokens(
-    *,
-    files: Mapping[str, str] | None = None,
-    extra: Iterable[str] = (),
-    vault_path: Path | None = None,
-    vault_refs: Iterable[str] = (),
-    blob_ids: Iterable[str] = (),
-) -> tuple[str, ...]:
-    tokens: list[str] = []
-    if vault_path is not None:
-        tokens.append(str(Path(vault_path).resolve()))
-    tokens.extend(ref for ref in vault_refs if ref)
-    tokens.extend(blob for blob in blob_ids if blob)
-    if files:
-        for path, body in files.items():
-            tokens.append(path)
-            tokens.append(posixpath.basename(path))
-            tokens.append(body)
-            for match in _QUOTED_LITERAL.finditer(body):
-                literal = match.group(2)
-                if len(literal) >= _SECRET_TOKEN_MIN:
-                    tokens.append(literal)
-            for line in body.splitlines():
-                stripped = line.strip()
-                if len(stripped) >= _SECRET_TOKEN_MIN:
-                    tokens.append(stripped)
-    tokens.extend(item for item in extra if item)
-    unique = []
-    seen = set()
-    for token in sorted(tokens, key=len, reverse=True):
-        if token and token not in seen:
-            seen.add(token)
-            unique.append(token)
-    return tuple(unique)
-
-
-def redact_text(value: str, tokens: Sequence[str]) -> str:
-    text = value
-    for token in tokens:
-        if token and token in text:
-            text = text.replace(token, _REDACTED)
-    return text
-
-
-def redact_findings(
-    findings: Sequence[Mapping[str, str]],
-    tokens: Sequence[str],
-) -> tuple[dict[str, str], ...]:
-    out = []
-    for item in findings:
-        row = {
-            key: redact_text(str(item[key]), tokens) for key in st.REVISE_FINDING_KEYS
-        }
-        out.append(row)
-    return tuple(out)
 
 
 def actionable_findings(
     verdict: st.ReviewerVerdict,
     findings: Sequence[Mapping[str, str]],
-    tokens: Sequence[str] = (),
 ) -> tuple[Mapping[str, Any], ...]:
     if verdict is st.ReviewerVerdict.PASS:
         if findings:
-            raise PrivateReviewError("PASS findings must be empty")
+            raise ReviewContractError("PASS findings must be empty")
         return ()
     if verdict is not st.ReviewerVerdict.REVISE:
-        raise PrivateReviewError("verdict must be PASS or REVISE")
-    checked = st.require_revise_findings(findings)
-    return st.require_revise_findings(redact_findings(checked, tokens))
-
-
-def _json_string_values(obj: object) -> tuple[str, ...]:
-    """String values of a JSON document. Keys are schema, not secrets."""
-    found: list[str] = []
-
-    def walk(item: object) -> None:
-        if isinstance(item, str):
-            found.append(item)
-        elif isinstance(item, dict):
-            for value in item.values():
-                walk(value)
-        elif isinstance(item, (list, tuple)):
-            for value in item:
-                walk(value)
-
-    walk(obj)
-    return tuple(found)
-
-
-def _leak_haystack(blob: str) -> str:
-    try:
-        parsed = json.loads(blob)
-    except json.JSONDecodeError:
-        return blob
-    return "\n".join(_json_string_values(parsed))
-
-
-def refuse_private_leak(
-    obj: object, tokens: Sequence[str], *, allow: Iterable[str] = ()
-) -> None:
-    allowed = tuple(str(item) for item in allow if item)
-    if isinstance(obj, (bytes, bytearray)):
-        blob = bytes(obj).decode("utf-8")
-    elif isinstance(obj, str):
-        blob = obj
-    else:
-        blob = st.canonical_bytes(obj).decode("utf-8")
-    haystack = _leak_haystack(blob)
-    for token in tokens:
-        if not token or any(token in public for public in allowed):
-            continue
-        if token in haystack:
-            raise PrivateLeakError("public payload leaked private token")
+        raise ReviewContractError("verdict must be PASS or REVISE")
+    return st.require_revise_findings(findings)
 
 
 def write_files(dest: Path, files: Mapping[str, str]) -> tuple[str, ...]:
@@ -407,10 +265,10 @@ def write_files(dest: Path, files: Mapping[str, str]) -> tuple[str, ...]:
         rel = normalize_repo_path(path)
         target = (root / rel).resolve()
         if not str(target).startswith(str(root) + "/") and target != root:
-            raise PrivateReviewError("refusing path outside destination")
+            raise ReviewContractError("refusing path outside destination")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body)
         written.append(rel)
     if not written:
-        raise PrivateReviewError("test draft requires at least one file")
+        raise ReviewContractError("test draft requires at least one file")
     return tuple(written)

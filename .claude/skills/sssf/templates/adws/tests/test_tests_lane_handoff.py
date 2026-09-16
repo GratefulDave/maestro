@@ -1,4 +1,4 @@
-"""Tests-lane seal handoff and typed lifecycle routing."""
+"""Tests-lane acceptance handoff and typed lifecycle routing."""
 
 from __future__ import annotations
 
@@ -313,7 +313,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
         self.assertEqual(
             st.next_stage_for(
                 st.LaneStage.TESTS_SEALED,
-                st.ArtifactKind.SEALED_TEST_BUNDLE,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE,
                 None,
             ),
             st.LaneStage.BUILDING,
@@ -321,11 +321,11 @@ class TestsLaneHandoffTests(unittest.TestCase):
         self.assertEqual(
             st.next_stage_for(
                 st.LaneStage.TESTS_SEALED,
-                st.ArtifactKind.SEALED_TEST_BUNDLE,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE,
                 None,
                 lane_kind="tests",
             ),
-            st.LaneStage.MERGED,
+            st.LaneStage.READY_TO_MERGE,
         )
         self.assertEqual(
             st.next_stage_for(
@@ -381,7 +381,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
                 ("run-handoff", "lane-tests"),
             )
         }
-        self.assertIn(st.ArtifactKind.SEALED_TEST_BUNDLE.value, tests_kinds)
+        self.assertIn(st.ArtifactKind.ACCEPTED_TEST_SUITE.value, tests_kinds)
         self.assertIn(st.ArtifactKind.TEST_DRAFT.value, tests_kinds)
         self.assertIn(st.ArtifactKind.TEST_REVIEW.value, tests_kinds)
         self.assertNotIn(st.ArtifactKind.BUILDER_OUTPUT.value, tests_kinds)
@@ -501,7 +501,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
         self.assertNotIn("pytest", calls)
         self.assertNotIn("build-wrong.py", calls)
 
-    def test_typed_build_sealed_suite_gate_uses_tests_predecessor(self) -> None:
+    def test_typed_build_suite_gate_uses_tests_predecessor(self) -> None:
         compiled = plan_compiler.compile_plan(
             _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:gate-auth"
         )
@@ -530,13 +530,13 @@ class TestsLaneHandoffTests(unittest.TestCase):
         }
         scheduler = self._start(compiled, actor, "run-gate-auth")
         build = next(lane for lane in compiled.lanes if lane.lane_id == "lane-build")
-        gate = scheduler._sealed_suite_gate(build)
+        gate = scheduler._suite_gate(build)
         self.assertIsNotNone(gate)
         self.assertEqual(gate.runner, "vitest")
         self.assertEqual(gate.argv, ("suite.test.ts",))
         self.assertEqual(gate.min_cases, 1)
         tests = next(lane for lane in compiled.lanes if lane.lane_id == "lane-tests")
-        self.assertEqual(scheduler._sealed_suite_gate(tests).runner, "vitest")
+        self.assertEqual(scheduler._suite_gate(tests).runner, "vitest")
         unified = plan_compiler.compile_plan(
             _unified_plan_bytes(), plan_revision=1, plan_artifact_ref="plan:gate-unified"
         )
@@ -561,7 +561,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
             gitpub.bind_target_worktree(self.repo, "refs/heads/main"),
             compiled=unified,
         )
-        own = unified_scheduler._sealed_suite_gate(unified.lanes[0])
+        own = unified_scheduler._suite_gate(unified.lanes[0])
         self.assertEqual(own.runner, "pytest")
         self.assertEqual(own.argv, ("tests/test_a.py",))
         self.assertEqual(own.min_cases, 2)
@@ -585,11 +585,11 @@ class TestsLaneHandoffTests(unittest.TestCase):
             )
         ]
         self.assertIn(st.ArtifactKind.TEST_DRAFT.value, kinds)
-        self.assertIn(st.ArtifactKind.SEALED_TEST_BUNDLE.value, kinds)
+        self.assertIn(st.ArtifactKind.ACCEPTED_TEST_SUITE.value, kinds)
         self.assertIn(st.ArtifactKind.BUILDER_OUTPUT.value, kinds)
         self.assertIn(st.ArtifactKind.INTEGRATION_MERGE.value, kinds)
         self.assertLess(
-            kinds.index(st.ArtifactKind.SEALED_TEST_BUNDLE.value),
+            kinds.index(st.ArtifactKind.ACCEPTED_TEST_SUITE.value),
             kinds.index(st.ArtifactKind.BUILDER_OUTPUT.value),
         )
 
@@ -827,7 +827,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
             (
                 "run-stale-bundle",
                 "lane-tests",
-                st.ArtifactKind.SEALED_TEST_BUNDLE.value,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE.value,
             ),
         ).fetchone()
         self.assertIsNotNone(stale)
@@ -855,8 +855,8 @@ class TestsLaneHandoffTests(unittest.TestCase):
         )
         build = next(lane for lane in amended.lanes if lane.lane_id == "lane-build")
         with self.assertRaises(sch.FactoryRefused) as raised:
-            scheduler._sealed_for(build)
-        self.assertIn("missing dependency sealed tests", str(raised.exception))
+            scheduler._accepted_suite_for(build)
+        self.assertIn("missing dependency accepted tests", str(raised.exception))
 
     def test_unchanged_tests_reseal_before_build_after_build_amendment(self) -> None:
         compiled = plan_compiler.compile_plan(
@@ -883,7 +883,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
             (
                 "run-reseal",
                 "lane-tests",
-                st.ArtifactKind.SEALED_TEST_BUNDLE.value,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE.value,
             ),
         ).fetchone()
         self.assertIsNotNone(stale)
@@ -928,7 +928,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
             target,
             compiled=amended,
         )
-        self.assertIsNone(scheduler._current_tests_sealed("lane-tests"))
+        self.assertIsNone(scheduler._current_accepted_suite("lane-tests"))
         resume = HandoffActor(self.repo, self.runtime.path / "worktrees")
         scheduler = sch.FactoryScheduler(
             self.store,
@@ -952,12 +952,12 @@ class TestsLaneHandoffTests(unittest.TestCase):
                 (
                     "run-reseal",
                     "lane-tests",
-                    st.ArtifactKind.SEALED_TEST_BUNDLE.value,
+                    st.ArtifactKind.ACCEPTED_TEST_SUITE.value,
                 ),
             )
         )
         self.assertEqual([row[0] for row in seals], [1, 2])
-        current = scheduler._current_tests_sealed("lane-tests")
+        current = scheduler._current_accepted_suite("lane-tests")
         self.assertIsNotNone(current)
         self.assertEqual(current.plan_revision, 2)
         builders = list(

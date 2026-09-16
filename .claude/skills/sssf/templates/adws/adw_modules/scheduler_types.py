@@ -13,13 +13,13 @@ CANONICAL_SCHEMA_VERSION = 1
 LEDGER_SCHEMA_VERSION_V1 = "artifact-factory.v1"
 LEDGER_SCHEMA_VERSION_V2 = "artifact-factory.v2"
 LEDGER_SCHEMA_VERSION_V3 = "artifact-factory.v3"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v4"
+LEDGER_SCHEMA_VERSION_V4 = "artifact-factory.v4"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v5"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
 NO_CODE_REVIEW = "NO_CODE_REVIEW"
 NO_BASE_INVALIDATION = "NO_BASE_INVALIDATION"
-NO_TEST_INVALIDATION = "NO_TEST_INVALIDATION"
 NO_CODE_REVIEW_REVISE = "NO_CODE_REVIEW_REVISE"
 NO_FINAL_REVIEW = "NO_FINAL_REVIEW"
 NO_PREDECESSOR = "NO_PREDECESSOR"
@@ -94,12 +94,11 @@ class ArtifactKind(str, Enum):
     LANE_PLAN = "LANE_PLAN"
     TEST_DRAFT = "TEST_DRAFT"
     TEST_REVIEW = "TEST_REVIEW"
-    SEALED_TEST_BUNDLE = "SEALED_TEST_BUNDLE"
+    ACCEPTED_TEST_SUITE = "ACCEPTED_TEST_SUITE"
     BUILDER_OUTPUT = "BUILDER_OUTPUT"
     CODE_REVIEW = "CODE_REVIEW"
     INTEGRATION_MERGE = "INTEGRATION_MERGE"
     BASE_INVALIDATION = "BASE_INVALIDATION"
-    TEST_INVALIDATION = "TEST_INVALIDATION"
     USER_WAIT = "USER_WAIT"
     USER_DECISION = "USER_DECISION"
     FINAL_INTEGRATION_REVIEW = "FINAL_INTEGRATION_REVIEW"
@@ -201,14 +200,25 @@ LANE_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.LANE_PLAN,
     ArtifactKind.TEST_DRAFT,
     ArtifactKind.TEST_REVIEW,
-    ArtifactKind.SEALED_TEST_BUNDLE,
+    ArtifactKind.ACCEPTED_TEST_SUITE,
     ArtifactKind.BUILDER_OUTPUT,
     ArtifactKind.CODE_REVIEW,
     ArtifactKind.INTEGRATION_MERGE,
     ArtifactKind.BASE_INVALIDATION,
-    ArtifactKind.TEST_INVALIDATION,
     ArtifactKind.USER_WAIT,
     ArtifactKind.USER_DECISION,
+)
+
+#: Lane artifact kinds a ledger may hold from before accepted tests became
+#: visible. `SEALED_TEST_BUNDLE` was the vault-pinned suite and
+#: `TEST_INVALIDATION` the reset an untyped lane took when a candidate landed
+#: on one of its hidden paths; neither is produced any more and neither is a
+#: member of `ArtifactKind`. They stay in the ledger's kind check so a v4
+#: ledger's rows survive the v5 rebuild and remain readable as history. A run
+#: parked on one of them is not resumed by this runtime; it is restarted.
+HISTORICAL_LANE_ARTIFACT_KINDS: Tuple[str, ...] = (
+    "SEALED_TEST_BUNDLE",
+    "TEST_INVALIDATION",
 )
 
 RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
@@ -234,6 +244,30 @@ class IllegalStageEdge(KernelError):
 
 class CanonicalIdentityError(KernelError):
     code = "CANONICAL_IDENTITY_INVALID"
+
+
+class LiveRunCutoverRequired(KernelError):
+    """A run's ledger holds an artifact kind this runtime no longer produces.
+
+    `SEALED_TEST_BUNDLE` and `TEST_INVALIDATION` survive the v5 migration as
+    readable history, but no lane in this runtime can advance from one: the
+    vault they point at is gone. Such a run is restarted, not resumed, and
+    every verb that binds it says so by name instead of failing in the enum.
+    """
+
+    code = "LIVE_RUN_CUTOVER_REQUIRED"
+
+    def __init__(self, run_id: str, kind: str) -> None:
+        super().__init__(f"{run_id}:{kind}")
+        self.run_id = run_id
+        self.kind = kind
+
+
+def stored_artifact_kind(value: str, *, run_id: str) -> "ArtifactKind":
+    """A stored kind string as an `ArtifactKind`, refusing the historical ones."""
+    if value in HISTORICAL_LANE_ARTIFACT_KINDS:
+        raise LiveRunCutoverRequired(run_id, value)
+    return ArtifactKind(value)
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -508,13 +542,11 @@ def writing_tests_input_digest(
     lane_plan_id: str,
     test_review_id: str,
     integration_head: str,
-    test_invalidation_id: str = NO_TEST_INVALIDATION,
 ) -> str:
     head = require_git_sha(integration_head, name="integration_head")
-    invalidation = test_invalidation_id or NO_TEST_INVALIDATION
     return lane_input_digest(
         {
-            "input_artifact_ids": [lane_plan_id, test_review_id, invalidation],
+            "input_artifact_ids": [lane_plan_id, test_review_id],
             "integration_head": head,
             "lane_id": lane_id,
             "lane_projection_digest": projection_digest,
@@ -524,23 +556,8 @@ def writing_tests_input_digest(
             "schema_version": CANONICAL_SCHEMA_VERSION,
             "spec_digest": spec_digest,
             "stage": LaneStage.WRITING_TESTS.value,
-            "test_invalidation": invalidation,
         }
     )
-
-
-def active_test_invalidation_id(
-    *,
-    invalidation_id: str | None,
-    invalidation_sequence: int | None,
-    draft_sequence: int | None,
-) -> str:
-    if not invalidation_id or invalidation_sequence is None:
-        return NO_TEST_INVALIDATION
-    if draft_sequence is not None and invalidation_sequence <= draft_sequence:
-        return NO_TEST_INVALIDATION
-    return invalidation_id
-
 
 
 def reviewing_tests_input_digest(
@@ -640,7 +657,7 @@ def reviewing_code_input_digest(
     spec_digest: str,
     projection_digest: str,
     lane_plan_id: str,
-    sealed_bundle_id: str,
+    accepted_suite_id: str,
     builder_output_id: str,
     builder_base_sha: str,
     candidate_ref: str,
@@ -651,7 +668,7 @@ def reviewing_code_input_digest(
             "builder_base_sha": builder_base_sha,
             "candidate_ref": candidate_ref,
             "candidate_sha": candidate_sha,
-            "input_artifact_ids": [lane_plan_id, sealed_bundle_id, builder_output_id],
+            "input_artifact_ids": [lane_plan_id, accepted_suite_id, builder_output_id],
             "lane_id": lane_id,
             "lane_projection_digest": projection_digest,
             "plan_digest": plan_digest,
@@ -1144,7 +1161,7 @@ COMPLETE_STAGE_EDGES: Tuple[StageEdge, ...] = (
     ),
     StageEdge(
         LaneStage.TESTS_SEALED,
-        ArtifactKind.SEALED_TEST_BUNDLE,
+        ArtifactKind.ACCEPTED_TEST_SUITE,
         None,
         LaneStage.BUILDING,
     ),
@@ -1165,12 +1182,6 @@ COMPLETE_STAGE_EDGES: Tuple[StageEdge, ...] = (
         ArtifactKind.CODE_REVIEW,
         ReviewerVerdict.REVISE,
         LaneStage.BUILDING,
-    ),
-    StageEdge(
-        LaneStage.REVIEWING_CODE,
-        ArtifactKind.TEST_INVALIDATION,
-        None,
-        LaneStage.WRITING_TESTS,
     ),
     StageEdge(
         LaneStage.READY_TO_MERGE,
@@ -1198,10 +1209,14 @@ def next_stage_for(
     if (
         normalized == LANE_KIND_TESTS
         and current is LaneStage.TESTS_SEALED
-        and kind is ArtifactKind.SEALED_TEST_BUNDLE
+        and kind is ArtifactKind.ACCEPTED_TEST_SUITE
         and verdict is None
     ):
-        return LaneStage.MERGED
+        # A tests lane's accepted suite is its candidate. It merges into the
+        # integration ref through the same READY_TO_MERGE edge a build lane
+        # takes, so the build lane that consumes it finds the suite in its
+        # base rather than behind an overlay.
+        return LaneStage.READY_TO_MERGE
     if (
         normalized == LANE_KIND_BUILD
         and current is LaneStage.PLANNED
@@ -1222,13 +1237,11 @@ def completed_stage_for(kind: ArtifactKind, payload: Mapping[str, Any]) -> LaneS
         return LaneStage.WRITING_TESTS
     if kind is ArtifactKind.TEST_REVIEW:
         return LaneStage.REVIEWING_TESTS
-    if kind is ArtifactKind.SEALED_TEST_BUNDLE:
+    if kind is ArtifactKind.ACCEPTED_TEST_SUITE:
         return LaneStage.TESTS_SEALED
     if kind is ArtifactKind.BUILDER_OUTPUT:
         return LaneStage.BUILDING
     if kind is ArtifactKind.CODE_REVIEW:
-        return LaneStage.REVIEWING_CODE
-    if kind is ArtifactKind.TEST_INVALIDATION:
         return LaneStage.REVIEWING_CODE
     if kind in (ArtifactKind.INTEGRATION_MERGE, ArtifactKind.BASE_INVALIDATION):
         return LaneStage.READY_TO_MERGE
