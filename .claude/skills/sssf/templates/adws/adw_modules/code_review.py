@@ -18,6 +18,7 @@ from . import hidden_vault as hv
 from . import private_review as pr
 from . import runner_resolution as rr
 from . import scheduler_types as st
+from . import test_binding as tb
 from . import tests_chain as tc
 from . import provisioning as prov
 
@@ -89,6 +90,12 @@ def run_integration_gate(
         state_root=state_root,
     )
     hv.copy_blobs_to_tree(vault, dest, files)
+    # Same invariant as the lane review below, and this is the site that
+    # survives PR B with the most weight on it: `failed` here is read by
+    # `FactoryScheduler._failed_run_gates`, which stands between a merged
+    # surface and both the final review and publication. A gate that measured
+    # bytes nobody accepted is a publication decision made on a forgery.
+    tb.verify_suite(files, dest)
     run = tc.run_private_suite(dest, tuple(files), gate=gate)
     min_cases = int(run.get("min_cases") or 1)
     counts = run["counts"]
@@ -104,6 +111,7 @@ def run_integration_gate(
         "failed": failed,
         "lane_id": lane_id,
         "min_cases": min_cases,
+        "test_suite_digest": tb.suite_digest(files),
     }
 
 
@@ -277,9 +285,17 @@ def _collect_at_base(
             state_root=state_root,
         )
         hv.copy_blobs_to_tree(vault, base_dest, files)
+        tb.verify_suite(files, base_dest)
         run, refusal = _run_sealed_suite(base_dest, files, gate=gate)
-    except hv.TreeContainmentRefused:
-        # Where the tree may be written is not a fact about the base commit.
+    except (hv.TreeContainmentRefused, tb.TestSuiteTampered):
+        # Neither is a fact about the base commit, and both must escape the
+        # absolution below. Where the tree may be written is one. The other is
+        # the suite itself not being the accepted suite -- a `PrivateReviewError`
+        # by inheritance, so the broad clause would read it as "the fault
+        # predates the candidate", return False, and let the candidate be
+        # measured against bytes nobody accepted while reporting the builder
+        # blameless. An operator fault absorbed as an absolution is worse than
+        # one that stops the run.
         raise
     except (pr.PrivateReviewError, hv.VaultError, OSError):
         return False
@@ -726,6 +742,14 @@ def measure_candidate(
     if not allow_candidate_paths:
         _refuse_candidate_private_collisions(dest, files)
     hv.copy_blobs_to_tree(vault, dest, files)
+    # The suite about to run is the suite that was accepted, or nothing runs.
+    # Today this reads back the overlay written on the line above, and it is
+    # not a tautology: it is the only statement of the invariant that survives
+    # the overlay's removal, when the bytes under a test path are whatever the
+    # candidate's own tree carries. A mismatch is never a candidate defect --
+    # `TestSuiteTampered` is a `SealedEnvironmentError`, so it refuses to the
+    # operator instead of billing the builder a revise round for it.
+    tb.verify_suite(files, dest)
     run, refusal = _run_sealed_suite(dest, files, gate=gate)
     collection_broken = False
     if refusal is not None or _collected_no_case(run):
@@ -935,6 +959,11 @@ def review_builder_output(
         "public_result_summary": summary,
         "redacted_failures": list(failure_lines),
         "sealed_digest": sealed_digest,
+        # What `sealed_digest` cannot say: that digest names a bundle in the
+        # vault, so it cannot be recomputed from the tree the suite ran in.
+        # This one can, which is what makes "the review ran the accepted
+        # suite" checkable after the fact against a checkout.
+        "test_suite_digest": tb.suite_digest(files),
         "verdict": verdict.value,
     }
     allowed = (

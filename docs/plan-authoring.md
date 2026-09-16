@@ -53,6 +53,9 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - A tests verifier that declares `declared_cases` declares one entry per case its gate's
   `min_cases` floor requires, each with a boolean `red_at_parent`, and at least one of them red
   (`CASE_FALSIFICATION_UNDECLARED`).
+- No lane declares an output covering a `lane_kind=tests` lane's declared outputs, which
+  are that lane's accepted suite (`OUTPUT_OVERLAPS_TEST_SUITE`). A lane may not own the
+  bytes it is graded against.
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate

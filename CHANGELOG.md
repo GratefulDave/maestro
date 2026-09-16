@@ -7,6 +7,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **A lane may not own the bytes it is graded against, and a review may not run
+  bytes nobody accepted** (`plan_validate.OUTPUT_OVERLAPS_TEST_SUITE`,
+  `git_publication.validate_declared_ownership(protected_paths=...)` raising
+  `CANDIDATE_TEST_PATH_REFUSED`, and the new `adw_modules/test_binding.py`
+  raising `TEST_SUITE_TAMPERED`). `MAESTRO_architecture.md` §11 recorded that
+  neither `plan_compiler` nor `validate_objective_plan` forbade a plan from
+  declaring an output covering a sealed path, leaving one runtime step -- the
+  pathspec subtraction in `_refresh_builder_checkout` -- as the only thing
+  between a build lane and its own acceptance suite. Three checks now state the
+  invariant instead of one step implementing it:
+
+  * at authoring time, a lane declaring an output that covers a
+    `lane_kind=tests` lane's declared outputs is refused by name. The generic
+    one-owner-per-path rule already refused the same plans and still does; what
+    it could not say is *which* invariant broke, and "two lanes want this path"
+    and "a lane wants to rewrite its grader" stop being the same sentence once
+    the accepted suite is carried in the builder's checkout;
+  * at admission, a tree-delta entry naming one of the lane's own sealed paths
+    is refused before any reviewer reads the candidate, on the old path of a
+    rename as well as the new. The protected set is the pair `_sealed_for`
+    resolves, passed through as `LaneContext.sealed_private_paths` -- declared
+    by the plan, never guessed from a path shape;
+  * at review, the suite present in the tree is hashed against the accepted
+    blob ids before the runner is invoked, at every site that materializes it
+    to run it -- the lane's code review, the base collection that decides
+    whether a broken collection is the candidate's doing, and the run-level
+    integration gate whose result gates the final review and publication. All
+    three, because a fix applied to one of several sibling paths is how this
+    factory has previously turned a loud round-one refusal into a quiet
+    multi-round failure blamed on the wrong actor. `TestSuiteTampered` is a
+    `SealedEnvironmentError`, so it reaches the operator and is never billed to
+    the builder as a revise round; at the base collection it is re-raised ahead
+    of the clause that absolves the candidate, which would otherwise absorb it
+    as "the fault predates the candidate". The `CODE_REVIEW` artifact and the
+    integration gate's result each record the `test-suite.v1` digest of what
+    ran; unlike `sealed_digest`, that value is a function of path-to-blob pairs
+    alone and so can be recomputed from a checkout.
+
+  Nothing is removed or weakened. The pathspec subtraction, the working-tree
+  removal, and `OUTPUT_OWNERSHIP_CONFLICT` all still run.
 - **A tests lane's plan states which cases are red at the parent commit, and the
   factory measures that instead of accepting "red"**
   (`spec.gate.declared_cases`; `plan_validate.CASE_FALSIFICATION_UNDECLARED`,

@@ -21,6 +21,7 @@ NEEDS_UNKNOWN = "NEEDS_UNKNOWN"
 GRAPH_CYCLE = "GRAPH_CYCLE"
 OUTPUT_PATH_INVALID = "OUTPUT_PATH_INVALID"
 OUTPUT_OWNERSHIP_CONFLICT = "OUTPUT_OWNERSHIP_CONFLICT"
+OUTPUT_OVERLAPS_TEST_SUITE = "OUTPUT_OVERLAPS_TEST_SUITE"
 ACCEPTANCE_MISSING = "ACCEPTANCE_MISSING"
 REVIEW_NODE_FORBIDDEN = "REVIEW_NODE_FORBIDDEN"
 BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
@@ -188,6 +189,7 @@ def validate_objective_plan(
         )
 
     _validate_ownership(parsed, refusals)
+    _validate_test_suite_outputs(parsed, kinds, refusals)
     _validate_build_lane_needs(parsed, kinds, refusals)
     if not any(item.code == GRAPH_CYCLE for item in refusals):
         refusals.extend(_cycles(parsed))
@@ -430,6 +432,66 @@ def _validate_ownership(
                         right_ptr,
                         "path {0} conflicts with {1} owned by {2}".format(
                             right_path, left_path, left_lane
+                        ),
+                    )
+                )
+
+
+def _validate_test_suite_outputs(
+    parsed: Sequence[Tuple[int, str, Sequence[Any], Sequence[Any], Any, Sequence[Any]]],
+    kinds: Mapping[str, str | None],
+    refusals: List[PlanRefusal],
+) -> None:
+    """No lane may declare an output covering another lane's test suite.
+
+    A ``lane_kind=tests`` lane's declared outputs ARE its accepted suite: the
+    tester authors its private acceptance files exactly at those paths
+    (``MAESTRO_architecture.md`` §11). So a build lane that also declares one of
+    them is asking to own the bytes it is graded against, and §11 recorded that
+    neither this validator nor the compiler forbade it -- the candidate was kept
+    off those paths only by a pathspec subtraction at commit time, one runtime
+    step with nothing upstream of it.
+
+    ``_validate_ownership`` already refuses the same plans under
+    ``OUTPUT_OWNERSHIP_CONFLICT``, and keeps doing so; this adds a refusal
+    rather than replacing one. What the generic rule cannot say is WHICH
+    invariant broke. "Two lanes want to own this path" is an authoring mistake
+    either lane could fix by renaming; "a lane wants to own its own grader" is
+    not, and the two stop being the same sentence the moment the accepted suite
+    is carried in the builder's checkout instead of behind a vault overlay.
+
+    Untyped lanes are covered on the same terms. Their own hidden meta-tests sit
+    at paths of the tester's choosing and are not decidable here, but a typed
+    tests lane's outputs are in the plan, and an untyped lane may not claim them.
+    """
+    suite: dict[str, str] = {}
+    for _index, lane_id, _needs, outputs, _spec, _acceptance in parsed:
+        if kinds.get(lane_id) != "tests":
+            continue
+        for raw in outputs:
+            normalized = normalize_declared_output(raw)
+            if normalized is not None:
+                suite.setdefault(normalized, lane_id)
+    if not suite:
+        return
+    for index, lane_id, _needs, outputs, _spec, _acceptance in parsed:
+        if kinds.get(lane_id) == "tests":
+            continue
+        for out_index, raw in enumerate(outputs):
+            normalized = normalize_declared_output(raw)
+            if normalized is None:
+                continue
+            for path, tests_lane in sorted(suite.items()):
+                if not outputs_conflict(normalized, path):
+                    continue
+                refusals.append(
+                    PlanRefusal(
+                        OUTPUT_OVERLAPS_TEST_SUITE,
+                        "/lanes/{0}/outputs/{1}".format(index, out_index),
+                        "lane {0} declares {1}, which covers {2}, the accepted "
+                        "test suite of lane {3}; a lane may not own the bytes "
+                        "it is graded against".format(
+                            lane_id, normalized, path, tests_lane
                         ),
                     )
                 )

@@ -747,5 +747,83 @@ class DecidedByTests(unittest.TestCase):
         self.assertNotEqual(one.plan_digest, other.plan_digest)
 
 
+class TestSuiteOutputsAreNobodyElsesToDeclare(unittest.TestCase):
+    """A lane may not declare an output covering another lane's test suite.
+
+    A `lane_kind=tests` lane's declared outputs ARE its accepted suite: the
+    tester authors its private acceptance files exactly there
+    (`MAESTRO_architecture.md` §11). A build lane that also declares one of
+    them is asking to own the bytes it is graded against.
+
+    The generic one-owner-per-path rule already refuses the same plans, and
+    keeps doing so -- nothing here replaces it. What it cannot say is WHICH
+    invariant was broken, and that distinction is about to become load-bearing:
+    once the accepted suite lives in the builder's checkout rather than behind
+    a vault overlay, "two lanes want this path" and "a lane wants to rewrite
+    its own grader" stop being the same sentence.
+    """
+
+    def _plan_with(self, build_outputs):
+        return _plan(
+            _lane("lane-t", lane_kind="tests", outputs=["tests/x_test.py"]),
+            _lane(
+                "lane-b",
+                lane_kind="build",
+                needs=["lane-t"],
+                outputs=build_outputs,
+            ),
+        )
+
+    def _refusals(self, payload):
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(_dump(payload))
+        return caught.exception
+
+    def test_a_build_lane_declaring_a_suite_path_is_refused_by_name(self):
+        exc = self._refusals(self._plan_with(["src/a.py", "tests/x_test.py"]))
+
+        self.assertIn(pv.OUTPUT_OVERLAPS_TEST_SUITE, _codes(exc))
+        named = [
+            item for item in exc.refusals
+            if item.code == pv.OUTPUT_OVERLAPS_TEST_SUITE
+        ]
+        self.assertEqual("/lanes/1/outputs/1", named[0].pointer)
+        self.assertIn("lane-b", named[0].message)
+        self.assertIn("lane-t", named[0].message)
+        self.assertIn("tests/x_test.py", named[0].message)
+
+    def test_an_ancestor_of_a_suite_path_is_refused(self):
+        exc = self._refusals(self._plan_with(["tests"]))
+
+        self.assertIn(pv.OUTPUT_OVERLAPS_TEST_SUITE, _codes(exc))
+
+    def test_an_untyped_lane_may_not_declare_a_suite_path_either(self):
+        payload = _plan(
+            _lane("lane-t", lane_kind="tests", outputs=["tests/x_test.py"]),
+            _lane("lane-u", outputs=["tests/x_test.py"]),
+        )
+
+        self.assertIn(pv.OUTPUT_OVERLAPS_TEST_SUITE, _codes(self._refusals(payload)))
+
+    def test_a_tests_lane_still_owns_its_own_outputs(self):
+        compiled = compile_plan(_dump(self._plan_with(["src/a.py"])))
+
+        self.assertEqual(
+            ("tests/x_test.py",), _lane_of(compiled, "lane-t").declared_outputs
+        )
+        self.assertEqual(("src/a.py",), _lane_of(compiled, "lane-b").declared_outputs)
+
+    def test_a_plan_with_no_tests_lane_is_untouched(self):
+        payload = _plan(
+            _lane("lane-a", outputs=["tests/x_test.py"]),
+            _lane("lane-b", outputs=["src/a.py"]),
+        )
+
+        compiled = compile_plan(_dump(payload))
+        self.assertEqual(
+            ("tests/x_test.py",), _lane_of(compiled, "lane-a").declared_outputs
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
