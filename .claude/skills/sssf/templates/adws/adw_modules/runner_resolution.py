@@ -1005,3 +1005,113 @@ def execute_cases(
         "returncode": result.returncode,
     }
 
+
+#: The flags each runner needs to report a PER-CASE outcome rather than a
+#: total. The third member of the `COLLECT_ARGS` / `EXECUTE_ARGS` family:
+#: collection answers "which cases exist", execution answers "how many
+#: passed", and this answers "which ones were red".
+#:
+#: A total cannot answer the question `case_outcomes` exists for. FDAdb run
+#: be064e58 `lane-wp3-adapter-build` read `executed=6 passed=5 failed=1` on
+#: three consecutive candidates and could not say, from that row, that the red
+#: one was the same case every time and had been red before any builder ran.
+#:
+#: pytest's `-v` prints `path::case OUTCOME`, one line per case; `--tb=no`
+#: removes the traceback, which is private test source and must neither be
+#: parsed nor carried. `-o addopts=` clears a repository ini that would
+#: otherwise cancel `-v` -- the same trap `COLLECT_ARGS` documents -- and
+#: `-p no:cacheprovider` keeps the measurement from writing into the tree it
+#: measures. vitest's verbose reporter prints `<mark> <file> > <title>`; the
+#: mode (`run`) stays `ResolvedRunner.execute_argv`'s to supply, so this table
+#: never carries it and can never reintroduce watch mode.
+FALSIFY_ARGS: Dict[str, Tuple[str, ...]] = {
+    "pytest": ("-p", "no:cacheprovider", "-o", "addopts=", "--tb=no", "-v"),
+    "vitest": ("--reporter=verbose",),
+}
+
+#: pytest verbose: `tests/test_x.py::test_case PASSED   [ 50%]`.
+_PYTEST_OUTCOME = re.compile(
+    r"^(\S+::\S+)\s+(PASSED|FAILED|ERROR|XFAIL|XPASS|SKIPPED)\b"
+)
+#: vitest verbose: `   x src/a.test.ts > does not classify  3ms`. The
+#: file-level roll-up line (`v src/a.test.ts (6 tests) 9ms`) carries no ` > `
+#: and is not a case.
+#: The trailing duration vitest appends to a case line (`… > title  3ms`) is
+#: not part of the identifier: it changes run to run, so leaving it on would
+#: make two measurements of the same case two different cases.
+_VITEST_OUTCOME = re.compile(
+    "^\\s*([✓×✗↓↻])\\s+(\\S+ > .+?)"
+    "(?:\\s+\\d+(?:\\.\\d+)?\\s*(?:ms|s))?\\s*$"
+)
+_VITEST_RED = ("×", "✗")
+
+
+class CaseOutcomesUnreadable(RuntimeError):
+    """The runner produced no per-case outcome this module can read."""
+
+    def __init__(self, runner: str, detail: str = "") -> None:
+        super().__init__(detail or runner)
+        self.runner = runner
+        self.detail = detail
+
+
+def case_outcomes(runner: str, output: str) -> Dict[str, bool]:
+    """Map each reported case identifier to whether it was RED.
+
+    Red is failed or errored. A skipped case is reported as not red, because a
+    suite that skipped a case has falsified nothing with it -- which is what
+    the caller then refuses on, rather than reading the skip as a failure.
+    """
+    found: Dict[str, bool] = {}
+    for line in (output or "").splitlines():
+        token = _ANSI.sub("", line).rstrip()
+        if runner == "pytest":
+            match = _PYTEST_OUTCOME.match(token.strip())
+            if match is not None:
+                found[match.group(1)] = match.group(2) in ("FAILED", "ERROR")
+            continue
+        match = _VITEST_OUTCOME.match(token)
+        if match is not None:
+            found[match.group(2).strip()] = match.group(1) in _VITEST_RED
+    return found
+
+
+@dataclass(frozen=True)
+class _OutcomeGate:
+    """The gate shape `execute_cases` reads. Not a plan gate; never persisted."""
+
+    argv: Tuple[str, ...]
+    cwd: str = "."
+
+
+def execute_case_outcomes(
+    resolved: ResolvedRunner,
+    gate: Any,
+    tree: Path,
+    *,
+    timeout_s: float = EXECUTE_TIMEOUT_S,
+) -> Dict[str, bool]:
+    """Run the gate's selectors and return each case's red/green outcome.
+
+    Fails closed: a run this module cannot read per-case raises
+    `CaseOutcomesUnreadable`, never an empty mapping. An empty mapping would
+    read downstream as "no case was red", which is the one answer a broken
+    measurement must not be allowed to give.
+    """
+    if resolved.runner not in FALSIFY_ARGS:
+        raise CaseOutcomesUnreadable(
+            resolved.runner, "no per-case reporting flags are declared"
+        )
+    argv = FALSIFY_ARGS[resolved.runner] + tuple(getattr(gate, "argv", ()) or ())
+    probe = _OutcomeGate(argv=argv, cwd=str(getattr(gate, "cwd", None) or "."))
+    raw = execute_cases(resolved, probe, tree, timeout_s=timeout_s)
+    outcomes = case_outcomes(resolved.runner, str(raw.get("output") or ""))
+    if not outcomes:
+        raise CaseOutcomesUnreadable(
+            resolved.runner,
+            "the runner exited {0} and reported no per-case outcome".format(
+                raw.get("returncode")
+            ),
+        )
+    return outcomes
+

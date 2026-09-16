@@ -6,6 +6,61 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **A tests lane's plan states which cases are red at the parent commit, and the
+  factory measures that instead of accepting "red"**
+  (`spec.gate.declared_cases`; `plan_validate.CASE_FALSIFICATION_UNDECLARED`,
+  `plan_contract_ingress._declared_cases`,
+  `runner_resolution.execute_case_outcomes`,
+  `scheduler._red_at_parent_divergences`). FDAdb run `be064e58`,
+  `lane-wp3-adapter-build`, burned three code-review rounds and parked
+  `NO_PROGRESS` on a sealed suite reading `executed=6 passed=5 failed=1`,
+  identically, from three different candidates. The red case, "does not treat
+  public label evidence as gap classification", asserts a **non-regression**
+  property — it should already have held at the parent — and its final
+  assertion called `src/lib/seo/label-band.ts`, a shipped module the lane does
+  not own, with a key that module does not recognise (`public_label_band`; its
+  slot is `public_band`). No change the builder was permitted to make could
+  move that assertion. The case was genuinely red at the parent, for a reason
+  that had nothing to do with the behaviour it claims to test, and three rounds
+  of test review passed it because "the suite is red at the parent" was true
+  the whole time.
+
+  A tests verifier may now carry `declared_cases`: one `{case, red_at_parent}`
+  per case, written by the plan author before any tester runs. The harness
+  measures each case's outcome once, in the draft-collect tree — which is the
+  parent commit with the draft's private files written on top — and reports a
+  `REVISE` citing `gate.declared_cases` for a declared case the parent ran
+  nothing named, a case declared red that was green, and a case declared green
+  that was red. The third is the be064e58 shape.
+
+  The comparison is over case **identifiers**, not failure text, and
+  deliberately so: matching a declared reason against a runner's failure prose
+  is fuzzy in both directions, and a false refusal on a good suite costs more
+  rounds than the gap it closes. Which cases are red is mechanical, is the same
+  question under pytest and vitest, and is sufficient here. A run that cannot
+  be adjudicated case by case raises `CaseOutcomesUnreadable` and refuses
+  (`PARENT_OUTCOMES_REFUSED`) rather than returning an empty mapping, which
+  would read downstream as "nothing was red".
+
+  **Optional on purpose.** Plans already shipped into deployments carry no
+  `declared_cases` and stay runnable — a new required IR field would refuse
+  them at `run start` the way `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE` refuses a
+  `maestro-plan.v1` plan, and that refusal cannot be answered while a plan is
+  mid-run. A lane that omits the field is checked on `min_cases` alone, exactly
+  as before. What is not optional is a *partial* declaration: once the field is
+  present the compiler requires an entry per `min_cases`, a boolean on each,
+  and at least one red case, because naming one easy case would satisfy the
+  check while leaving the suite unfalsified. `CASE_FALSIFICATION_UNDECLARED` is
+  an authoring obligation and, like `OBLIGATION_UNOBSERVABLE`, is never
+  re-judged against a revision a run already holds.
+
+  Falsified against the real binaries under both runners, not a stubbed
+  `subprocess.run`: a two-case suite whose second case calls an unowned module
+  with an unrecognised key is reported `declared green at the parent, observed
+  red` by pytest 9.1.1 and vitest 3.2.4 alike, and is accepted by both once the
+  assertion is moved onto the seam the lane owns.
+
 ### Changed
 - **A command the factory runs inside a provisioned tree runs in that tree's
   environment** (`adw_modules/tree_env.py`, wired into `runner_resolution.resolve`,
