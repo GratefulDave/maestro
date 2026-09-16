@@ -589,8 +589,7 @@ class LaunchSpec:
     #: Per-role checkout roots used when a role pane is created lazily.
     role_cwds: Mapping[str, Path] = field(default_factory=dict)
     #: Path Herdr opens the lane's child Space on, when the launching role's
-    #: own cwd is not a git worktree. A private-tree role is materialized out
-    #: of the vault without `.git`, and `worktree open` refuses such a path.
+    #: own cwd is not a git worktree: `worktree open` refuses such a path.
     child_anchor: Optional[Path] = None
     #: Refresh an adopted stable role's existing CWD before prompt delivery.
     prepare_adopted_cwd: Optional[Callable[[Path], None]] = None
@@ -4234,9 +4233,8 @@ class HerdrLauncher:
     ) -> _TabLayout:
         """The linked lane child this role's panes live in, created lazily."""
         self._bind_run_identity(spec)
-        # `worktree` is the launching role's own cwd, and a private-tree role's
-        # cwd is materialized out of the vault with no `.git`, because the
-        # reviewer must not carry the repository's object database.
+        # `worktree` is the launching role's own cwd, and a role cwd that is
+        # not a registered worktree (the operator's non-git tree) has no anchor.
         # `herdr worktree open` resolves a registered git worktree and answers
         # `worktree_not_found` for anything else, so anchoring the lane's child
         # there refuses every launch of that role. The child is a per-lane

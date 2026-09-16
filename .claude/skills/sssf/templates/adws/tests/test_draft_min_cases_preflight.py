@@ -1,4 +1,4 @@
-"""The lane's gate measures the private TEST_DRAFT, and answers with a verdict.
+"""The lane's gate measures the TEST_DRAFT, and answers with a verdict.
 
 Native collect/list against `gate.min_cases` and `gate.required_cases`. What the
 measurement produces is a REVISE recorded on the tests lane -- never an
@@ -22,7 +22,6 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ADWS))
 from adw_modules import git_publication as gitpub
-from adw_modules import hidden_vault as hv
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import runner_resolution as rr
@@ -206,7 +205,7 @@ class DraftActor:
     @staticmethod
     def _finding(index: int) -> dict:
         return {
-            "implementation_area": "private tests",
+            "implementation_area": "tests",
             "observed_behavior": "case {0} asserts nothing about refusal".format(index),
             "required_behavior": "assert the refusal path too",
             "violated_requirement": "a.txt is written",
@@ -365,9 +364,6 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.assertEqual(len(reviews[0]["findings"]), 1)
         return reviews[0]["findings"][0]
 
-    def _vault(self) -> Path:
-        return hv.vault_path(self.runtime.path, RUN_ID)
-
     # -- a measured refusal is a REVISE, not the end of the run ------------
 
     def test_short_draft_records_a_revise_and_sends_the_lane_back(self) -> None:
@@ -415,21 +411,21 @@ class DraftGateVerdictTests(unittest.TestCase):
 
     # -- the artifact a verdict is about outlives the verdict ---------------
 
-    def test_the_refused_draft_is_pinned_in_the_vault(self) -> None:
+    def test_the_refused_draft_is_pinned_as_a_candidate(self) -> None:
         body = "def broken(\n"
         actor = DraftActor([body])
         scheduler = self._start(actor)
         self._round(scheduler)
         draft = self._drafts()[0]
-        ref = draft["private_draft_ref"]
+        ref = draft["candidate_ref"]
         self.assertTrue(
-            ref.startswith("refs/maestro/drafts/{0}/{1}/".format(RUN_ID, LANE_ID))
+            ref.startswith("refs/maestro/candidates/{0}/{1}/".format(RUN_ID, LANE_ID))
         )
-        vault = self._vault()
-        refs = _git(vault, "for-each-ref", "--format=%(refname)", "refs/maestro/drafts")
+        refs = _git(self.repo, "for-each-ref", "--format=%(refname)", "refs/maestro/candidates")
         self.assertIn(ref, refs.splitlines())
+        self.assertEqual(_git(self.repo, "rev-parse", ref), draft["candidate_sha"])
         self.assertEqual(
-            _git(vault, "show", "{0}:{1}".format(ref, PRIVATE)) + "\n", body
+            _git(self.repo, "show", "{0}:{1}".format(ref, PRIVATE)) + "\n", body
         )
 
     def test_the_collect_tree_is_still_discarded(self) -> None:
@@ -457,9 +453,12 @@ class DraftGateVerdictTests(unittest.TestCase):
         self.assertEqual(len(self._reviews()), 3)
         self.assertEqual(actor.review_calls, 0)
         drafts = self._drafts()
-        self.assertEqual(len({d["private_draft_digest"] for d in drafts}), 3)
+        # Three rounds, three candidate refs, one suite: identical bytes name
+        # the identical candidate, which is exactly the repetition that parks.
+        self.assertEqual(len({d["candidate_ref"] for d in drafts}), 3)
+        self.assertEqual(len({d["test_suite_digest"] for d in drafts}), 1)
         self.assertEqual(sch._review_content_history(
-            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW, self._vault()
+            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW
         ), [])
 
     def test_test_review_a_b_a_cycle_parks_on_the_same_path(self) -> None:
@@ -553,7 +552,7 @@ class DraftGateVerdictTests(unittest.TestCase):
             self._round(scheduler)
         scheduler._writing_tests(LANE_ID)
         history = sch._review_content_history(
-            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW, self._vault()
+            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW
         )
         self.assertFalse(sch._stalled(history, st.ArtifactKind.TEST_REVIEW))
 
@@ -585,7 +584,7 @@ class DraftGateVerdictTests(unittest.TestCase):
             self.store, RUN_ID, amended, runtime=self.runtime, target=scheduler.target
         )
         self.assertEqual(sch._review_content_history(
-            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW, self._vault()
+            self.store, RUN_ID, LANE_ID, st.ArtifactKind.TEST_REVIEW
         ), [])
 
     def test_collected_plateau_despite_executable_edits_pauses(self) -> None:
@@ -678,7 +677,7 @@ class DraftGateVerdictTests(unittest.TestCase):
             "mkdir -p node_modules/.bin && cp {0} node_modules/.bin/vitest".format(fake),
         )
 
-    def test_vitest_collect_refused_forwards_stderr_not_private_source(self) -> None:
+    def test_vitest_collect_refused_forwards_stderr_verbatim(self) -> None:
         secret = "SECRET_ORACLE_LITERAL"
         body = _vitest_cases(1).replace("case 0", secret)
         actor = DraftActor([body], selector=VITEST_PRIVATE)
@@ -699,8 +698,10 @@ class DraftGateVerdictTests(unittest.TestCase):
         observed = finding["observed_behavior"]
         self.assertIn("ERR_MODULE_NOT_FOUND", observed)
         self.assertIn("Cannot find package 'vitest'", observed)
-        self.assertNotIn(secret, json.dumps(finding))
-        self.assertIn("[redacted]", observed)
+        # The runner's words reach the tester whole: the draft is the tester's
+        # own file, and nothing about it is hidden from anyone any more.
+        self.assertIn(secret, observed)
+        self.assertNotIn("[redacted]", observed)
         self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
         self.assertEqual(actor.review_calls, 0)
 

@@ -11,7 +11,7 @@ decided which *files* were present and the operator's shell decided which
 *interpreter and module set* resolved them, and the second half of that
 sentence is not something a candidate, a tester, or a reviewer can act on.
 
-Measured on FDAdb run `d246ae95`: the sealed suite failed
+Measured on FDAdb run `d246ae95`: the accepted suite failed
 `ModuleNotFoundError: No module named 'bcrypt'` in three consecutive review
 rounds. `bcrypt` was installed in the review tree's own `.venv`. The scheduler
 had been started with `uv run`, which exports `VIRTUAL_ENV` pointing at the

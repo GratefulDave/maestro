@@ -159,11 +159,11 @@ class _Harness:
             next_plan_revision=plan.plan_revision + 1,
             public_contract={"acceptance_criteria": ["emits FAQ records"]},
             reviews=({"kind": "CODE_REVIEW", "verdict": "REVISE"},),
-            redacted_failures=("1 failed",),
+            failure_output=("1 failed",),
             lane_gates="stage WAITING_FOR_USER",
             ir_path=str(self.tmp / "current.ir.json"),
             revision_out_path=str(out),
-            sealed_files={"tests/faq.spec.ts": "expect(record.disclaimer)"},
+            suite_files={"tests/faq.spec.ts": "expect(record.disclaimer)"},
             amendment_rules="rules",
             allowed_lane_ids=att.paired_lane_ids(plan.lanes, lane_id),
         )

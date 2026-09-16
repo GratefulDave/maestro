@@ -10,7 +10,7 @@ the failure banner, which the shape anchor fixed, and
 which has exactly that shape. Measured 2026-09-03 on FDAdb
 `lane-wp7-page-build`, whose sealed config boots the Astro pipeline and leaves
 the Vite server open: 15 cases ran, the runner exited 0, and the sealed suite
-refused `SEALED_SUITE_COUNTS_UNPARSEABLE` against a candidate whose tests all
+refused `SUITE_COUNTS_UNPARSEABLE` against a candidate whose tests all
 passed.
 
 These are real captures, split into the two streams the harness captures

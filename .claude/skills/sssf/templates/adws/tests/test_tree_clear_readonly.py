@@ -21,7 +21,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 import maestro
-from adw_modules import hidden_vault as hv
+from adw_modules import tree_materialize as tm
 from adw_modules import launcher as lch
 
 
@@ -79,11 +79,11 @@ class RefreshMaterializedCommitReadOnlyTest(_ReadOnlyTreeCase):
         _git(repo, "rm", "-q", "seed.txt")
         second = _commit(repo, "next.txt")
         tree = self.root / "tree"
-        hv.materialize_commit(repo, first, tree, state_root=self.root)
+        tm.materialize_commit(repo, first, tree, state_root=self.root)
         _read_only_leftover(tree)
         inode = tree.stat().st_ino
 
-        hv.refresh_materialized_commit(repo, second, tree, state_root=self.root)
+        tm.refresh_materialized_commit(repo, second, tree, state_root=self.root)
 
         self.assertEqual(tree.stat().st_ino, inode)
         self.assertTrue((tree / "next.txt").is_file())

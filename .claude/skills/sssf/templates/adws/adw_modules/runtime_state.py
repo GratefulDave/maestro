@@ -15,7 +15,6 @@ LEDGER_FILENAME = "lifecycle.sqlite3"
 RUNTIME_STATE_MODE = 0o700
 LAYOUT_CHILDREN = (
     "artifacts",
-    "vault",
     "locks",
     "receipts",
     "plans",

@@ -29,10 +29,9 @@ nearly the same words, and the tester had fixed both in round 2: the three
 which round 3's finding quotes -- exists only in round 1. Measured afterwards,
 the reviewer's materialized tree still hashed to the round-1 draft's bytes.
 
-Nothing could notice. A private tree carries no sha to compare against, and the
-ledger records the input *artifact id* rather than the bytes handed to the
-reader, so `input_digest` moved every round while the file did not -- which is
-also what kept the identical-input check from firing. The lane redrafted three
+Nothing could notice. The ledger records the input *artifact id* rather than
+the bytes handed to the reader, so `input_digest` moved every round while the
+file did not -- which is also what kept the identical-input check from firing. The lane redrafted three
 times, made no progress against findings that were already answered, and parked
 at WAITING_FOR_USER.
 
@@ -53,7 +52,6 @@ from typing import cast
 
 import maestro
 from adw_modules import git_publication as gitpub
-from adw_modules import hidden_vault as hv
 from adw_modules import launcher as lch
 from adw_modules.scheduler import LaneContext
 from adw_modules.scheduler_types import (
@@ -107,53 +105,18 @@ def _lane() -> LaneProjection:
     )
 
 
-def _commit_suite(vault: Path, *, parent: str | None, body: str | None) -> str:
-    """A vault commit, so the draft's private files are a real tree diff."""
-    entries = []
-    if body is not None:
-        blob = subprocess.check_output(
-            ["git", "-C", str(vault), "hash-object", "-w", "--stdin"],
-            input=body.encode("utf-8"),
-        ).decode().strip()
-        entries.append("100644 blob {0}\tsuite.test.ts".format(blob))
-    inner = subprocess.run(
-        ["git", "-C", str(vault), "mktree"],
-        input="\n".join(entries) + "\n" if entries else "",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    middle = subprocess.run(
-        ["git", "-C", str(vault), "mktree"],
-        input="040000 tree {0}\tprivate\n".format(inner),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    top = subprocess.run(
-        ["git", "-C", str(vault), "mktree"],
-        input="040000 tree {0}\ttests\n".format(middle),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    args = ["git", "-C", str(vault), "commit-tree", top, "-m", "draft"]
-    if parent is not None:
-        args += ["-p", parent]
-    return subprocess.check_output(
-        args,
-        text=True,
-        env={
-            "GIT_AUTHOR_NAME": "factory",
-            "GIT_AUTHOR_EMAIL": "factory@example.test",
-            "GIT_COMMITTER_NAME": "factory",
-            "GIT_COMMITTER_EMAIL": "factory@example.test",
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-        },
-    ).strip()
+def _commit_suite(repo: Path, *, parent: str, body: str) -> str:
+    """A draft candidate in the run repository: the parent plus the suite."""
+    binding = gitpub.bind_target_worktree(repo, "refs/heads/main")
+    return gitpub.commit_files_on_base(
+        binding,
+        base_sha=parent,
+        files={_SUITE: body.encode("utf-8")},
+        message=b"draft\n",
+    )
 
 
-def _draft(ref: str) -> LaneArtifact:
+def _draft(sha: str, ref: str) -> LaneArtifact:
     return LaneArtifact(
         kind=ArtifactKind.TEST_DRAFT,
         plan_revision=1,
@@ -163,6 +126,9 @@ def _draft(ref: str) -> LaneArtifact:
         output_digest="22" * 32,
         artifact_ref=ref,
         payload={
+            "candidate_ref": ref,
+            "candidate_sha": sha,
+            "files": {_SUITE: "00" * 20},
             "input_digest": "11" * 32,
             "public_contract": {
                 "acceptance_criteria": ["the suite is written"],
@@ -300,6 +266,8 @@ def _review_ctx(draft: LaneArtifact) -> LaneContext:
         input_digest="33" * 32,
         stage=LaneStage.REVIEWING_TESTS,
         artifacts={"TEST_DRAFT": draft},
+        candidate_ref=str(draft.payload["candidate_ref"]),
+        candidate_sha=str(draft.payload["candidate_sha"]),
         public_contract=dict(draft.payload["public_contract"]),
     )
 
@@ -319,28 +287,24 @@ def _code_ctx(candidate: str) -> LaneContext:
             "acceptance_criteria": ["the suite is written"],
             "declared_outputs": [_SUITE],
         },
-        sealed_digest="55" * 32,
+        test_suite_digest="test-suite.v1:" + "55" * 32,
     )
 
 
-class APrivateTreeIsMaterializedFromTheDispatchedDraft(unittest.TestCase):
+class ATestReviewerCheckoutIsTheDispatchedDraftCandidate(unittest.TestCase):
     def test_a_second_round_after_a_resume_reads_the_second_draft(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bench = _Bench(tmp)
-            vault = hv.ensure_vault(bench.state, "run-1")
-            base = _commit_suite(vault, parent=None, body=None)
-            first = _commit_suite(vault, parent=base, body=_ROUND_ONE)
-            second = _commit_suite(vault, parent=base, body=_ROUND_TWO)
-            hv.pin_object_ref(vault, "refs/maestro/drafts/run-1/lane-a/one", first)
-            hv.pin_object_ref(vault, "refs/maestro/drafts/run-1/lane-a/two", second)
+            first = _commit_suite(bench.product, parent=bench.head, body=_ROUND_ONE)
+            second = _commit_suite(bench.product, parent=bench.head, body=_ROUND_TWO)
+            one = "refs/maestro/candidates/run-1/lane-a/one"
+            two = "refs/maestro/candidates/run-1/lane-a/two"
+            _git(bench.product, "update-ref", one, first)
+            _git(bench.product, "update-ref", two, second)
 
-            bench.actor.review_tests(
-                _review_ctx(_draft("refs/maestro/drafts/run-1/lane-a/one"))
-            )
+            bench.actor.review_tests(_review_ctx(_draft(first, one)))
             bench.restart()
-            bench.actor.review_tests(
-                _review_ctx(_draft("refs/maestro/drafts/run-1/lane-a/two"))
-            )
+            bench.actor.review_tests(_review_ctx(_draft(second, two)))
 
             # The bug: this used to read [_ROUND_ONE, _ROUND_ONE]. The second
             # dispatch reached the reviewer with the first draft still on disk.
@@ -349,20 +313,16 @@ class APrivateTreeIsMaterializedFromTheDispatchedDraft(unittest.TestCase):
     def test_the_tree_on_disk_holds_the_last_dispatched_draft(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bench = _Bench(tmp)
-            vault = hv.ensure_vault(bench.state, "run-1")
-            base = _commit_suite(vault, parent=None, body=None)
-            first = _commit_suite(vault, parent=base, body=_ROUND_ONE)
-            second = _commit_suite(vault, parent=base, body=_ROUND_TWO)
-            hv.pin_object_ref(vault, "refs/maestro/drafts/run-1/lane-a/one", first)
-            hv.pin_object_ref(vault, "refs/maestro/drafts/run-1/lane-a/two", second)
+            first = _commit_suite(bench.product, parent=bench.head, body=_ROUND_ONE)
+            second = _commit_suite(bench.product, parent=bench.head, body=_ROUND_TWO)
+            one = "refs/maestro/candidates/run-1/lane-a/one"
+            two = "refs/maestro/candidates/run-1/lane-a/two"
+            _git(bench.product, "update-ref", one, first)
+            _git(bench.product, "update-ref", two, second)
 
-            bench.actor.review_tests(
-                _review_ctx(_draft("refs/maestro/drafts/run-1/lane-a/one"))
-            )
+            bench.actor.review_tests(_review_ctx(_draft(first, one)))
             bench.restart()
-            bench.actor.review_tests(
-                _review_ctx(_draft("refs/maestro/drafts/run-1/lane-a/two"))
-            )
+            bench.actor.review_tests(_review_ctx(_draft(second, two)))
 
             tree = (
                 bench.state

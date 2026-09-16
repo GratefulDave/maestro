@@ -12,9 +12,9 @@ respect to the lane being graded.
     hashed against the accepted blob ids before the runner is invoked, and a
     mismatch refuses as an environment fault rather than a candidate defect.
 
-Today the accepted suite is overlaid into the review tree from the vault, so the
-third check reads what that copy just wrote. It is written to mean the same
-thing when the suite is carried in the tree itself and the overlay is gone.
+The accepted suite is carried in the candidate's own tree -- the tests lane
+merged it, or the untyped lane built on it -- so the third check reads the bytes
+the candidate's history put there. There is no overlay.
 """
 
 from __future__ import annotations
@@ -34,8 +34,7 @@ sys.path.insert(0, str(ADWS))
 
 from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import git_publication as gp  # noqa: E402
-from adw_modules import hidden_vault as hv  # noqa: E402
-from adw_modules import private_review as pr  # noqa: E402
+from adw_modules import review_contract as rc  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import test_binding as tb  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
@@ -75,7 +74,7 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-#: What `tests_chain.run_private_suite` returns for a suite that ran and passed.
+#: What `tests_chain.run_suite` returns for a suite that ran and passed.
 _GREEN_RUN = {
     "counts": {"passed": 1, "failed": 0, "errored": 0, "skipped": 0},
     "executed": 1,
@@ -104,9 +103,8 @@ def _entry(**overrides) -> gp.TreeDeltaEntry:
 class SuiteDigestIsAPropertyOfTheFiles(unittest.TestCase):
     """The digest binds path-to-blob pairs and nothing about a commit.
 
-    `tests_chain._manifest_digest` includes the draft commit, so it cannot be
-    recomputed from a checkout. This one can, which is what lets the same value
-    be asserted against an overlay today and against a tree tomorrow.
+    It can be recomputed from any checkout, which is what lets the same value
+    be asserted against the review tree, the base tree and the integration gate.
     """
 
     def test_the_digest_is_order_independent(self):
@@ -199,11 +197,11 @@ class VerifySuiteHashesTheTree(unittest.TestCase):
         self.assertNotIn(SECRET_LITERAL, str(caught.exception))
 
     def test_the_refusal_is_an_environment_fault_not_a_candidate_defect(self):
-        """`SEALED_SUITE_*` surfacing, so it never reaches the builder as REVISE."""
+        """`SUITE_*` surfacing, so it never reaches the builder as REVISE."""
         error = tb.TestSuiteTampered(self.path, self.blob, "ABSENT")
 
-        self.assertIsInstance(error, pr.SealedEnvironmentError)
-        self.assertIsNotNone(cr.sealed_environment_detail(error))
+        self.assertIsInstance(error, rc.SuiteEnvironmentError)
+        self.assertIsNotNone(cr.suite_environment_detail(error))
 
 
 class ProtectedPathsAreNotOwnable(unittest.TestCase):
@@ -360,16 +358,13 @@ class ProtectedPathsAreNotOwnable(unittest.TestCase):
 
         self.assertEqual((TEST_PATH,), recorded["protected"])
 
-    def test_the_scheduler_passes_a_typed_build_lanes_own_sealed_paths(self):
+    def test_the_scheduler_passes_every_lanes_own_test_paths(self):
         """The protected set is the plan's, never a path-glob over names.
 
-        And it is a TYPED build lane's set. An untyped lane's sealed files are
-        its own hidden meta-tests at paths the tester chose, where a candidate
-        collision is answered by `PRIVATE_PATH_COLLISION`, a durable
-        `TEST_INVALIDATION` and a reset to `WRITING_TESTS`
-        (`tests/test_private_path_invalidation.py`). Refusing those at
-        admission replaces a recovery with a dead run, which is what the first
-        version of this wiring did.
+        Every lane kind. An untyped lane's tests are in its builder's base too
+        (`_untyped_builder_base`), so a candidate landing on one is the same
+        violation a typed lane's is, not the collision the retired
+        `TEST_INVALIDATION` reset used to answer.
         """
         source = (ADWS / "adw_modules" / "scheduler.py").read_text()
         tree = ast.parse(source)
@@ -385,8 +380,8 @@ class ProtectedPathsAreNotOwnable(unittest.TestCase):
             keywords = {kw.arg: kw for kw in call.keywords}
             self.assertIn("protected_paths", keywords)
             expression = ast.unparse(keywords["protected_paths"].value)
-            self.assertIn("ctx.sealed_private_paths", expression)
-            self.assertIn("LANE_KIND_BUILD", expression)
+            self.assertIn("ctx.protected_test_paths", expression)
+            self.assertNotIn("LANE_KIND_BUILD", expression)
 
 
 class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
@@ -414,8 +409,8 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _request(self, input_digest: str) -> pr.VaultLaneRequest:
-        return pr.VaultLaneRequest(
+    def _request(self, input_digest: str) -> rc.LaneRequest:
+        return rc.LaneRequest(
             run_id=self.run_id,
             lane_id=self.lane_id,
             plan_revision=1,
@@ -424,48 +419,50 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
             input_digest=input_digest,
         )
 
+    def _binding(self) -> gp.TargetBinding:
+        return gp.bind_target_worktree(self.repo, INTEGRATION_REF)
+
     def _seal(self) -> st.LaneArtifact:
+        """The accepted suite: a draft admitted on the base and accepted as-is."""
         draft = tc.write_test_draft(
             request=self._request(_digest("draft")),
-            state_root=self.state,
-            run_repo=self.repo,
-            integration_ref=INTEGRATION_REF,
+            binding=self._binding(),
+            integration_head=self.base,
             files={TEST_PATH: TEST_SOURCE},
             public_contract=CONTRACT,
-            worktrees_root=self.worktrees / "draft",
-        )
-        tokens = tc.draft_private_tokens(
-            state_root=self.state, run_id=self.run_id, draft=draft
+            declared_outputs=[TEST_PATH],
         )
         review = tc.review_test_draft(
             request=self._request(_digest("test-review")),
             verdict=st.ReviewerVerdict.PASS,
             findings=(),
             test_draft=draft,
-            private_tokens=tokens,
         )
-        builder = hv.linked_worktree(self.repo, self.root / "builder", self.base)
-        return tc.seal_accepted_tests(
-            request=self._request(_digest("seal")),
-            state_root=self.state,
-            run_repo=self.repo,
-            builder_worktree=builder,
+        return tc.accept_tests(
+            request=self._request(_digest("accept")),
             test_draft=draft,
             test_review=review,
         )
 
     def _candidate(self) -> tuple[str, str]:
-        (self.repo / "refund.py").write_text(
-            "def refund(amount):\n"
-            "    if amount < 0:\n"
-            "        return None\n"
-            "    return amount\n"
+        """A candidate built on the accepted suite, as a build lane's is."""
+        suite_sha = str(self.sealed.payload["candidate_sha"])
+        sha = gp.commit_files_on_base(
+            self._binding(),
+            base_sha=suite_sha,
+            files={
+                "refund.py": (
+                    "def refund(amount):\n"
+                    "    if amount < 0:\n"
+                    "        return None\n"
+                    "    return amount\n"
+                ).encode("utf-8")
+            },
+            message=b"candidate\n",
         )
-        _git(self.repo, "add", "refund.py")
-        _git(self.repo, "commit", "-qm", "candidate")
-        sha = _git(self.repo, "rev-parse", "HEAD")
         ref = st.candidate_ref(self.run_id, self.lane_id, _digest("build-" + sha))
         _git(self.repo, "update-ref", ref, sha)
+        self.base = suite_sha
         return sha, ref
 
     def _review(self, digest_label: str):
@@ -476,7 +473,7 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
             candidate_sha=self.candidate_sha,
             candidate_ref=self.candidate_ref,
             builder_base_sha=self.base,
-            sealed_bundle=self.sealed,
+            accepted_suite=self.sealed,
             verdict=st.ReviewerVerdict.PASS,
             scratch_root=self.state / ("scratch-" + digest_label),
             architecture_constraints=CONSTRAINTS,
@@ -489,59 +486,55 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
         # which is exactly the environment fault the suite already carries a
         # dozen of. The tampering case below stubs it for a different and
         # stronger reason: to prove it is never reached.
-        with mock.patch.object(cr.tc, "run_private_suite", return_value=_GREEN_RUN):
+        with mock.patch.object(cr.tc, "run_suite", return_value=_GREEN_RUN):
             artifact = self._review("clean")
-        vault = hv.ensure_vault(self.state, self.run_id)
-        files = tc.sealed_private_files(vault, self.sealed)
+        files = tc.suite_files(self.sealed)
 
         self.assertEqual(
             tb.suite_digest(files), artifact.payload["test_suite_digest"]
         )
-        self.assertIn("sealed_digest", artifact.payload)
-        self.assertNotIn(SECRET_LITERAL, json.dumps(artifact.payload))
+        self.assertNotIn("sealed_digest", artifact.payload)
+        self.assertEqual(
+            artifact.payload["test_suite_digest"],
+            self.sealed.payload["test_suite_digest"],
+        )
 
-    def _tampering_copy(self):
-        """A `copy_blobs_to_tree` that writes the accepted suite, then edits it.
+    def _tampering_tree(self):
+        """A `_review_tree` that materializes the tree, then edits the suite in it.
 
-        Stands in for the world PR B creates, where the bytes under a test path
-        are whatever the tree carries rather than what the vault just wrote.
+        The bytes under a test path are whatever the tree carries; this makes
+        them not the accepted ones after materialization and before the check.
         """
-        real_copy = hv.copy_blobs_to_tree
+        real_tree = cr._review_tree
 
-        def _tamper(vault, dest, files):
-            real_copy(vault, dest, files)
-            for path in files:
-                target = Path(dest) / path
-                target.write_text(
-                    target.read_text().replace("is None", "is not None")
-                )
+        def _tamper(repo, sha, dest, *args, **kwargs):
+            tree = real_tree(repo, sha, dest, *args, **kwargs)
+            target = Path(tree) / TEST_PATH
+            target.write_text(target.read_text().replace("is None", "is not None"))
+            return tree
 
         return _tamper
 
     def test_a_tampered_base_tree_refuses_rather_than_absolving_the_builder(self):
         """`_collect_at_base` must not swallow this into "not the candidate's".
 
-        Its broad `except (PrivateReviewError, VaultError, OSError): return
-        False` is a deliberate absolution: a base that cannot run the suite
+        Its broad `except (ReviewContractError, MaterializeError, OSError):
+        return False` is a deliberate absolution: a base that cannot run the suite
         proves the fault predates the candidate. `TestSuiteTampered` is a
-        `PrivateReviewError` by inheritance and would be absorbed by that same
+        `ReviewContractError` by inheritance and would be absorbed by that same
         clause -- turning an operator fault into the quieter and wrong claim
         that the builder is blameless, and then measuring the candidate against
         a suite nobody accepted.
         """
-        vault = hv.ensure_vault(self.state, self.run_id)
-        files = tc.sealed_private_files(vault, self.sealed)
-        runner = mock.Mock(name="run_private_suite")
+        files = tc.suite_files(self.sealed)
+        runner = mock.Mock(name="run_suite")
 
-        with mock.patch.object(
-            cr.hv, "copy_blobs_to_tree", side_effect=self._tampering_copy()
-        ):
-            with mock.patch.object(cr.tc, "run_private_suite", runner):
+        with mock.patch.object(cr, "_review_tree", side_effect=self._tampering_tree()):
+            with mock.patch.object(cr.tc, "run_suite", runner):
                 with self.assertRaises(tb.TestSuiteTampered) as caught:
                     cr._collect_at_base(
                         candidate_repo=self.repo,
                         builder_base_sha=self.base,
-                        vault=vault,
                         files=files,
                         scratch_root=self.state / "scratch-base-tampered",
                         lane_id=self.lane_id,
@@ -556,32 +549,29 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
         self.assertEqual(TEST_PATH, caught.exception.path)
 
     def test_a_tampered_suite_refuses_before_the_runner_is_invoked(self):
-        runner = mock.Mock(name="run_private_suite")
-        with mock.patch.object(
-            cr.hv, "copy_blobs_to_tree", side_effect=self._tampering_copy()
-        ):
-            with mock.patch.object(cr.tc, "run_private_suite", runner):
+        runner = mock.Mock(name="run_suite")
+        with mock.patch.object(cr, "_review_tree", side_effect=self._tampering_tree()):
+            with mock.patch.object(cr.tc, "run_suite", runner):
                 with self.assertRaises(tb.TestSuiteTampered) as caught:
                     self._review("tampered")
 
         runner.assert_not_called()
         self.assertEqual(TEST_PATH, caught.exception.path)
         self.assertNotIn(SECRET_LITERAL, str(caught.exception))
-        self.assertIsNotNone(cr.sealed_environment_detail(caught.exception))
+        self.assertIsNotNone(cr.suite_environment_detail(caught.exception))
 
 
 class TheIntegrationGateRunsTheAcceptedSuite(TheReviewRunsTheAcceptedSuite):
-    """The run-level gate overlays the same suite and is verified the same way.
+    """The run-level gate reads the same suite off the head and verifies it the same way.
 
-    `run_integration_gate` is the site that matters most once the suite lives in
-    the integration head's own history rather than behind an overlay: its
-    `failed` flag is read by `FactoryScheduler._failed_run_gates`, which stands
-    between a merged surface and both the final review and publication. An
-    unverified gate there is a publication decision made about bytes nobody
-    accepted.
+    `run_integration_gate` is the site that matters most now that the suite
+    lives in the integration head's own history: its `failed` flag is read by
+    `FactoryScheduler._failed_run_gates`, which stands between a merged surface
+    and both the final review and publication. An unverified gate there is a
+    publication decision made about bytes nobody accepted.
 
     Inherits the fixture, not the assertions -- the two review sites are set up
-    from the same sealed bundle and the same repository.
+    from the same accepted suite and the same repository.
     """
 
     def _gate(self, digest_label: str):
@@ -592,25 +582,22 @@ class TheIntegrationGateRunsTheAcceptedSuite(TheReviewRunsTheAcceptedSuite):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=self.candidate_sha,
-            sealed_bundle=self.sealed,
+            accepted_suite=self.sealed,
             scratch_root=self.state / ("gate-" + digest_label),
         )
 
     def test_the_gate_reports_the_suite_digest_it_ran(self):
-        with mock.patch.object(cr.tc, "run_private_suite", return_value=_GREEN_RUN):
+        with mock.patch.object(cr.tc, "run_suite", return_value=_GREEN_RUN):
             result = self._gate("gate-clean")
-        vault = hv.ensure_vault(self.state, self.run_id)
-        files = tc.sealed_private_files(vault, self.sealed)
+        files = tc.suite_files(self.sealed)
 
         self.assertEqual(tb.suite_digest(files), result["test_suite_digest"])
         self.assertFalse(result["failed"])
 
-    def test_a_tampered_gate_overlay_refuses_before_the_runner(self):
-        runner = mock.Mock(name="run_private_suite")
-        with mock.patch.object(
-            cr.hv, "copy_blobs_to_tree", side_effect=self._tampering_copy()
-        ):
-            with mock.patch.object(cr.tc, "run_private_suite", runner):
+    def test_a_tampered_gate_tree_refuses_before_the_runner(self):
+        runner = mock.Mock(name="run_suite")
+        with mock.patch.object(cr, "_review_tree", side_effect=self._tampering_tree()):
+            with mock.patch.object(cr.tc, "run_suite", runner):
                 with self.assertRaises(tb.TestSuiteTampered) as caught:
                     self._gate("gate-tampered")
 

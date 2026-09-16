@@ -15,7 +15,7 @@ stall:
 # stopping for a human. Opt-in: 0 (and absent) refuses the verb with
 # ATTEND_DISABLED, so an upgraded deployment keeps parking for its operator
 # until someone sets this key in *this* file. The operator agent it dispatches
-# reads the sealed suite; builders and reviewers still do not.
+# reads the accepted suite, as builders and reviewers do in their own checkouts.
 attend:
   max_amendments_per_lane: 0
   max_amendments_per_run: 10

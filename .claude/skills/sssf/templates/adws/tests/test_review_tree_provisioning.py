@@ -1,12 +1,12 @@
-"""The review tree is provisioned before its sealed suite runs.
+"""The review tree is provisioned before its accepted suite runs.
 
 `_review_tree` used to be a bare source snapshot: it materialized a commit and
-handed the tree straight to `run_private_suite`, with none of the candidate's
+handed the tree straight to `run_suite`, with none of the candidate's
 declared dependencies installed. A project whose conftest imports `bcrypt`
 therefore collected zero cases, `runner_failed` read `executed < min_cases`,
-and a reviewer's PASS was overridden to REVISE with "sealed private tests
-failed, errored, or did not execute" -- blaming the builder for a suite that
-never ran.
+and a reviewer's PASS was overridden to REVISE with "accepted tests failed,
+errored, or did not execute" -- blaming the builder for a suite that never
+ran.
 
 These cases pin the fix from the outside: the deployment's `provision_argv`
 runs inside the review tree, after materialization and before the suite, on
@@ -35,9 +35,9 @@ sys.path.insert(0, str(ADWS))
 
 import maestro  # noqa: E402
 from adw_modules import code_review as cr  # noqa: E402
-from adw_modules import hidden_vault as hv  # noqa: E402
+from adw_modules import git_publication as gitpub  # noqa: E402
 from adw_modules import launcher as lch  # noqa: E402
-from adw_modules import private_review as pr  # noqa: E402
+from adw_modules import review_contract as rc  # noqa: E402
 from adw_modules import provisioning  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
@@ -70,7 +70,7 @@ _STAMP = pathlib.Path(__file__).resolve().parents[1] / "{stamp}"
 def {selector}():
     stamp = json.loads(_STAMP.read_text())
     assert stamp["materialized"] is True
-    assert stamp["sealed_present"] is False
+    assert stamp["suite_present"] is True
     assert refund(-1) is None, "{literal}"
 """.format(
     stamp=STAMP,
@@ -132,8 +132,8 @@ def _repo(root: Path) -> Path:
     return repo
 
 
-def _request(*, run_id: str, lane_id: str, input_digest: str) -> pr.VaultLaneRequest:
-    return pr.VaultLaneRequest(
+def _request(*, run_id: str, lane_id: str, input_digest: str) -> rc.LaneRequest:
+    return rc.LaneRequest(
         run_id=run_id,
         lane_id=lane_id,
         plan_revision=1,
@@ -170,21 +170,20 @@ class ReviewTreeProvisioning(unittest.TestCase):
     # -- fixtures ---------------------------------------------------------
 
     def _seal(self, source: str, tag: str) -> st.LaneArtifact:
+        """Accept a suite and merge it: the head then carries it, as a build lane's base does."""
+        binding = gitpub.bind_target_worktree(self.repo, INTEGRATION_REF)
+        head = _git(self.repo, "rev-parse", "HEAD")
         draft = tc.write_test_draft(
             request=_request(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
                 input_digest=_digest("draft-" + tag),
             ),
-            state_root=self.state,
-            run_repo=self.repo,
-            integration_ref=INTEGRATION_REF,
+            binding=binding,
+            integration_head=head,
             files={TEST_PATH: source},
             public_contract=CONTRACT,
-            worktrees_root=self.worktrees / tag,
-        )
-        tokens = tc.draft_private_tokens(
-            state_root=self.state, run_id=self.run_id, draft=draft
+            declared_outputs=[TEST_PATH],
         )
         review = tc.review_test_draft(
             request=_request(
@@ -195,22 +194,21 @@ class ReviewTreeProvisioning(unittest.TestCase):
             verdict=st.ReviewerVerdict.PASS,
             findings=(),
             test_draft=draft,
-            private_tokens=tokens,
         )
-        head = _git(self.repo, "rev-parse", "HEAD")
-        builder = hv.linked_worktree(self.repo, self.root / ("builder-" + tag), head)
-        return tc.seal_accepted_tests(
+        accepted = tc.accept_tests(
             request=_request(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
-                input_digest=_digest("seal-" + tag),
+                input_digest=_digest("accept-" + tag),
             ),
-            state_root=self.state,
-            run_repo=self.repo,
-            builder_worktree=builder,
             test_draft=draft,
             test_review=review,
         )
+        # What the tests lane's merge does to the integration ref: the head
+        # now carries the suite, and every candidate below descends from it.
+        _git(self.repo, "update-ref", INTEGRATION_REF, str(accepted.payload["candidate_sha"]))
+        _git(self.repo, "reset", "-q", "--hard", "HEAD")
+        return accepted
 
     def _head(self) -> tuple[str, str]:
         sha = _git(self.repo, "rev-parse", "HEAD")
@@ -223,8 +221,9 @@ class ReviewTreeProvisioning(unittest.TestCase):
 
         It stands in for `bun install` / `uv sync`: it runs in the review tree,
         writes into it, and reports what it could see. `materialized` proves the
-        commit was extracted first; `sealed_present` proves the sealed blobs had
-        not been copied in yet, which is the containment ordering.
+        commit was extracted first; `suite_present` proves the accepted suite
+        was already in the tree -- it is in the commit's history, not overlaid
+        after provisioning.
         """
         script = self.root / ("provision-" + tag + ".py")
         script.write_text(
@@ -232,7 +231,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             "cwd = pathlib.Path.cwd()\n"
             "stamp = {\n"
             '    "materialized": (cwd / "refund.py").is_file(),\n'
-            '    "sealed_present": (cwd / "%s").exists(),\n'
+            '    "suite_present": (cwd / "%s").exists(),\n'
             '    "cwd": str(cwd),\n'
             "}\n"
             'if %d != 0:\n'
@@ -262,14 +261,14 @@ class ReviewTreeProvisioning(unittest.TestCase):
             candidate_sha=sha,
             candidate_ref=ref,
             builder_base_sha=base,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             verdict=st.ReviewerVerdict.PASS,
             scratch_root=scratch,
             architecture_constraints=CONSTRAINTS,
             provision_argv=self._provision_script("cr"),
         )
 
-        # The sealed case asserts the stamp exists, so a PASS with a real
+        # The accepted case asserts the stamp exists, so a PASS with a real
         # executed case is only reachable if provisioning ran before the suite.
         self.assertIs(artifact.verdict, st.ReviewerVerdict.PASS)
         summary = artifact.payload["public_result_summary"]
@@ -281,7 +280,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         self.assertEqual(len(stamps), 1, stamps)
         stamp = json.loads(stamps[0].read_text())
         self.assertTrue(stamp["materialized"], "provisioning ran before materialize")
-        self.assertFalse(stamp["sealed_present"], "sealed blobs copied before provision")
+        self.assertTrue(stamp["suite_present"], "the suite is in the materialized tree")
 
     def test_integration_gate_provisions_after_materialize_before_suite(self):
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "gate")
@@ -295,7 +294,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=self._provision_script("gate"),
         )
@@ -307,7 +306,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         self.assertEqual(len(stamps), 1, stamps)
         stamp = json.loads(stamps[0].read_text())
         self.assertTrue(stamp["materialized"])
-        self.assertFalse(stamp["sealed_present"])
+        self.assertTrue(stamp["suite_present"])
 
     # -- B2/B5: absent provision_argv changes nothing ---------------------
 
@@ -328,7 +327,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 candidate_sha=sha,
                 candidate_ref=ref,
                 builder_base_sha=base,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 verdict=st.ReviewerVerdict.PASS,
                 scratch_root=self.state / "scratch-empty",
                 architecture_constraints=CONSTRAINTS,
@@ -350,7 +349,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-blank",
                 provision_argv=("", ""),
             )
@@ -365,7 +364,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         base = _git(self.repo, "rev-parse", "HEAD")
         sha, ref = self._head()
 
-        with mock.patch.object(tc, "run_private_suite") as runner:
+        with mock.patch.object(tc, "run_suite") as runner:
             with self.assertRaises(cr.ReviewProvisioningError) as ctx:
                 cr.review_builder_output(
                     request=_request(
@@ -378,7 +377,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     candidate_sha=sha,
                     candidate_ref=ref,
                     builder_base_sha=base,
-                    sealed_bundle=sealed,
+                    accepted_suite=sealed,
                     verdict=st.ReviewerVerdict.PASS,
                     scratch_root=self.state / "scratch-fail",
                     architecture_constraints=CONSTRAINTS,
@@ -392,13 +391,13 @@ class ReviewTreeProvisioning(unittest.TestCase):
         self.assertIn("REVIEW_TREE_PROVISION_FAILED", str(exc))
         # The distinguishing property: this is not the runner-failure finding.
         self.assertNotIn(cr._RUNNER_REVISE["observed_behavior"], str(exc))
-        self.assertNotIn("sealed private tests", str(exc))
+        self.assertNotIn("accepted tests failed", str(exc))
 
     def test_provisioning_failure_refuses_the_integration_gate(self):
         sealed = self._seal(PLAIN_TEST_SOURCE, "gatefail")
         head = _git(self.repo, "rev-parse", "HEAD")
 
-        with mock.patch.object(tc, "run_private_suite") as runner:
+        with mock.patch.object(tc, "run_suite") as runner:
             with self.assertRaises(cr.ReviewProvisioningError):
                 cr.run_integration_gate(
                     run_id=self.run_id,
@@ -407,7 +406,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     state_root=self.state,
                     integration_repo=self.repo,
                     integration_sha=head,
-                    sealed_bundle=sealed,
+                    accepted_suite=sealed,
                     scratch_root=self.state / "scratch-gatefail",
                     provision_argv=self._provision_script("gatefail", exit_code=3),
                 )
@@ -425,20 +424,19 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-absent",
                 provision_argv=("maestro-no-such-provisioner",),
             )
 
         self.assertIsNone(ctx.exception.returncode)
-        self.assertIsInstance(ctx.exception, pr.PrivateReviewError)
+        self.assertIsInstance(ctx.exception, rc.ReviewContractError)
 
-    # -- hard constraint: the sealed boundary survives --------------------
+    # -- hard constraint: the provisioner's words are the provisioner's --------
 
-    def test_provisioning_refusal_carries_no_private_test_content(self):
+    def test_provisioning_refusal_carries_the_provisioners_words_only(self):
         sealed = self._seal(PLAIN_TEST_SOURCE, "leak")
         head = _git(self.repo, "rev-parse", "HEAD")
-        vault = hv.vault_path(self.state, self.run_id)
 
         with self.assertRaises(cr.ReviewProvisioningError) as ctx:
             cr.run_integration_gate(
@@ -448,25 +446,22 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-leak",
                 provision_argv=self._provision_script("leak", exit_code=3),
             )
 
         text = str(ctx.exception)
+        self.assertIn("provisioner refused", text)
         self.assertNotIn(SECRET_LITERAL, text)
         self.assertNotIn(SECRET_SELECTOR, text)
-        self.assertNotIn(str(vault), text)
-        self.assertNotIn(sealed.artifact_ref, text)
 
     def test_provisioning_writes_only_into_the_review_tree(self):
         sealed = self._seal(PROVISIONED_TEST_SOURCE, "isolate")
         head = _git(self.repo, "rev-parse", "HEAD")
-        vault = hv.vault_path(self.state, self.run_id)
         scratch = self.state / "scratch-isolate"
 
         repo_before = _tree_bytes(self.repo)
-        vault_before = _tree_bytes(vault)
 
         result = cr.run_integration_gate(
             run_id=self.run_id,
@@ -475,7 +470,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=self._provision_script("isolate"),
         )
@@ -485,7 +480,6 @@ class ReviewTreeProvisioning(unittest.TestCase):
         stamps = list(scratch.glob("*/" + STAMP))
         self.assertEqual(len(stamps), 1, stamps)
         self.assertEqual(_tree_bytes(self.repo), repo_before)
-        self.assertEqual(_tree_bytes(vault), vault_before)
         self.assertEqual(
             json.loads(stamps[0].read_text())["cwd"],
             str(stamps[0].parent.resolve()),
@@ -521,7 +515,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             "cwd = pathlib.Path.cwd()\n"
             "stamp = {\n"
             '    "materialized": (cwd / "refund.py").is_file(),\n'
-            '    "sealed_present": (cwd / "%s").exists(),\n'
+            '    "suite_present": (cwd / "%s").exists(),\n'
             '    "cwd": str(cwd),\n'
             "}\n"
             'pathlib.Path("%s").write_text(json.dumps(stamp))\n' % (TEST_PATH, STAMP)
@@ -544,7 +538,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=("bash", "-lc", script),
         )
@@ -568,7 +562,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-shellfail",
                 provision_argv=("bash", "-lc", "true && exit 7"),
             )
@@ -592,7 +586,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
         recorded: list[object] = []
 
         with mock.patch.object(
-            pr, "make_lane_artifact", side_effect=lambda **kw: recorded.append(kw)
+            rc, "make_lane_artifact", side_effect=lambda **kw: recorded.append(kw)
         ):
             with self.assertRaises(cr.ReviewProvisioningError) as ctx:
                 cr.review_builder_output(
@@ -606,7 +600,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     candidate_sha=sha,
                     candidate_ref=ref,
                     builder_base_sha=base,
-                    sealed_bundle=sealed,
+                    accepted_suite=sealed,
                     verdict=st.ReviewerVerdict.PASS,
                     scratch_root=self.state / "scratch-envfail",
                     architecture_constraints=CONSTRAINTS,
@@ -624,7 +618,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
     def test_an_unusable_interpreter_is_not_demoted_to_a_candidate_defect(self):
         """The peer's `requires-python` refusal shares this boundary.
 
-        `run_private_suite` raises `SEALED_SUITE_RUNNER_UNUSABLE` when no
+        `run_suite` raises `SUITE_RUNNER_UNUSABLE` when no
         interpreter satisfies the project. That refusal has to propagate:
         converting it into `runner_failed` would blame the builder for the
         harness's Python version.
@@ -633,9 +627,9 @@ class ReviewTreeProvisioning(unittest.TestCase):
         base = _git(self.repo, "rev-parse", "HEAD")
         sha, ref = self._head()
 
-        unusable = pr.SealedEnvironmentError("SEALED_SUITE_RUNNER_UNUSABLE:pytest")
-        with mock.patch.object(tc, "run_private_suite", side_effect=unusable):
-            with self.assertRaises(pr.SealedEnvironmentError) as ctx:
+        unusable = rc.SuiteEnvironmentError("SUITE_RUNNER_UNUSABLE:pytest")
+        with mock.patch.object(tc, "run_suite", side_effect=unusable):
+            with self.assertRaises(rc.SuiteEnvironmentError) as ctx:
                 cr.review_builder_output(
                     request=_request(
                         run_id=self.run_id,
@@ -647,19 +641,19 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     candidate_sha=sha,
                     candidate_ref=ref,
                     builder_base_sha=base,
-                    sealed_bundle=sealed,
+                    accepted_suite=sealed,
                     verdict=st.ReviewerVerdict.PASS,
                     scratch_root=self.state / "scratch-unusable",
                     architecture_constraints=CONSTRAINTS,
                 )
 
-        self.assertIn("SEALED_SUITE_RUNNER_UNUSABLE", str(ctx.exception))
+        self.assertIn("SUITE_RUNNER_UNUSABLE", str(ctx.exception))
         self.assertNotIn(cr._RUNNER_REVISE["observed_behavior"], str(ctx.exception))
 
     # -- collection failure vs test failure: different actors -------------
 
     def _uncollectable(self, tag: str, *, break_at_base: bool) -> st.LaneArtifact:
-        """A sealed suite whose import fails, optionally only at the candidate.
+        """An accepted suite whose import fails, optionally only at the candidate.
 
         `break_at_base` False means the module the suite imports is missing at
         the base commit too -- an undeclared dependency. True means the base
@@ -677,9 +671,9 @@ class ReviewTreeProvisioning(unittest.TestCase):
         recorded: list[object] = []
 
         with mock.patch.object(
-            pr, "make_lane_artifact", side_effect=lambda **kw: recorded.append(kw)
+            rc, "make_lane_artifact", side_effect=lambda **kw: recorded.append(kw)
         ):
-            with self.assertRaises(cr.SealedEnvironmentError) as ctx:
+            with self.assertRaises(cr.SuiteEnvironmentError) as ctx:
                 cr.review_builder_output(
                     request=_request(
                         run_id=self.run_id,
@@ -691,7 +685,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                     candidate_sha=sha,
                     candidate_ref=ref,
                     builder_base_sha=base,
-                    sealed_bundle=sealed,
+                    accepted_suite=sealed,
                     verdict=st.ReviewerVerdict.PASS,
                     scratch_root=self.state / "scratch-undeclared",
                     architecture_constraints=CONSTRAINTS,
@@ -702,14 +696,14 @@ class ReviewTreeProvisioning(unittest.TestCase):
         # Either shape is correct and both are non-blaming: the runner's own
         # refusal re-raised (its interpreter detail preserved), or the
         # counts-based refusal when a runner resolved but measured nothing.
-        self.assertIsNotNone(cr.sealed_environment_detail(ctx.exception))
+        self.assertIsNotNone(cr.suite_environment_detail(ctx.exception))
         self.assertNotIn(cr._RUNNER_REVISE["observed_behavior"], detail)
         self.assertNotIn(cr._COLLECTION_REVISE["observed_behavior"], detail)
 
     def test_the_typed_environment_boundary_covers_a_collection_refusal(self):
         self.assertIn(
-            "SEALED_SUITE_NOT_COLLECTED",
-            cr.sealed_environment_detail(cr.SealedSuiteNotCollectedError(4, "x")) or "",
+            "SUITE_NOT_COLLECTED",
+            cr.suite_environment_detail(cr.SuiteNotCollectedError(4, "x")) or "",
         )
 
     def test_a_candidate_that_breaks_collection_still_gets_a_revise(self):
@@ -737,7 +731,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             candidate_sha=sha,
             candidate_ref=ref,
             builder_base_sha=base,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             verdict=st.ReviewerVerdict.PASS,
             scratch_root=self.state / "scratch-broke",
             architecture_constraints=CONSTRAINTS,
@@ -773,7 +767,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             candidate_sha=sha,
             candidate_ref=ref,
             builder_base_sha=base,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             verdict=st.ReviewerVerdict.PASS,
             scratch_root=self.state / "scratch-genuine",
             architecture_constraints=CONSTRAINTS,
@@ -821,7 +815,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-timeout",
                 provision_argv=("bun", "install"),
                 provision_timeout_s=5400.0,
@@ -842,7 +836,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
                 state_root=self.state,
                 integration_repo=self.repo,
                 integration_sha=head,
-                sealed_bundle=sealed,
+                accepted_suite=sealed,
                 scratch_root=self.state / "scratch-deftimeout",
                 provision_argv=("bun", "install"),
             )
@@ -873,7 +867,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=argv,
         )
@@ -890,7 +884,7 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=argv,
         )
@@ -914,54 +908,27 @@ class ReviewTreeProvisioning(unittest.TestCase):
             state_root=self.state,
             integration_repo=self.repo,
             integration_sha=head,
-            sealed_bundle=sealed,
+            accepted_suite=sealed,
             scratch_root=scratch,
             provision_argv=(),
         )
 
         self.assertTrue(result["failed"])
 
-    # -- collision detection stays unprovisioned --------------------------
-
-    def test_collision_detection_does_not_provision(self):
-        sealed = self._seal(PLAIN_TEST_SOURCE, "collide")
-        sha, _ref = self._head()
-
-        with mock.patch.object(provisioning, "run_harness_process") as harness:
-            cr.detect_candidate_private_collisions(
-                request=_request(
-                    run_id=self.run_id,
-                    lane_id=self.lane_id,
-                    input_digest=_digest("collide"),
-                ),
-                state_root=self.state,
-                candidate_repo=self.repo,
-                candidate_sha=sha,
-                sealed_bundle=sealed,
-                scratch_root=self.state / "scratch-collide",
-            )
-            harness.assert_not_called()
-
 
 class OperatorErrorBoundary(unittest.TestCase):
     """An environment fault leaves `main()` as typed JSON, not a traceback.
 
-    Nothing between the review call and `main()` catches `PrivateReviewError`:
-    the only `except` around `cr.review_builder_output` is
-    `PrivatePathCollisionError`, and `scheduler.run()` catches only
-    `KeyboardInterrupt`. So the operator boundary is the one place this can be
-    typed, and these cases pin that it is.
+    Nothing between the review call and `main()` catches `ReviewContractError`,
+    and `scheduler.run()` catches only `KeyboardInterrupt`. So the operator
+    boundary is the one place this can be typed, and these cases pin that it is.
     """
 
     def test_nothing_between_the_review_and_main_catches_it(self):
-        # `scheduler.py` wraps `cr.review_builder_output` in exactly one
-        # `except prv.PrivatePathCollisionError`. An environment fault must not
-        # be a member of that type, or it would be recorded as a test
-        # invalidation instead of reaching the operator.
+        source = (ADWS / "adw_modules" / "scheduler.py").read_text()
+        self.assertNotIn("except rc.ReviewContractError", source)
         exc = cr.ReviewProvisioningError(("bun", "install"), 1)
-        self.assertNotIsInstance(exc, pr.PrivatePathCollisionError)
-        self.assertNotIsInstance(exc, pr.IsolationError)
-        self.assertIsInstance(exc, cr.SealedEnvironmentError)
+        self.assertIsInstance(exc, cr.SuiteEnvironmentError)
 
     def _main_with(self, exc: BaseException) -> tuple[int, dict]:
         buffer = io.StringIO()
@@ -982,7 +949,7 @@ class OperatorErrorBoundary(unittest.TestCase):
         code, emitted = self._main_with(exc)
 
         self.assertEqual(code, 3)
-        self.assertEqual(emitted["outcome"], cr.SEALED_ENVIRONMENT_OUTCOME)
+        self.assertEqual(emitted["outcome"], cr.SUITE_ENVIRONMENT_OUTCOME)
         self.assertIn("REVIEW_TREE_PROVISION_FAILED", emitted["detail"])
         self.assertIn("bun install", emitted["detail"])
         self.assertIn("lockfile is stale", emitted["detail"])
@@ -993,15 +960,15 @@ class OperatorErrorBoundary(unittest.TestCase):
         # The message worker-runner raises: resolved invocation, measured
         # version, the specifier, and the declaring file all have to survive.
         message = (
-            "SEALED_SUITE_PYTHON_UNSUPPORTED:pytest:"
+            "SUITE_PYTHON_UNSUPPORTED:pytest:"
             "/usr/local/bin/python3.11 -m pytest:3.11.9:>=3.12:"
             "services/api-gateway/pyproject.toml"
         )
 
-        code, emitted = self._main_with(pr.SealedEnvironmentError(message))
+        code, emitted = self._main_with(rc.SuiteEnvironmentError(message))
 
         self.assertEqual(code, 3)
-        self.assertEqual(emitted["outcome"], cr.SEALED_ENVIRONMENT_OUTCOME)
+        self.assertEqual(emitted["outcome"], cr.SUITE_ENVIRONMENT_OUTCOME)
         for fragment in (
             "/usr/local/bin/python3.11 -m pytest",
             "3.11.9",
@@ -1018,63 +985,62 @@ class OperatorErrorBoundary(unittest.TestCase):
         fifth arriving anywhere in the runner chain would have fallen through to
         a traceback. Class membership has no such list to fall out of date.
         """
-        unknown = pr.SealedEnvironmentError("A_CODE_THIS_MODULE_NEVER_HEARD_OF:x")
-        self.assertIsNotNone(cr.sealed_environment_detail(unknown))
+        unknown = rc.SuiteEnvironmentError("A_CODE_THIS_MODULE_NEVER_HEARD_OF:x")
+        self.assertIsNotNone(cr.suite_environment_detail(unknown))
 
         exit_code, emitted = self._main_with(unknown)
         self.assertEqual(exit_code, 3)
-        self.assertEqual(emitted["outcome"], cr.SEALED_ENVIRONMENT_OUTCOME)
+        self.assertEqual(emitted["outcome"], cr.SUITE_ENVIRONMENT_OUTCOME)
 
     def test_every_environment_code_the_runner_chain_raises_is_typed(self):
         # Including the two that postdate the deleted prefix list.
         for code_name in (
             "REVIEW_TREE_PROVISION_FAILED",
-            "SEALED_SUITE_PYTHON_UNSUPPORTED",
-            "SEALED_SUITE_RUNNER_UNUSABLE",
-            "SEALED_SUITE_RUNNER_AMBIGUOUS",
-            "SEALED_SUITE_COUNTS_UNPARSEABLE",
-            "SEALED_SUITE_ALL_CASES_SKIPPED",
+            "SUITE_PYTHON_UNSUPPORTED",
+            "SUITE_RUNNER_UNUSABLE",
+            "SUITE_RUNNER_AMBIGUOUS",
+            "SUITE_COUNTS_UNPARSEABLE",
+            "SUITE_ALL_CASES_SKIPPED",
         ):
             with self.subTest(code=code_name):
                 exit_code, emitted = self._main_with(
-                    pr.SealedEnvironmentError(code_name + ":detail")
+                    rc.SuiteEnvironmentError(code_name + ":detail")
                 )
                 self.assertEqual(exit_code, 3)
-                self.assertEqual(emitted["outcome"], cr.SEALED_ENVIRONMENT_OUTCOME)
+                self.assertEqual(emitted["outcome"], cr.SUITE_ENVIRONMENT_OUTCOME)
                 self.assertIn(code_name, emitted["detail"])
 
     def test_the_outcome_string_is_the_base_class_code(self):
         # One definition. A rename in private_review moves both together.
         self.assertEqual(
-            cr.SEALED_ENVIRONMENT_OUTCOME, pr.SealedEnvironmentError.code
+            cr.SUITE_ENVIRONMENT_OUTCOME, rc.SuiteEnvironmentError.code
         )
 
     def test_both_review_refusals_are_that_one_class(self):
         self.assertIsInstance(
-            cr.ReviewProvisioningError(("bun",), 1), pr.SealedEnvironmentError
+            cr.ReviewProvisioningError(("bun",), 1), rc.SuiteEnvironmentError
         )
         self.assertIsInstance(
-            cr.SealedSuiteNotCollectedError(4, "x"), pr.SealedEnvironmentError
+            cr.SuiteNotCollectedError(4, "x"), rc.SuiteEnvironmentError
         )
 
     def test_a_contract_refusal_is_not_relabelled_as_an_environment_fault(self):
-        # Every other PrivateReviewError names a factory invariant. Mapping
+        # Every other ReviewContractError names a factory invariant. Mapping
         # those to an environment outcome would tell the operator to go install
         # something, which would be a lie.
-        with self.assertRaises(pr.PrivateReviewError):
-            self._main_with(pr.PrivateReviewError("code review requires SEALED"))
+        with self.assertRaises(rc.ReviewContractError):
+            self._main_with(rc.ReviewContractError("code review requires SEALED"))
 
         self.assertIsNone(
-            cr.sealed_environment_detail(
-                pr.PrivateReviewError("sealed bundle has no private tests")
+            cr.suite_environment_detail(
+                rc.ReviewContractError("sealed bundle has no private tests")
             )
         )
-        self.assertIsNone(cr.sealed_environment_detail(RuntimeError("unrelated")))
+        self.assertIsNone(cr.suite_environment_detail(RuntimeError("unrelated")))
 
-    def test_the_typed_detail_carries_no_sealed_file_name(self):
-        # The detail reaches the operator's console. Provisioning runs before
-        # any sealed blob is copied in, so its stderr cannot name one -- this
-        # pins that the boundary does not add one either.
+    def test_the_typed_detail_carries_only_the_provisioners_words(self):
+        # The detail reaches the operator's console as the provisioner's own
+        # stderr -- this pins that the boundary does not add anything to it.
         exc = cr.ReviewProvisioningError(("uv", "sync"), 1, "resolution failed")
 
         _code, emitted = self._main_with(exc)
@@ -1160,10 +1126,10 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
         scheduler.target = SimpleNamespace(target_repository_root="/repo")
         lane = SimpleNamespace(lane_id="lane-a")
         scheduler._run_gate_lanes = lambda lanes: (lane,)
-        scheduler._current_tests_sealed = lambda lane_id: SimpleNamespace(
+        scheduler._current_accepted_suite = lambda lane_id: SimpleNamespace(
             payload={}, artifact_id="a1"
         )
-        scheduler._sealed_suite_gate = lambda lane: None
+        scheduler._suite_gate = lambda lane: None
 
         with mock.patch.object(sch, "_record_as_lane_artifact", return_value=None):
             with mock.patch.object(
@@ -1208,11 +1174,11 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
             },
         )
         scheduler._common = lambda lane_id: (row, lane)
-        scheduler._sealed_for = lambda lane_arg: artifact
+        scheduler._accepted_suite_for = lambda lane_arg: artifact
         scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
-        scheduler._sealed_suite_gate = lambda lane_arg: None
+        scheduler._suite_gate = lambda lane_arg: None
 
-        measurement = sch.cr.SealedMeasurement(
+        measurement = sch.cr.SuiteMeasurement(
             summary={
                 "errored": 0,
                 "executed": 3,
@@ -1225,7 +1191,6 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
             min_cases=1,
             run={},
             files={},
-            vault=Path("/state/vault"),
         )
         with mock.patch.object(sch, "_latest", return_value=artifact), mock.patch.object(
             sch, "_record_as_lane_artifact", return_value=None

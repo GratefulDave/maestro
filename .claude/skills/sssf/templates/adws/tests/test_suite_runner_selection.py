@@ -1,7 +1,7 @@
 """The sealed suite's runner is derived from the sealed files, never assumed.
 
 Nothing in the artifact-factory plan schema can carry a gate, so every sealed
-suite reaches `tests_chain.run_private_suite` with `gate=None`. That path used
+suite reaches `tests_chain.run_suite` with `gate=None`. That path used
 to answer `pytest` unconditionally and pin the invocation to the scheduler's own
 interpreter, so a vitest suite was executed by pytest (`found no collectors`,
 exit 4, zero cases) and a pytest suite was executed by whatever Python the
@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from adw_modules import private_review as pr
+from adw_modules import review_contract as rc
 from adw_modules import runner_resolution as rr
 from adw_modules import tests_chain as tc
 
@@ -51,21 +51,21 @@ class DerivedRunnerTest(unittest.TestCase):
         self.assertEqual(gate.argv, ("src/a.test.ts", "src/helpers.ts"))
 
     def test_mixed_runners_refuse(self) -> None:
-        with self.assertRaises(pr.PrivateReviewError) as caught:
+        with self.assertRaises(rc.ReviewContractError) as caught:
             tc._suite_gate(None, ("tests/test_thing.py", "src/a.test.ts"))
-        self.assertIn("SEALED_SUITE_RUNNER_AMBIGUOUS", str(caught.exception))
+        self.assertIn("SUITE_RUNNER_AMBIGUOUS", str(caught.exception))
 
     def test_unrecognised_files_refuse(self) -> None:
         for files in ((), ("src/helpers.ts",), ("docs/notes.md", "Makefile")):
             with self.subTest(files=files):
-                with self.assertRaises(pr.PrivateReviewError) as caught:
+                with self.assertRaises(rc.ReviewContractError) as caught:
                     tc._suite_gate(None, files)
                 self.assertIn(
-                    "SEALED_SUITE_RUNNER_UNDERIVABLE", str(caught.exception)
+                    "SUITE_RUNNER_UNDERIVABLE", str(caught.exception)
                 )
 
     def test_refusal_does_not_name_sealed_files(self) -> None:
-        with self.assertRaises(pr.PrivateReviewError) as caught:
+        with self.assertRaises(rc.ReviewContractError) as caught:
             tc._suite_gate(None, ("private/secret_selector.ts",))
         self.assertNotIn("secret_selector", str(caught.exception))
 
@@ -95,19 +95,19 @@ class ExplicitGateStillWinsTest(unittest.TestCase):
 
     def test_mapping_gate_validation_is_unchanged(self) -> None:
         for gate, fragment in (
-            ({"runner": "nose", "min_cases": 1}, "unsupported sealed suite runner"),
+            ({"runner": "nose", "min_cases": 1}, "unsupported suite runner"),
             ({"runner": "pytest", "min_cases": 0}, "min_cases"),
             ({"runner": "pytest", "min_cases": True}, "min_cases"),
             ({"runner": "pytest", "min_cases": 1, "argv": "x"}, "argv"),
             ({"runner": "pytest", "min_cases": 1, "cwd": 3}, "cwd"),
         ):
             with self.subTest(gate=gate):
-                with self.assertRaises(pr.PrivateReviewError) as caught:
+                with self.assertRaises(rc.ReviewContractError) as caught:
                     tc._suite_gate(gate, ("tests/test_thing.py",))
                 self.assertIn(fragment, str(caught.exception))
 
     def test_a_non_mapping_gate_is_still_refused(self) -> None:
-        with self.assertRaises(pr.PrivateReviewError) as caught:
+        with self.assertRaises(rc.ReviewContractError) as caught:
             tc._suite_gate(["pytest"], ("tests/test_thing.py",))
         self.assertIn("not a mapping", str(caught.exception))
 
@@ -124,9 +124,9 @@ class PytestGoesThroughResolveTest(unittest.TestCase):
         unusable = rr.RunnerUnusable("pytest", rr.Reason.UNRESOLVED, ".")
         with tempfile.TemporaryDirectory() as tree:
             with mock.patch.object(rr, "resolve", side_effect=unusable):
-                with self.assertRaises(pr.PrivateReviewError) as caught:
-                    tc.run_private_suite(Path(tree), ("tests/test_thing.py",))
-        self.assertIn("SEALED_SUITE_RUNNER_UNUSABLE:pytest", str(caught.exception))
+                with self.assertRaises(rc.ReviewContractError) as caught:
+                    tc.run_suite(Path(tree), ("tests/test_thing.py",))
+        self.assertIn("SUITE_RUNNER_UNUSABLE:pytest", str(caught.exception))
 
 
 class VersionSpecifierTest(unittest.TestCase):
@@ -282,12 +282,12 @@ class DeclaredPythonIsEnforcedTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(tc, "_interpreter_release", return_value=(3, 9, 6))
             )
-            with self.assertRaises(pr.PrivateReviewError) as caught:
+            with self.assertRaises(rc.ReviewContractError) as caught:
                 tc._assert_declared_python(
                     resolved, root, root, ".", ("tests/test_x.py",)
                 )
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_PYTHON_UNSUPPORTED", message)
+        self.assertIn("SUITE_PYTHON_UNSUPPORTED", message)
         self.assertIn("3.9.6", message)
         self.assertIn(">=3.12", message)
         self.assertIn("pyproject.toml", message)
@@ -328,7 +328,7 @@ class DeclaredPythonIsEnforcedTest(unittest.TestCase):
                 )
             )
 
-    def test_run_private_suite_refuses_before_it_executes_anything(self) -> None:
+    def test_run_suite_refuses_before_it_executes_anything(self) -> None:
         with contextlib.ExitStack() as stack:
             root = self._tree(stack)
             (root / "tests" / "test_x.py").write_text("", encoding="utf-8")
@@ -348,10 +348,10 @@ class DeclaredPythonIsEnforcedTest(unittest.TestCase):
                 mock.patch.object(tc, "_interpreter_release", return_value=(3, 9, 6))
             )
             execute = stack.enter_context(mock.patch.object(rr, "execute_cases"))
-            with self.assertRaises(pr.PrivateReviewError) as caught:
-                tc.run_private_suite(root, ("tests/test_x.py",))
+            with self.assertRaises(rc.ReviewContractError) as caught:
+                tc.run_suite(root, ("tests/test_x.py",))
             execute.assert_not_called()
-        self.assertIn("SEALED_SUITE_PYTHON_UNSUPPORTED", str(caught.exception))
+        self.assertIn("SUITE_PYTHON_UNSUPPORTED", str(caught.exception))
 
 
 class MeasuredAgainstARealInterpreterTest(unittest.TestCase):
@@ -399,17 +399,17 @@ class UnparseableCountsAreRefusedTest(unittest.TestCase):
                 "execute_cases",
                 return_value={"output": output, "returncode": 0},
             ):
-                with self.assertRaises(pr.PrivateReviewError) as caught:
-                    tc.run_private_suite(Path(tree), files)
+                with self.assertRaises(rc.ReviewContractError) as caught:
+                    tc.run_suite(Path(tree), files)
         return str(caught.exception)
 
     def test_vitest_with_no_summary_is_refused(self) -> None:
         message = self._run(("src/a.test.ts",), "vitest", "\n RUN  v4.1.11\n\n")
-        self.assertIn("SEALED_SUITE_COUNTS_UNPARSEABLE:vitest", message)
+        self.assertIn("SUITE_COUNTS_UNPARSEABLE:vitest", message)
 
     def test_pytest_with_no_summary_is_refused(self) -> None:
         message = self._run(("tests/test_a.py",), "pytest", "no summary here\n")
-        self.assertIn("SEALED_SUITE_COUNTS_UNPARSEABLE:pytest", message)
+        self.assertIn("SUITE_COUNTS_UNPARSEABLE:pytest", message)
 
     def test_the_refusal_names_the_measurement_not_the_candidate(self) -> None:
         message = self._run(("tests/test_a.py",), "pytest", "")
@@ -434,7 +434,7 @@ class UnparseableCountsAreRefusedTest(unittest.TestCase):
                 "execute_cases",
                 return_value={"output": "No test files found\n", "returncode": 1},
             ):
-                out = tc.run_private_suite(Path(tree), ("src/a.test.ts",))
+                out = tc.run_suite(Path(tree), ("src/a.test.ts",))
         self.assertEqual(out["executed"], 0)
         self.assertEqual(out["returncode"], 1)
         self.assertEqual(out["counts"]["passed"], 0)
@@ -453,7 +453,7 @@ class UnparseableCountsAreRefusedTest(unittest.TestCase):
                     "returncode": 0,
                 },
             ):
-                out = tc.run_private_suite(Path(tree), ("src/a.test.ts",))
+                out = tc.run_suite(Path(tree), ("src/a.test.ts",))
         self.assertEqual(out["executed"], 3)
         self.assertEqual(out["counts"]["passed"], 3)
         self.assertEqual(out["min_cases"], 1)
@@ -475,7 +475,7 @@ class RealPytestIsCountedTest(unittest.TestCase):
     def test_passing_cases_are_counted_from_real_output(self) -> None:
         body = "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"
         with self._tree("test_real.py", body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertEqual(out["returncode"], 0)
         self.assertEqual(out["executed"], 2)
         self.assertEqual(out["counts"]["passed"], 2)
@@ -483,7 +483,7 @@ class RealPytestIsCountedTest(unittest.TestCase):
     def test_failing_cases_are_counted_from_real_output(self) -> None:
         body = "def test_one():\n    assert True\n\n\ndef test_two():\n    assert False\n"
         with self._tree("test_real_fail.py", body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertNotEqual(out["returncode"], 0)
         self.assertEqual(out["executed"], 2)
         self.assertEqual(out["counts"]["failed"], 1)
@@ -494,7 +494,7 @@ class RealPytestIsCountedTest(unittest.TestCase):
             "    assert True\n\n\ndef test_two():\n    assert True\n"
         )
         with self._tree("test_real_skip.py", body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertEqual(out["returncode"], 0)
         self.assertEqual(out["counts"]["skipped"], 1)
         self.assertEqual(out["counts"]["passed"], 1)
@@ -503,7 +503,7 @@ class RealPytestIsCountedTest(unittest.TestCase):
     def test_errored_collection_stays_on_the_failure_path(self) -> None:
         body = "import a_module_that_does_not_exist  # noqa: F401\n"
         with self._tree("test_real_error.py", body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertNotEqual(out["returncode"], 0)
         self.assertEqual(out["counts"]["errored"], 1)
         self.assertEqual(out["executed"], 1)
@@ -549,7 +549,7 @@ class RealVitestIsCountedTest(unittest.TestCase):
                     ),
                 )
             )
-            out = tc.run_private_suite(root, ("src/a.test.ts",), timeout_s=300.0)
+            out = tc.run_suite(root, ("src/a.test.ts",), timeout_s=300.0)
             after = hashlib.sha256(case.read_bytes()).hexdigest()
         # A measurement must never mutate its subject: `vitest list --json <path>`
         # once overwrote a tester's committed test file, because `--json` takes
@@ -610,7 +610,7 @@ class VitestSummaryParsingTest(unittest.TestCase):
 
     def test_the_banner_alone_parses_to_nothing(self) -> None:
         # Not a summary, so it must contribute no counts rather than be read as
-        # one. `run_private_suite` turns a zero count on exit 0 into a refusal.
+        # one. `run_suite` turns a zero count on exit 0 into a refusal.
         banner = "⎯⎯⎯ Failed Tests 11 ⎯⎯⎯"
         self.assertEqual(sum(tc._parse_suite_counts("vitest", banner).values()), 0)
 
@@ -725,10 +725,10 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
                 "resolve",
                 return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
             ):
-                with self.assertRaises(pr.SealedEnvironmentError) as caught:
-                    tc.run_private_suite(root, (selector,), timeout_s=300.0)
+                with self.assertRaises(rc.SuiteEnvironmentError) as caught:
+                    tc.run_suite(root, (selector,), timeout_s=300.0)
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", message)
+        self.assertIn("SUITE_ALL_CASES_SKIPPED:vitest", message)
         self.assertIn("every one of the 2 counted cases", message)
 
     def test_a_fixture_that_cannot_start_refuses_despite_the_non_zero_exit(
@@ -763,10 +763,10 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
                 "resolve",
                 return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
             ):
-                with self.assertRaises(pr.SealedEnvironmentError) as caught:
-                    tc.run_private_suite(root, (selector,), timeout_s=300.0)
+                with self.assertRaises(rc.SuiteEnvironmentError) as caught:
+                    tc.run_suite(root, (selector,), timeout_s=300.0)
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", message)
+        self.assertIn("SUITE_ALL_CASES_SKIPPED:vitest", message)
         self.assertIn("is not a defect in the candidate under test", message)
 
     def test_a_genuinely_failing_run_still_reaches_the_failure_path(self) -> None:
@@ -786,7 +786,7 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
                 "resolve",
                 return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
             ):
-                run = tc.run_private_suite(root, (selector,), timeout_s=300.0)
+                run = tc.run_suite(root, (selector,), timeout_s=300.0)
         self.assertNotEqual(run["returncode"], 0)
         self.assertEqual(run["counts"]["failed"], 1)
         self.assertEqual(run["counts"]["passed"], 1)
@@ -813,7 +813,7 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
 
 
 class EnvironmentFaultsAreTypedTest(unittest.TestCase):
-    """Every environment fault is a `pr.SealedEnvironmentError` by class.
+    """Every environment fault is a `rc.SuiteEnvironmentError` by class.
 
     The operator boundary recognises these structurally. A match on the message
     prefix would rot the first time a code is renamed or a sixth case is added:
@@ -821,8 +821,8 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
     instead of a repair instruction.
     """
 
-    def _refuse(self, call) -> pr.PrivateReviewError:
-        with self.assertRaises(pr.PrivateReviewError) as caught:
+    def _refuse(self, call) -> rc.ReviewContractError:
+        with self.assertRaises(rc.ReviewContractError) as caught:
             call()
         return caught.exception
 
@@ -834,22 +834,22 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
                     "resolve",
                     return_value=rr.ResolvedRunner(runner=runner, executable="/bin/x"),
                 ), mock.patch.object(rr, "execute_cases", return_value=raw):
-                    tc.run_private_suite(Path(tree), files)
+                    tc.run_suite(Path(tree), files)
 
         return call
 
     def test_every_environment_fault_subclasses_the_shared_base(self) -> None:
         cases = {
-            "SEALED_SUITE_RUNNER_UNDERIVABLE": lambda: tc._suite_gate(
+            "SUITE_RUNNER_UNDERIVABLE": lambda: tc._suite_gate(
                 None, ("src/helpers.ts",)
             ),
-            "SEALED_SUITE_RUNNER_AMBIGUOUS": lambda: tc._suite_gate(
+            "SUITE_RUNNER_AMBIGUOUS": lambda: tc._suite_gate(
                 None, ("tests/test_a.py", "src/a.test.ts")
             ),
-            "SEALED_SUITE_COUNTS_UNPARSEABLE": self._suite(
+            "SUITE_COUNTS_UNPARSEABLE": self._suite(
                 ("tests/test_a.py",), "pytest", {"output": "", "returncode": 0}
             ),
-            "SEALED_SUITE_ALL_CASES_SKIPPED": self._suite(
+            "SUITE_ALL_CASES_SKIPPED": self._suite(
                 ("tests/test_a.py",),
                 "pytest",
                 {"output": "2 skipped in 0.01s", "returncode": 0},
@@ -858,7 +858,7 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
         for code, call in cases.items():
             with self.subTest(code=code):
                 exc = self._refuse(call)
-                self.assertIsInstance(exc, pr.SealedEnvironmentError)
+                self.assertIsInstance(exc, rc.SuiteEnvironmentError)
                 self.assertTrue(str(exc).startswith(code), str(exc))
 
     def test_an_unusable_runner_is_typed(self) -> None:
@@ -871,11 +871,11 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
                         "pytest", rr.Reason.UNRESOLVED, "."
                     ),
                 ):
-                    tc.run_private_suite(Path(tree), ("tests/test_a.py",))
+                    tc.run_suite(Path(tree), ("tests/test_a.py",))
 
         exc = self._refuse(call)
-        self.assertIsInstance(exc, pr.SealedEnvironmentError)
-        self.assertTrue(str(exc).startswith("SEALED_SUITE_RUNNER_UNUSABLE:pytest"))
+        self.assertIsInstance(exc, rc.SuiteEnvironmentError)
+        self.assertTrue(str(exc).startswith("SUITE_RUNNER_UNUSABLE:pytest"))
 
     def test_an_unsupported_interpreter_is_typed(self) -> None:
         if tc.tomllib is None:
@@ -898,8 +898,8 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
                     resolved, root, root, ".", ("tests/test_x.py",)
                 )
             )
-        self.assertIsInstance(exc, pr.SealedEnvironmentError)
-        self.assertTrue(str(exc).startswith("SEALED_SUITE_PYTHON_UNSUPPORTED"))
+        self.assertIsInstance(exc, rc.SuiteEnvironmentError)
+        self.assertTrue(str(exc).startswith("SUITE_PYTHON_UNSUPPORTED"))
 
     def test_the_message_text_is_unchanged_by_the_reparenting(self) -> None:
         # worker-provision asserts the resolved invocation, measured version,
@@ -917,7 +917,7 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
 
     def test_the_base_carries_the_operator_outcome_code(self) -> None:
         self.assertEqual(
-            pr.SealedEnvironmentError.code, "SEALED_SUITE_ENVIRONMENT_REFUSED"
+            rc.SuiteEnvironmentError.code, "SUITE_ENVIRONMENT_REFUSED"
         )
 
     def test_the_operator_boundary_recognises_every_code_this_module_raises(
@@ -934,17 +934,17 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
         from adw_modules import code_review as cr
 
         codes = (
-            "SEALED_SUITE_RUNNER_UNDERIVABLE",
-            "SEALED_SUITE_RUNNER_AMBIGUOUS",
-            "SEALED_SUITE_PYTHON_UNSUPPORTED",
-            "SEALED_SUITE_RUNNER_UNUSABLE",
-            "SEALED_SUITE_COUNTS_UNPARSEABLE",
-            "SEALED_SUITE_ALL_CASES_SKIPPED",
+            "SUITE_RUNNER_UNDERIVABLE",
+            "SUITE_RUNNER_AMBIGUOUS",
+            "SUITE_PYTHON_UNSUPPORTED",
+            "SUITE_RUNNER_UNUSABLE",
+            "SUITE_COUNTS_UNPARSEABLE",
+            "SUITE_ALL_CASES_SKIPPED",
         )
         for code in codes:
             with self.subTest(code=code):
-                exc = pr.SealedEnvironmentError("{0}: detail".format(code))
-                detail = cr.sealed_environment_detail(exc)
+                exc = rc.SuiteEnvironmentError("{0}: detail".format(code))
+                detail = cr.suite_environment_detail(exc)
                 self.assertIsNotNone(detail, code)
                 self.assertIn("{0}: detail".format(code), detail)
 
@@ -954,8 +954,8 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
         from adw_modules import code_review as cr
 
         self.assertIsNone(
-            cr.sealed_environment_detail(
-                pr.PrivateReviewError("sealed suite gate is not a mapping")
+            cr.suite_environment_detail(
+                rc.ReviewContractError("suite gate is not a mapping")
             )
         )
 
@@ -970,8 +970,8 @@ class EnvironmentFaultsAreTypedTest(unittest.TestCase):
         ):
             with self.subTest(gate=gate):
                 exc = self._refuse(lambda: tc._suite_gate(gate, files))
-                self.assertIsInstance(exc, pr.PrivateReviewError)
-                self.assertNotIsInstance(exc, pr.SealedEnvironmentError)
+                self.assertIsInstance(exc, rc.ReviewContractError)
+                self.assertNotIsInstance(exc, rc.SuiteEnvironmentError)
 
 
 class AllCasesSkippedIsRefusedTest(unittest.TestCase):
@@ -1017,10 +1017,10 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             "    assert True\n"
         )
         with self._pytest_tree("test_all_skipped.py", body) as (root, selector):
-            with self.assertRaises(pr.PrivateReviewError) as caught:
-                tc.run_private_suite(root, (selector,))
+            with self.assertRaises(rc.ReviewContractError) as caught:
+                tc.run_suite(root, (selector,))
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:pytest", message)
+        self.assertIn("SUITE_ALL_CASES_SKIPPED:pytest", message)
         self.assertIn("evaluated nothing", message)
         self.assertIn("not a defect in the candidate", message)
 
@@ -1031,9 +1031,9 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             'it.skip("b", () => { expect(1).toBe(1); });\n'
         )
         with self._vitest_tree(body) as (root, selector):
-            with self.assertRaises(pr.PrivateReviewError) as caught:
-                tc.run_private_suite(root, (selector,), timeout_s=300.0)
-        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", str(caught.exception))
+            with self.assertRaises(rc.ReviewContractError) as caught:
+                tc.run_suite(root, (selector,), timeout_s=300.0)
+        self.assertIn("SUITE_ALL_CASES_SKIPPED:vitest", str(caught.exception))
 
     def test_one_passed_beside_many_skipped_is_not_refused(self) -> None:
         body = ["import pytest\n\n"]
@@ -1044,7 +1044,7 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             )
         body.append("\ndef test_real():\n    assert 1 + 1 == 2\n")
         with self._pytest_tree("test_mixed.py", "".join(body)) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertEqual(out["returncode"], 0)
         self.assertEqual(out["counts"]["passed"], 1)
         self.assertEqual(out["counts"]["skipped"], 10)
@@ -1057,7 +1057,7 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             'it("b", () => { expect(1 + 1).toBe(2); });\n'
         )
         with self._vitest_tree(body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,), timeout_s=300.0)
+            out = tc.run_suite(root, (selector,), timeout_s=300.0)
         self.assertEqual(out["returncode"], 0)
         self.assertEqual(out["counts"]["passed"], 1)
         self.assertEqual(out["counts"]["skipped"], 1)
@@ -1069,7 +1069,7 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             "def test_two():\n    assert False\n"
         )
         with self._pytest_tree("test_all_fail.py", body) as (root, selector):
-            out = tc.run_private_suite(root, (selector,))
+            out = tc.run_suite(root, (selector,))
         self.assertNotEqual(out["returncode"], 0)
         self.assertEqual(out["counts"]["failed"], 2)
         self.assertEqual(out["executed"], 2)
@@ -1080,8 +1080,8 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
             "def test_secret_selector():\n    assert True\n"
         )
         with self._pytest_tree("test_secret_selector.py", body) as (root, selector):
-            with self.assertRaises(pr.PrivateReviewError) as caught:
-                tc.run_private_suite(root, (selector,))
+            with self.assertRaises(rc.ReviewContractError) as caught:
+                tc.run_suite(root, (selector,))
         message = str(caught.exception)
         self.assertNotIn("secret_selector", message)
         self.assertNotIn("tests/", message)
@@ -1109,10 +1109,10 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
                 "execute_cases",
                 return_value={"output": "2 skipped in 0.01s", "returncode": 2},
             ):
-                with self.assertRaises(pr.SealedEnvironmentError) as caught:
-                    tc.run_private_suite(Path(tree), ("tests/test_a.py",))
+                with self.assertRaises(rc.SuiteEnvironmentError) as caught:
+                    tc.run_suite(Path(tree), ("tests/test_a.py",))
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:pytest", message)
+        self.assertIn("SUITE_ALL_CASES_SKIPPED:pytest", message)
         self.assertIn("is not a defect in the candidate under test", message)
 
 
@@ -1164,7 +1164,7 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
                 "def test_candidate():\n    assert IDENTITY == 'candidate'\n",
                 encoding="utf-8",
             )
-            out = tc.run_private_suite(tree, ("test_identity.py",))
+            out = tc.run_suite(tree, ("test_identity.py",))
         self.assertEqual(out["returncode"], 0, out["output"])
         self.assertEqual(out["counts"]["passed"], 1)
 
@@ -1201,7 +1201,7 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
                 'it("candidate", () => { expect(1 + 1).toBe(2); });\n',
                 encoding="utf-8",
             )
-            out = tc.run_private_suite(tree, (selector,), timeout_s=300.0)
+            out = tc.run_suite(tree, (selector,), timeout_s=300.0)
         self.assertEqual(out["returncode"], 0, out["output"])
         self.assertEqual(out["counts"]["passed"], 1)
 
@@ -1219,11 +1219,11 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
             with mock.patch.object(
                 tc, "_interpreter_release", return_value=(3, 9, 6)
             ), mock.patch.object(rr, "execute_cases") as execute:
-                with self.assertRaises(pr.PrivateReviewError) as caught:
-                    tc.run_private_suite(tree, ("tests/test_a.py",))
+                with self.assertRaises(rc.ReviewContractError) as caught:
+                    tc.run_suite(tree, ("tests/test_a.py",))
                 execute.assert_not_called()
         message = str(caught.exception)
-        self.assertIn("SEALED_SUITE_PYTHON_UNSUPPORTED", message)
+        self.assertIn("SUITE_PYTHON_UNSUPPORTED", message)
         self.assertIn(str(tree / ".venv" / "bin" / "pytest"), message)
 
 

@@ -76,7 +76,7 @@ class _Recorder:
 
 
 class _FactoryFixture(unittest.TestCase):
-    """A `FactoryScheduler` with vault and checkout isolated; nothing else patched."""
+    """A `FactoryScheduler` with tree materialization isolated; nothing else patched."""
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -101,19 +101,18 @@ class _FactoryFixture(unittest.TestCase):
         self.factory._provision_argv = ("provisioner", "--install")
         self.factory._provision_timeout_s = 7
         self.factory._say = lambda *_: None
+        self.factory._integration_head = lambda: "test-base"
         for name, value in (
-            ("ensure_vault", self.root / "vault"),
-            ("seed", "test-base"),
-            ("scratch_worktree_path", self.tree),
-            ("checkout_vault_worktree", None),
+            ("scratch_tree_path", self.tree),
+            ("materialize_commit", None),
         ):
-            patch = mock.patch.object(scheduler.hv, name, return_value=value)
+            patch = mock.patch.object(scheduler.tm, name, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
         patch = mock.patch.object(
             scheduler,
             "_remove_collect_tree",
-            side_effect=lambda tree, _: shutil.rmtree(tree, ignore_errors=True),
+            side_effect=lambda tree: shutil.rmtree(tree, ignore_errors=True),
         )
         patch.start()
         self.addCleanup(patch.stop)
@@ -140,12 +139,12 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
         resolved = rr.ResolvedRunner(runner="vitest", executable="/nonexistent/vitest")
         with (
             mock.patch.object(scheduler.rr, "resolve", return_value=resolved),
-            mock.patch.object(scheduler.prv, "write_files"),
+            mock.patch.object(scheduler.rc, "write_files"),
             mock.patch.object(
                 scheduler.rr, "collect_cases", return_value=("src/a.test.ts > a",)
             ) as collect,
         ):
-            ids = self.factory._collect_private_draft(ctx, gate, {"src/a.test.ts": "it()"})
+            ids = self.factory._collect_draft(ctx, gate, {"src/a.test.ts": "it()"})
         self.assertEqual(ids, ("src/a.test.ts > a",))
         self.assertEqual(
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7)]
@@ -173,7 +172,7 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
 
     def test_the_review_tree(self) -> None:
         dest = self.root / "review"
-        with mock.patch.object(cr.hv, "materialize_commit", return_value=dest) as materialize:
+        with mock.patch.object(cr.tm, "materialize_commit", return_value=dest) as materialize:
             cr._review_tree(
                 self.root / "repo",
                 "a" * 40,
@@ -192,7 +191,7 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
             self.assertFalse(hasattr(rr, name), name)
         import inspect
 
-        for fn in (rr.collect_cases, rr.execute_cases, scheduler.tc.run_private_suite):
+        for fn in (rr.collect_cases, rr.execute_cases, scheduler.tc.run_suite):
             self.assertNotIn("runtime_root", inspect.signature(fn).parameters, fn.__name__)
 
 

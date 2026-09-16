@@ -1,6 +1,10 @@
-"""Test-author / test-reviewer / seal payloads as LaneArtifact.
+"""Test-author / test-reviewer / acceptance payloads as LaneArtifact.
 
-Does not write lane_state. Private bytes stay in the vault object database.
+Does not write lane_state. A test draft is an ordinary candidate: its files are
+committed on the integration head in the run repository, admitted through the
+same `admit_candidate` path a builder's candidate takes, and pinned at a
+candidate ref. Acceptance records the candidate and the `test_binding` digest
+of its files; nothing is hidden from anyone.
 """
 
 from __future__ import annotations
@@ -10,12 +14,14 @@ import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Collection, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
-from . import hidden_vault as hv
-from . import private_review as pr
+from . import git_publication as gitpub
+from . import review_contract as rc
 from . import runner_resolution as rr
 from . import scheduler_types as st
+from . import test_binding as tb
+from . import tree_materialize as tm
 
 _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfailed)")
 
@@ -55,7 +61,7 @@ _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfail
 #: `lane-wp7-page-build`, whose config boots the Astro pipeline and leaves the
 #: Vite server open: the suite ran 15 cases and exited 0, the reverse scan took
 #: that warning, and every count parsed as zero -- refused
-#: `SEALED_SUITE_COUNTS_UNPARSEABLE` against a candidate whose sealed tests all
+#: `SUITE_COUNTS_UNPARSEABLE` against a candidate whose tests all
 #: passed. Feeding stdout alone to the parser returns 15; the combined capture
 #: returns 0.
 #:
@@ -63,370 +69,196 @@ _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfail
 #: `N passed`/`N failed`/`N skipped`; no warning does. A suite that genuinely
 #: executed nothing still refuses, which is the point of the check.
 _VITEST_SUMMARY = re.compile(r"^\s*Tests\s+.*?\d+\s+(?:passed|failed|skipped)\b")
-PRIVATE_MANIFEST_SCHEMA = "private-manifest.v1"
+
+#: The commit message of every test draft. A draft commit is content-addressed
+#: (`git_publication.commit_files_on_base` fixes author, committer and date),
+#: so identical bytes on the same base reach the identical sha every time:
+#: a redraft of identical files is the same candidate, and a crash between
+#: committing and recording re-derives the same commit rather than a second.
+DRAFT_COMMIT_MESSAGE = b"maestro test draft\n"
 
 
-def _private_blobs(vault: Path, base: str, commit: str) -> tuple[tuple[str, str], ...]:
-    before = dict(hv.list_commit_blobs(vault, base))
-    after = hv.list_commit_blobs(vault, commit)
-    return tuple((path, blob) for path, blob in after if before.get(path) != blob)
+def suite_files(artifact: st.LaneArtifact) -> dict[str, str]:
+    """The accepted suite as a path-to-blob map, off a TEST_DRAFT or ACCEPTED_TEST_SUITE."""
+    if artifact.kind not in (
+        st.ArtifactKind.TEST_DRAFT,
+        st.ArtifactKind.ACCEPTED_TEST_SUITE,
+    ):
+        raise rc.ReviewContractError("suite files require TEST_DRAFT or ACCEPTED_TEST_SUITE")
+    files = artifact.payload.get("files")
+    if not isinstance(files, Mapping) or not files:
+        raise rc.ReviewContractError("test artifact carries no files")
+    return {str(path): str(blob) for path, blob in files.items()}
 
 
-def _manifest_digest(commit: str, files: Sequence[tuple[str, str]]) -> str:
-    return st.digest_bytes(
-        st.canonical_bytes(
-            {
-                "commit": commit,
-                "files": [{"blob": blob, "path": path} for path, blob in files],
-            }
-        )
-    )
-
-
-def _declared_changed_blobs(
-    vault: Path,
-    base: str,
-    commit: str,
-    declared_outputs: Sequence[str],
-) -> tuple[tuple[str, str], ...]:
-    declared = tuple(pr.normalize_repo_path(path) for path in declared_outputs)
-    wanted = set(declared)
-    selected = tuple(
-        (path, blob)
-        for path, blob in _private_blobs(vault, base, commit)
-        if path in wanted
-    )
-    present = {path for path, _blob in selected}
-    missing = [path for path in declared if path not in present]
-    if missing:
-        raise pr.PrivateReviewError(
-            "declared outputs missing or unchanged: {0}".format(", ".join(missing))
-        )
-    return selected
-
-
-def _select_private_blobs(
-    vault: Path,
-    commit: str,
-    payload: Mapping[str, object],
-) -> tuple[tuple[str, str], ...]:
-    # The private files are what the draft commit changed against the base it
-    # was written on, and that base is the commit's own parent. Reading it off
-    # `refs/maestro/integration-seed` instead would make the manifest a
-    # function of a ref that every later draft force-updates: once integration
-    # moved, an older bundle's files no longer matched its recorded digest.
-    base = hv.rev_parse(vault, commit + "^")
-    if payload.get("private_manifest_schema") == PRIVATE_MANIFEST_SCHEMA:
-        selected = _private_blobs(vault, base, commit)
-        if not selected:
-            raise pr.PrivateReviewError("private manifest selected no files")
-        digest = _manifest_digest(commit, selected)
-        expected = payload.get("private_manifest_digest")
-        if expected is None:
-            expected = payload.get("private_draft_digest") or payload.get(
-                "sealed_digest"
-            )
-        if digest != expected:
-            raise pr.PrivateReviewError("private manifest digest mismatch")
-        return selected
-    contract = payload["public_contract"]
-    if not isinstance(contract, Mapping):
-        raise pr.PrivateReviewError("public_contract must be a mapping")
-    declared = pr.as_str_tuple(contract["declared_outputs"], "declared_outputs")
-    return _declared_changed_blobs(vault, base, commit, declared)
-
+def read_suite(repo: Path, files: Mapping[str, str]) -> dict[str, str]:
+    """The suite's bodies, read out of the run repository's object database."""
+    return {
+        path: tm.cat_blob(Path(repo), blob).decode("utf-8", errors="replace")
+        for path, blob in files.items()
+    }
 
 
 def write_test_draft(
     *,
-    request: pr.VaultLaneRequest,
-    state_root: Path,
-    run_repo: Path,
-    integration_ref: str,
+    request: rc.LaneRequest,
+    binding: gitpub.TargetBinding,
+    integration_head: str,
     files: Mapping[str, str],
     public_contract: Mapping[str, object],
-    worktrees_root: Path,
+    declared_outputs: Sequence[str] | None = None,
 ) -> st.LaneArtifact:
-    contract = pr.public_contract(
-        acceptance_criteria=pr.as_str_tuple(
+    """Commit the tester's files on the integration head and admit the candidate.
+
+    `declared_outputs` is what the draft may own. A typed tests lane's is its
+    lane's declared outputs, which `FactoryScheduler._require_typed_test_outputs`
+    has already proved equal to the written set. An untyped lane's tests sit at
+    paths of the tester's choosing, so its draft owns exactly what it wrote.
+    """
+    contract = rc.public_contract(
+        acceptance_criteria=rc.as_str_tuple(
             public_contract["acceptance_criteria"], "acceptance_criteria"
         ),
-        declared_outputs=pr.as_str_tuple(
+        declared_outputs=rc.as_str_tuple(
             public_contract["declared_outputs"], "declared_outputs"
         ),
     )
-    envelope = tuple(
-        sorted({pr.normalize_repo_path(path) for path in files})
-    )
-    if not envelope:
-        raise pr.PrivateReviewError("test draft files are empty")
-    vault = hv.ensure_vault(state_root, request.run_id)
-    base = hv.seed(vault, run_repo, integration_ref)
-    dest = hv.scratch_worktree_path(
-        worktrees_root, "draft-{0}".format(request.lane_id)
-    )
-    hv.checkout_vault_worktree(vault, base, dest)
-    # The worktree stays registered until the draft ref is pinned. Its HEAD
-    # is the only thing anchoring the commit before that ref exists, so
-    # removing it earlier would leave the commit unreferenced across every
-    # check below. A draft those checks refuse still ends with the worktree
-    # gone and no ref, which is the intended outcome for a refused draft.
-    try:
-        written = pr.write_files(dest, files)
-        commit = hv.commit_all(
-            dest,
-            "test draft {0}".format(request.input_digest),
-            paths=written,
+    written = {rc.normalize_repo_path(path): body for path, body in files.items()}
+    if not written:
+        raise rc.ReviewContractError("test draft files are empty")
+    owned = tuple(
+        sorted(
+            {rc.normalize_repo_path(item) for item in declared_outputs}
+            if declared_outputs is not None
+            else set(written)
         )
-        private = _private_blobs(vault, base, commit)
-        selected_paths = tuple(path for path, _blob in private)
-        if frozenset(selected_paths) != frozenset(envelope):
-            raise pr.PrivateReviewError(
-                "path-limited draft commit files mismatch envelope"
+    )
+    st.require_git_sha(integration_head, name="integration_head")
+    candidate = gitpub.commit_files_on_base(
+        binding,
+        base_sha=integration_head,
+        files={path: body.encode("utf-8") for path, body in written.items()},
+        message=DRAFT_COMMIT_MESSAGE,
+    )
+    git = binding.git()
+    # A tests lane merges its accepted suite, so a lane re-drafted after an
+    # amendment can write bytes the integration head already carries. That
+    # draft changes nothing: it is the head itself, admitted `changed=false`,
+    # and it takes the same zero-delta merge edge an unchanged build
+    # candidate does. Committing it anyway would be an empty commit, which
+    # admission refuses as `changed=true empty delta`.
+    changed = git.commit_tree_oid(candidate) != git.commit_tree_oid(integration_head)
+    if not changed:
+        candidate = integration_head
+    admitted = gitpub.admit_candidate(
+        binding,
+        run_id=request.run_id,
+        lane_id=request.lane_id,
+        input_digest=request.input_digest,
+        builder_base_sha=integration_head,
+        candidate_sha=candidate,
+        changed=changed,
+        declared_outputs=owned,
+    )
+    blobs: dict[str, str] = {}
+    for path in sorted(written):
+        blob = git.tree_blob(candidate, path)
+        if blob is None:
+            raise rc.ReviewContractError(
+                "draft commit does not carry {0}".format(path)
             )
-        private_draft_digest = _manifest_digest(commit, private)
-        ref = hv.draft_ref(request.run_id, request.lane_id, private_draft_digest)
-        payload = {
-            "input_artifact_ids": list(request.input_artifact_ids),
-            "input_digest": request.input_digest,
-            "private_draft_digest": private_draft_digest,
-            "private_draft_ref": ref,
-            "private_manifest_digest": private_draft_digest,
-            "private_manifest_schema": PRIVATE_MANIFEST_SCHEMA,
-            "public_contract": contract,
-        }
-
-        private_files = {
-            path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in private
-        }
-        tokens = pr.collect_private_tokens(
-            files=private_files,
-            vault_path=vault,
-            vault_refs=(ref,),
-            blob_ids=tuple(blob for _path, blob in private) + (commit,),
-        )
-        public_tokens = pr.public_contract_allow(
-            contract,
-            extra=(
-                request.input_digest,
-                private_draft_digest,
-                ref,
-                PRIVATE_MANIFEST_SCHEMA,
-            ),
-        )
-        pr.refuse_private_leak(payload, tokens, allow=public_tokens)
-        artifact = pr.make_lane_artifact(
-            kind=st.ArtifactKind.TEST_DRAFT,
-            request=request,
-            payload=payload,
-            artifact_ref=ref,
-        )
-
-        pr.refuse_private_leak(
-            st.canonical_bytes(artifact.payload),
-            tokens,
-            allow=public_tokens,
-        )
-        # Pinned last so a draft the checks above refused leaves no ref behind.
-        # The name is a digest over the commit, so this either creates the ref
-        # or finds it already pinned to this same commit; it cannot collide.
-        hv.update_immutable_ref(vault, ref, commit)
-    finally:
-        hv.remove_vault_worktree(vault, dest)
-    return artifact
+        blobs[path] = blob
+    payload = {
+        "builder_base_sha": admitted["builder_base_sha"],
+        "candidate_ref": admitted["candidate_ref"],
+        "candidate_sha": admitted["candidate_sha"],
+        "changed": admitted["changed"],
+        "files": blobs,
+        "input_artifact_ids": list(request.input_artifact_ids),
+        "input_digest": request.input_digest,
+        "public_contract": contract,
+        "test_suite_digest": tb.suite_digest(blobs),
+    }
+    return rc.make_lane_artifact(
+        kind=st.ArtifactKind.TEST_DRAFT,
+        request=request,
+        payload=payload,
+        artifact_ref=admitted["candidate_ref"],
+    )
 
 
 def review_test_draft(
     *,
-    request: pr.VaultLaneRequest,
+    request: rc.LaneRequest,
     verdict: st.ReviewerVerdict,
     findings: Sequence[Mapping[str, str]] = (),
     test_draft: st.LaneArtifact,
-    private_tokens: Sequence[str] = (),
 ) -> st.LaneArtifact:
     if test_draft.kind is not st.ArtifactKind.TEST_DRAFT:
-        raise pr.PrivateReviewError("test review requires TEST_DRAFT")
-    findings_out = pr.actionable_findings(verdict, findings, private_tokens)
+        raise rc.ReviewContractError("test review requires TEST_DRAFT")
+    findings_out = rc.actionable_findings(verdict, findings)
     payload = {
         "findings": [dict(item) for item in findings_out],
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
         "verdict": verdict.value,
     }
-    if private_tokens:
-        pr.refuse_private_leak(payload, private_tokens)
-    artifact = pr.make_lane_artifact(
+    return rc.make_lane_artifact(
         kind=st.ArtifactKind.TEST_REVIEW,
         request=request,
         payload=payload,
         artifact_ref="test-review:{0}".format(request.input_digest),
         verdict=verdict,
     )
-    if private_tokens:
-        pr.refuse_private_leak(st.canonical_bytes(artifact.payload), private_tokens)
-    return artifact
 
 
-def seal_accepted_tests(
+def accept_tests(
     *,
-    request: pr.VaultLaneRequest,
-    state_root: Path,
-    run_repo: Path,
-    builder_worktree: Path | None,
+    request: rc.LaneRequest,
     test_draft: st.LaneArtifact,
     test_review: st.LaneArtifact,
-    released: Collection[str] = (),
-    integration_initial_sha: str | None = None,
 ) -> st.LaneArtifact:
-    """Seal the accepted draft and prove its bytes are still private.
+    """Pin the accepted draft as the suite every later stage is bound to.
 
-    `released` names the object ids the run repository is allowed to hold:
-    the blobs a build lane's integration merge already carried out of the
-    vault at these same paths (`FactoryScheduler._released_object_ids`). An
-    unchanged tests lane re-sealing after an amendment finds its own accepted
-    bytes in the product repository for that reason and no other; anything
-    else present there is still a leak and still refuses.
-
-    `integration_initial_sha` names the integration commit the run was
-    created on. An object reachable from it is not a leak, because git
-    identifies a blob by its content: a tester who writes a file whose bytes
-    already exist somewhere in the base -- a boilerplate `conftest.py`, an
-    empty `__init__.py`, whose blob id is the same everywhere -- produces an
-    object the repository was already holding before the vault held any draft
-    of this run. Two facts make the exemption safe rather than a loosening.
-    That object set is fixed at run creation, so nothing this run does can
-    add to it and no escape can authorize itself into it. And a blob
-    reachable from the base is in every builder checkout by construction, so
-    exempting it hands the builder nothing it could not already read. The
-    question narrows from "does the product repository hold these bytes" to
-    "does it hold them for a reason older than this run"; anything present
-    and not reachable from that commit is still a leak and still refuses.
-    Left unset, the exemption is empty and the check is exactly as it was.
+    Nothing is re-committed and nothing moves: the candidate the reviewer
+    read is the candidate that is accepted, and `test_suite_digest` is the
+    `test_binding` digest of exactly its files. Every site that runs the suite
+    verifies the tree it runs in against these blobs first (`TEST_SUITE_TAMPERED`),
+    and every candidate a build lane submits is refused at admission if its
+    delta names one of these paths (`CANDIDATE_TEST_PATH_REFUSED`).
     """
     if test_draft.kind is not st.ArtifactKind.TEST_DRAFT:
-        raise pr.PrivateReviewError("seal requires TEST_DRAFT")
+        raise rc.ReviewContractError("acceptance requires TEST_DRAFT")
     if test_review.kind is not st.ArtifactKind.TEST_REVIEW:
-        raise pr.PrivateReviewError("seal requires TEST_REVIEW")
+        raise rc.ReviewContractError("acceptance requires TEST_REVIEW")
     if test_review.verdict is not st.ReviewerVerdict.PASS:
-        raise pr.PrivateReviewError("seal requires TEST_REVIEW PASS")
-    vault = hv.ensure_vault(state_root, request.run_id)
-    commit = hv.rev_parse(vault, test_draft.artifact_ref)
-    contract = test_draft.payload["public_contract"]
-    private = _select_private_blobs(vault, commit, test_draft.payload)
-    # Sealing accepts the draft commit as it is; nothing is re-committed. The
-    # sealed digest is therefore the draft's manifest digest recomputed over
-    # the same commit and the same blobs, and equals `private_draft_digest`
-    # by construction. `_select_private_blobs` has already refused a draft
-    # whose recorded digest does not match that recomputation, so the two
-    # names are one identity carried under two ref namespaces, not a
-    # coincidence.
-    sealed_digest = _manifest_digest(commit, private)
-    sealed = hv.sealed_ref(request.run_id, request.lane_id, sealed_digest)
-    object_ids = (commit,) + tuple(blob for _path, blob in private)
-    refused = tuple(oid for oid in object_ids if oid not in released)
-    if refused and integration_initial_sha:
-        # Walking the base commit costs a full rev-list, so pay it only once
-        # and only when something is actually present to explain. A clean
-        # seal -- the ordinary case -- never touches it.
-        if any(not hv.object_is_absent(run_repo, oid) for oid in refused):
-            base_objects = hv.objects_reachable_from(run_repo, integration_initial_sha)
-            refused = tuple(oid for oid in refused if oid not in base_objects)
-    hv.prove_absent((run_repo,), refused)
-    if builder_worktree is not None:
-        hv.prove_absent((builder_worktree,), object_ids)
-        if commit in hv.advertised_object_ids(run_repo):
-            raise pr.IsolationError("run repository advertises the sealed commit")
-        builder_objects = hv.batch_object_ids(builder_worktree)
-        if any(object_id in builder_objects for object_id in object_ids):
-            raise pr.IsolationError("builder object database holds sealed tests")
-        reachable = hv.rev_list_objects(builder_worktree)
-        for object_id in object_ids:
-            if object_id in reachable:
-                raise pr.IsolationError("builder rev-list reaches private object")
-        hv.prove_unfetchable(run_repo, builder_worktree, commit)
-        vault_path = hv.vault_path(state_root, request.run_id).resolve()
-        builder_root = builder_worktree.resolve()
-        if vault_path in builder_root.parents:
-            raise pr.IsolationError("vault is inside the builder worktree")
-        if str(vault_path).startswith(str(builder_root) + os.sep):
-            raise pr.IsolationError("vault is under the builder worktree")
+        raise rc.ReviewContractError("acceptance requires TEST_REVIEW PASS")
+    files = suite_files(test_draft)
+    digest = tb.suite_digest(files)
+    if test_draft.payload.get("test_suite_digest") != digest:
+        raise rc.ReviewContractError("test draft digest does not match its files")
     payload = {
+        "builder_base_sha": test_draft.payload["builder_base_sha"],
+        "candidate_ref": test_draft.payload["candidate_ref"],
+        "candidate_sha": test_draft.payload["candidate_sha"],
+        "changed": bool(test_draft.payload.get("changed", True)),
+        "files": files,
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
-        "public_contract": contract,
-        "sealed_digest": sealed_digest,
+        "public_contract": test_draft.payload["public_contract"],
+        "test_suite_digest": digest,
     }
-    if test_draft.payload.get("private_manifest_schema") == PRIVATE_MANIFEST_SCHEMA:
-        payload["private_manifest_digest"] = sealed_digest
-        payload["private_manifest_schema"] = PRIVATE_MANIFEST_SCHEMA
-
-    files = {path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in private}
-    tokens = pr.collect_private_tokens(
-        files=files,
-        vault_path=hv.vault_path(state_root, request.run_id),
-        vault_refs=(test_draft.artifact_ref, sealed),
-        blob_ids=object_ids,
-    )
-    public_tokens = pr.public_contract_allow(
-        contract,
-        extra=(
-            request.input_digest,
-            sealed_digest,
-            *(
-                (PRIVATE_MANIFEST_SCHEMA,)
-                if payload.get("private_manifest_schema") == PRIVATE_MANIFEST_SCHEMA
-                else ()
-            ),
-        ),
-    )
-
-    pr.refuse_private_leak(payload, tokens, allow=public_tokens)
-    artifact = pr.make_lane_artifact(
-        kind=st.ArtifactKind.SEALED_TEST_BUNDLE,
+    return rc.make_lane_artifact(
+        kind=st.ArtifactKind.ACCEPTED_TEST_SUITE,
         request=request,
         payload=payload,
-        artifact_ref=sealed,
-    )
-    pr.refuse_private_leak(
-        st.canonical_bytes(artifact.payload),
-        tokens,
-        allow=public_tokens,
-    )
-    # Pinned last, for the same reason as the draft ref; it cannot collide.
-    hv.update_immutable_ref(vault, sealed, commit)
-    return artifact
-
-
-def sealed_private_files(
-    vault: Path, sealed_artifact: st.LaneArtifact
-) -> dict[str, str]:
-    commit = hv.rev_parse(vault, sealed_artifact.artifact_ref)
-    return {
-        path: blob
-        for path, blob in _select_private_blobs(
-            vault, commit, sealed_artifact.payload
-        )
-    }
-
-def private_draft_overlay_paths(
-    vault: Path, test_draft: st.LaneArtifact
-) -> tuple[str, ...]:
-    if test_draft.kind is not st.ArtifactKind.TEST_DRAFT:
-        raise pr.PrivateReviewError("overlay listing requires TEST_DRAFT")
-    commit = hv.rev_parse(vault, test_draft.artifact_ref)
-    return tuple(
-        path
-        for path, _blob in _select_private_blobs(
-            vault, commit, test_draft.payload
-        )
+        artifact_ref=str(test_draft.payload["candidate_ref"]),
     )
 
 
-
-
-#: Which runner a sealed file's name names. `.py` is pytest outright; a
+#: Which runner a test file's name names. `.py` is pytest outright; a
 #: JavaScript or TypeScript file only names vitest when it is a test file, so a
-#: `.ts` helper sealed beside a `.test.ts` suite does not get a vote of its own.
+#: `.ts` helper accepted beside a `.test.ts` suite does not get a vote of its own.
 #: Anything else votes for nothing.
 _PYTEST_SUFFIX = ".py"
 _VITEST_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
@@ -434,7 +266,7 @@ _VITEST_STEMS = (".test", ".spec")
 
 
 def _file_runner(path: str) -> str | None:
-    """The runner a single sealed file names, or `None` when it names none."""
+    """The runner a single test file names, or `None` when it names none."""
     name = str(path).rsplit("/", 1)[-1]
     if name.endswith(_PYTEST_SUFFIX):
         return "pytest"
@@ -448,32 +280,30 @@ def _file_runner(path: str) -> str | None:
 
 
 def _derive_runner(files: Sequence[str]) -> str:
-    """The one runner a sealed file set names, or a refusal.
+    """The one runner a test file set names, or a refusal.
 
     Nothing in the artifact-factory plan schema can supply a gate —
     `plan_model.LANE_KEYS` has no `gate` key and `plan_validate` refuses a lane
-    carrying one — so every sealed suite arrives here with `gate=None`. This
+    carrying one — so every suite arrives here with `gate=None`. This
     used to answer `pytest` unconditionally, which ran a vitest suite under
     pytest: `found no collectors for …/paid-dpa.test.ts`, exit 4, zero cases
-    executed, which `code_review` reads as a failed sealed suite and turns a
+    executed, which `code_review` reads as a failed suite and turns a
     reviewer PASS into REVISE. Deriving is the fix; guessing is what broke it,
     so an ambiguous or unreadable file set refuses instead of picking a side.
     """
     named = {runner for runner in map(_file_runner, files) if runner is not None}
     if len(named) == 1:
         return named.pop()
-    # Only the distinct suffixes go in the message: the sealed file names are
-    # private and this error travels back through public review payloads.
     suffixes = sorted(
         {"." + str(path).rsplit(".", 1)[-1] for path in files if "." in str(path)}
     )
     if not named:
-        raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_RUNNER_UNDERIVABLE: no sealed file names a runner "
+        raise rc.SuiteEnvironmentError(
+            "SUITE_RUNNER_UNDERIVABLE: no test file names a runner "
             "(suffixes: {0})".format(", ".join(suffixes) or "none")
         )
-    raise pr.SealedEnvironmentError(
-        "SEALED_SUITE_RUNNER_AMBIGUOUS: sealed files name more than one runner "
+    raise rc.SuiteEnvironmentError(
+        "SUITE_RUNNER_AMBIGUOUS: test files name more than one runner "
         "({0}; suffixes: {1})".format(", ".join(sorted(named)), ", ".join(suffixes))
     )
 
@@ -489,19 +319,19 @@ def _suite_gate(gate: Any, files: Sequence[str]) -> SimpleNamespace:
     if isinstance(gate, SimpleNamespace):
         return gate
     if not isinstance(gate, Mapping):
-        raise pr.PrivateReviewError("sealed suite gate is not a mapping")
+        raise rc.ReviewContractError("suite gate is not a mapping")
     runner = gate.get("runner")
     if runner not in rr.EXECUTE_ARGS:
-        raise pr.PrivateReviewError("unsupported sealed suite runner")
+        raise rc.ReviewContractError("unsupported suite runner")
     min_cases = gate.get("min_cases")
     if isinstance(min_cases, bool) or not isinstance(min_cases, int) or min_cases < 1:
-        raise pr.PrivateReviewError("min_cases")
+        raise rc.ReviewContractError("min_cases")
     argv = gate.get("argv") or ()
     if not isinstance(argv, (list, tuple)):
-        raise pr.PrivateReviewError("argv")
+        raise rc.ReviewContractError("argv")
     cwd = gate.get("cwd") or "."
     if not isinstance(cwd, str) or not cwd:
-        raise pr.PrivateReviewError("cwd")
+        raise rc.ReviewContractError("cwd")
     return SimpleNamespace(
         runner=str(runner),
         argv=tuple(str(item) for item in argv),
@@ -517,7 +347,7 @@ def _suite_gate(gate: Any, files: Sequence[str]) -> SimpleNamespace:
 # `requires-python = ">=3.12"` in its `pyproject.toml` while the only pytest on
 # the machine runs 3.9. That combination cannot import the project at all, and
 # the way it fails is the problem — `executed == 0`, which `code_review` reads
-# as "sealed private tests failed, errored, or did not execute" and reports
+# as "suite failed, errored, or did not execute" and reports
 # against the BUILDER. No builder can raise the harness's Python version, so
 # this refuses with its own typed error naming the environment instead.
 #
@@ -645,7 +475,7 @@ def _python_requirements(
 ) -> tuple[tuple[str, str], ...]:
     """`(pyproject path, requires-python)` for every project the suite touches.
 
-    The gate's own `cwd` and each sealed file's directory are both walked
+    The gate's own `cwd` and each test file's directory are both walked
     upward, because a monorepo declares `requires-python` beside the service
     under test (`services/api-gateway/pyproject.toml`) rather than at the root
     the gate happens to run from.
@@ -656,8 +486,8 @@ def _python_requirements(
     starts = [base / (cwd or ".")]
     for path in files:
         try:
-            relative = pr.normalize_repo_path(str(path))
-        except pr.PrivateReviewError:
+            relative = rc.normalize_repo_path(str(path))
+        except rc.ReviewContractError:
             continue
         starts.append((base / relative).parent)
     found: dict[str, str] = {}
@@ -751,8 +581,8 @@ def _assert_declared_python(
     for project, specifier in requirements:
         if _satisfies(version, specifier) is not False:
             continue
-        raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_PYTHON_UNSUPPORTED: the sealed suite resolved pytest to "
+        raise rc.SuiteEnvironmentError(
+            "SUITE_PYTHON_UNSUPPORTED: the suite resolved pytest to "
             "{0}, running Python {1}, which does not satisfy requires-python "
             "{2!r} declared in {3}. This is a harness environment fault: the "
             "candidate under test was never executed, and no change to it can "
@@ -763,7 +593,7 @@ def _assert_declared_python(
 def _suite_selectors(
     gate: SimpleNamespace, files: Sequence[str], tree: Path
 ) -> tuple[str, ...]:
-    argv, selectors = pr.substituted_gate_argv(gate.argv, files, tree)
+    argv, selectors = rc.substituted_gate_argv(gate.argv, files, tree)
     if gate.runner == "pytest":
         return (
             "--rootdir",
@@ -776,11 +606,10 @@ def _suite_selectors(
             # at this verbosity.
             "-vv",
             # One location-and-exception line per failure. `--tb=no` printed
-            # nothing but pytest's short summary, whose only content is
-            # `path::case_name` -- private, dropped, and therefore a lane that
-            # reported zero forwardable failures on every round forever.
-            # Verified against the real binary: this yields
-            # `path:LINE: AttributeError: ...` and no test source.
+            # nothing but pytest's short summary, which names the case and
+            # not the assertion; the builder needs the assertion. Verified
+            # against the real binary: this yields
+            # `path:LINE: AttributeError: ...`.
             "--tb=line",
             "-o",
             "addopts=",
@@ -823,7 +652,7 @@ def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
     return counts
 
 
-def run_private_suite(
+def run_suite(
     tree: Path,
     paths: Sequence[str],
     *,
@@ -841,42 +670,22 @@ def run_private_suite(
         # Only the path operands. `_suite_selectors` returns a whole
         # invocation -- `--rootdir . -vv --tb=line …` -- and those flags are
         # this suite's reporting shape, not the probe's question.
-        _argv, selectors = pr.substituted_gate_argv(bound.argv, files, Path(tree))
+        _argv, selectors = rc.substituted_gate_argv(bound.argv, files, Path(tree))
         resolved = rr.resolve(
             bound.runner, Path(tree), bound.cwd, paths=selectors
         )
     except rr.RunnerUnusable as extra:
-        # The measurement travels with the refusal. `SEALED_SUITE_RUNNER_UNUSABLE:
+        # The measurement travels with the refusal. `SUITE_RUNNER_UNUSABLE:
         # vitest` alone cannot tell UNRESOLVED (the runner was never installed --
         # repair `provision_argv`) from INCAPABLE (it is installed and cannot
         # resolve this project's config -- repair the config or its deps), and
         # those have opposite repairs. `detail` names the reason, the candidates
-        # tried, the resolved binary, the probe exit and the probe's own words.
-        # Redacted, because the probe output can quote sealed test source, and
-        # the tree path names the vault checkout.
-        # Bodies, not just paths. `collect_private_tokens(files=...)` takes a
-        # path -> body mapping and tokenises the source itself -- every quoted
-        # literal and every line of it -- where `extra=` would redact the file
-        # names alone. A collect error quotes the source that failed to import,
-        # and `code_review._run_sealed_suite` puts `str(exc)` into the run's
-        # `output`, so an unredacted probe output carries sealed source out of
-        # this boundary. The caller has the bodies and drops them at the
-        # signature (`tuple(files)`), so read them back from the tree they were
-        # materialised into; unreadable is not fatal here, since a token that
-        # cannot be built is one this refusal simply never had.
-        bodies: dict[str, str] = {}
-        for path in files:
-            try:
-                bodies[path] = (Path(tree) / path).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-        tokens = pr.collect_private_tokens(
-            files=bodies,
-            extra=tuple(files) + (str(tree), str(Path(tree).resolve())),
-        )
-        detail = pr.redact_text(getattr(extra, "detail", "") or str(extra), tokens)
-        raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_RUNNER_UNUSABLE:{0}: {1}".format(bound.runner, detail)
+        # tried, the resolved binary, the probe exit and the probe's own words,
+        # verbatim: the suite is visible, so nothing in a probe's output is a
+        # secret to anyone who reads this.
+        detail = getattr(extra, "detail", "") or str(extra)
+        raise rc.SuiteEnvironmentError(
+            "SUITE_RUNNER_UNUSABLE:{0}: {1}".format(bound.runner, detail)
         ) from extra
     _assert_declared_python(resolved, Path(tree), Path(tree), bound.cwd, files)
     exec_gate = SimpleNamespace(
@@ -904,7 +713,7 @@ def run_private_suite(
         # This used to credit `executed = min_cases; counts["passed"] = executed`
         # for every runner except pytest. No plan can declare a gate, so
         # `min_cases` is always 1, and the moment vitest became reachable that
-        # fabrication turned "vitest executed nothing" into a green sealed suite
+        # fabrication turned "vitest executed nothing" into a green suite
         # binding the candidate — `code_review`'s `executed < min_cases` check
         # cannot fire against a count this function invented. A false REVISE is
         # loud and costs builder rounds; a false green is silent and ships.
@@ -920,8 +729,8 @@ def run_private_suite(
         # pytest needs no exemption from the same rule: it cannot exit 0 having
         # collected nothing, because that is exit 5 (NO_TESTS_COLLECTED). Both
         # runners now fail closed identically.
-        raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_COUNTS_UNPARSEABLE:{0}: the sealed suite's runner "
+        raise rc.SuiteEnvironmentError(
+            "SUITE_COUNTS_UNPARSEABLE:{0}: the suite's runner "
             "exited 0 but reported no executed cases, so how many cases ran "
             "could not be measured. An unreadable measurement is not a pass "
             "and is not a defect in the candidate under test.".format(bound.runner)
@@ -955,14 +764,14 @@ def run_private_suite(
         # builder. Measured on vitest 3.2.7: a `beforeAll` that throws exits 1
         # with `Tests  2 skipped (2)`, evaluating nothing. FDAdb run
         # be064e58 `lane-wp3-adapter-build` spent three REVISE rounds and a
-        # NO_PROGRESS park on exactly that, because the sealed suite spawned
+        # NO_PROGRESS park on exactly that, because the suite spawned
         # `python3` off PATH and the interpreter it found had no `uvicorn`.
         #
         # Whether the runner exited 0 or 1 while evaluating nothing says
         # nothing about the candidate; `evaluated == 0` is the whole question.
-        raise pr.SealedEnvironmentError(
-            "SEALED_SUITE_ALL_CASES_SKIPPED:{0}: every one of the {1} counted "
-            "cases was skipped, so the sealed suite evaluated nothing. A suite "
+        raise rc.SuiteEnvironmentError(
+            "SUITE_ALL_CASES_SKIPPED:{0}: every one of the {1} counted "
+            "cases was skipped, so the suite evaluated nothing. A suite "
             "that asserted nothing is not a pass and is not a defect in the "
             "candidate under test.".format(bound.runner, executed)
         )
@@ -974,29 +783,3 @@ def run_private_suite(
         "returncode": returncode,
         "runner": bound.runner,
     }
-
-
-def run_private_pytest(
-    tree: Path, paths: Sequence[str], timeout_s: float = 120.0
-) -> dict:
-    return run_private_suite(tree, paths, timeout_s=timeout_s)
-
-
-
-def draft_private_tokens(
-    *,
-    state_root: Path,
-    run_id: str,
-    draft: st.LaneArtifact,
-) -> tuple[str, ...]:
-    vault = hv.ensure_vault(state_root, run_id)
-    commit = hv.rev_parse(vault, draft.artifact_ref)
-    private = _select_private_blobs(vault, commit, draft.payload)
-    files = {path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in private}
-    return pr.collect_private_tokens(
-        files=files,
-        vault_path=vault,
-        vault_refs=(draft.artifact_ref,),
-        blob_ids=(commit,) + tuple(blob for _path, blob in private),
-    )
-

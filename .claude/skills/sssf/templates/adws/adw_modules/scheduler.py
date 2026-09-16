@@ -23,12 +23,12 @@ from typing import Any, Optional, Protocol
 from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
-from . import hidden_vault as hv
-from . import private_review as prv
 from . import provisioning as prov
+from . import review_contract as rc
 from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
+from . import tree_materialize as tm
 from .lifecycle import (
     AmendmentRefused,
     ArtifactRecord,
@@ -85,7 +85,7 @@ class DraftCollectionRefused(FactoryRefused):
     `min_cases`, an unsupported runner, `required_cases` longer than the floor.
     Nothing a tester writes can answer that, so it refuses the run.
 
-    `_collect_private_draft` also raises it, and there it *is* about a draft:
+    `_collect_draft` also raises it, and there it *is* about a draft:
     that call site is inside `_measure_draft_gate`, which catches it and turns
     it into a REVISE the tester is asked to answer. It reaches no further.
     Before 2026-09-05 it did: on FDAdb run a2ea7355 one tests lane submitted a
@@ -113,6 +113,12 @@ class ParentOutcomesRefused(DraftCollectionRefused):
 
 class TypedTestOutputsRefused(FactoryRefused):
     code = "TYPED_TEST_OUTPUTS"
+
+
+class TestFileOnDeclaredOutput(FactoryRefused):
+    """An untyped lane's tester wrote a test at one of the lane's own outputs."""
+
+    code = "TEST_FILE_ON_DECLARED_OUTPUT"
 
 
 def classify_executing_runtime(maestro_file: Path) -> str:
@@ -218,7 +224,7 @@ def _lane_artifact_by_id(
         run_id=run_id,
         lane_id=lane_id,
         sequence=row["sequence"],
-        kind=st.ArtifactKind(row["artifact_kind"]),
+        kind=st.stored_artifact_kind(row["artifact_kind"], run_id=run_id),
         plan_revision=row["plan_revision"],
         input_digest=row["input_digest"],
         output_digest=row["output_digest"],
@@ -261,7 +267,7 @@ def _substantive_blob(repo: Path, path: str, oid: str) -> str:
     suffix = Path(path).suffix
     if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"} or oid == "NO_BLOB":
         return oid
-    raw = hv.cat_blob(repo, oid)
+    raw = tm.cat_blob(repo, oid)
     if suffix != ".py":
         try:
             tokens = bsf._tokenize_javascript(raw.decode("utf-8"), comparison=True)
@@ -293,14 +299,11 @@ def _review_content_history(
     run_id: str,
     lane_id: str,
     review_kind: st.ArtifactKind,
-    vault: Optional[Path] = None,
 ) -> list[tuple[str, int | None]]:
     """Content of the exact reviewed artifacts in the current argument.
 
     USER_WAIT and plan revision reset the window. A changed applicable base,
-    spec, projection or sealed suite starts a new argument, not a cycle.
-    Private identities stay here: neither the ledger nor operator output gets
-    the draft's paths, blobs, or content digest.
+    spec, projection or accepted suite starts a new argument, not a cycle.
     """
     marker = 0
     for row in store.conn.execute(
@@ -316,6 +319,7 @@ def _review_content_history(
     )
     history: list[tuple[str, int | None]] = []
     applicability = None
+    repo: Path | None = None
     for row in store.conn.execute(
         "SELECT payload_json, spec_digest, lane_projection_digest "
         "FROM lane_artifacts WHERE run_id=? AND lane_id=? AND artifact_kind=? "
@@ -335,18 +339,21 @@ def _review_content_history(
         if len(producers) != 1:
             raise FactoryRefused("review must name exactly one reviewed artifact")
         payload = producers[0].payload
+        if repo is None:
+            # The blobs a draft or a candidate names live in the run
+            # repository's object database, whichever kind is being read.
+            repo = Path(store.conn.execute(
+                "SELECT target_repository_root FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()["target_repository_root"])
         if producer_kind is st.ArtifactKind.TEST_DRAFT:
-            if vault is None:
-                raise FactoryRefused("test content history requires the private vault")
-            commit = hv.rev_parse(vault, payload["private_draft_ref"])
             content = sorted(
-                (path, _substantive_blob(vault, path, oid))
-                for path, oid in tc._select_private_blobs(vault, commit, payload)
+                (path, _substantive_blob(repo, path, oid))
+                for path, oid in dict(payload["files"]).items()
             )
             current = (
                 row["spec_digest"],
                 row["lane_projection_digest"],
-                hv.rev_parse(vault, commit + "^"),
+                payload["builder_base_sha"],
                 st.digest_canonical(payload["public_contract"]),
             )
         else:
@@ -354,13 +361,10 @@ def _review_content_history(
                 payload["spec_digest"],
                 payload["projection_digest"],
                 payload["builder_base_sha"],
-                payload["sealed_test_digest"],
+                payload["test_suite_digest"],
             )
             # The admitted fixed-base delta names old/new paths, modes and
             # blobs. Commit metadata and attempt ids are deliberately absent.
-            repo = Path(store.conn.execute(
-                "SELECT target_repository_root FROM runs WHERE run_id=?", (run_id,)
-            ).fetchone()["target_repository_root"])
             content = []
             for entry in payload["tree_delta"]:
                 item = dict(entry)
@@ -402,7 +406,7 @@ def _stalled(
 ) -> bool:
     """REVISE stops on regression, three flat outcomes, or repeated syntax.
 
-    A build round is measured by the sealed suite's passed count, and one
+    A build round is measured by the accepted suite's passed count, and one
     round below the applicable best is a regression at any setting.
 
     A tests round is measured by both quantities it can move, as the pair
@@ -440,7 +444,7 @@ def _stalled(
 
 def _writing_tests_predecessors(
     store: ArtifactStore, run_id: str, lane_id: str
-) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord], str, str]:
+) -> tuple[Optional[ArtifactRecord], str]:
     review = _latest(
         store,
         run_id,
@@ -448,18 +452,8 @@ def _writing_tests_predecessors(
         st.ArtifactKind.TEST_REVIEW,
         verdict=st.ReviewerVerdict.REVISE,
     )
-    invalidation = _latest(
-        store, run_id, lane_id, st.ArtifactKind.TEST_INVALIDATION
-    )
-    draft = _latest(store, run_id, lane_id, st.ArtifactKind.TEST_DRAFT)
     review_id = review.artifact_id if review is not None else st.NO_TEST_REVIEW
-    invalidation_id = st.active_test_invalidation_id(
-        invalidation_id=invalidation.artifact_id if invalidation is not None else None,
-        invalidation_sequence=invalidation.sequence if invalidation is not None else None,
-        draft_sequence=draft.sequence if draft is not None else None,
-    )
-    active = invalidation if invalidation_id != st.NO_TEST_INVALIDATION else None
-    return review, active, review_id, invalidation_id
+    return review, review_id
 
 
 
@@ -556,6 +550,24 @@ UNSAFE_LEGACY_REBASE_KINDS = frozenset(
 )
 
 
+def refuse_historical_artifacts(store: ArtifactStore, run_id: str) -> None:
+    """Refuse a run whose ledger still holds a pre-v5 suite artifact.
+
+    Checked once where a run is bound, before any verb reads its artifacts,
+    so `run resume`, `run status`, `run amend` and `run attend` all answer
+    `LIVE_RUN_CUTOVER_REQUIRED` rather than whichever reader reaches the row
+    first.
+    """
+    placeholders = ",".join("?" for _ in st.HISTORICAL_LANE_ARTIFACT_KINDS)
+    row = store.conn.execute(
+        "SELECT artifact_kind FROM lane_artifacts WHERE run_id=? "
+        "AND artifact_kind IN ({0}) ORDER BY sequence LIMIT 1".format(placeholders),
+        (run_id, *st.HISTORICAL_LANE_ARTIFACT_KINDS),
+    ).fetchone()
+    if row is not None:
+        raise st.LiveRunCutoverRequired(run_id, str(row[0]))
+
+
 def recorded_artifact_kinds(
     store: ArtifactStore, run_id: str
 ) -> tuple[st.ArtifactKind, ...]:
@@ -564,12 +576,12 @@ def recorded_artifact_kinds(
         "SELECT artifact_kind FROM lane_artifacts WHERE run_id=?",
         (run_id,),
     ):
-        kinds.append(st.ArtifactKind(row[0]))
+        kinds.append(st.stored_artifact_kind(row[0], run_id=run_id))
     for row in store.conn.execute(
         "SELECT artifact_kind FROM run_artifacts WHERE run_id=?",
         (run_id,),
     ):
-        kinds.append(st.ArtifactKind(row[0]))
+        kinds.append(st.stored_artifact_kind(row[0], run_id=run_id))
     return tuple(kinds)
 
 
@@ -756,51 +768,107 @@ def plan_artifact_ref_for(store: ArtifactStore, run_id: str, plan_revision: int)
     return found[0]
 
 
-def _released_sealed_files(
-    store: ArtifactStore, state_root: Path, run_id: str, lane: st.LaneProjection
-) -> dict[str, bytes]:
-    """The accepted suite a lane's integration merge carries out of the vault.
+def _merge_producers(
+    store: ArtifactStore, run_id: str, lane: st.LaneProjection
+) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord]]:
+    """The candidate and the passing review a READY_TO_MERGE lane merges.
 
-    An authored build lane releases its predecessor tests lane's sealed
-    bundle at the current revision: path to bytes, the same map
-    `code_review.measure_candidate` overlays for review, so what the
-    integration ref carries is what the candidate was judged against.
-
-    An untyped lane releases nothing. Its private files are hidden
-    meta-tests at paths of the tester's choosing, and `REVIEWING_CODE`
-    refuses a candidate that holds a file at any of them
-    (`PRIVATE_PATH_COLLISION`). Once released they would be in every later
-    base, and the lane's own rebuild after an amendment would be refused for
-    carrying its own suite. Releasing those needs that check to change
-    first; it is not done here.
+    A build lane merges its BUILDER_OUTPUT under its CODE_REVIEW PASS. A tests
+    lane merges its ACCEPTED_TEST_SUITE -- the candidate its test reviewer
+    accepted -- under that TEST_REVIEW PASS. Same edge, same payload keys
+    (`builder_base_sha`, `candidate_ref`, `candidate_sha`), one producer pair
+    per lane kind. `ArtifactStore._merge_producers` is the same rule read off
+    the ledger's own tables.
     """
-    if lane.lane_kind != st.LANE_KIND_BUILD:
-        return {}
-    revision = run_row(store, run_id)["plan_revision"]
-    for dep in lane.needs:
-        dep_lane = next(
-            (
-                item
-                for item in store.active_projection(run_id)
-                if item.lane_id == dep
+    if lane.lane_kind == st.LANE_KIND_TESTS:
+        revision = run_row(store, run_id)["plan_revision"]
+        return (
+            _latest(
+                store,
+                run_id,
+                lane.lane_id,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE,
+                plan_revision=revision,
             ),
-            None,
+            _latest(
+                store,
+                run_id,
+                lane.lane_id,
+                st.ArtifactKind.TEST_REVIEW,
+                verdict=st.ReviewerVerdict.PASS,
+            ),
         )
-        if dep_lane is None or dep_lane.lane_kind != st.LANE_KIND_TESTS:
-            continue
-        sealed = _latest(
+    return (
+        _latest(store, run_id, lane.lane_id, st.ArtifactKind.BUILDER_OUTPUT),
+        _latest(
             store,
             run_id,
-            dep,
-            st.ArtifactKind.SEALED_TEST_BUNDLE,
-            plan_revision=revision,
-        )
-        if sealed is None:
-            raise FactoryRefused(f"missing dependency sealed tests {dep}")
-        vault = hv.ensure_vault(state_root, run_id)
-        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, dep_lane))
-        return {path: hv.cat_blob(vault, blob) for path, blob in blobs.items()}
-    raise FactoryRefused("missing tests-lane sealed bundle")
+            lane.lane_id,
+            st.ArtifactKind.CODE_REVIEW,
+            verdict=st.ReviewerVerdict.PASS,
+        ),
+    )
+
+
+def _merge_artifacts(
+    lane: st.LaneProjection, producer: ArtifactRecord, review: ArtifactRecord
+) -> dict[str, ArtifactRecord]:
+    if lane.lane_kind == st.LANE_KIND_TESTS:
+        return {"ACCEPTED_TEST_SUITE": producer, "TEST_REVIEW": review}
+    return {"BUILDER_OUTPUT": producer, "CODE_REVIEW": review}
+
+
+def _base_head(
+    target: gitpub.TargetBinding, lane: st.LaneProjection, builder_base_sha: str
+) -> str:
+    """The integration head a lane's builder base was cut from.
+
+    A typed lane builds on the integration head itself: a build lane's base
+    already carries its predecessor tests lane's merged suite, and a tests
+    lane's draft is committed straight on the head. An untyped lane builds
+    on the head plus its own accepted suite (`_untyped_builder_base`), one
+    commit above the head, so the head is that commit's first parent. This
+    is what `decide_merge_action` measures staleness against.
+    """
+    if lane.lane_kind is not None:
+        return builder_base_sha
+    parents = target.git().commit_parents(builder_base_sha)
+    if not parents:
+        raise FactoryRefused("untyped builder base has no parent")
+    return parents[0]
+
+
+ACCEPTED_TESTS_COMMIT_MESSAGE = b"maestro accepted tests\n"
+
+
+def _untyped_builder_base(
+    target: gitpub.TargetBinding,
+    head: str,
+    accepted: st.LaneArtifact,
+) -> str:
+    """The commit an untyped lane builds on: the integration head plus its suite.
+
+    A typed build lane finds its suite in the head because the tests lane
+    merged it there. An untyped lane authors and builds in one lane, and its
+    tests are its own, so they are put on top of the current head as one
+    content-addressed commit -- the same bytes the reviewer accepted, at the
+    same paths, on whatever head the lane builds against now. The candidate's
+    delta is measured from this commit, so its tests are in its base and
+    `CANDIDATE_TEST_PATH_REFUSED` protects them exactly as it protects a typed
+    lane's; `verify_suite` proves they are still the accepted blobs before
+    the suite runs. Nothing is overlaid into any tree at any later point.
+    """
+    repo = Path(target.target_repository_root)
+    files = {
+        path: tm.cat_blob(repo, blob)
+        for path, blob in tc.suite_files(accepted).items()
+    }
+    return gitpub.commit_files_on_base(
+        target,
+        base_sha=head,
+        files=files,
+        message=ACCEPTED_TESTS_COMMIT_MESSAGE,
+    )
 
 
 def _explain_ahead_merge(
@@ -813,27 +881,20 @@ def _explain_ahead_merge(
     row: Mapping[str, Any],
     state_root: Path,
 ) -> Optional[tuple[LaneContext, Mapping[str, Any]]]:
+    del state_root
     lane = next(
         item for item in store.active_projection(run_id) if item.lane_id == lane_id
     )
-    builder = _latest(store, run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT)
-    review = _latest(
-        store,
-        run_id,
-        lane_id,
-        st.ArtifactKind.CODE_REVIEW,
-        verdict=st.ReviewerVerdict.PASS,
-    )
+    builder, review = _merge_producers(store, run_id, lane)
     if builder is None or review is None:
         return None
     try:
-        released = _released_sealed_files(store, state_root, run_id, lane)
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=ledger_tip,
-            sealed_present=gitpub.sealed_files_present(target, ledger_tip, released),
+            base_head=_base_head(target, lane, builder.payload["builder_base_sha"]),
         )
     except (gitpub.GitPublicationRefused, FactoryRefused):
         return None
@@ -861,7 +922,7 @@ def _explain_ahead_merge(
         plan_artifact_ref=plan_artifact_ref_for(store, run_id, row["plan_revision"]),
         input_digest=digest,
         stage=st.LaneStage.READY_TO_MERGE,
-        artifacts={"BUILDER_OUTPUT": builder, "CODE_REVIEW": review},
+        artifacts=_merge_artifacts(lane, builder, review),
         builder_base_sha=builder.payload["builder_base_sha"],
         candidate_ref=builder.payload["candidate_ref"],
         candidate_sha=builder.payload["candidate_sha"],
@@ -881,7 +942,6 @@ def _explain_ahead_merge(
             before_sha=ledger_tip,
             epoch_seconds=merge_epoch_seconds(row["created_at"]),
             input_digest=digest,
-            sealed_files=released,
         )
     except gitpub.GitPublicationRefused:
         return None
@@ -920,7 +980,7 @@ def reconcile_orphaned_integration_merge_locked(
     if len(matches) != 1:
         raise FactoryRefused("orphaned integration merge is not uniquely attributable")
     ctx, payload = matches[0]
-    artifact = prv.make_lane_artifact(
+    artifact = rc.make_lane_artifact(
         kind=st.ArtifactKind.INTEGRATION_MERGE,
         request=_request(ctx),
         payload=payload,
@@ -1053,40 +1113,42 @@ class LaneContext:
     integration_head: str = ""
     entry_kind: st.BuildingEntryKind = st.BuildingEntryKind.INITIAL
     public_contract: Mapping[str, Any] | None = None
-    sealed_digest: str = ""
+    #: `test_binding.suite_digest` of the accepted suite this lane is graded
+    #: against: for a build lane its tests-lane predecessor's, for an untyped
+    #: lane its own.
+    test_suite_digest: str = ""
     draft_correction: Sequence[Mapping[str, str]] | None = None
-    #: Counts from the sealed suite, measured before the code reviewer votes.
-    #: Public by construction -- the same five integers ship to the builder as
-    #: `public_result_summary` -- so showing them to the reviewer leaks nothing
-    #: and is the difference between a located finding and a canned sentence.
-    sealed_result_summary: Mapping[str, int] | None = None
+    #: Counts from the accepted suite, measured before the code reviewer
+    #: votes. The same five integers ship to the builder as
+    #: `public_result_summary`; showing them to the reviewer is the difference
+    #: between a located finding and a canned sentence.
+    suite_result_summary: Mapping[str, int] | None = None
     #: Set on the second ask, when the suite is red and the reviewer's first
     #: answer carried no finding the builder could act on.
-    sealed_findings_required: bool = False
+    suite_findings_required: bool = False
     #: Set on the second ask, when the reviewer's first `violated_requirement`
     #: was not a verbatim quote of the public contract. Without it the re-ask
     #: is byte-identical and a paraphrase repeats: FDAdb run be064e58
     #: `lane-wp3-reader-tests` refused REVIEW_FINDING_UNCITED on a finding the
     #: contract does state, reworded both times.
     rejected_citation: str = ""
-    #: The names -- and only the names -- the sealed acceptance suite binds to:
-    #: module specifiers, the symbols imported from each, and the result-object
-    #: keys the assertions read. Names are contract; values are secrets. The
-    #: builder cannot be expected to guess a symbol it was never told about,
-    #: and guessing is exactly what it did nineteen times on FDAdb before this
-    #: field existed. Derived from the sealed files by `bound_surface`, which
-    #: extracts identifiers and never literals, numbers, or fixture data.
+    #: The names the accepted suite binds to: module specifiers, the symbols
+    #: imported from each, and the result-object keys the assertions read.
+    #: An index into a suite the builder can also read in full; it was the
+    #: only thing the builder was told while the suite was hidden, and it
+    #: still saves a builder from guessing a symbol nineteen times before
+    #: opening the file. Derived from the accepted files by `bound_surface`.
     bound_surface: Mapping[str, Any] | None = None
-    #: The paths of THIS lane's own sealed acceptance suite -- for a build
-    #: lane, its tests-lane predecessor's; for an untyped lane, its own. The
-    #: builder's checkout must not hold a file at any of them, whatever its
-    #: base carries. A build lane's merge releases that suite into the
-    #: integration ref, so after an amendment the lane's own new base is an
-    #: integration head that carries the suite it is graded against. The merge
-    #: cannot un-release it; `maestro._refresh_builder_checkout` removes it
-    #: from the working tree instead. Other lanes' released suites are not
-    #: here: they are part of the surface this lane legitimately builds on.
-    sealed_private_paths: tuple[str, ...] = ()
+    #: The paths of THIS lane's own accepted suite -- for a build lane, its
+    #: tests-lane predecessor's; for an untyped lane, its own. They are in
+    #: the builder's checkout, and the builder may read them. It may not
+    #: create, edit, delete, rename or copy them: `admit_candidate` refuses a
+    #: candidate whose delta names one (`CANDIDATE_TEST_PATH_REFUSED`) before
+    #: any reviewer reads it, and `verify_suite` refuses to measure a tree
+    #: whose bytes at these paths are not the accepted blobs
+    #: (`TEST_SUITE_TAMPERED`). Other lanes' merged suites are not here: they
+    #: are part of the surface this lane legitimately builds on.
+    protected_test_paths: tuple[str, ...] = ()
 
 
 class StageActor(Protocol):
@@ -1211,8 +1273,8 @@ _PROCESS_LOCK_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 
 
-def _request(ctx: LaneContext) -> prv.VaultLaneRequest:
-    return prv.VaultLaneRequest(
+def _request(ctx: LaneContext) -> rc.LaneRequest:
+    return rc.LaneRequest(
         run_id=ctx.run_id,
         lane_id=ctx.lane.lane_id,
         plan_revision=ctx.plan_revision,
@@ -1342,7 +1404,7 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
 def _collect_gate(
     gate: SimpleNamespace, files: Mapping[str, str], tree: Path
 ) -> SimpleNamespace:
-    argv, _selectors = prv.substituted_gate_argv(gate.argv, files, tree)
+    argv, _selectors = rc.substituted_gate_argv(gate.argv, files, tree)
     return SimpleNamespace(
         runner=gate.runner,
         argv=argv,
@@ -1356,9 +1418,8 @@ def _collect_gate(
 def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
     """The collection refusal, as a finding its own author can act on.
 
-    The detail is whatever the refusal carries, redacted at the raise, and the
-    tester authored the files it describes -- the seal keeps private tests from
-    the builder, not from the actor that wrote them.
+    The detail is whatever the refusal carries, verbatim; the tester authored
+    the files it describes.
 
     What it does *not* say is "fix what the refusal names", which is what it
     used to say. A collect that never returns names a stopwatch --
@@ -1373,7 +1434,7 @@ def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
     return st.require_revise_findings(
         (
             {
-                "implementation_area": "private tests",
+                "implementation_area": "tests",
                 "observed_behavior": (
                     "the lane's gate could not list the draft's cases. The "
                     "runner reported: {0}".format(detail)
@@ -1413,7 +1474,7 @@ def _draft_required_cases_findings(
     return st.require_revise_findings(
         (
             {
-                "implementation_area": "private tests",
+                "implementation_area": "tests",
                 "observed_behavior": (
                     "native collect listed no case named: {0}".format(
                         ", ".join(missing)
@@ -1486,7 +1547,7 @@ def _red_at_parent_findings(
     return st.require_revise_findings(
         (
             {
-                "implementation_area": "private tests",
+                "implementation_area": "tests",
                 "observed_behavior": (
                     "run against the parent commit, the draft's cases did not "
                     "match the outcomes this lane's plan declares: {0}".format(
@@ -1511,7 +1572,7 @@ def _red_at_parent_unreadable_findings(detail: str) -> tuple[dict[str, str], ...
     return st.require_revise_findings(
         (
             {
-                "implementation_area": "private tests",
+                "implementation_area": "tests",
                 "observed_behavior": (
                     "the draft could not be measured case by case against the "
                     "parent commit. The runner reported: {0}".format(detail)
@@ -1520,7 +1581,7 @@ def _red_at_parent_unreadable_findings(detail: str) -> tuple[dict[str, str], ...
                     "every case must run to a per-case verdict at the parent "
                     "commit, so the plan's declared red and green outcomes can "
                     "be compared against it. A suite whose cases cannot be "
-                    "individually adjudicated cannot be sealed"
+                    "individually adjudicated cannot be accepted"
                 ),
                 "violated_requirement": "gate.declared_cases",
             },
@@ -1534,7 +1595,7 @@ def _draft_min_cases_findings(
     return st.require_revise_findings(
         (
             {
-                "implementation_area": "private tests",
+                "implementation_area": "tests",
                 "observed_behavior": "native collect listed {0} cases".format(
                     collected
                 ),
@@ -1591,14 +1652,16 @@ def _bind_reviewer_findings(
     )
 
 
-def _remove_collect_tree(dest: Path, vault: Path) -> None:
-    hv.remove_vault_worktree(vault, dest)
+def _remove_collect_tree(dest: Path) -> None:
+    tm.remove_tree(dest)
 
 
 def _write_test_files(extra: Mapping[str, Any]) -> dict[str, str]:
-    files = extra.get("files") or extra.get("private_files") or {}
+    files = (
+        extra.get("test_files") or extra.get("files") or extra.get("private_files") or {}
+    )
     if not files:
-        raise FactoryRefused("write_tests produced no private files")
+        raise FactoryRefused("write_tests produced no test files")
     return dict(files)
 
 
@@ -1610,7 +1673,7 @@ def _resolved_provision_argv(
 
     The deployment's `provision_argv` already reaches the launcher, which
     provisions agent worktrees. A *review* tree is materialized by the scheduler
-    instead, so it has to be provisioned from here or its sealed suite runs
+    instead, so it has to be provisioned from here or its accepted suite runs
     against a tree with nothing installed -- collecting zero cases, which
     `code_review` then reports as the builder's tests failing.
 
@@ -1933,8 +1996,8 @@ class FactoryScheduler:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
             if plan is None:
                 raise FactoryRefused("missing LANE_PLAN")
-            _review, _invalidation, review_id, invalidation_id = (
-                _writing_tests_predecessors(self.store, self.run_id, lane_id)
+            _review, review_id = _writing_tests_predecessors(
+                self.store, self.run_id, lane_id
             )
             return (
                 st.writing_tests_input_digest(
@@ -1942,7 +2005,6 @@ class FactoryScheduler:
                     lane_plan_id=plan.artifact_id,
                     test_review_id=review_id,
                     integration_head=self._integration_head(),
-                    test_invalidation_id=invalidation_id,
                 ),
                 {},
             )
@@ -1975,7 +2037,7 @@ class FactoryScheduler:
                 verdict=st.ReviewerVerdict.PASS,
             )
             if plan is None or draft is None or review is None:
-                raise FactoryRefused("missing sealed-test inputs")
+                raise FactoryRefused("missing accepted-suite inputs")
             return (
                 st.tests_sealed_input_digest(
                     **common,
@@ -1987,7 +2049,7 @@ class FactoryScheduler:
             )
         if stage is st.LaneStage.BUILDING:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-            sealed = self._sealed_for(lane)
+            suite = self._accepted_suite_for(lane)
             if plan is None:
                 raise FactoryRefused("missing BUILDING inputs")
             revision = row["plan_revision"]
@@ -2014,9 +2076,9 @@ class FactoryScheduler:
                 entry = st.BuildingEntryKind.CODE_REVISE
             else:
                 entry = st.BuildingEntryKind.INITIAL
-            builder_base = self._integration_head()
+            builder_base = self._builder_base(lane, suite)
             receipts = self._dep_receipts(lane.needs)
-            ids = [plan.artifact_id, sealed.artifact_id]
+            ids = [plan.artifact_id, suite.artifact_id]
             ids.extend(
                 item.artifact_id for item in receipts if item.artifact_id not in ids
             )
@@ -2061,17 +2123,17 @@ class FactoryScheduler:
             }
         if stage is st.LaneStage.REVIEWING_CODE:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-            sealed = self._sealed_for(lane)
+            suite = self._accepted_suite_for(lane)
             builder = _latest(
                 self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
             )
-            if plan is None or sealed is None or builder is None:
+            if plan is None or suite is None or builder is None:
                 raise FactoryRefused("missing REVIEWING_CODE inputs")
             return (
                 st.reviewing_code_input_digest(
                     **common,
                     lane_plan_id=plan.artifact_id,
-                    sealed_bundle_id=sealed.artifact_id,
+                    accepted_suite_id=suite.artifact_id,
                     builder_output_id=builder.artifact_id,
                     builder_base_sha=builder.payload["builder_base_sha"],
                     candidate_ref=builder.payload["candidate_ref"],
@@ -2080,16 +2142,7 @@ class FactoryScheduler:
                 {},
             )
         if stage is st.LaneStage.READY_TO_MERGE:
-            builder = _latest(
-                self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
-            )
-            review = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.CODE_REVIEW,
-                verdict=st.ReviewerVerdict.PASS,
-            )
+            builder, review = _merge_producers(self.store, self.run_id, lane)
             if builder is None or review is None:
                 raise FactoryRefused("missing READY_TO_MERGE inputs")
             head = self._integration_head()
@@ -2182,7 +2235,7 @@ class FactoryScheduler:
             return self._compiled_kinds[lane_id]
         return self.store._lane_kind(self.run_id, lane_id)
 
-    def _sealed_suite_gate(self, lane: st.LaneProjection) -> SimpleNamespace | None:
+    def _suite_gate(self, lane: st.LaneProjection) -> SimpleNamespace | None:
         if lane.lane_kind == st.LANE_KIND_BUILD:
             for dep in lane.needs:
                 if self._lane_kind(dep) == st.LANE_KIND_TESTS:
@@ -2192,40 +2245,60 @@ class FactoryScheduler:
 
 
 
-    def _current_tests_sealed(self, lane_id: str) -> ArtifactRecord | None:
+    def _current_accepted_suite(self, lane_id: str) -> ArtifactRecord | None:
         revision = run_row(self.store, self.run_id)["plan_revision"]
         return _latest(
             self.store,
             self.run_id,
             lane_id,
-            st.ArtifactKind.SEALED_TEST_BUNDLE,
+            st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
 
+    def _accepted_suite_for(self, lane: st.LaneProjection) -> ArtifactRecord:
+        """The accepted suite this lane is graded against.
 
-    def _sealed_for(self, lane: st.LaneProjection) -> ArtifactRecord:
+        A build lane's is its tests-lane predecessor's; an untyped lane's is
+        its own. Named by the plan, never guessed from a path shape.
+        """
         if lane.lane_kind == st.LANE_KIND_BUILD:
             for dep in lane.needs:
                 if self._lane_kind(dep) == st.LANE_KIND_TESTS:
-                    sealed = self._current_tests_sealed(dep)
-                    if sealed is None:
-                        raise FactoryRefused(f"missing dependency sealed tests {dep}")
-                    return sealed
-            raise FactoryRefused("missing tests-lane sealed bundle")
-        sealed = self._current_tests_sealed(lane.lane_id)
-        if sealed is None:
+                    suite = self._current_accepted_suite(dep)
+                    if suite is None:
+                        raise FactoryRefused(f"missing dependency accepted tests {dep}")
+                    return suite
+            raise FactoryRefused("missing tests-lane accepted suite")
+        suite = self._current_accepted_suite(lane.lane_id)
+        if suite is None:
             raise FactoryRefused("missing BUILDING inputs")
-        return sealed
+        return suite
+
+    def _builder_base(self, lane: st.LaneProjection, suite: ArtifactRecord) -> str:
+        """The commit this lane's builder starts from.
+
+        The integration head for a typed build lane, which carries the merged
+        suite; the head plus the lane's own accepted suite for an untyped lane
+        (`_untyped_builder_base`). Content-addressed in both cases, so the
+        pause/resume digest that reads this off a paused lane recomputes the
+        same sha.
+        """
+        head = self._integration_head()
+        if lane.lane_kind is not None:
+            return head
+        return _untyped_builder_base(
+            self.target, head, _record_as_lane_artifact(suite, lane)
+        )
 
     def _dep_receipts(self, needs: Sequence[str]) -> list[ArtifactRecord]:
         receipts = []
         revision = run_row(self.store, self.run_id)["plan_revision"]
         for dep in needs:
             if self._lane_kind(dep) == st.LANE_KIND_TESTS:
-                sealed = self._current_tests_sealed(dep)
-                if sealed is None:
-                    raise FactoryRefused(f"missing dependency sealed tests {dep}")
-                receipts.append(sealed)
+                suite = self._current_accepted_suite(dep)
+                if suite is None:
+                    raise FactoryRefused(f"missing dependency accepted tests {dep}")
+                receipts.append(suite)
                 continue
             merge = _latest(
                 self.store,
@@ -2277,7 +2350,7 @@ class FactoryScheduler:
         }
         if lane.lane_kind is not None:
             payload["lane_kind"] = lane.lane_kind
-        artifact = prv.make_lane_artifact(
+        artifact = rc.make_lane_artifact(
             kind=st.ArtifactKind.LANE_PLAN,
             request=_request(ctx),
             payload=payload,
@@ -2329,7 +2402,7 @@ class FactoryScheduler:
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
         if plan is None:
             raise FactoryRefused("missing LANE_PLAN")
-        review, invalidation, review_id, invalidation_id = _writing_tests_predecessors(
+        review, review_id = _writing_tests_predecessors(
             self.store, self.run_id, lane_id
         )
         tip = self._integration_head()
@@ -2343,13 +2416,10 @@ class FactoryScheduler:
             lane_plan_id=plan.artifact_id,
             test_review_id=review_id,
             integration_head=tip,
-            test_invalidation_id=invalidation_id,
         )
         artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
         if review is not None:
             artifacts["TEST_REVIEW"] = review
-        if invalidation is not None:
-            artifacts["TEST_INVALIDATION"] = invalidation
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -2361,38 +2431,41 @@ class FactoryScheduler:
             artifacts=artifacts,
             integration_head=tip,
         )
-        self._say(lane_id, "asking tester for private test draft")
+        self._say(lane_id, "asking tester for a test draft")
         extra = dict(self.actor.write_tests(ctx))
         self._say(lane_id, "tester returned a draft")
         # The draft is recorded first and measured at REVIEWING_TESTS, where a
         # verdict about it can be recorded beside it. Measuring here and
         # refusing meant a refused draft was never written anywhere: the
-        # scratch worktree that held it was removed in the `finally` of
-        # `_collect_private_draft`, and the only reason FDAdb run a2ea7355
-        # could be diagnosed at all is that the agent happened to leave copies
-        # in its own scratch directory. An artifact a verdict is about has to
-        # outlive the verdict.
+        # scratch tree that held it was removed in the `finally` of
+        # `_collect_draft`, and the only reason FDAdb run a2ea7355 could be
+        # diagnosed at all is that the agent happened to leave copies in its
+        # own scratch directory. An artifact a verdict is about has to outlive
+        # the verdict. The draft is a candidate now -- committed on the head
+        # and pinned at a candidate ref -- so it outlives everything.
         files = _write_test_files(extra)
         self._require_typed_test_outputs(lane, files)
-        contract = prv.public_contract(
+        self._refuse_test_files_on_outputs(lane, files)
+        contract = rc.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
         )
         artifact = tc.write_test_draft(
             request=_request(ctx),
-            state_root=self.runtime.path,
-            run_repo=Path(self.target.target_repository_root),
-            integration_ref=st.integration_ref(self.run_id),
+            binding=self.target,
+            integration_head=tip,
             files=files,
             public_contract=contract,
-            worktrees_root=self.runtime.path / "worktrees",
+            declared_outputs=(
+                lane.declared_outputs
+                if lane.lane_kind == st.LANE_KIND_TESTS
+                else None
+            ),
         )
         _complete(
             self.store,
             ctx,
-            _with_input_artifact_ids(
-                artifact, [plan.artifact_id, review_id, invalidation_id]
-            ),
+            _with_input_artifact_ids(artifact, [plan.artifact_id, review_id]),
         )
 
     def _require_typed_test_outputs(
@@ -2400,36 +2473,50 @@ class FactoryScheduler:
     ) -> None:
         if lane.lane_kind != st.LANE_KIND_TESTS:
             return
-        returned = {prv.normalize_repo_path(path) for path in files}
+        returned = {rc.normalize_repo_path(path) for path in files}
         declared = set(lane.declared_outputs)
         if returned != declared:
             undeclared = sorted(returned - declared)
             missing = sorted(declared - returned)
-            detail = "private files must equal declared outputs"
+            detail = "test files must equal declared outputs"
             if undeclared:
                 detail += "; undeclared: " + ", ".join(undeclared)
             if missing:
                 detail += "; missing: " + ", ".join(missing)
             raise TypedTestOutputsRefused(detail)
 
+    def _refuse_test_files_on_outputs(
+        self, lane: st.LaneProjection, files: Mapping[str, str]
+    ) -> None:
+        """An untyped lane's tests may not sit at its own product outputs.
 
-    def _draft_private_files(self, draft: st.LaneArtifact) -> dict[str, str]:
-        """The draft's own private bytes, read back out of the vault.
-
-        `write_test_draft` pinned them under `refs/maestro/drafts/...` before
-        this stage was reached, so the measurement below reads the artifact
-        rather than a scratch tree that no longer exists.
+        Its tests are committed into the base its builder starts from and
+        protected there (`CANDIDATE_TEST_PATH_REFUSED`), so a test written at
+        a declared output would make that output unwritable by the builder.
+        A typed tests lane's outputs ARE its tests, and its build lane's
+        outputs are kept off them by the plan (`OUTPUT_OVERLAPS_TEST_SUITE`).
         """
-        vault = hv.ensure_vault(self.runtime.path, self.run_id)
-        commit = hv.rev_parse(vault, draft.artifact_ref)
-        files: dict[str, str] = {}
-        for path in tc.private_draft_overlay_paths(vault, draft):
-            blob = hv.blob_id_in(vault, commit, path)
-            if blob is None:
-                raise FactoryRefused("draft blob missing for {0}".format(path))
-            files[path] = hv.cat_blob(vault, blob).decode("utf-8")
+        if lane.lane_kind is not None:
+            return
+        collisions = sorted(
+            {rc.normalize_repo_path(path) for path in files} & set(lane.declared_outputs)
+        )
+        if collisions:
+            raise TestFileOnDeclaredOutput(", ".join(collisions))
+
+
+    def _draft_files(self, draft: st.LaneArtifact) -> dict[str, str]:
+        """The draft's own bytes, read back off its pinned candidate.
+
+        `write_test_draft` admitted the draft as a candidate before this stage
+        was reached, so the measurement below reads the artifact's blobs out
+        of the run repository rather than a scratch tree that no longer exists.
+        """
+        files = tc.read_suite(
+            Path(self.target.target_repository_root), tc.suite_files(draft)
+        )
         if not files:
-            raise FactoryRefused("draft carries no private files")
+            raise FactoryRefused("draft carries no test files")
         return files
 
     def _measure_draft_gate(
@@ -2456,9 +2543,9 @@ class FactoryScheduler:
         gate = _lane_gate(self.actor, ctx.lane.lane_id)
         if gate is None:
             return None, None
-        files = self._draft_private_files(draft)
+        files = self._draft_files(draft)
         try:
-            collected, outcomes = self._collect_private_draft(ctx, gate, files)
+            collected, outcomes = self._collect_draft(ctx, gate, files)
         except ParentOutcomesRefused as refused:
             return _red_at_parent_unreadable_findings(str(refused)), None
         except DraftCollectionRefused as refused:
@@ -2510,14 +2597,13 @@ class FactoryScheduler:
         if not wanted:
             return
         run_repo = Path(self.target.target_repository_root)
-        vault = hv.ensure_vault(self.runtime.path, self.run_id)
-        base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
+        base = self._integration_head()
         unusable: list[str] = []
         for runner, cwd in wanted:
-            dest = hv.scratch_worktree_path(
+            dest = tm.scratch_tree_path(
                 self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
             )
-            hv.checkout_vault_worktree(vault, base, dest)
+            tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
             keep = False
             try:
                 self._say("", "checking {0} is usable in {1}".format(runner, cwd))
@@ -2555,11 +2641,6 @@ class FactoryScheduler:
                 # it could start. `scratch_worktree_path` randomizes the name,
                 # so a kept tree can never be one a later call is refused for
                 # adopting.
-                # Named unredacted, unlike the draft-collect tree below: no
-                # private byte is ever written here -- `prv.write_files` is not
-                # on this path and the checkout is the integration ref, which
-                # sealed tests never reach -- so redacting the path hid the
-                # evidence and protected nothing.
                 keep = True
                 detail = getattr(extra, "detail", None) or str(extra)
                 unusable.append(
@@ -2569,29 +2650,27 @@ class FactoryScheduler:
                 )
             finally:
                 if not keep:
-                    _remove_collect_tree(dest, vault)
+                    _remove_collect_tree(dest)
         if unusable:
             raise RunnerPreflightRefused("; ".join(unusable))
 
-    def _collect_private_draft(
+    def _collect_draft(
         self,
         ctx: LaneContext,
         gate: SimpleNamespace,
         files: Mapping[str, str],
     ) -> tuple[tuple[str, ...], Mapping[str, bool]]:
         run_repo = Path(self.target.target_repository_root)
-        vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
-        base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
-        dest = hv.scratch_worktree_path(
+        base = self._integration_head()
+        dest = tm.scratch_tree_path(
             self.runtime.path / "worktrees",
             "draft-collect-{0}".format(ctx.lane.lane_id),
         )
-        hv.checkout_vault_worktree(vault, base, dest)
+        tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
         keep = False
         try:
-            # Provision before probing, without exposing any private draft
-            # bytes to the environment measurement -- and with nothing bridged
-            # in from the product checkout, so a dependency the deployment's
+            # Provision before probing, with nothing bridged in from the
+            # product checkout, so a dependency the deployment's
             # `provision_argv` does not install is missing here exactly as it
             # is missing in the tester's tree.
             prov.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
@@ -2621,13 +2700,12 @@ class FactoryScheduler:
                 # environment is usable.
                 (),
             )
-            prv.write_files(dest, files)
+            rc.write_files(dest, files)
             measured = _collect_gate(gate, files, Path(dest))
             ids = rr.collect_cases(resolved, measured, dest)
             # The tree this collected in IS the parent commit -- `base` is the
-            # integration seed with only the draft's private files written on
-            # top -- so the red-at-parent measurement belongs here and nowhere
-            # else. A second tree would provision twice and, worse, would let
+            # integration head with only the draft's files written on top --
+            # so the red-at-parent measurement belongs here and nowhere else. A second tree would provision twice and, worse, would let
             # the two measurements disagree about which commit they were made
             # against.
             outcomes: Mapping[str, bool] = {}
@@ -2639,13 +2717,7 @@ class FactoryScheduler:
             rr.RunnerUnusable,
             rr.CaseOutcomesUnreadable,
         ) as extra:
-            detail = getattr(extra, "detail", None) or extra.__class__.__name__
-            tokens = prv.collect_private_tokens(
-                files=files,
-                extra=(str(dest), str(Path(dest).resolve())),
-                vault_path=vault,
-            )
-            redacted = prv.redact_text(str(detail), tokens)
+            detail = str(getattr(extra, "detail", None) or extra.__class__.__name__)
             if isinstance(extra, rr.RunnerUnusable):
                 # The runner itself cannot run here. That is the harness's
                 # environment, never the draft, so it must not become a
@@ -2659,22 +2731,17 @@ class FactoryScheduler:
                 #
                 # And the same fault keeps the same evidence: this refusal ends
                 # the run and is read by an operator, so the tree it was
-                # measured in stays, named beside the redacted detail. Naming
-                # the directory is not naming its contents -- the detail is
-                # still redacted because a runner's error text can quote draft
-                # source, and the directory itself is under
-                # `runtime_state_root`, mode 0700, where the vault already
-                # holds these files.
+                # measured in stays, named beside the detail.
                 keep = True
                 raise RunnerPreflightRefused(
-                    "{0}; measured in {1}, which is kept".format(redacted, dest)
+                    "{0}; measured in {1}, which is kept".format(detail, dest)
                 ) from extra
             if isinstance(extra, rr.CaseOutcomesUnreadable):
-                raise ParentOutcomesRefused(redacted) from extra
-            raise DraftCollectionRefused(redacted) from extra
+                raise ParentOutcomesRefused(detail) from extra
+            raise DraftCollectionRefused(detail) from extra
         finally:
             if not keep:
-                _remove_collect_tree(dest, vault)
+                _remove_collect_tree(dest)
 
 
 
@@ -2703,6 +2770,8 @@ class FactoryScheduler:
             input_digest=digest,
             stage=st.LaneStage.REVIEWING_TESTS,
             artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft},
+            candidate_ref=str(draft.payload["candidate_ref"]),
+            candidate_sha=str(draft.payload["candidate_sha"]),
             public_contract=draft.payload.get("public_contract"),
         )
         draft_artifact = _record_as_lane_artifact(draft, lane)
@@ -2761,17 +2830,11 @@ class FactoryScheduler:
                             citation[:120],
                         )
                     ) from exc
-        tokens = tc.draft_private_tokens(
-            state_root=self.runtime.path,
-            run_id=self.run_id,
-            draft=draft_artifact,
-        )
         artifact = tc.review_test_draft(
             request=_request(ctx),
             verdict=verdict,
             findings=findings,
             test_draft=draft_artifact,
-            private_tokens=tokens,
         )
         if collected is not None:
             payload = dict(artifact.payload, public_result_summary={"collected": collected})
@@ -2803,7 +2866,7 @@ class FactoryScheduler:
             verdict=st.ReviewerVerdict.PASS,
         )
         if plan is None or draft is None or review is None:
-            raise FactoryRefused("missing sealed-test inputs")
+            raise FactoryRefused("missing accepted-suite inputs")
         digest = st.tests_sealed_input_digest(
             run_id=self.run_id,
             lane_id=lane_id,
@@ -2827,15 +2890,10 @@ class FactoryScheduler:
             public_contract=draft.payload.get("public_contract"),
         )
         test_draft = _record_as_lane_artifact(draft, lane)
-        artifact = tc.seal_accepted_tests(
+        artifact = tc.accept_tests(
             request=_request(ctx),
-            state_root=self.runtime.path,
-            run_repo=Path(self.target.target_repository_root),
-            builder_worktree=None,
             test_draft=test_draft,
             test_review=_record_as_lane_artifact(review, lane),
-            released=self._released_object_ids(lane, test_draft),
-            integration_initial_sha=str(row["integration_initial_sha"]),
         )
         _complete(
             self.store,
@@ -2845,71 +2903,36 @@ class FactoryScheduler:
             ),
         )
 
-    def _released_object_ids(
-        self, lane: st.LaneProjection, test_draft: st.LaneArtifact
-    ) -> frozenset[str]:
-        """Blobs of this lane's draft that a build lane's merge already released.
-
-        Only an authored tests lane is ever released (`_released_sealed_files`),
-        and only at its own declared paths. A blob is released when the
-        integration tip carries it at the path the draft wrote it to; that
-        same blob anywhere else in the product repository is a leak and stays
-        one. Reading it off the integration ref rather than the ledger keeps
-        the proof about bytes: it is what the builder's base actually holds.
-        """
-        if lane.lane_kind != st.LANE_KIND_TESTS:
-            return frozenset()
-        vault = hv.ensure_vault(self.runtime.path, self.run_id)
-        head = self._integration_head()
-        git = self.target.git()
-        released = set()
-        for path in tc.private_draft_overlay_paths(vault, test_draft):
-            blob = git.tree_blob(head, path)
-            if blob is not None:
-                released.add(blob)
-        return frozenset(released)
-
-    def _own_sealed_paths(
-        self, lane: st.LaneProjection, sealed: ArtifactRecord
+    def _own_test_paths(
+        self, lane: st.LaneProjection, suite: ArtifactRecord
     ) -> tuple[str, ...]:
-        """Where this lane's own sealed acceptance suite lives in a tree.
+        """Where this lane's own accepted suite lives in a tree.
 
-        `sealed` is what `_sealed_for` resolved: for a build lane its
-        tests-lane predecessor's bundle, for an untyped lane its own. Read
-        the same way `_bound_surface` reads it, so the two agree about which
-        bundle is the lane's own.
-
-        Names only -- the keys of the path-to-blob map, never a blob. These
-        are the paths `maestro._refresh_builder_checkout` removes from the
-        builder's working tree. A vault read that fails leaves the set empty,
-        which would silently drop the guard, so it is allowed to raise: a
-        builder launched over its own suite is worse than a refused lane.
+        `suite` is what `_accepted_suite_for` resolved: for a build lane its
+        tests-lane predecessor's, for an untyped lane its own. Names only --
+        the keys of the path-to-blob map. These are the paths
+        `admit_candidate` refuses a candidate for touching.
         """
-        vault = hv.ensure_vault(self.runtime.path, self.run_id)
-        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, lane))
-        return tuple(sorted(blobs))
+        return tuple(sorted(tc.suite_files(_record_as_lane_artifact(suite, lane))))
 
     def _bound_surface(
-        self, lane: st.LaneProjection, sealed: ArtifactRecord
+        self, lane: st.LaneProjection, suite: ArtifactRecord
     ) -> Mapping[str, Any] | None:
-        """The names the sealed acceptance suite binds to, for the builder.
+        """The names the accepted suite binds to, an index for the builder.
 
-        Names are contract; values are secrets. `derive_bound_surface` returns
-        module specifiers, the symbols imported from each, and the keys read off
-        result objects -- never a string literal, a number, a selector, or
-        fixture data -- so this crosses the private-test boundary on the same
-        terms as the five public counts.
+        `derive_bound_surface` returns module specifiers, the symbols imported
+        from each, and the keys read off result objects. The builder can read
+        the suite itself; this is the summary that tells it which names to
+        look for first.
 
-        Read from the vault exactly the way `_reviewing_code` and
-        `code_review.measure_candidate` read it: `hidden_vault` for the bare
-        repository, `tests_chain.sealed_private_files` for the path-to-blob map.
+        Read off the run repository exactly the way `_reviewing_code` and
+        `code_review.measure_candidate` read it: the artifact's path-to-blob
+        map, the blobs out of the object database.
         """
-        vault = hv.ensure_vault(self.runtime.path, self.run_id)
-        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, lane))
-        files = {
-            path: hv.cat_blob(vault, blob).decode("utf-8")
-            for path, blob in blobs.items()
-        }
+        files = tc.read_suite(
+            Path(self.target.target_repository_root),
+            tc.suite_files(_record_as_lane_artifact(suite, lane)),
+        )
         surface = bsf.derive_bound_surface(files)
         if not surface.get("modules") and not surface.get("object_keys"):
             # Nothing extracted is not an empty contract, it is no contract.
@@ -2920,7 +2943,7 @@ class FactoryScheduler:
     def _building(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = self._sealed_for(lane)
+        suite = self._accepted_suite_for(lane)
         if plan is None:
             raise FactoryRefused("missing BUILDING inputs")
         revision = row["plan_revision"]
@@ -2947,9 +2970,9 @@ class FactoryScheduler:
             entry = st.BuildingEntryKind.CODE_REVISE
         else:
             entry = st.BuildingEntryKind.INITIAL
-        builder_base = self._integration_head()
+        builder_base = self._builder_base(lane, suite)
         receipts = self._dep_receipts(lane.needs)
-        ids = [plan.artifact_id, sealed.artifact_id]
+        ids = [plan.artifact_id, suite.artifact_id]
         ids.extend(
             item.artifact_id for item in receipts if item.artifact_id not in ids
         )
@@ -2995,7 +3018,7 @@ class FactoryScheduler:
         )
         artifacts: dict[str, ArtifactRecord] = {
             "LANE_PLAN": plan,
-            "SEALED_TEST_BUNDLE": sealed,
+            "ACCEPTED_TEST_SUITE": suite,
         }
         if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
             artifacts["CODE_REVIEW"] = revise
@@ -3010,19 +3033,19 @@ class FactoryScheduler:
             artifacts=artifacts,
             builder_base_sha=builder_base,
             entry_kind=entry,
-            public_contract=prv.public_contract(
+            public_contract=rc.public_contract(
                 acceptance_criteria=lane.public_acceptance,
                 declared_outputs=lane.declared_outputs,
             ),
-            sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
-            sealed_private_paths=self._own_sealed_paths(lane, sealed),
+            test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
+            protected_test_paths=self._own_test_paths(lane, suite),
         )
-        surface = self._bound_surface(lane, sealed)
+        surface = self._bound_surface(lane, suite)
         if surface is not None:
             ctx = dataclasses.replace(ctx, bound_surface=surface)
             self._say(
                 lane_id,
-                "derived the bound surface from the sealed suite",
+                "derived the bound surface from the accepted suite",
                 "{0} module(s), {1} result key(s)".format(
                     len(surface.get("modules") or ()),
                     len(surface.get("object_keys") or ()),
@@ -3042,26 +3065,14 @@ class FactoryScheduler:
             candidate_sha=candidate_sha,
             changed=changed,
             declared_outputs=lane.declared_outputs,
-            # The suite this lane is graded against, named by the plan. The
-            # launch already removes these paths from the builder's working
-            # tree and subtracts them from the commit pathspec; this refuses a
-            # candidate that reached them anyway, before any reviewer reads it.
-            #
-            # Typed build lanes only, and that is the whole point of the
-            # condition. A typed lane's protected set is its predecessor tests
-            # lane's declared outputs, which it may never own. An untyped
-            # lane's is its OWN hidden meta-tests, sitting at paths of the
-            # tester's choosing -- and a candidate landing on one of those is
-            # not a violation at all. It is the collision §11 already answers,
-            # with `PRIVATE_PATH_COLLISION` at review, a durable
-            # `TEST_INVALIDATION`, and a reset to `WRITING_TESTS` so the tester
-            # moves. Refusing it here would replace that recovery with a dead
-            # run.
-            protected_paths=(
-                ctx.sealed_private_paths
-                if lane.lane_kind == st.LANE_KIND_BUILD
-                else ()
-            ),
+            # The suite this lane is graded against, named by the plan. It is
+            # in the builder's base -- merged there by the tests lane, or put
+            # there by `_untyped_builder_base` -- and this refuses a candidate
+            # whose delta names any of it, before any reviewer reads it. Every
+            # lane kind: an untyped lane's tests are in its base too now, so
+            # a candidate landing on one is the same violation, not the
+            # collision the retired `TEST_INVALIDATION` reset used to answer.
+            protected_paths=ctx.protected_test_paths,
         )
         builder_payload = {
             "builder_base_sha": admitted["builder_base_sha"],
@@ -3072,16 +3083,12 @@ class FactoryScheduler:
             "input_artifact_ids": ids,
             "input_digest": digest,
             "plan_revision": row["plan_revision"],
-            "sealed_test_digest": ctx.sealed_digest,
             "spec_digest": lane.spec_digest,
             "projection_digest": lane.lane_projection_digest,
+            "test_suite_digest": ctx.test_suite_digest,
             "tree_delta": admitted.get("tree_delta") or [],
         }
-        prv.refuse_private_leak(
-            builder_payload,
-            prv.collect_private_tokens(extra=tuple(extra.get("private_tokens") or ())),
-        )
-        artifact = prv.make_lane_artifact(
+        artifact = rc.make_lane_artifact(
             kind=st.ArtifactKind.BUILDER_OUTPUT,
             request=_request(ctx),
             payload=builder_payload,
@@ -3092,11 +3099,11 @@ class FactoryScheduler:
     def _reviewing_code(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = self._sealed_for(lane)
+        suite = self._accepted_suite_for(lane)
         builder = _latest(
             self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
         )
-        if plan is None or sealed is None or builder is None:
+        if plan is None or suite is None or builder is None:
             raise FactoryRefused("missing REVIEWING_CODE inputs")
         digest = st.reviewing_code_input_digest(
             run_id=self.run_id,
@@ -3106,13 +3113,13 @@ class FactoryScheduler:
             spec_digest=lane.spec_digest,
             projection_digest=lane.lane_projection_digest,
             lane_plan_id=plan.artifact_id,
-            sealed_bundle_id=sealed.artifact_id,
+            accepted_suite_id=suite.artifact_id,
             builder_output_id=builder.artifact_id,
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
         )
-        product_contract = prv.public_contract(
+        product_contract = rc.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
         )
@@ -3126,162 +3133,138 @@ class FactoryScheduler:
             stage=st.LaneStage.REVIEWING_CODE,
             artifacts={
                 "LANE_PLAN": plan,
-                "SEALED_TEST_BUNDLE": sealed,
+                "ACCEPTED_TEST_SUITE": suite,
                 "BUILDER_OUTPUT": builder,
             },
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
             public_contract=product_contract,
-            sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
+            test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
         )
-        ids = [plan.artifact_id, sealed.artifact_id, builder.artifact_id]
-        sealed_artifact = _record_as_lane_artifact(sealed, lane)
+        ids = [plan.artifact_id, suite.artifact_id, builder.artifact_id]
+        suite_artifact = _record_as_lane_artifact(suite, lane)
         request = _request(ctx)
-        typed_build = lane.lane_kind == st.LANE_KIND_BUILD
-        if not typed_build:
-            try:
-                cr.detect_candidate_private_collisions(
-                    request=request,
-                    state_root=self.runtime.path,
-                    candidate_repo=Path(self.target.target_repository_root),
-                    candidate_sha=builder.payload["candidate_sha"],
-                    sealed_bundle=sealed_artifact,
-                    scratch_root=self.runtime.path / "worktrees",
-                )
-            except prv.PrivatePathCollisionError as exc:
-                self._complete_test_invalidation(
-                    ctx, ids, sealed_artifact, exc
-                )
-                return
         constraints = tuple(lane.public_acceptance) or ("produce declared outputs",)
-        try:
-            # Measure BEFORE the reviewer votes. A reviewer that does not know
-            # the suite is red votes PASS with no findings, the harness then
-            # downgrades it, and the builder is handed a canned sentence naming
-            # no file -- which is how a lane burns a round learning nothing.
+        # Measure BEFORE the reviewer votes. A reviewer that does not know
+        # the suite is red votes PASS with no findings, the harness then
+        # downgrades it, and the builder is handed a canned sentence naming
+        # no file -- which is how a lane burns a round learning nothing.
+        self._say(
+            lane_id,
+            "provisioning review tree and running the accepted suite",
+            "candidate {0}".format(builder.payload["candidate_sha"][:12]),
+        )
+        measurement = cr.measure_candidate(
+            request=request,
+            state_root=self.runtime.path,
+            candidate_repo=Path(self.target.target_repository_root),
+            candidate_sha=builder.payload["candidate_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            builder_base_sha=builder.payload["builder_base_sha"],
+            accepted_suite=suite_artifact,
+            scratch_root=self.runtime.path / "worktrees",
+            gate=self._suite_gate(lane),
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
+        )
+        counts = measurement.summary
+        self._say(
+            lane_id,
+            "accepted suite {0}".format(
+                "FAILED" if measurement.runner_failed else "passed"
+            ),
+            "{0} executed, {1} passed, {2} failed, {3} errored".format(
+                counts["executed"],
+                counts["passed"],
+                counts["failed"],
+                counts["errored"],
+            ),
+        )
+        ctx = dataclasses.replace(
+            ctx, suite_result_summary=dict(measurement.summary)
+        )
+        self._say(lane_id, "asking code reviewer")
+        verdict, findings = self.actor.review_code(ctx)
+        self._say(
+            lane_id,
+            "code reviewer answered {0}".format(verdict.value),
+            "{0} finding(s)".format(len(findings)),
+        )
+        if measurement.runner_failed and not findings:
+            # It saw the counts and still had nothing locatable to say. Ask
+            # once more, saying so. One extra reviewer turn is cheap next to
+            # a builder round spent guessing which of five cases failed.
             self._say(
                 lane_id,
-                "provisioning review tree and running sealed suite",
-                "candidate {0}".format(builder.payload["candidate_sha"][:12]),
+                "no actionable finding against a red suite, asking again",
             )
-            measurement = cr.measure_candidate(
-                request=request,
-                state_root=self.runtime.path,
-                candidate_repo=Path(self.target.target_repository_root),
-                candidate_sha=builder.payload["candidate_sha"],
-                candidate_ref=builder.payload["candidate_ref"],
-                builder_base_sha=builder.payload["builder_base_sha"],
-                sealed_bundle=sealed_artifact,
-                scratch_root=self.runtime.path / "worktrees",
-                allow_candidate_paths=typed_build,
-                gate=self._sealed_suite_gate(lane),
-                provision_argv=self._provision_argv,
-                provision_timeout_s=self._provision_timeout_s,
+            verdict, findings = self.actor.review_code(
+                dataclasses.replace(ctx, suite_findings_required=True)
             )
-            counts = measurement.summary
             self._say(
                 lane_id,
-                "sealed suite {0}".format(
-                    "FAILED" if measurement.runner_failed else "passed"
+                "code reviewer answered {0} on the second ask".format(
+                    verdict.value
                 ),
-                "{0} executed, {1} passed, {2} failed, {3} errored".format(
-                    counts["executed"],
-                    counts["passed"],
-                    counts["failed"],
-                    counts["errored"],
-                ),
-            )
-            ctx = dataclasses.replace(
-                ctx, sealed_result_summary=dict(measurement.summary)
-            )
-            self._say(lane_id, "asking code reviewer")
-            verdict, findings = self.actor.review_code(ctx)
-            self._say(
-                lane_id,
-                "code reviewer answered {0}".format(verdict.value),
                 "{0} finding(s)".format(len(findings)),
             )
-            if measurement.runner_failed and not findings:
-                # It saw the counts and still had nothing locatable to say. Ask
-                # once more, saying so. One extra reviewer turn is cheap next to
-                # a builder round spent guessing which of five cases failed.
-                self._say(
-                    lane_id,
-                    "no actionable finding against a red suite, asking again",
+        try:
+            findings = _bind_reviewer_findings(
+                findings,
+                contract_text=_public_contract_text(product_contract),
+            )
+        except st.CanonicalIdentityError as first:
+            self._say(
+                lane_id,
+                "reviewer finding does not cite the contract, asking again",
+            )
+            verdict, findings = self.actor.review_code(
+                dataclasses.replace(
+                    ctx, rejected_citation=_rejected_citation(first)
                 )
-                verdict, findings = self.actor.review_code(
-                    dataclasses.replace(ctx, sealed_findings_required=True)
-                )
-                self._say(
-                    lane_id,
-                    "code reviewer answered {0} on the second ask".format(
-                        verdict.value
-                    ),
-                    "{0} finding(s)".format(len(findings)),
-                )
+            )
+            self._say(
+                lane_id,
+                "code reviewer answered {0} on the second ask".format(
+                    verdict.value
+                ),
+                "{0} finding(s)".format(len(findings)),
+            )
             try:
                 findings = _bind_reviewer_findings(
                     findings,
                     contract_text=_public_contract_text(product_contract),
                 )
-            except st.CanonicalIdentityError as first:
-                self._say(
-                    lane_id,
-                    "reviewer finding does not cite the contract, asking again",
-                )
-                verdict, findings = self.actor.review_code(
-                    dataclasses.replace(
-                        ctx, rejected_citation=_rejected_citation(first)
+            except st.CanonicalIdentityError as exc:
+                citation = getattr(exc, "offending_requirement", "")
+                if not isinstance(citation, str):
+                    citation = ""
+                raise ReviewFindingUncited(
+                    "{0}:{1}:{2}".format(
+                        lane_id,
+                        "code-reviewer",
+                        citation[:120],
                     )
-                )
-                self._say(
-                    lane_id,
-                    "code reviewer answered {0} on the second ask".format(
-                        verdict.value
-                    ),
-                    "{0} finding(s)".format(len(findings)),
-                )
-                try:
-                    findings = _bind_reviewer_findings(
-                        findings,
-                        contract_text=_public_contract_text(product_contract),
-                    )
-                except st.CanonicalIdentityError as exc:
-                    citation = getattr(exc, "offending_requirement", "")
-                    if not isinstance(citation, str):
-                        citation = ""
-                    raise ReviewFindingUncited(
-                        "{0}:{1}:{2}".format(
-                            lane_id,
-                            "code-reviewer",
-                            citation[:120],
-                        )
-                    ) from exc
-            artifact = cr.review_builder_output(
-                request=request,
-                state_root=self.runtime.path,
-                candidate_repo=Path(self.target.target_repository_root),
-                candidate_sha=builder.payload["candidate_sha"],
-                candidate_ref=builder.payload["candidate_ref"],
-                builder_base_sha=builder.payload["builder_base_sha"],
-                sealed_bundle=sealed_artifact,
-                verdict=verdict,
-                findings=findings,
-                scratch_root=self.runtime.path / "worktrees",
-                architecture_constraints=constraints,
-                allow_candidate_paths=typed_build,
-                public_contract=product_contract,
-                gate=self._sealed_suite_gate(lane),
-                provision_argv=self._provision_argv,
-                provision_timeout_s=self._provision_timeout_s,
-                measurement=measurement,
-            )
-        except prv.PrivatePathCollisionError as exc:
-            self._complete_test_invalidation(
-                ctx, ids, sealed_artifact, exc
-            )
-            return
+                ) from exc
+        artifact = cr.review_builder_output(
+            request=request,
+            state_root=self.runtime.path,
+            candidate_repo=Path(self.target.target_repository_root),
+            candidate_sha=builder.payload["candidate_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            builder_base_sha=builder.payload["builder_base_sha"],
+            accepted_suite=suite_artifact,
+            verdict=verdict,
+            findings=findings,
+            scratch_root=self.runtime.path / "worktrees",
+            architecture_constraints=constraints,
+            public_contract=product_contract,
+            gate=self._suite_gate(lane),
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
+            measurement=measurement,
+        )
         _complete(
             self.store,
             ctx,
@@ -3289,12 +3272,12 @@ class FactoryScheduler:
         )
         settled = artifact.verdict
         if settled is not None and settled is not verdict:
-            # The sealed measurement outranked the reviewer, which it can now
-            # do in one direction only: a failing runner promoting a PASS. Say
-            # so, because the transition came from the suite and not the vote.
+            # The measurement outranked the reviewer, which it can do in one
+            # direction only: a failing runner promoting a PASS. Say so,
+            # because the transition came from the suite and not the vote.
             self._say(
                 lane_id,
-                "sealed suite is authoritative; verdict recorded as {0}".format(
+                "accepted suite is authoritative; verdict recorded as {0}".format(
                     settled.value
                 ),
                 "reviewer said {0}".format(verdict.value),
@@ -3324,7 +3307,7 @@ class FactoryScheduler:
         instead of re-judging an artifact that was already judged.
 
         The stage selects the outcome a round can move -- the review's findings
-        count on a tests round, the sealed suite's passed count on a build
+        count on a tests round, the accepted suite's passed count on a build
         round -- plus substantive content. A findings count measures whether
         the same argument is shrinking; it still grants nothing and still
         causes no transition.
@@ -3336,8 +3319,7 @@ class FactoryScheduler:
             else st.ArtifactKind.CODE_REVIEW
         )
         history = _review_content_history(
-            self.store, self.run_id, lane_id, review_kind,
-            hv.vault_path(self.runtime.path, self.run_id),
+            self.store, self.run_id, lane_id, review_kind
         )
         if not _stalled(
             history,
@@ -3365,73 +3347,27 @@ class FactoryScheduler:
             ),
         )
 
-    def _complete_test_invalidation(
-        self,
-        ctx: LaneContext,
-        ids: Sequence[str],
-        sealed_bundle: st.LaneArtifact,
-        collision: prv.PrivatePathCollisionError,
-    ) -> None:
-        vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
-        files = tc.sealed_private_files(vault, sealed_bundle)
-        private_files = {
-            path: hv.cat_blob(vault, blob).decode("utf-8")
-            for path, blob in files.items()
-        }
-        tokens = prv.collect_private_tokens(
-            files=private_files,
-            vault_path=vault,
-            vault_refs=(sealed_bundle.artifact_ref,),
-            blob_ids=tuple(files.values()),
-        )
-        allow = prv.public_contract_allow(
-            sealed_bundle.payload["public_contract"],
-            extra=(
-                ctx.input_digest,
-                str(sealed_bundle.payload.get("sealed_digest") or ""),
-            ),
-        )
-        payload = cr.test_invalidation_payload(
-            input_digest=ctx.input_digest,
-            input_artifact_ids=ids,
-            collision=collision,
-            tokens=tokens,
-            allow=allow,
-        )
-        artifact = prv.make_lane_artifact(
-            kind=st.ArtifactKind.TEST_INVALIDATION,
-            request=_request(ctx),
-            payload=payload,
-            artifact_ref="test-invalidation:{0}".format(ctx.input_digest),
-        )
-        _complete(self.store, ctx, _with_input_artifact_ids(artifact, ids))
-
-
-
     def _ready_to_merge(self, lane_id: str) -> None:
+        """Merge the lane's accepted candidate into the integration ref.
+
+        For a build lane that is its reviewed BUILDER_OUTPUT; for a tests lane
+        it is its ACCEPTED_TEST_SUITE, the draft its test reviewer passed.
+        Both take the same three edges -- merge, revalidate, or base
+        invalidation -- and both leave the integration ref one merge commit
+        ahead, so a build lane that consumes a tests lane finds the suite in
+        its base the way it finds any predecessor's output there.
+        """
         row, lane = self._common(lane_id)
-        builder = _latest(
-            self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
-        )
-        review = _latest(
-            self.store,
-            self.run_id,
-            lane_id,
-            st.ArtifactKind.CODE_REVIEW,
-            verdict=st.ReviewerVerdict.PASS,
-        )
+        builder, review = _merge_producers(self.store, self.run_id, lane)
         if builder is None or review is None:
             raise FactoryRefused("missing READY_TO_MERGE inputs")
         head = self._integration_head()
-        released = _released_sealed_files(
-            self.store, self.runtime.path, self.run_id, lane
-        )
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=head,
-            sealed_present=gitpub.sealed_files_present(self.target, head, released),
+            base_head=_base_head(self.target, lane, builder.payload["builder_base_sha"]),
         )
         if decision.action == "BASE_INVALIDATION":
             digest = st.base_invalidation_input_digest(
@@ -3455,7 +3391,7 @@ class FactoryScheduler:
                 plan_artifact_ref=self._plan_artifact_ref(row),
                 input_digest=digest,
                 stage=st.LaneStage.READY_TO_MERGE,
-                artifacts={"BUILDER_OUTPUT": builder, "CODE_REVIEW": review},
+                artifacts=_merge_artifacts(lane, builder, review),
                 integration_head=head,
             )
             payload = gitpub.base_invalidation_payload(
@@ -3467,7 +3403,7 @@ class FactoryScheduler:
                 input_digest=digest,
             )
             payload["integration_head"] = head
-            artifact = prv.make_lane_artifact(
+            artifact = rc.make_lane_artifact(
                 kind=st.ArtifactKind.BASE_INVALIDATION,
                 request=_request(ctx),
                 payload=payload,
@@ -3497,7 +3433,7 @@ class FactoryScheduler:
             plan_artifact_ref=self._plan_artifact_ref(row),
             input_digest=digest,
             stage=st.LaneStage.READY_TO_MERGE,
-            artifacts={"BUILDER_OUTPUT": builder, "CODE_REVIEW": review},
+            artifacts=_merge_artifacts(lane, builder, review),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
@@ -3527,12 +3463,11 @@ class FactoryScheduler:
                 before_sha=head,
                 epoch_seconds=merge_epoch_seconds(row["created_at"]),
                 input_digest=digest,
-                sealed_files=released,
             )
         payload = dict(payload)
         payload["integration_head"] = head
         payload["input_digest"] = digest
-        artifact = prv.make_lane_artifact(
+        artifact = rc.make_lane_artifact(
             kind=st.ArtifactKind.INTEGRATION_MERGE,
             request=_request(ctx),
             payload=payload,
@@ -3550,7 +3485,7 @@ class FactoryScheduler:
         f50638ab reached 87 of them, 5.8G, against 5.7G of live checkouts.
 
         Safe because these are derived: each is rebuilt from an immutable
-        commit plus the sealed blobs on demand. The merge is recorded before
+        commit on demand. The merge is recorded before
         this runs, so a failure here costs disk, never progress -- which is why
         every error is swallowed rather than raised.
         """
@@ -3599,8 +3534,8 @@ class FactoryScheduler:
     ) -> tuple[str, ...]:
         failures = []
         for lane in self._run_gate_lanes(lanes):
-            sealed = self._current_tests_sealed(lane.lane_id)
-            if sealed is None:
+            suite = self._current_accepted_suite(lane.lane_id)
+            if suite is None:
                 continue
             result = cr.run_integration_gate(
                 run_id=self.run_id,
@@ -3609,9 +3544,9 @@ class FactoryScheduler:
                 state_root=self.runtime.path,
                 integration_repo=Path(self.target.target_repository_root),
                 integration_sha=head,
-                sealed_bundle=_record_as_lane_artifact(sealed, lane),
+                accepted_suite=_record_as_lane_artifact(suite, lane),
                 scratch_root=self.runtime.path / "worktrees",
-                gate=self._sealed_suite_gate(lane),
+                gate=self._suite_gate(lane),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
             )
@@ -3692,7 +3627,7 @@ class FactoryScheduler:
                                 citation[:120],
                             )
                         ) from exc
-            checked = prv.actionable_findings(verdict, findings)
+            checked = rc.actionable_findings(verdict, findings)
             payload = {
                 "affected_lanes": list(affected)
                 if verdict is st.ReviewerVerdict.REVISE

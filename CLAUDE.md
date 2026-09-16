@@ -3,8 +3,8 @@
 Maestro is a **nine-stage artifact factory**. Durable workflow authority is the one
 mutable `lane_state.stage` field (`PLANNED`, `WRITING_TESTS`, `REVIEWING_TESTS`,
 `TESTS_SEALED`, `BUILDING`, `REVIEWING_CODE`, `READY_TO_MERGE`, `MERGED`,
-`WAITING_FOR_USER`). Git commits and sealed artifact digests identify immutable
-inputs and outputs; they do not independently encode stage. Ledger, vault, locks,
+`WAITING_FOR_USER`). Git commits and artifact digests identify immutable
+inputs and outputs; they do not independently encode stage. Ledger, locks,
 receipts, copied plans, and ephemeral worktrees live only under the deployment's
 absolute `runtime_state_root` (mode `0700`, outside the target repository). Every
 `run start`, `run resume`, `run amend`, and `run status` revalidates
@@ -23,7 +23,7 @@ There is no retry, skip, abandon, attempt-salvage, or coordinator/workspace verb
 
 | Document | What it binds |
 |---|---|
-| `MAESTRO_architecture.md` | Executable factory contract: nine stages, compiler checks, artifacts, runtime binding, private-test boundary, operator verbs |
+| `MAESTRO_architecture.md` | Executable factory contract: nine stages, compiler checks, artifacts, runtime binding, test-suite immutability boundary, operator verbs |
 | `docs/plan-authoring.md` | The only supported path from a source document to an executable plan |
 | `AGENTS.md` | Repository layout and where the implementation actually lives |
 
@@ -32,14 +32,25 @@ you were given contradicts them, the documents win — say so rather than follow
 
 ## Three rules that invalidate work if broken
 
+The second rule changed on 2026-09-16, as a labeled contract change: accepted
+tests used to be sealed in a vault and hidden from the builder; they are visible
+now, and the rule is about immutability.
+
 1. **Typed records only** — a run fails if any lifecycle transition is caused by
    pane text, prompt text, a free-text envelope field, or an agent's claim about
    its own work. Transitions key on immutable artifacts and `PASS` / `REVISE`
    verdicts, never on model prose.
-2. **Sealed tests stay private** — accepted tests are sealed in the vault. The
-   builder receives the public contract, architecture constraints, allowed paths,
-   prior redacted review, and sealed digest. It does not receive private source,
-   fixtures, selectors, expected literals, or vault paths.
+2. **Accepted tests stay immutable** — the accepted suite is a merged candidate
+   in the builder's own checkout, and the builder reads it. It may not create,
+   edit, delete, rename or copy a suite path: a candidate that does is refused
+   `CANDIDATE_TEST_PATH_REFUSED` at admission, and every review hashes the suite
+   against the accepted blobs before running it (`TEST_SUITE_TAMPERED`). The
+   `ACCEPTED_TEST_SUITE` digest binds the builder, the code review and the run
+   gate to the same bytes. The builder and reviewer prompts say the reviewer
+   grades against the acceptance criteria, not the suite; that is an
+   instruction, not a check -- there is no blocking finding kind for an
+   implementation shaped to the assertions, and no reviewer-authored probe
+   runs after the suite is frozen.
 3. **A weakened check is a contract change, never a fix** — a diff that deletes
    or weakens a verdict, a check, or an error path is never the fix for a
    blocked run. It lands on its own, labeled as such, separately from the bug
@@ -50,9 +61,9 @@ Rule 3 has two receipts in this repository, and both were bundled.
 `ad186ba` (#187, 2026-09-02), "stop refusing work the factory has already
 accepted", carried seven changes under a theme of unblocking a stuck run. One of
 them, in `review_builder_output` (`adw_modules/code_review.py`), rewrites a
-reviewer's `REVISE` to `PASS` whenever the sealed suite is green and moves the
+reviewer's `REVISE` to `PASS` whenever the suite is green and moves the
 findings to an `advisory_findings` key that never reaches the builder and never
-causes a transition. The scheduler logs it plainly — `"sealed suite is
+causes a transition. The scheduler logs it plainly — `"suite is
 authoritative; verdict recorded as PASS"` beside `"reviewer said REVISE"`
 (`adw_modules/scheduler.py`). Bundled with six other changes, nobody saw it.
 Alone, it would have read as what it is: a decision that a reviewer cannot block.
@@ -62,7 +73,8 @@ The integration reviewer kept reporting that sealed test paths were absent from
 its checkout. The finding was wrong as a gate failure and correct as a fact about
 the branch — the tests genuinely were not in the repository. Instead of releasing
 them, the fix dropped the finding and turned a `REVISE` with no survivors into
-`PASS`. It shipped bundled with an unrelated envelope-race fix, and it persists
+`PASS`. (The tests are in the repository now: a tests lane merges its accepted
+suite, and the vault that kept them out was removed on 2026-09-16.) It shipped bundled with an unrelated envelope-race fix, and it persists
 nothing about what it dropped: the artifact keeps only the survivors and the log
 keeps a count, so the evidence a suppression destroyed cannot be recovered
 afterwards.
@@ -331,7 +343,7 @@ read §19 beside it.
 `Gate.runner` was `Literal["pytest", "vitest"]` because Maestro counted executed
 cases against `min_cases`. A shell script, Makefile target, `psql` migration,
 or `curl` check proved nothing countable and was refused with `maestro.command`.
-Factory code review still runs sealed pytest against a candidate; that runner is
+Factory code review still runs the accepted pytest suite against a candidate; that runner is
 not a lane-stage gate and `min_cases` is not workflow authority. Counting note
 that remains true for any pytest invocation: a repo whose `pytest.ini` sets `-v`
 cancels `-q`, so collection must pass `-o addopts=` or it silently returns zero.
@@ -515,8 +527,9 @@ Two things follow, and neither is a new gate:
 
 Same run, one finding was false: the reviewer reported the build lane's gate exiting 4
 because `services/label-batch/tests/observations` does not exist on the integration
-surface. `_failed_run_gates` (`scheduler.py`) overlays the sealed bundle onto the
-integration head before running it, and it had already passed — a gate failure there
+surface. `_failed_run_gates` (`scheduler.py`) overlaid the sealed bundle onto the
+integration head before running it (the overlay was removed on 2026-09-16; the suite
+is merged into the head now), and it had already passed — a gate failure there
 produces exactly one fixed finding, `_INTEGRATION_GATE_REVISE`, which this verdict did
 not carry. **A located finding from a reviewer is a claim, not a measurement.** Check it
 against the factory's own row before acting on it.
@@ -549,7 +562,8 @@ name for three.
 **And the first fix for that was in the wrong place.** It provisioned the actor's tree from
 `HerdrLauncher.launch` — which runs before the launcher's own `spec.prepare_adopted_cwd`
 callback, and that callback is a materialization: it re-runs `prepare_cwd`, and for a
-private tree `hv.refresh_materialized_commit` unlinks every child. So on the two paths that
+materialized tree `refresh_materialized_commit` unlinks every child (the private tree and
+`hidden_vault` were removed on 2026-09-16; the ordering rule outlives them). So on the two paths that
 reach a pane which already exists, a reused role pane and an adopted agent, the tree was
 provisioned and then wiped, and the agent started in it anyway. The test reviewer reported
 `vitest/config` `ERR_MODULE_NOT_FOUND` for ten rounds and was right every time. The

@@ -28,7 +28,7 @@ uv run adws/maestro.py run status <run-id>
 ```
 
 `run start` must execute from the stamped deployment (`adws/maestro.py`), not from Maestro,
-the-library, or any other template source (`RUN_REPOSITORY_MISMATCH`). Ledger, vault, locks,
+the-library, or any other template source (`RUN_REPOSITORY_MISMATCH`). Ledger, locks,
 receipts, copied plans, and ephemeral worktrees live only under the deployment's absolute
 `runtime_state_root` (mode `0700`, outside the target repository). Every start, resume, amend, and
 status revalidates `runtime_state_fingerprint` before reading or mutating run state.
@@ -70,7 +70,7 @@ an approved IR in place.
 ## Nine-stage lane execution
 
 Exactly these stages exist. The persisted `lane_state.stage` field is the sole durable workflow
-authority. Git commits and sealed artifact digests identify immutable inputs and outputs; they do
+authority. Git commits and artifact digests identify immutable inputs and outputs; they do
 not independently encode stage.
 
 ```text
@@ -88,35 +88,34 @@ WAITING_FOR_USER
 Product flow for every ready lane:
 
 1. Materialize `LANE_PLAN` from the approved plan artifact (`PLANNED` → `WRITING_TESTS`).
-2. Private test author emits `TEST_DRAFT` (private draft digest/ref plus public behavioral
-   contract).
-3. Test reviewer emits `TEST_REVIEW`: `PASS` seals; `REVISE` returns to the author with four-key
-   actionable findings.
-4. `SEALED_TEST_BUNDLE` records vault digest/reference. Private bytes are absent from every
-   builder input, and from the run repository until step 7 releases them.
-5. Builder emits `BUILDER_OUTPUT` bound to plan revision, integration base SHA, sealed-test digest,
-   and an immutable candidate ref/SHA. The builder receives the public contract, architecture
-   constraints, allowed paths, prior redacted review, and the sealed digest. It never receives
-   private source, fixtures, selectors, expected literals, or vault paths.
-6. Code reviewer runs the sealed tests against the candidate and emits `CODE_REVIEW`. `PASS`
-   advances to merge; `REVISE` returns to `BUILDING` with redacted findings.
+2. Test author emits `TEST_DRAFT`: the draft committed on the integration head and admitted as
+   a candidate, with its path-to-blob map, `test_suite_digest`, and public behavioral contract.
+3. Test reviewer reads an ordinary checkout of that candidate and emits `TEST_REVIEW`: `PASS`
+   accepts; `REVISE` returns to the author with four-key actionable findings.
+4. `ACCEPTED_TEST_SUITE` records the accepted candidate and its digest. A `lane_kind=tests` lane
+   then merges that candidate into the integration ref exactly as a build lane merges its own.
+5. Builder emits `BUILDER_OUTPUT` bound to plan revision, base SHA, `test_suite_digest`, and an
+   immutable candidate ref/SHA. Its base carries the accepted suite at the paths the prompt names
+   as `test_paths`; the builder reads them and may not write them. A candidate whose delta names
+   one is refused `CANDIDATE_TEST_PATH_REFUSED` before any reviewer reads it.
+6. Code reviewer runs the accepted suite from the candidate tree, after verifying the bytes at
+   the suite paths against the accepted blobs (`TEST_SUITE_TAMPERED` otherwise), and emits
+   `CODE_REVIEW` with the runner's `failure_output` verbatim. `PASS` advances to merge; `REVISE`
+   returns to `BUILDING`. The reviewer grades against the acceptance criteria, not the suite.
 7. `INTEGRATION_MERGE` records `before_sha`, accepted candidate SHA, and `after_sha`. Each accepted
-   lane merges exactly once into `refs/maestro/integration/<run-id>`. A build lane's merge also
-   releases its predecessor tests lane's accepted suite into that tree, so the repository carries
-   the tests its candidate was graded against.
+   lane -- tests, build, or untyped -- merges exactly once into `refs/maestro/integration/<run-id>`.
 8. A dependent lane's first `BUILDING` input includes every needed lane's accepted integration
    artifact.
-9. When every lane is `MERGED`, final integration review evaluates the integration commit with all
-   sealed tests. `PASS` permits exactly-once publication to `main` with an immutable receipt;
-   `REVISE` waits for `run amend`.
+9. When every lane is `MERGED`, final integration review evaluates the integration commit, which
+   carries every accepted suite. `PASS` permits exactly-once publication to `main` with an
+   immutable receipt; `REVISE` waits for `run amend`.
 
 `REVISE` is artifact data, not a stage. Review roles are stages of the lane, never synthetic DAG
 nodes. Resume after process death recreates the current incomplete stage from its last immutable
 input. No live actor, pane, dirty worktree, or process is adopted.
 
 A `REVISE` finding must include violated requirement, observed behavior, required behavior, and
-implementation area. It must not include private test source, fixtures, selectors, expected
-literals, or vault paths.
+implementation area. It is a claim about the candidate against the contract, never a test edit.
 
 ## Single repository
 
@@ -152,45 +151,49 @@ There is no `retry`, `skip`, `abandon`, or `attempt salvage` verb. Those mechani
 
 ## Public contract a tests lane must declare
 
-A tests lane authors private tests that later judge a builder. What the compiler and builder see is
-the **public behavioral contract**, not the test source.
+A tests lane authors tests that later judge a builder. What the compiler judges is the **public
+behavioral contract**; what the builder is graded against is the accepted suite, which it can read
+and cannot change.
 
-Author public acceptance criteria on the lane. Declared outputs are the implementation files the
-paired build lane may write — never the private test paths. The sealed bundle's public payload is
-acceptance criteria plus declared outputs plus `sealed_digest`. Private draft bytes stay in the
-vault.
+Author public acceptance criteria on the lane. A tests lane's declared outputs ARE its accepted
+suite: the tester writes exactly those paths, and the paired build lane's declared outputs are the
+implementation files it may write. `ACCEPTED_TEST_SUITE` records the accepted candidate, its
+path-to-blob map and `test_suite_digest`; the bytes live in the run repository like every other
+lane's output.
 
-**The builder cannot read those tests.** That is the shipped contract, not a future option. Sealed
-tests never enter the builder worktree, builder refs, rev-list, or fetch paths, and they do not
-enter the run repository until the paired build lane's merge releases them into the integration
-ref — after that lane's own code review, so no builder could have shaped a candidate to them. A
-lane's own suite is stripped from its checkout on every turn even when its base already carries it.
-Anyone auditing a builder prompt and finding private test source, fixtures, selectors, or expected
-literals is looking at a leak.
+**The builder reads those tests and may not touch them.** That is the shipped contract. The tests
+lane merges its suite into the integration ref before the build lane starts, so the builder's
+checkout carries it at the paths its prompt names as `test_paths`. A candidate whose tree delta
+creates, edits, deletes, renames or copies one of those paths is refused
+`CANDIDATE_TEST_PATH_REFUSED` before any reviewer reads it, and every review site hashes the suite
+against the accepted blobs before running it (`TEST_SUITE_TAMPERED`). The code reviewer grades the
+candidate against the acceptance criteria and the public contract, not against the suite. That is
+an instruction in both prompts, not a mechanism: no blocking finding kind for an implementation
+shaped to the assertions exists, and reviewer-authored post-freeze probes are not implemented.
 
-A `REVISE` from code review may name the violated public requirement and the implementation area. It
-must not quote the private assertion.
+A `REVISE` from code review names the violated public requirement and the implementation area, and
+carries the runner's failure output verbatim.
 
 ### Practical authoring rules
 
-- **Write the public acceptance so it is falsifiable without leaking the encoding.** "Negative
-  amounts are refused" is a contract. The private `assert` message is not.
-- **Declare the public interface before private tests bind to it.** In the existing public
+- **Write the public acceptance as a contract, not as a case.** "Negative amounts are refused" is
+  a contract. One `assert` message is a case, and the reviewer grades against the contract.
+- **Declare the public interface before tests bind to it.** In the existing public
   acceptance criteria or `spec.instruction`, state the required module/import path, export or
   callable name, argument and return shapes, and observable errors. The paired tests and build
   lanes must consume that same public declaration. A module filename alone does not declare a
   function. Test authors must not invent a private binding, and test reviewers must report
   undeclared bindings or ambiguity as contract-adequacy findings through the existing `REVISE`
-  path. Builders must not recover missing signatures from sealed tests or guess a set of aliases.
-  Public signatures are not private fixtures, selectors, expected literals, or assertion text;
-  those remain sealed. This is an authoring obligation, not a new compiler gate or schema field.
-- **Keep private tests out of declared outputs.** A path the builder is allowed to write cannot also
-  be the hidden suite.
+  path. Builders must not spray aliases to satisfy a name a test happens to use when the public
+  contract does not declare it; a suite bound to an undeclared name is a finding against the
+  suite. This is an authoring obligation, not a new compiler gate or schema field.
+- **Keep tests out of the build lane's declared outputs.** A path the builder is allowed to write
+  cannot also be the suite it is graded against (`OUTPUT_OVERLAPS_TEST_SUITE`).
 - **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.
   A lane's instruction has to be dischargeable inside that permission.
-- **Do not invent a second gate command for the builder.** Code review runs the sealed suite in a
-  harness scratch tree composed from the candidate commit plus vault blobs. The builder does not
-  receive runner argv that names private paths.
+- **Do not invent a second gate command for the builder.** Code review runs the accepted suite in
+  a harness tree materialized from the candidate commit, which carries the suite. The builder does
+  not receive runner argv.
 - **Say *required*, not merely *present*, and require the refusal cases that prove it.** An
   obligation phrased as "every record carries X" is discharged by a suite that only ever supplies X.
   That suite cannot tell a required argument from an optional one, so a builder may legitimately
@@ -462,7 +465,7 @@ claim-onset-provenance: every observation carries provenance
 Three rules for writing them:
 
 - **Examples are public.** They reach the tester, the builder and every reviewer verbatim, in the
-  lane's acceptance text. State the contract's answers there, never a sealed case's fixtures or selectors.
+  lane's acceptance text. State the contract's answers there; the accepted cases then assert them.
 - **Exact, not described.** `input` and `expect` are literals a case can compare with `==`. "A
   sorted mapping" is a description; `{"a": 1, "b": 2}` serialized as `'{"a":1,"b":2}'` is an answer.
 - **An example decides a question someone would ask.** Plan review asks, once per gating obligation,
@@ -492,8 +495,8 @@ repository-relative `source_artifacts`, so `--repo-root .` resolves them.
 the-library `skills/plan-contract/SKILL.md`, section "Writing a new plan, end to end".
 
 **Name every harness prerequisite.** If a required verifier command runs `git`, `docker`, or any
-other tool, the plan lists that tool as a prerequisite. The private test tree is a one-commit git
-repository with no remote and one ref, so forbid depending on git history, remotes, or refs, never
+other tool, the plan lists that tool as a prerequisite. The harness runs the suite in a one-commit
+git repository with no remote and one ref, so forbid depending on git history, remotes, or refs, never
 running `git` (FDAdb `be064e58` `lane-wp3-reader-tests` parked four rounds on a `git grep` test).
 
 A run already bound to a plan is not re-judged. `run resume`, `run status`, `run attend` and the
@@ -504,7 +507,7 @@ being shipped, started, or amended into a run needs examples.
 
 A rejection is not a fresh start and it is not a retry budget. `TEST_REVIEW(REVISE)` returns the
 lane to `WRITING_TESTS` with the same `LANE_PLAN` and four-key findings. `CODE_REVIEW(REVISE)`
-returns the lane to `BUILDING` from the sealed bundle and redacted findings. Neither loop requires
+returns the lane to `BUILDING` from the accepted suite, the findings and the failure output. Neither loop requires
 `run amend`.
 
 Two consequences for authoring. First, write the instruction so it reads correctly a second time,
@@ -532,7 +535,7 @@ round.
 `run attend --run <run-id>` automates that authoring loop where a deployment opts into it
 (`attend.max_amendments_per_lane` in that deployment's `maestro.config.yaml`; absent means off, and
 a runtime mirror never carries the key). It dispatches one operator agent, which reads the lane's
-public contract, its recent reviews, its gate table, the current Plan IR **and the sealed suite**,
+public contract, its recent reviews, its gate table, the current Plan IR and the accepted suite,
 and writes one revision IR. Maestro then validates and approves that revision with `planctl`,
 projects it, and applies it exactly as `run amend` would.
 
@@ -550,11 +553,9 @@ Three authoring consequences.
   what the suite asserts, and an amendment that narrows a check should land on its own, labeled as
   such — not inside an amendment whose stated purpose was to unblock a lane.
 
-The privilege is worth stating plainly, because it is the one boundary this verb moves: the
-operator agent reads the sealed suite. Builders and reviewers still do not. A deployment that turns
-`run attend` on is accepting that an amendment may put into a public contract an expectation the
-suite had been asserting privately — which is usually the correct repair, and is always a
-disclosure.
+The operator agent reads the accepted suite, as the builder and every reviewer do in their own
+checkouts. A deployment that turns `run attend` on is accepting that an amendment may put into a
+public contract an expectation the suite asserts — which is usually the correct repair.
 
 ## Several repositories
 
@@ -619,11 +620,11 @@ A tests verifier may carry `declared_cases`, a list of `{case, red_at_parent}`. 
 substring a runner prints for that case (`path::name` under pytest, `path > title` under vitest);
 `red_at_parent` says whether it fails at the commit the lane branches from. Ingress projects it
 onto `spec.gate.declared_cases` and refuses it on a build verifier
-(`UNMAPPABLE_VERIFIERS:<lane>.declared_cases`) — a build gate runs the sealed suite against a
+(`UNMAPPABLE_VERIFIERS:<lane>.declared_cases`) — a build gate runs the accepted suite against a
 candidate, where every case is expected green.
 
 The harness measures it once, in the draft-collect tree, which is the parent commit with the
-draft's private files written on top. Three divergences are `REVISE` findings against the tester,
+draft's files written on top. Three divergences are `REVISE` findings against the tester,
 citing `gate.declared_cases`: a declared case the parent ran nothing named, a case declared red
 that was green, and a case declared green that was red. The third is what this field exists for.
 
@@ -660,9 +661,9 @@ coverage. The `RUN_TEST_STRENGTH_CONTRACT_ABSENT` refusal at `run start` is gone
 historical; the ingress refusal above replaces it, which means an omission is caught when the plan
 is compiled rather than when a run is attempted.
 
-Those fields named private selectors and expected literals. They must not appear on a builder
-prompt or in public `CODE_REVIEW` findings under the factory contract. Public acceptance criteria
-replace them as the builder-visible obligation.
+Those fields named selectors and expected literals as gate configuration. Public acceptance
+criteria replace them as the builder's obligation; the accepted suite in the builder's checkout is
+where the cases live.
 
 ### Historical merged-test pairing
 
@@ -671,16 +672,19 @@ lane's commit had to carry the accepted test files byte-identically
 (`tests_chain.compare_test_bytes`, `PairingRefusal.BYTES_SUBSTITUTED`). **The build lane could read
 those tests, and that was then specified as the design rather than a leak.**
 
-That pairing rule is withdrawn. Sealed private tests never merge into the builder's tree. The
-factory equivalent is `SEALED_TEST_BUNDLE` in the vault, plus an absence proof against the builder
-worktree that holds for the lane's own suite unconditionally, and one against the run repository
-that holds until the paired build lane's merge releases the accepted suite into the integration
-ref. Final integration review runs sealed tests against the integration commit; publication is
-receipt-backed exactly once onto `main`.
+That pairing rule was withdrawn in favour of a vault: sealed tests never merged into the
+builder's tree, the factory carried `SEALED_TEST_BUNDLE` in a bare repository outside the run
+repository, and an absence proof held against the builder worktree. That secrecy was removed in
+turn (`MAESTRO_architecture.md` §11): accepted tests are visible again, and what replaced the
+byte-identity pairing check is immutability -- the tests lane merges its accepted suite before the
+build lane starts, a candidate that touches a suite path is refused at admission
+(`CANDIDATE_TEST_PATH_REFUSED`), and every review verifies the suite's blobs before running it
+(`TEST_SUITE_TAMPERED`). Final integration review reads the integration commit, which carries every
+accepted suite; publication is receipt-backed exactly once onto `main`.
 
-`test_visibility: "merged" | "hidden"` on `maestro-plan.v5` was the migration sketch for that
-withdrawal. Hidden visibility is now the only builder-facing behavior; there is no merged-test
-compatibility path in the factory slice.
+`test_visibility: "merged" | "hidden"` on `maestro-plan.v5` was the migration sketch for the
+vault. Neither value exists in the factory slice: the suite is visible, and its immutability is
+not a plan option.
 
 ### Historical review budgets and repair chains
 

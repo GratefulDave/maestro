@@ -281,11 +281,11 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
             next_plan_revision=3,
             public_contract={"acceptance_criteria": ["x"]},
             reviews=(),
-            redacted_failures=(),
+            failure_output=(),
             lane_gates="",
             ir_path=str(self.revision),
             revision_out_path=str(self.revision),
-            sealed_files={},
+            suite_files={},
             amendment_rules="rules",
             allowed_lane_ids=("lane-a",),
         )

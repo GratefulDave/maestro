@@ -215,7 +215,7 @@ def ledger(tmp_path: Path) -> dict:
                     "spec_digest": DIGEST,
                     "projection_digest": DIGEST,
                     "builder_base_sha": head,
-                    "sealed_test_digest": DIGEST,
+                    "test_suite_digest": DIGEST,
                     # The admitted delta's real shape: old/new path and oid
                     # per entry. A fixture that invents keys measures nothing --
                     # `_review_content_history` reads `old_path` and stops.

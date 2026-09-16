@@ -234,7 +234,7 @@ class _ScriptedReviewer:
 
 
 def _green_measurement():
-    return sch.cr.SealedMeasurement(
+    return sch.cr.SuiteMeasurement(
         summary={
             "errored": 0,
             "executed": 1,
@@ -247,7 +247,6 @@ def _green_measurement():
         min_cases=1,
         run={},
         files={},
-        vault=Path("/state/vault"),
     )
 
 
@@ -268,7 +267,14 @@ def _drive_reviewing_tests(actor):
     )
     row = {"plan_revision": 1, "plan_digest": _digest("plan")}
     plan = SimpleNamespace(artifact_id="plan-1")
-    draft = SimpleNamespace(artifact_id="draft-1", payload={"public_contract": PUBLIC})
+    draft = SimpleNamespace(
+        artifact_id="draft-1",
+        payload={
+            "public_contract": PUBLIC,
+            "candidate_ref": st.candidate_ref("run1", "lane-a", _digest("t")),
+            "candidate_sha": "4" * 40,
+        },
+    )
     scheduler._common = lambda lane_id: (row, lane)
     scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
     completed: list[object] = []
@@ -285,8 +291,6 @@ def _drive_reviewing_tests(actor):
         scheduler, "_measure_draft_gate", return_value=(None, None)
     ), mock.patch.object(
         sch, "_record_as_lane_artifact", side_effect=lambda art, lane_arg: art
-    ), mock.patch.object(
-        sch.tc, "draft_private_tokens", return_value=()
     ), mock.patch.object(
         sch.tc,
         "review_test_draft",
@@ -325,13 +329,13 @@ def _drive_reviewing_code(actor):
             "builder_base_sha": "1" * 40,
             "candidate_ref": st.candidate_ref("run1", "lane-a", _digest("b")),
             "candidate_sha": "2" * 40,
-            "sealed_digest": "3" * 64,
+            "test_suite_digest": "test-suite.v1:" + "3" * 64,
         },
     )
     scheduler._common = lambda lane_id: (row, lane)
-    scheduler._sealed_for = lambda lane_arg: artifact
+    scheduler._accepted_suite_for = lambda lane_arg: artifact
     scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
-    scheduler._sealed_suite_gate = lambda lane_arg: None
+    scheduler._suite_gate = lambda lane_arg: None
     completed: list[object] = []
     blocked: list[str] = []
     scheduler._block_if_stalled = lambda lane_id: blocked.append(lane_id)

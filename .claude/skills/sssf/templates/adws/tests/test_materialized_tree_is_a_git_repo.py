@@ -28,7 +28,7 @@ from unittest import mock
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
-from adw_modules import hidden_vault as hv
+from adw_modules import tree_materialize as tm
 
 
 def _clean_env() -> dict[str, str]:
@@ -94,7 +94,7 @@ class _Case(unittest.TestCase):
 
 class GitGrepRunsInTheTreeTest(_Case):
     def test_git_grep_finds_a_tracked_literal_and_misses_an_absent_one(self) -> None:
-        tree = hv.materialize_commit(
+        tree = tm.materialize_commit(
             self.repo, self.sha, self.state / "worktrees" / "t", state_root=self.state
         )
         hit = _git(tree, "grep", "-n", "RUNTIME_WIRING_NEEDLE", check=False)
@@ -106,21 +106,21 @@ class GitGrepRunsInTheTreeTest(_Case):
         self.assertEqual(miss.returncode, 1, miss.stderr)
 
     def test_refresh_makes_the_new_commit_the_only_one(self) -> None:
-        tree = hv.materialize_commit(
+        tree = tm.materialize_commit(
             self.repo, self.sha, self.state / "worktrees" / "t", state_root=self.state
         )
         (self.repo / "later.txt").write_text("LATER_LITERAL\n", encoding="utf-8")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-q", "-m", "later")
         second = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
-        hv.refresh_materialized_commit(self.repo, second, tree, state_root=self.state)
+        tm.refresh_materialized_commit(self.repo, second, tree, state_root=self.state)
         self.assertEqual(_git(tree, "grep", "-n", "LATER_LITERAL", check=False).returncode, 0)
         self.assertEqual(_git(tree, "rev-list", "--all", "--count").stdout.strip(), "1")
 
 
 class TheTreeRepositoryHoldsOneCommitTest(_Case):
     def test_one_commit_one_branch_no_foreign_refs_clean_status(self) -> None:
-        tree = hv.materialize_commit(
+        tree = tm.materialize_commit(
             self.repo, self.sha, self.state / "worktrees" / "t", state_root=self.state
         )
         self.assertTrue((tree / ".git").is_dir(), "a gitfile would link elsewhere")
@@ -142,18 +142,18 @@ class DestinationInsideAUserRepoIsRefusedTest(_Case):
     def test_refused_and_the_user_repo_is_byte_identical(self) -> None:
         before = _snapshot(self.repo)
         dest = self.repo / "nested-tree"
-        with self.assertRaises(hv.TreeContainmentRefused):
+        with self.assertRaises(tm.TreeContainmentRefused):
             # A state root that wrongly contains the repository.
-            hv.materialize_commit(self.repo, self.sha, dest, state_root=self.root)
-        with self.assertRaises(hv.TreeContainmentRefused):
-            hv.materialize_commit(self.repo, self.sha, dest, state_root=self.state)
+            tm.materialize_commit(self.repo, self.sha, dest, state_root=self.root)
+        with self.assertRaises(tm.TreeContainmentRefused):
+            tm.materialize_commit(self.repo, self.sha, dest, state_root=self.state)
         self.assertFalse(dest.exists())
         self.assertEqual(_snapshot(self.repo), before)
 
     def test_refresh_into_a_user_repo_deletes_nothing(self) -> None:
         before = _snapshot(self.repo)
-        with self.assertRaises(hv.TreeContainmentRefused):
-            hv.refresh_materialized_commit(
+        with self.assertRaises(tm.TreeContainmentRefused):
+            tm.refresh_materialized_commit(
                 self.repo, self.sha, self.repo / "deploy", state_root=self.root
             )
         self.assertTrue((self.repo / "deploy" / "tests" / "wiring.test.mjs").is_file())
@@ -161,8 +161,8 @@ class DestinationInsideAUserRepoIsRefusedTest(_Case):
 
     def test_explicit_forbidden_path_is_refused(self) -> None:
         other = self.state / "worktrees"
-        with self.assertRaises(hv.TreeContainmentRefused):
-            hv.materialize_commit(
+        with self.assertRaises(tm.TreeContainmentRefused):
+            tm.materialize_commit(
                 self.repo,
                 self.sha,
                 other / "t",
@@ -178,7 +178,7 @@ class SourceRepositoryIsUntouchedTest(_Case):
         # ref, and `status --porcelain --ignored`. Nothing is excluded --
         # `git archive` only reads objects, so no file there may change.
         before = _snapshot(self.repo)
-        hv.materialize_commit(
+        tm.materialize_commit(
             self.repo, self.sha, self.state / "worktrees" / "t", state_root=self.state
         )
         self.assertEqual(_snapshot(self.repo), before)
@@ -193,7 +193,7 @@ class CallerGitDirDoesNotRedirectTheInitTest(_Case):
             "GIT_INDEX_FILE": str(self.repo / ".git" / "index"),
         }
         with mock.patch.dict(os.environ, hostile):
-            tree = hv.materialize_commit(
+            tree = tm.materialize_commit(
                 self.repo,
                 self.sha,
                 self.state / "worktrees" / "t",

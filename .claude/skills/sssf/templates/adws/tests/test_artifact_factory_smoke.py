@@ -139,23 +139,6 @@ class ArtifactFactorySmokeHarnessTest(unittest.TestCase):
         self.assertEqual(loaded["dashboard"]["ui_port"], 4317)
         self.assertTrue(loaded["dashboard"]["open"])
 
-    def test_private_leak_scans_only_objects_added_after_factory_baseline(self) -> None:
-        product = smoke.init_product(self.root / "product")
-        runtime = product / "runtime.py"
-        runtime.write_text("selector = contract_field\n", encoding="utf-8")
-        baseline = smoke.commit_declared(product, (runtime,))
-
-        public = product / "public" / "a.txt"
-        public.parent.mkdir()
-        public.write_text("safe\n", encoding="utf-8")
-        smoke.commit_declared(product, (public,))
-        self.assertEqual(smoke.private_leak(product, baseline), [])
-
-        leaked = product / "public" / "leak.txt"
-        leaked.write_text("selector\n", encoding="utf-8")
-        smoke.commit_declared(product, (leaked,))
-        self.assertIn("public/leak.txt", smoke.private_leak(product, baseline))
-
     def test_relative_state_is_refused(self) -> None:
         product = smoke.init_product(self.root / "product")
         with self.assertRaises(smoke.SmokeRefused) as raised:

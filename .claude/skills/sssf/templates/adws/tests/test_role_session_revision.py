@@ -122,7 +122,7 @@ def _builder_ctx(head: str, lane: LaneProjection) -> LaneContext:
             "acceptance_criteria": ["a.txt is written"],
             "declared_outputs": ["a.txt"],
         },
-        sealed_digest="33" * 32,
+        test_suite_digest="test-suite.v1:" + "33" * 32,
     )
 
 
@@ -450,7 +450,7 @@ class ARefusedCloseIsReportedAndNotFatal(unittest.TestCase):
                 _tester_ctx(bench.head, _lane(spec_digest=_SPEC_B))
             )
 
-            self.assertIn("private_files", result)
+            self.assertIn("test_files", result)
             self.assertEqual(launcher.cancels, [])
             # The dispatch still happened. Whether it reached a new pane is the
             # launcher's business: a close that could not be proven leaves the

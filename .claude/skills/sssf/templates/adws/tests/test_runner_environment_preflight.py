@@ -25,7 +25,7 @@ class PreflightRefusal(unittest.TestCase):
 
 
 class RealResolverPreflight(unittest.TestCase):
-    """Keep vault setup isolated, but execute the production resolver and probe."""
+    """Keep tree setup isolated, but execute the production resolver and probe."""
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -47,18 +47,17 @@ class RealResolverPreflight(unittest.TestCase):
         self.factory._provision_argv = ()
         self.factory._provision_timeout_s = 1
         self.factory._say = lambda *_: None
+        self.factory._integration_head = lambda: "test-base"
         for name, value in (
-            ("ensure_vault", self.root / "vault"),
-            ("seed", "test-base"),
-            ("scratch_worktree_path", self.tree),
-            ("checkout_vault_worktree", None),
+            ("scratch_tree_path", self.tree),
+            ("materialize_commit", None),
         ):
-            patch = mock.patch.object(scheduler.hv, name, return_value=value)
+            patch = mock.patch.object(scheduler.tm, name, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
         patch = mock.patch.object(
             scheduler, "_remove_collect_tree",
-            side_effect=lambda tree, _: shutil.rmtree(tree),
+            side_effect=lambda tree: shutil.rmtree(tree),
         )
         patch.start()
         self.addCleanup(patch.stop)

@@ -294,7 +294,7 @@ def _validate_declared_cases(
 
     "The suite is red at the parent" is not falsification. FDAdb run be064e58
     `lane-wp3-adapter-build` burned three code-review rounds and parked
-    `NO_PROGRESS` on a sealed suite reading `executed=6 passed=5 failed=1`,
+    `NO_PROGRESS` on an accepted suite reading `executed=6 passed=5 failed=1`,
     identically, from three different candidates. The red case asserted a
     non-regression property -- it should have been GREEN at the parent -- and
     its final assertion called a shipped module the lane did not own, with a
@@ -458,7 +458,7 @@ def _validate_test_suite_outputs(
     invariant broke. "Two lanes want to own this path" is an authoring mistake
     either lane could fix by renaming; "a lane wants to own its own grader" is
     not, and the two stop being the same sentence the moment the accepted suite
-    is carried in the builder's checkout instead of behind a vault overlay.
+    is carried in the builder's checkout, which it is.
 
     Untyped lanes are covered on the same terms. Their own hidden meta-tests sit
     at paths of the tester's choosing and are not decidable here, but a typed

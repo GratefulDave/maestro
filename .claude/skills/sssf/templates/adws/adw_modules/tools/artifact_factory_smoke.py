@@ -22,7 +22,6 @@ if str(ADWS_ROOT) not in sys.path:
 
 from adw_modules import git_publication as gitpub  # noqa: E402
 from adw_modules import route_admission as admission  # noqa: E402
-from adw_modules.hidden_vault import vault_path  # noqa: E402
 from adw_modules.lifecycle import ArtifactStore  # noqa: E402
 from adw_modules.runtime_state import LAYOUT_CHILDREN, RuntimeStateRoot  # noqa: E402
 from adw_modules.scheduler import classify_executing_runtime  # noqa: E402
@@ -520,11 +519,6 @@ def collect_evidence(
             "{0}!={1}".format(published_sha, integration_sha),
         )
 
-    leak = private_leak(product, integration_initial_sha)
-    if leak:
-        raise SmokeRefused("PRIVATE_TEST_LEAK", json.dumps(leak, sort_keys=True))
-
-    vault = vault_path(state, run_id)
     return {
         "final_review_fingerprint": fingerprint,
         "integration_ref": integration_ref(run_id),
@@ -533,55 +527,17 @@ def collect_evidence(
         "main_sha": main_sha,
         "merge_counts": merge_counts,
         "merge_shas": merge_shas,
-        "private_leak": leak,
         "publication_count": len(publications),
         "published_sha": published_sha,
         "stages": stages,
         "transitions": transitions,
-        "vault": str(vault) if vault.exists() else "",
     }
-
-
-def private_leak(product: Path, integration_initial_sha: str) -> list[str]:
-    found: list[str] = []
-    product_vault = product / "vaults"
-    if product_vault.exists():
-        found.append(str(product_vault))
-    needles = tuple(FORBIDDEN_PRIVATE_KEYS)
-    listed = _git(
-        product,
-        "rev-list",
-        "--objects",
-        "--all",
-        "--not",
-        integration_initial_sha,
-        check=False,
-    )
-    for line in listed.splitlines():
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            continue
-        sha, name = parts
-        lowered = name.lower()
-        if any(token in lowered for token in needles):
-            found.append(name)
-            continue
-        blob = subprocess.run(
-            ["git", "-C", str(product), "cat-file", "-p", sha],
-            capture_output=True,
-            check=False,
-        )
-        text = blob.stdout.decode("utf-8", "replace")
-        if any(token in text for token in needles):
-            found.append(name or sha)
-    return found
 
 
 def containment(product: Path, state: Path) -> dict[str, Any]:
     violations = []
     forbidden_names = set(LAYOUT_CHILDREN) | {
         "lifecycle.sqlite3",
-        "vaults",
         "worktrees",
         "receipts",
         "locks",

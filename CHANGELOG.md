@@ -6,6 +6,117 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change: accepted tests are visible and immutable
+
+> **Operator warning -- read before mirroring this runtime into a deployment.**
+> Opening a ledger with this runtime migrates it from `artifact-factory.v4` to
+> `v5` in place, forward-only. The previous runtime cannot reopen a v5 ledger,
+> and there is no rollback. Any run whose ledger holds a `SEALED_TEST_BUNDLE`
+> or `TEST_INVALIDATION` row refuses every run verb with
+> `LIVE_RUN_CUTOVER_REQUIRED:<run_id>:<kind>` and must be restarted as a new
+> run. Before mirroring: let or stop every run in that deployment, copy
+> `<runtime_state_root>/lifecycle.sqlite3` somewhere safe, then mirror.
+
+Maestro stops hiding accepted test suites from builders. Tests are visible to
+every actor and immutable with respect to the lane graded against them. This
+lands alone, labeled as what it is, under CLAUDE.md rule 3: the vault and every
+secrecy check are deleted, and the guards that replace them are the ones #288
+added. The reasons: the secrecy surface caused run failures (#287 and the
+provisioning-ordering incidents recorded in CLAUDE.md), redaction destroyed the
+failure diagnostics builders needed so lanes plateaued for rounds on ambiguities
+the assertions would have resolved on turn one, and #275 already publishes each
+claim's expected answers in the plan, so the assertions were largely derivable
+anyway.
+
+What changed in the lifecycle:
+
+- A test draft is a candidate. `tests_chain.write_test_draft` commits the
+  tester's files on the integration head (`git_publication.commit_files_on_base`,
+  content-addressed) and admits the commit through `admit_candidate`; `TEST_DRAFT`
+  records the candidate ref/sha, the path-to-blob map and `test_suite_digest`.
+  The test reviewer reads an ordinary checkout of that candidate, taken from the
+  draft artifact's own `candidate_sha`; a draft without one is refused rather
+  than falling back to the integration head, which does not hold the draft.
+  A draft whose bytes the integration head already carries (a tests lane
+  re-drafted after an amendment, its suite already merged) is admitted as the
+  head itself with `changed=false`, and `TEST_DRAFT` and `ACCEPTED_TEST_SUITE`
+  record `changed`, so it takes the zero-delta merge edge instead of being
+  refused `CANDIDATE_OUTPUT_OWNERSHIP_REFUSED:changed=true empty delta`.
+- `SEALED_TEST_BUNDLE` is renamed `ACCEPTED_TEST_SUITE` and records the same
+  candidate, blobs and digest; nothing is re-committed. The stage `TESTS_SEALED`
+  keeps its enum value (renaming a stage is a ledger migration) and means "suite
+  accepted and pinned". This is ledger schema `artifact-factory.v5`: the
+  lane-artifact kind check is rebuilt to admit the new kind and keep the two
+  historical ones readable (`SEALED_TEST_BUNDLE`, `TEST_INVALIDATION`).
+  Readable, not runnable: every stored kind string is converted through
+  `scheduler_types.stored_artifact_kind`, and `_bind_existing_run` checks the
+  run first (`refuse_historical_artifacts`), so a run holding either kind
+  refuses `LIVE_RUN_CUTOVER_REQUIRED:<run_id>:<kind>` on `run resume`,
+  `run status`, `run amend` and `run attend` instead of raising `ValueError`.
+- A `lane_kind=tests` lane merges its accepted suite through `READY_TO_MERGE`
+  and the ordinary `INTEGRATION_MERGE` path. The special case that sent it to
+  `MERGED` at seal with no merge is gone, and so is the sealed-file overlay in
+  `_expected_merge_commit`, `sealed_files_present`, and the `released`
+  object-id bookkeeping. A build lane's base is the integration head, which
+  carries its predecessor's suite. An untyped lane builds on a content-addressed
+  commit of the head plus its own accepted suite (`_untyped_builder_base`), and
+  `decide_merge_action` measures staleness against the head that base was cut
+  from (`base_head`).
+- The builder's working tree is no longer stripped of its suite and the commit
+  pathspec is no longer subtracted. `LaneContext.sealed_private_paths` is
+  `protected_test_paths`, passed to `admit_candidate` for every lane kind; the
+  builder prompt names those paths, says they may not be touched, says the
+  reviewer grades against the acceptance criteria, and carries the prior
+  review's `failure_output` verbatim.
+- `CODE_REVIEW.redacted_failures` is `failure_output`: the runner's failure
+  lines, unredacted, same line cap. `code_review.builder_view` drops
+  `private_tokens`, `allow_names`, `refuse_private_leak` and `redacted_failures`
+  and gains `failure_output`, `test_paths` and `test_suite_digest`. Code review
+  materializes the candidate (or the base, or the integration head) with no
+  overlay; `test_binding.verify_suite` at all three sites is now load-bearing.
+- The `SEALED_SUITE_*` refusal family is `SUITE_*`
+  (`SUITE_RUNNER_UNUSABLE`, `SUITE_RUNNER_UNDERIVABLE`, `SUITE_RUNNER_AMBIGUOUS`,
+  `SUITE_PYTHON_UNSUPPORTED`, `SUITE_COUNTS_UNPARSEABLE`,
+  `SUITE_ALL_CASES_SKIPPED`, `SUITE_NOT_COLLECTED`), `SealedEnvironmentError` is
+  `SuiteEnvironmentError`, and the operator outcome `SEALED_SUITE_ENVIRONMENT_REFUSED`
+  is `SUITE_ENVIRONMENT_REFUSED`. None is deleted: each says "the measurement did
+  not happen", which is not a secrecy concern.
+- The tester envelope key is `test_files` (`private_files` is still read).
+
+Removed, with the guard that replaces each:
+
+| Removed | Replacement |
+|---|---|
+| `adw_modules/hidden_vault.py` (vault, drafts/sealed refs, absence proofs, `copy_blobs_to_tree`) | `adw_modules/tree_materialize.py` keeps materialization only; the suite is a merged candidate |
+| `adw_modules/private_review.py` (`collect_private_tokens`, `redact_text`, `redact_findings`, `refuse_private_leak`, `PrivateLeakError`, `IsolationError`, `PrivatePathCollisionError`, `VaultLaneRequest`) | `adw_modules/review_contract.py` (`ReviewContractError`, `SuiteEnvironmentError`, `LaneRequest`, `public_contract`, `substituted_gate_argv`, `actionable_findings`, `write_files`) |
+| `PRIVATE_PATH_COLLISION`, `TEST_INVALIDATION`, the `REVIEWING_CODE → WRITING_TESTS` reset, `detect_candidate_private_collisions`, `_refuse_candidate_private_collisions` | the untyped lane's tests are in its base; a candidate touching one is `CANDIDATE_TEST_PATH_REFUSED` at admission (LSP references: the collision detector was the only producer of `TEST_INVALIDATION`) |
+| `_refresh_builder_checkout(strip=...)`, `_strip_paths`, `_exclude_pathspec`, `_refresh_private_tree`, `_prepare(private_tree=True)` | `CANDIDATE_TEST_PATH_REFUSED` and `TEST_SUITE_TAMPERED` |
+| `redacted_failure_lines`, `_bound_surface_names`, `_redacted_advisory` | `code_review.failure_lines` |
+| `runtime_state.LAYOUT_CHILDREN` `vault`, `gc_worktrees` vault registrations, `artifact_factory_smoke.private_leak` | none needed |
+
+Deleted tests, with the invariant each pinned and where it lives now:
+
+| Deleted | Pinned | Now |
+|---|---|---|
+| `test_hidden_test_containment.py` | sealed objects absent from the product repo and builder | gone with the vault; visibility is the contract |
+| `test_sealed_release.py` | a build merge releases the predecessor suite; re-seal after amendment | `test_visible_suite.py` (a tests lane merges; the build base carries the suite) |
+| `test_redacted_failures.py` | failure lines redacted, case names dropped | `test_visible_suite.py` (e): `failure_output` carries the assertion verbatim and names the case |
+| `test_builder_suite_strip.py` | the suite is absent from the builder's checkout | inverted: `test_visible_suite.py` (a) asserts it is present; immutability is `CANDIDATE_TEST_PATH_REFUSED` (c) |
+| `test_private_path_invalidation.py` | collision resets an untyped lane to `WRITING_TESTS` | gone with `TEST_INVALIDATION`; a collision is refused at admission |
+| `test_draft_ref_window.py` | a draft commit is anchored until its vault ref pins it | a draft is admitted and pinned at a candidate ref in one call |
+
+Renamed tests: `test_sealed_suite_runner_selection.py` → `test_suite_runner_selection.py`,
+`test_sealed_refusal_carries_its_measurement.py` → `test_suite_refusal_carries_its_measurement.py`,
+`test_reviewer_sees_sealed_result.py` → `test_reviewer_sees_suite_result.py`,
+`test_private_review_contract.py` → `test_review_contract.py`. Converted:
+`test_review_tree_provisioning.py`, `test_role_tree_matches_dispatch.py`,
+`test_draft_min_cases_preflight.py`, `test_test_suite_binding.py`,
+`test_factory_cutover.py`, `test_tests_lane_handoff.py`.
+
+Docs: `MAESTRO_architecture.md` §11 is "Test-suite immutability boundary"; §12,
+§3, §4, §16 and §17 follow; CLAUDE.md rule 2 is "Accepted tests stay
+immutable"; `docs/plan-authoring.md` no longer describes a vault.
+
 ### Added
 - **A lane may not own the bytes it is graded against, and a review may not run
   bytes nobody accepted** (`plan_validate.OUTPUT_OVERLAPS_TEST_SUITE`,
@@ -45,8 +156,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     ran; unlike `sealed_digest`, that value is a function of path-to-blob pairs
     alone and so can be recomputed from a checkout.
 
-  Nothing is removed or weakened. The pathspec subtraction, the working-tree
-  removal, and `OUTPUT_OWNERSHIP_CONFLICT` all still run.
+  Nothing is removed or weakened by this entry: as of it, the pathspec
+  subtraction, the working-tree removal, and `OUTPUT_OWNERSHIP_CONFLICT` all
+  still ran. The first two were removed later by the contract change above
+  ("accepted tests are visible and immutable").
 - **A tests lane's plan states which cases are red at the parent commit, and the
   factory measures that instead of accepting "red"**
   (`spec.gate.declared_cases`; `plan_validate.CASE_FALSIFICATION_UNDECLARED`,
