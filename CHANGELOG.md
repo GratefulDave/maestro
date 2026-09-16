@@ -7,6 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **A sealed suite that evaluated nothing refuses whatever the runner's exit
+  code was** (`adw_modules/tests_chain.py`). `SEALED_SUITE_ALL_CASES_SKIPPED`
+  carried a `returncode == 0` guard, so the refusal fired for a deliberately
+  skipped suite and exempted the shape that matters: a suite whose fixture
+  cannot start exits non-zero with every case skipped, evaluating nothing, and
+  was billed to the builder as a `REVISE`. The guard protected nothing it
+  claimed to — a run with real failures has `evaluated > 0` and never reaches
+  the branch — so it is deleted rather than replaced by a second refusal.
+  Whether the runner exited 0 or 1 while evaluating nothing says nothing about
+  the candidate. Downstream is unchanged: the refusal flows into
+  `code_review`'s existing base-commit differential, which decides whether the
+  candidate caused it and otherwise hands the operator `NEVER_EXECUTED`.
+  Measured on real binaries — a `beforeAll` that throws exits 1 with
+  `Tests  2 skipped (2)` on vitest 3.2.7. On FDAdb run `be064e58`,
+  `lane-wp3-adapter-build` spent three REVISE rounds and a `NO_PROGRESS` park
+  on exactly this, because its sealed suite spawned `python3` off PATH and the
+  interpreter it found had no `uvicorn`.
 - **The herdr-lanes sidebar plugin moved to its own repository,
   `GratefulDave/herdr-radar-plus` (private), with its history.** It was never
   part of the ADW runtime; nothing here references it.

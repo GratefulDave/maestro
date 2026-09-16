@@ -731,6 +731,66 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
         self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", message)
         self.assertIn("every one of the 2 counted cases", message)
 
+    def test_a_fixture_that_cannot_start_refuses_despite_the_non_zero_exit(
+        self,
+    ) -> None:
+        """The shape that cost FDAdb run be064e58 three builder rounds.
+
+        A `beforeAll` that throws is how a sealed suite reports that its
+        environment never came up -- there, a gateway the suite spawns with a
+        bare `python3` that had no `uvicorn`. vitest exits non-zero and skips
+        every case, so the run evaluates nothing while `executed` reads six.
+        A `returncode == 0` guard on the refusal exempted exactly this and
+        billed it to the builder as a REVISE, three rounds running.
+
+        Asserted against the real binary, because the claim is about how vitest
+        exits and counts when a hook throws; a stubbed runner would only replay
+        the numbers this test is here to establish.
+        """
+        body = (
+            'import { beforeAll, it, expect } from "vitest";\n'
+            'beforeAll(() => { throw new Error("gateway exited 1"); });\n'
+            'it("a", () => { expect(1).toBe(1); });\n'
+            'it("b", () => { expect(1).toBe(1); });\n'
+        )
+        counts, code = self._counts(body)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(counts["skipped"], 2)
+        self.assertEqual(counts["passed"] + counts["failed"] + counts["errored"], 0)
+        with self._project(body) as (root, selector):
+            with mock.patch.object(
+                rr,
+                "resolve",
+                return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
+            ):
+                with self.assertRaises(pr.SealedEnvironmentError) as caught:
+                    tc.run_private_suite(root, (selector,), timeout_s=300.0)
+        message = str(caught.exception)
+        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", message)
+        self.assertIn("is not a defect in the candidate under test", message)
+
+    def test_a_genuinely_failing_run_still_reaches_the_failure_path(self) -> None:
+        """What the deleted `returncode == 0` guard claimed to protect.
+
+        It protected nothing: a run with real failures has `evaluated > 0`, so
+        it never reaches the refusal. Asserted so a future reader does not
+        reintroduce the guard to defend this case.
+        """
+        with self._project(
+            'import { it, expect } from "vitest";\n'
+            'it("a", () => { expect(1).toBe(2); });\n'
+            'it("b", () => { expect(1).toBe(1); });\n'
+        ) as (root, selector):
+            with mock.patch.object(
+                rr,
+                "resolve",
+                return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
+            ):
+                run = tc.run_private_suite(root, (selector,), timeout_s=300.0)
+        self.assertNotEqual(run["returncode"], 0)
+        self.assertEqual(run["counts"]["failed"], 1)
+        self.assertEqual(run["counts"]["passed"], 1)
+
     def test_the_summary_is_on_stdout_and_the_banner_on_stderr(self) -> None:
         """The mechanism itself, so a reporter change is caught here first."""
         with self._project(
@@ -1026,9 +1086,19 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
         self.assertNotIn("secret_selector", message)
         self.assertNotIn("tests/", message)
 
-    def test_a_nonzero_exit_with_only_skips_is_not_refused(self) -> None:
-        # A run that failed is the builder's to see, not the harness's to
-        # reinterpret. Only an exit-0 suite that evaluated nothing refuses.
+    def test_a_nonzero_exit_with_only_skips_refuses_too(self) -> None:
+        # This asserted the opposite until FDAdb run be064e58, on the reading
+        # that "a run that failed is the builder's to see, not the harness's to
+        # reinterpret". A run that failed is -- but a run that evaluated
+        # nothing did not fail, it never asked. Its exit code reports that its
+        # fixture could not start, which is a fact about the environment and
+        # not about the candidate, and billing it to the builder cost three
+        # REVISE rounds and a NO_PROGRESS park on `lane-wp3-adapter-build`.
+        #
+        # The old guard was never the thing keeping a real failure on the
+        # failure path: a suite with a real failure has `evaluated > 0` and
+        # never reaches this refusal. `test_a_fully_failing_suite_stays_on_the
+        # _failure_path` above is that case, and still passes.
         with tempfile.TemporaryDirectory() as tree:
             with mock.patch.object(
                 rr,
@@ -1039,9 +1109,11 @@ class AllCasesSkippedIsRefusedTest(unittest.TestCase):
                 "execute_cases",
                 return_value={"output": "2 skipped in 0.01s", "returncode": 2},
             ):
-                out = tc.run_private_suite(Path(tree), ("tests/test_a.py",))
-        self.assertEqual(out["returncode"], 2)
-        self.assertEqual(out["executed"], 2)
+                with self.assertRaises(pr.SealedEnvironmentError) as caught:
+                    tc.run_private_suite(Path(tree), ("tests/test_a.py",))
+        message = str(caught.exception)
+        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:pytest", message)
+        self.assertIn("is not a defect in the candidate under test", message)
 
 
 def _capable_stub(path: Path, exit_code: int) -> Path:
