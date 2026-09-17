@@ -199,11 +199,18 @@ carries the runner's failure output verbatim.
   plan whose declared outputs contain the call site, or
   `{"deferred_to": "<work package or plan>"}`, an explicit deferral naming the sibling
   work that will consume it. The compiler refuses an absent, empty, both-keys,
-  unknown-key, self-naming or unknown-lane declaration (`INTERFACE_UNCONSUMED`), under
+  unknown-key, self-naming, unknown-lane or tests-lane declaration
+  (`INTERFACE_UNCONSUMED`), under
   exactly the conditions `INTERFACE_UNDECLARED` applies: a build lane paired with a tests
   lane, at ship, start and amend, never re-judged against a revision a run already holds.
   `consumed_by` rides the same projection as the rest of the entry, so tester, test
   reviewer, builder and code reviewer read it too.
+
+  The named lane may not be the paired tests lane. That lane is already in the build
+  lane's `needs`, so it is the cheapest string to reach for — and a tests lane's declared
+  outputs are its accepted suite, never a call site, so accepting it would certify
+  precisely the published-export-with-no-caller shape this obligation exists to refuse.
+  Name the lane that calls the export, or declare `deferred_to`.
 
   A deferral is never refused for being a deferral. It is refused only for being silent.
   This is a declaration the author answers, not a measurement: nothing reads the

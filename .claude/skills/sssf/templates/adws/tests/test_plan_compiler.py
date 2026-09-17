@@ -703,6 +703,61 @@ class InterfaceConsumedTests(unittest.TestCase):
         )
         self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
 
+    def test_paired_tests_lane_as_consumer_is_refused(self):
+        """The cheapest wrong answer, and the WP5 shape itself.
+
+        `lane-tests` is already in the build lane's `needs`, so it is the
+        first string an author under review pressure reaches for -- and a
+        tests lane's declared outputs are its accepted suite, never a call
+        site. Accepting it would certify a published export with no caller,
+        which is the defect `consumed_by` exists to name.
+        """
+        caught = self._refusals(
+            self._paired(self._entry({"lane": "lane-tests"}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        refusal = [
+            item for item in caught.refusals
+            if item.code == pv.INTERFACE_UNCONSUMED
+        ][0]
+        self.assertIn("tests lane", refusal.message)
+
+    def test_a_distinct_build_lane_with_its_own_outputs_is_a_consumer(self):
+        """The accepting case the tests-lane refusal has to be told apart from.
+
+        Same plan, same `needs` edge back to the tests lane, but the consumer
+        is a build lane declaring a file of its own for the call to live in.
+        """
+        compiled = compile_plan(
+            _dump(
+                self._paired(
+                    self._entry({"lane": "lane-app"}),
+                    extra_lanes=(
+                        _lane(
+                            "lane-app",
+                            needs=("lane-tests", "lane-build"),
+                            outputs=["src/app.py"],
+                            lane_kind="build",
+                            spec={
+                                "intent": "app",
+                                "interface": [
+                                    dict(
+                                        _INTERFACE_ENTRY,
+                                        module="src/app.py",
+                                        name="main",
+                                    )
+                                ],
+                            },
+                        ),
+                    ),
+                )
+            )
+        )
+        self.assertEqual(
+            {"lane": "lane-app"},
+            _lane_of(compiled, "lane-build").public_interface[0]["consumed_by"],
+        )
+
     def test_self_consumption_is_refused(self):
         caught = self._refusals(
             self._paired(self._entry({"lane": "lane-build"}))

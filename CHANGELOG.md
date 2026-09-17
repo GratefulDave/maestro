@@ -13,8 +13,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `consumed_by`, an object with exactly one of `lane` (a lane declared in this
   plan whose declared outputs contain the call site) or `deferred_to` (a nonempty
   name for the sibling work package or plan that will consume it). Absent, empty,
-  both keys, an unknown key, an undeclared lane, or the declaring lane itself is
-  refused. The check applies under exactly the conditions `INTERFACE_UNDECLARED`
+  both keys, an unknown key, an undeclared lane, the declaring lane itself, or
+  a lane whose kind is `tests` is refused. A tests lane asserts the interface
+  rather than consuming it, and its declared outputs are the accepted suite
+  rather than a call site, so naming it — the cheapest answer, since it is
+  already in the build lane's `needs` — would certify exactly the
+  published-export-with-no-caller shape this check exists to refuse. The check
+  applies under exactly the conditions `INTERFACE_UNDECLARED`
   applies: paired build lanes only, judged at ship, start and amend, inert on
   tests / untyped / unpaired lanes, and never re-judged against a revision a run
   is already bound to.

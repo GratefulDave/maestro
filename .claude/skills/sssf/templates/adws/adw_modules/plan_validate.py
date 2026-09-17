@@ -494,6 +494,14 @@ def _validate_consumers(
     here reads the repository or an import graph. A deferral is never refused
     for being a deferral -- it is refused only for being absent.
 
+    A named lane may not be the paired tests lane. That lane is already in the
+    build lane's ``needs``, so it is the cheapest string an author under review
+    pressure writes -- and it certifies exactly the WP5 shape this check exists
+    to refuse, because a tests lane's declared outputs are its accepted suite,
+    never a call site. A lane with no declared outputs is refused earlier and
+    harder: ``outputs`` must be a nonempty array (``SCHEMA_INVALID``), so no
+    such lane reaches here in a plan that could otherwise compile.
+
     Judged exactly where ``_validate_interface`` judges presence and shape:
     on a build lane paired with a tests lane, at ship, start and amend only.
     """
@@ -529,6 +537,18 @@ def _validate_consumers(
                     entry_ptr,
                     "consumed_by.lane must name a lane declared in this plan; "
                     "use deferred_to for work outside it",
+                )
+            )
+        elif kinds.get(named) == "tests":
+            refusals.append(
+                PlanRefusal(
+                    INTERFACE_UNCONSUMED,
+                    entry_ptr,
+                    "consumed_by.lane names a tests lane; a tests lane asserts "
+                    "the interface, it does not consume it, and its declared "
+                    "outputs are the accepted suite rather than a call site. "
+                    "Name the lane that calls this export, or declare "
+                    "deferred_to",
                 )
             )
 
