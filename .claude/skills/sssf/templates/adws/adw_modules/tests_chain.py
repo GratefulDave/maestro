@@ -122,6 +122,7 @@ def write_test_draft(
         declared_outputs=rc.as_str_tuple(
             public_contract["declared_outputs"], "declared_outputs"
         ),
+        interface=public_contract.get("interface") or (),
     )
     written = {rc.normalize_repo_path(path): body for path, body in files.items()}
     if not written:

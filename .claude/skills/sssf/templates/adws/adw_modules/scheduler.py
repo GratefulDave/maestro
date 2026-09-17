@@ -1627,13 +1627,22 @@ def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
 
     Same mapping `pr.public_contract` / `tests_chain.write_test_draft` /
     `code_review.builder_view` project -- acceptance_criteria plus
-    declared_outputs -- not a second projection.
+    declared_outputs plus the declared interface entries -- not a second
+    projection.
     """
     if not isinstance(contract, Mapping):
         return ""
     criteria = contract.get("acceptance_criteria") or ()
     outputs = contract.get("declared_outputs") or ()
-    return " ".join([str(item) for item in criteria] + [str(item) for item in outputs])
+    interface = contract.get("interface") or ()
+    return " ".join(
+        [str(item) for item in criteria]
+        + [str(item) for item in outputs]
+        + [
+            json.dumps(entry, sort_keys=True, ensure_ascii=False)
+            for entry in interface
+        ]
+    )
 
 
 def _rejected_citation(exc: BaseException) -> str:
@@ -2421,6 +2430,11 @@ class FactoryScheduler:
         artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
         if review is not None:
             artifacts["TEST_REVIEW"] = review
+        contract = rc.public_contract(
+            acceptance_criteria=lane.public_acceptance,
+            declared_outputs=lane.declared_outputs,
+            interface=lane.public_interface,
+        )
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -2431,6 +2445,7 @@ class FactoryScheduler:
             stage=st.LaneStage.WRITING_TESTS,
             artifacts=artifacts,
             integration_head=tip,
+            public_contract=contract,
         )
         self._say(lane_id, "asking tester for a test draft")
         extra = dict(self.actor.write_tests(ctx))
@@ -2447,10 +2462,6 @@ class FactoryScheduler:
         files = _write_test_files(extra)
         self._require_typed_test_outputs(lane, files)
         self._refuse_test_files_on_outputs(lane, files)
-        contract = rc.public_contract(
-            acceptance_criteria=lane.public_acceptance,
-            declared_outputs=lane.declared_outputs,
-        )
         artifact = tc.write_test_draft(
             request=_request(ctx),
             binding=self.target,
@@ -3044,6 +3055,7 @@ class FactoryScheduler:
             public_contract=rc.public_contract(
                 acceptance_criteria=lane.public_acceptance,
                 declared_outputs=lane.declared_outputs,
+                interface=lane.public_interface,
             ),
             test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
             protected_test_paths=self._own_test_paths(lane, suite),
@@ -3130,6 +3142,7 @@ class FactoryScheduler:
         product_contract = rc.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
+            interface=lane.public_interface,
         )
         ctx = LaneContext(
             run_id=self.run_id,

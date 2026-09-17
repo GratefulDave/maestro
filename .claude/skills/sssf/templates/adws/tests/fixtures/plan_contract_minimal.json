@@ -200,6 +200,20 @@
         "lane-b": ["src/b.py"]
       },
       "integration_branch": "main",
+      "interfaces": {
+        "lane-b": [
+          {
+            "kind": "callable",
+            "module": "src/b.py",
+            "name": "build_contract",
+            "signature": {
+              "parameters": [{"name": "record", "type": "Mapping"}],
+              "returns": "dict"
+            },
+            "errors": ["ValueError"]
+          }
+        ]
+      },
       "prohibited_effects": [
         {
           "effect": "network",

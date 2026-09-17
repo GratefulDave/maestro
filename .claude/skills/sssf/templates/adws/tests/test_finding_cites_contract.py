@@ -261,6 +261,7 @@ def _drive_reviewing_tests(actor):
         spec_digest=_digest("spec"),
         lane_projection_digest=_digest("projection"),
         public_acceptance=(CONTRACT_CLAUSE,),
+        public_interface=(),
         declared_outputs=("tests/test_refund.py",),
         lane_kind=st.LANE_KIND_TESTS,
         needs=(),
@@ -318,6 +319,7 @@ def _drive_reviewing_code(actor):
         spec_digest=_digest("spec"),
         lane_projection_digest=_digest("projection"),
         public_acceptance=(CONTRACT_CLAUSE,),
+        public_interface=(),
         declared_outputs=("services/api/app.py",),
         lane_kind=st.LANE_KIND_BUILD,
         needs=(),
@@ -368,6 +370,7 @@ def _drive_final_review(actor):
             spec_digest, (), outputs, lane_kind=st.LANE_KIND_BUILD
         ),
         public_acceptance=(CONTRACT_CLAUSE,),
+        public_interface=(),
         lane_kind=st.LANE_KIND_BUILD,
     )
     recorded: dict[str, object] = {}

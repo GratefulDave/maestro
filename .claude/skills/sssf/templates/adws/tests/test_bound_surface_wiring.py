@@ -90,6 +90,7 @@ def _scheduler(actor=None):
         spec_digest=_digest("spec"),
         lane_projection_digest=_digest("projection"),
         public_acceptance=("a paid workspace is offered the entity DPA",),
+        public_interface=(),
         declared_outputs=("src/lib/paidDpa.ts",),
         lane_kind=st.LANE_KIND_BUILD,
         needs=(),

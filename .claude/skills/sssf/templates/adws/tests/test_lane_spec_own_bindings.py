@@ -198,6 +198,30 @@ def _two_pair_ir() -> dict:
     })
     ir["extensions"]["maestro"]["outputs"]["lane-t2"] = ["tests/test_c.py"]
     ir["extensions"]["maestro"]["outputs"]["lane-b2"] = ["src/c.py"]
+    ir["extensions"]["maestro"]["interfaces"] = {
+        "lane-b": [
+            {
+                "kind": "callable",
+                "module": "src/b.py",
+                "name": "build_contract",
+                "signature": {
+                    "parameters": [{"name": "record", "type": "Mapping"}],
+                    "returns": "dict",
+                },
+            }
+        ],
+        "lane-b2": [
+            {
+                "kind": "callable",
+                "module": "src/c.py",
+                "name": "build_second",
+                "signature": {
+                    "parameters": [{"name": "record", "type": "Mapping"}],
+                    "returns": "dict",
+                },
+            }
+        ],
+    }
     ir["rendered_bindings"] = [
         _binding("claim-t", "tests/test_t.py exercises the public contract."),
         _binding("claim-b1", "src/b.py implements the happy path."),

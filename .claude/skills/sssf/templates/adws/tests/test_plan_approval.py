@@ -76,8 +76,16 @@ class SameSignatureAsPlanctl(unittest.TestCase):
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "plan_contract_minimal.json"
 #: planctl.question_surface_sha256 over tests/fixtures/plan_contract_minimal.json,
-#: computed with the-library planctl (feat/claim-decided-by, c73f4b7).
-_FIXTURE_SURFACE = "7f05fbc61cfff531365e7a4faf4e4914a41d3c9d7779821a873cc33fa28ff650"
+#: computed with the-library planctl (feat/plan-interface-declared, v3 surface).
+_FIXTURE_SURFACE = "9033a26da8d552635b27727a48e27f717d4c8cb3463ae8bbf3e168c208a02c25"
+
+#: the-library's valid Plan IR fixture (skills/plan-contract/fixtures/
+#: valid-plan-ir.json @ feat/plan-interface-declared 8df8c76), vendored here so
+#: the pin survives without that checkout.
+_VALID_PLAN_IR = Path(__file__).resolve().parent / "fixtures" / "valid-plan-ir.json"
+#: planctl v3 question_surface_sha256 over _VALID_PLAN_IR; the value the
+#: cross-vendor re-review pinned as the repaired branch's surface.
+_VALID_PLAN_SURFACE = "887b144d7d4a4d0dad7041572e72f20e27663ee73710035f97161921b644ca3c"
 
 
 def _claims_only_surface(ir: dict) -> str:
@@ -89,11 +97,45 @@ def _claims_only_surface(ir: dict) -> str:
     return plan_approval.hashlib.sha256(plan_approval.canonical_json(surface)).hexdigest()
 
 
+def _v2_surface(ir: dict) -> str:
+    """The v2 algorithm: the discharge relation without interfaces/depends_on."""
+
+    def part(name: str, key: str, fields: tuple) -> list:
+        kept = [
+            {field: item.get(field) for field in fields}
+            for item in plan_approval._records(ir, name)
+        ]
+        return sorted(kept, key=lambda item: str(item.get(key)))
+
+    surface = {
+        "claims": sorted(
+            ({k: v for k, v in claim.items() if k != "decided_by"}
+             for claim in plan_approval._records(ir, "claims")),
+            key=lambda claim: str(claim.get("claim_id")),
+        ),
+        "lanes": part("lanes", "lane_id", ("lane_id", "lane_kind", "claim_ids", "verifier_ids")),
+        "verifiers": part("verifiers", "verifier_id", ("verifier_id", "lane_ids", "claim_ids")),
+        "traceability": part(
+            "traceability", "requirement_id",
+            ("requirement_id", "lane_ids", "verifier_ids", "claim_ids"),
+        ),
+    }
+    return plan_approval.hashlib.sha256(plan_approval.canonical_json(surface)).hexdigest()
+
+
 class SameQuestionSurfaceAsPlanctl(unittest.TestCase):
     def test_the_pinned_vector(self) -> None:
         ir = json.loads(_FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(_FIXTURE_SURFACE, plan_approval.question_surface_sha256(ir))
         self.assertNotEqual(_FIXTURE_SURFACE, _claims_only_surface(ir))
+        self.assertNotEqual(_FIXTURE_SURFACE, _v2_surface(ir))
+
+    def test_the_library_valid_plan_ir_pinned_vector(self) -> None:
+        """The repaired branch's fixture: planctl v3 and this module must agree."""
+        ir = json.loads(_VALID_PLAN_IR.read_text(encoding="utf-8"))
+        self.assertEqual(
+            _VALID_PLAN_SURFACE, plan_approval.question_surface_sha256(ir))
+        self.assertNotEqual(_VALID_PLAN_SURFACE, _v2_surface(ir))
 
     def test_against_the_real_planctl_when_it_is_here(self) -> None:
         path = _planctl_path()
@@ -124,11 +166,26 @@ class SameQuestionSurfaceAsPlanctl(unittest.TestCase):
         example = copy.deepcopy(base)
         example["claims"][0]["decided_by"] = [{"input": 1, "expect": 2}]
         variants["decided_by only"] = example
+        declared = copy.deepcopy(base)
+        declared.setdefault("extensions", {}).setdefault("maestro", {})[
+            "interfaces"
+        ] = {"lane-t": [{"kind": "callable", "module": "m.py", "name": "f",
+                         "signature": {"parameters": [{"name": "x", "type": "int"}],
+                                       "returns": "int"}}]}
+        variants["with interfaces"] = declared
+        changed_iface = copy.deepcopy(declared)
+        changed_iface["extensions"]["maestro"]["interfaces"]["lane-t"][0]["name"] = "g"
+        variants["interface name"] = changed_iface
+        paired = copy.deepcopy(base)
+        paired["lanes"][0]["depends_on"] = ["lane-t"]
+        variants["lane pairing"] = paired
         digests = {name: plan_approval.question_surface_sha256(ir) for name, ir in variants.items()}
         self.assertEqual(digests["fixture"], digests["decided_by only"])
-        for changed in ("lane mapping", "lane kind", "verifier mapping", "with traceability"):
+        for changed in ("lane mapping", "lane kind", "verifier mapping", "with traceability",
+                        "with interfaces", "lane pairing"):
             self.assertNotEqual(digests["fixture"], digests[changed], changed)
         self.assertNotEqual(digests["with traceability"], digests["traceability mapping"])
+        self.assertNotEqual(digests["with interfaces"], digests["interface name"])
         for name, ir in variants.items():
             with self.subTest(variant=name):
                 self.assertEqual(
@@ -138,10 +195,16 @@ class SameQuestionSurfaceAsPlanctl(unittest.TestCase):
                     planctl.source_inventory_digest(ir, Path(tempfile.gettempdir())),
                     plan_receipts.source_inventory_sha256(ir),
                 )
+        valid = json.loads(_VALID_PLAN_IR.read_text(encoding="utf-8"))
+        self.assertEqual(
+            planctl.question_surface_sha256(valid),
+            plan_approval.question_surface_sha256(valid),
+        )
 
 
 class StaleQuestionSurfaceIsRefused(unittest.TestCase):
-    """Cross-vendor review r3: a correctly signed receipt over the current IR, v1 surface."""
+    """Cross-vendor review r3: a correctly signed receipt over the current IR,
+    whose question surface is an older algorithm's digest."""
 
     def test_ship_refuses_and_writes_no_plan(self) -> None:
         from adw_modules import plan_contract_ingress as ingress
@@ -179,6 +242,24 @@ class StaleQuestionSurfaceIsRefused(unittest.TestCase):
             ingress.author_from_plan_contract(
                 ir_path, receipt, out, root / "repo", reviewer_key=plan_receipts.KEY)
             self.assertTrue(out.exists())
+
+    def test_verify_receipt_accepts_v3_and_refuses_v2(self) -> None:
+        """Contract change: only the v3 surface verifies; a v2 receipt is stale."""
+        ir = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+        ir_bytes = _FIXTURE.read_bytes()
+        plan_approval.verify_receipt(
+            ir_bytes,
+            plan_receipts.signed_receipt(ir_bytes),
+            None,
+            plan_receipts.KEY,
+        )
+        stale = plan_receipts.signed_receipt(
+            ir_bytes, question_surface_sha256=_v2_surface(ir))
+        self.assertEqual(
+            stale["signature"], plan_approval.signature(stale, plan_receipts.KEY))
+        with self.assertRaises(plan_approval.ApprovalRefused) as caught:
+            plan_approval.verify_receipt(ir_bytes, stale, None, plan_receipts.KEY)
+        self.assertEqual("RECEIPT_QUESTION_SURFACE", caught.exception.code)
 
 
 class RequireApprovedPlan(unittest.TestCase):

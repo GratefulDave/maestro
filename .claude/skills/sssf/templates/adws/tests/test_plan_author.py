@@ -11,11 +11,24 @@ from adw_modules.plan_model import SCHEMA_VERSION
 
 
 def _lane(lane_id: str, *, needs=(), outputs=None, lane_kind: str) -> dict:
+    spec = {"goal": lane_id}
+    if lane_kind == "build":
+        spec["interface"] = [
+            {
+                "kind": "callable",
+                "module": "src/{0}.py".format(lane_id),
+                "name": "build_{0}".format(lane_id.replace("-", "_")),
+                "signature": {
+                    "parameters": [{"name": "record", "type": "Mapping"}],
+                    "returns": "dict",
+                },
+            }
+        ]
     return {
         "id": lane_id,
         "needs": list(needs),
         "outputs": list(outputs if outputs is not None else ["src/{0}.py".format(lane_id)]),
-        "spec": {"goal": lane_id},
+        "spec": spec,
         "acceptance": ["{0} holds".format(lane_id)],
         "lane_kind": lane_kind,
     }

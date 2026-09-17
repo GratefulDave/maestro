@@ -112,6 +112,7 @@ def _lane(
     needs: tuple[str, ...] = (),
     outputs: tuple[str, ...] = ("a.txt",),
     lane_kind: str | None = None,
+    public_interface: tuple[Mapping[str, Any], ...] = (),
 ) -> LaneProjection:
     spec_digest = "ab" * 32
     return LaneProjection(
@@ -123,6 +124,7 @@ def _lane(
             spec_digest, needs, outputs, lane_kind=lane_kind
         ),
         public_acceptance=("a.txt is written",),
+        public_interface=public_interface,
         lane_kind=lane_kind,
     )
 
@@ -1606,6 +1608,167 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(len(set(resolved_role_cwds.values())), 5)
             for role, path in resolved_role_cwds.items():
                 self.assertEqual(path.parent.name, role)
+
+    def test_declared_interface_reaches_all_four_role_prompts(self) -> None:
+        """The declared interface reaches every role prompt as the same value.
+
+        FDAdb run 872123da parked because the tester had to invent bindings:
+        the declaration has to reach the tester, the test reviewer, the
+        builder and the code reviewer as identical bytes, or the four roles
+        grade against different surfaces again.
+        """
+        interface_entry = {
+            "kind": "route",
+            "module": "src/bff/widgets.py",
+            "name": "list_widgets",
+            "signature": {
+                "method": "GET",
+                "path": "/api/widgets",
+                "params": [{"name": "cursor", "type": "str | None"}],
+                "response": {
+                    "status": 200,
+                    "body": {
+                        "items": [{"id": "str", "label": "str"}],
+                        "next_cursor": "str | None",
+                    },
+                },
+            },
+            "errors": ["WidgetUnavailable"],
+        }
+        contract = {
+            "acceptance_criteria": ["the widget list endpoint is served"],
+            "declared_outputs": ["tests/test_widget.py"],
+            "interface": [interface_entry],
+        }
+        build_contract = dict(contract)
+        build_contract["declared_outputs"] = ["src/bff/widgets.py"]
+        tests_lane = _lane(
+            lane_id="lane-tests",
+            outputs=("tests/test_widget.py",),
+            lane_kind="tests",
+            public_interface=(interface_entry,),
+        )
+        build_lane = _lane(
+            lane_id="lane-build",
+            needs=("lane-tests",),
+            outputs=("src/bff/widgets.py",),
+            lane_kind="build",
+            public_interface=(interface_entry,),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            recorder = RecordingLauncher(
+                files={"tests/test_widget.py": "assert True\n"},
+                envelope={
+                    "test_files": {"tests/test_widget.py": "assert True\n"}
+                },
+            )
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
+            )
+            actor.write_tests(
+                LaneContext(
+                    run_id="run-iface",
+                    lane=tests_lane,
+                    plan_revision=1,
+                    plan_digest="cd" * 32,
+                    plan_artifact_ref="plan:x",
+                    input_digest="11" * 32,
+                    stage=LaneStage.WRITING_TESTS,
+                    artifacts={},
+                    integration_head=head,
+                    public_contract=contract,
+                )
+            )
+            draft = tchain.write_test_draft(
+                request=rcv.LaneRequest(
+                    run_id="run-iface",
+                    lane_id=tests_lane.lane_id,
+                    plan_revision=1,
+                    spec_digest=tests_lane.spec_digest,
+                    lane_projection_digest=tests_lane.lane_projection_digest,
+                    input_digest="11" * 32,
+                ),
+                binding=target,
+                integration_head=head,
+                files={"tests/test_widget.py": "assert True\n"},
+                public_contract=contract,
+                declared_outputs=["tests/test_widget.py"],
+            )
+            recorder.envelope = {"verdict": "PASS", "findings": []}
+            actor.review_tests(
+                LaneContext(
+                    run_id="run-iface",
+                    lane=tests_lane,
+                    plan_revision=1,
+                    plan_digest="cd" * 32,
+                    plan_artifact_ref="plan:x",
+                    input_digest="22" * 32,
+                    stage=LaneStage.REVIEWING_TESTS,
+                    artifacts={"TEST_DRAFT": draft},  # type: ignore[dict-item]
+                    candidate_sha=str(draft.payload["candidate_sha"]),
+                    public_contract=draft.payload["public_contract"],
+                )
+            )
+            recorder.files = {"src/bff/widgets.py": "def list_widgets(): ...\n"}
+            actor.build(
+                LaneContext(
+                    run_id="run-iface",
+                    lane=build_lane,
+                    plan_revision=1,
+                    plan_digest="cd" * 32,
+                    plan_artifact_ref="plan:x",
+                    input_digest="33" * 32,
+                    stage=LaneStage.BUILDING,
+                    artifacts={
+                        "ACCEPTED_TEST_SUITE": SimpleNamespace(
+                            artifact_id="suite-1"
+                        )
+                    },
+                    builder_base_sha=head,
+                    public_contract=build_contract,
+                    test_suite_digest="test-suite.v1:" + "44" * 32,
+                )
+            )
+            actor.review_code(
+                LaneContext(
+                    run_id="run-iface",
+                    lane=build_lane,
+                    plan_revision=1,
+                    plan_digest="cd" * 32,
+                    plan_artifact_ref="plan:x",
+                    input_digest="55" * 32,
+                    stage=LaneStage.REVIEWING_CODE,
+                    artifacts={
+                        "ACCEPTED_TEST_SUITE": SimpleNamespace(
+                            artifact_id="suite-1"
+                        )
+                    },
+                    builder_base_sha=head,
+                    candidate_sha=head,
+                    public_contract=build_contract,
+                    test_suite_digest="test-suite.v1:" + "44" * 32,
+                )
+            )
+            prompts = {
+                launch["prompt"]["role"]: launch["prompt"]
+                for launch in recorder.launches
+            }
+            self.assertEqual(
+                {"tester", "test-reviewer", "builder", "code-reviewer"},
+                set(prompts),
+            )
+            for role, prompt in prompts.items():
+                with self.subTest(role=role):
+                    self.assertEqual(
+                        [interface_entry],
+                        prompt["public_contract"]["interface"],
+                    )
 
 
 class RoleRouteBindingTest(unittest.TestCase):

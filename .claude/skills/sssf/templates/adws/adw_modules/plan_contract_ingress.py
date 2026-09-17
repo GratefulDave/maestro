@@ -470,6 +470,7 @@ _EXTENSION_PROJECTION: Dict[str, Optional[str]] = {
     "outputs": "outputs",
     "integration_branch": "spec.integration.integration_branch",
     "prohibited_effects": "spec.effects",
+    "interfaces": "spec.interface, spec.obligations.for_build_lanes",
     "repo": None,
     "integration_gate": None,
 }
@@ -905,6 +906,7 @@ def _obligations(
         packed = _pack_obligations(ir, build_lane, build_verifiers[0])
         packed["lane_id"] = projected["id"]
         packed["acceptance"] = list(projected["acceptance"])
+        packed["interface"] = list(projected["spec"].get("interface") or [])
         paired.append(packed)
         paired_lanes.append(build_lane)
     own = _pack_obligations(ir, lane, verifier)
@@ -1156,6 +1158,9 @@ def _assert_ingress_projection_is_total(
     if spec.get("integration", {}).get("integration_branch") != branch:
         _fail("spec.integration.integration_branch", branch,
               spec.get("integration", {}).get("integration_branch"))
+    declared_interface = (maestro.get("interfaces") or {}).get(lane_id)
+    if list(spec.get("interface") or []) != list(declared_interface or []):
+        _fail("spec.interface", declared_interface, spec.get("interface"))
     if kind == "tests":
         obligations = spec.get("obligations") or {}
         if [item.get("claim_id") for item in obligations.get("claims") or []] != claim_ids:
@@ -1180,6 +1185,13 @@ def _assert_ingress_projection_is_total(
         if actual_paired != paired:
             _fail("obligations.for_build_lanes", paired, actual_paired)
         lane_index = _records_by_id(ir, "lanes", "lane_id")
+        interfaces = maestro.get("interfaces") or {}
+        for item in obligations.get("for_build_lanes") or []:
+            declared = interfaces.get(item.get("lane_id"))
+            if list(item.get("interface") or []) != list(declared or []):
+                _fail(
+                    "obligations.for_build_lanes.interface",
+                    declared, item.get("interface"))
         expected_bindings = _rendered_bindings_for(
             ir,
             _carried_claim_ids(
@@ -1229,6 +1241,10 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     outputs_by_lane = maestro.get("outputs")
     if not isinstance(outputs_by_lane, dict) or not outputs_by_lane:
         raise IngressError("UNMAPPABLE_OUTPUTS")
+    interfaces_by_lane = maestro.get("interfaces")
+    if interfaces_by_lane is not None and not isinstance(
+            interfaces_by_lane, dict):
+        raise IngressError("UNMAPPABLE_INTERFACES")
     integration = maestro.get("integration_gate")
     branch = maestro.get("integration_branch")
     if not isinstance(branch, str) or not branch:
@@ -1332,6 +1348,11 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             ],
             "bindings": _bindings(lane, lane_kind),
         }
+        if (
+            isinstance(interfaces_by_lane, dict)
+            and lane_id in interfaces_by_lane
+        ):
+            spec["interface"] = interfaces_by_lane[lane_id]
         projected = {
             "id": lane_id,
             "needs": needs,

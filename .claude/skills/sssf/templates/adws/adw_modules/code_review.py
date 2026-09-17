@@ -440,6 +440,7 @@ def builder_view(
         declared_outputs=rc.as_str_tuple(
             public_contract["declared_outputs"], "declared_outputs"
         ),
+        interface=public_contract.get("interface") or (),
     )
     if prior_code_review is None:
         prior: object = st.NO_CODE_REVIEW

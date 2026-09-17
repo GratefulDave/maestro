@@ -10,6 +10,7 @@ from .plan_model import (
     SCHEMA_VERSION,
     PlanRefusal,
     decided_by_problems,
+    interface_problems,
     restriction_problems,
     normalize_declared_output,
     outputs_conflict,
@@ -28,6 +29,7 @@ BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
 OBLIGATION_UNOBSERVABLE = "OBLIGATION_UNOBSERVABLE"
 OBLIGATION_UNDECIDED = "OBLIGATION_UNDECIDED"
 CASE_FALSIFICATION_UNDECLARED = "CASE_FALSIFICATION_UNDECLARED"
+INTERFACE_UNDECLARED = "INTERFACE_UNDECLARED"
 
 
 def validate_objective_plan(
@@ -186,6 +188,9 @@ def validate_objective_plan(
         _validate_acceptance(pointer, acceptance, refusals, bound_run=bound_run)
         _validate_declared_cases(
             pointer, spec, kinds.get(lane_id), refusals, bound_run=bound_run
+        )
+        _validate_interface(
+            pointer, spec, kinds, lane_id, needs, refusals, bound_run=bound_run
         )
 
     _validate_ownership(parsed, refusals)
@@ -400,6 +405,63 @@ def _validate_declared_cases(
                 gate_ptr,
                 "no declared case is red_at_parent; a suite that is green "
                 "before the lane's outputs exist proves nothing about them",
+            )
+        )
+
+def _validate_interface(
+    pointer: str,
+    spec: Mapping[str, Any],
+    kinds: Mapping[str, Any],
+    lane_id: str,
+    needs: Sequence[Any],
+    refusals: List[PlanRefusal],
+    *,
+    bound_run: bool = False,
+) -> None:
+    """A build lane paired with a tests lane must declare its public interface.
+
+    The tester binds to the build lane's declared interface, not to names it
+    invents: an undeclared binding is an unclosable review loop (the reviewer
+    revises the invented name, the builder ships a different one, the suite
+    keeps failing on a name that was never promised). ``spec.interface`` is
+    the authored declaration; it is projected into ``public_contract`` so the
+    tester, the test reviewer, the builder and the code reviewer all read the
+    same bytes.
+
+    The refusal applies exactly to a build lane paired with a tests lane:
+    presence and shape are judged only there, so an interface-shaped value on
+    a tests, untyped or unpaired lane is inert data, not a refusal. Like the
+    obligation checks this is an authoring obligation: it is judged when a
+    plan is shipped, started, or amended, and never re-judged against a
+    revision a run already holds.
+    """
+    if bound_run:
+        return
+    if kinds.get(lane_id) != "build":
+        return
+    paired = any(
+        isinstance(need, str) and kinds.get(need) == "tests" for need in needs
+    )
+    if not paired:
+        return
+    interface = spec.get("interface") if isinstance(spec, Mapping) else None
+    for problem in interface_problems(interface):
+        refusals.append(
+            PlanRefusal(
+                INTERFACE_UNDECLARED,
+                pointer + "/spec/interface",
+                problem,
+            )
+        )
+    if not interface:
+        refusals.append(
+            PlanRefusal(
+                INTERFACE_UNDECLARED,
+                pointer + "/spec/interface",
+                "a build lane paired with a tests lane must declare the "
+                "public interface its tests bind to; declare spec.interface "
+                "entries naming each module, export and signature the suite "
+                "may call",
             )
         )
 

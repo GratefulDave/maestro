@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import dataclasses
 import os
 import hashlib
 import sqlite3
@@ -683,6 +684,7 @@ class ArtifactStoreTests(unittest.TestCase):
             row[1] for row in self.store.conn.execute("PRAGMA table_info(dag_lanes)")
         }
         self.assertIn("public_acceptance_json", dag_columns)
+        self.assertIn("public_interface_json", dag_columns)
         self.assertNotIn("lane_kind", dag_columns)
 
     def test_public_acceptance_round_trips_through_active_projection(self) -> None:
@@ -697,6 +699,34 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(
             tuple(__import__("json").loads(row[0])), ("observable behavior",)
         )
+
+    def test_public_interface_round_trips_through_active_projection(self) -> None:
+        entry = {
+            "kind": "callable",
+            "module": "src/a.py",
+            "name": "build_a",
+            "signature": {
+                "parameters": [{"name": "record", "type": "Mapping"}],
+                "returns": "dict",
+            },
+        }
+        lane = st.LaneProjection(
+            lane_id="lane-iface",
+            needs=(),
+            spec_digest=digest_label("spec:lane-iface"),
+            declared_outputs=("lane-iface.py",),
+            lane_projection_digest=st.lane_projection_digest(
+                digest_label("spec:lane-iface"), (), ("lane-iface.py",)
+            ),
+            public_interface=(entry,),
+        )
+        plan = make_plan(lane)
+        binding = dataclasses.replace(
+            make_binding(), integration_ref=st.integration_ref("run-iface")
+        )
+        self.store.create_run("run-iface", plan, binding)
+        reconstructed = self.store.active_projection("run-iface")
+        self.assertEqual(reconstructed[0].public_interface, (entry,))
 
     def test_legacy_ledger_refuses_execution(self) -> None:
         path = Path(self._tmp.name) / "legacy.sqlite3"
@@ -1858,7 +1888,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
 
         migrated = ArtifactStore(dest)
         self.addCleanup(migrated.close)
-        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v5")
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v6")
         self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
         # v3 widened the run-artifact kind check the same way v2 widened the
         # lane one. A migration that stops at the stamp leaves an ATTEND_SESSION
