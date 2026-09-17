@@ -652,7 +652,8 @@ which the ingress projects onto the paired build lane's `spec.interface`, and
 the objective compiler refuses `INTERFACE_UNDECLARED` when a build lane paired
 with a tests lane declares none. The WP5 r6 plan itself still declares its
 bindings only in obligations prose; the structured field applies to plans
-authored after this change, and that plan would need an amendment to carry it.
+authored after this change. A bound run is not re-judged, so that run needs no
+further amendment to keep going.
 The declared entries ride the lane projection into `public_contract`, so
 tester, test reviewer, and builder read the same bytes. **A rule that
 punishes guessing only works when the truth is written down somewhere the guesser can read
