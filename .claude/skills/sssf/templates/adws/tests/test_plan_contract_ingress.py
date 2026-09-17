@@ -21,7 +21,28 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "plan_contract_minimal.
 
 
 def _ir() -> dict:
-    return json.loads(FIXTURE.read_text(encoding="utf-8"))
+    """The pinned fixture, plus the consumer declaration a plan now compiles with.
+
+    `plan_contract_minimal.json` is a cross-tool parity vector: its bytes are
+    pinned to planctl's own `question_surface_sha256` output
+    (`test_plan_approval.SameQuestionSurfaceAsPlanctl`), so recomputing that
+    digest from this repository's implementation would destroy what the pin
+    proves. `consumed_by` is therefore injected here rather than edited into
+    the file.
+    """
+    ir = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    return _with_consumers(ir)
+
+
+def _with_consumers(ir: dict) -> dict:
+    for entries in (ir.get("extensions", {})
+                    .get("maestro", {})
+                    .get("interfaces") or {}).values():
+        for entry in entries:
+            entry.setdefault(
+                "consumed_by", {"deferred_to": "the next work package"}
+            )
+    return ir
 
 
 def _write_json(path: Path, payload: dict) -> bytes:

@@ -114,6 +114,7 @@ def _plan_bytes() -> bytes:
                     "interface": [
                         {
                             "kind": "callable",
+                            "consumed_by": {"deferred_to": "WP-next wires this"},
                             "module": "product.py",
                             "name": "refund",
                             "signature": {

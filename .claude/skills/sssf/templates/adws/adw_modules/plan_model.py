@@ -24,9 +24,14 @@ RESTRICTION_KEYS = frozenset(
 DECIDED_BY_EXAMPLE_KEYS = frozenset({"input", "expect", "refuses"})
 REFUSAL_KEYS = frozenset({"error", "message"})
 INTERFACE_ENTRY_KEYS = frozenset(
-    {"kind", "module", "name", "signature", "errors"}
+    {"kind", "module", "name", "signature", "errors", "consumed_by"}
 )
 INTERFACE_KINDS = frozenset({"callable", "route", "component"})
+#: A consumer declaration is exactly one of these, never both and never
+#: neither: ``lane`` names a lane in this plan whose declared outputs contain
+#: the call site, ``deferred_to`` names the sibling work package or plan that
+#: will consume the interface.
+CONSUMED_BY_KEYS = frozenset({"lane", "deferred_to"})
 _INTERFACE_HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 )
@@ -301,6 +306,48 @@ def interface_entry_problems(entry: Any) -> Tuple[str, ...]:
     ):
         problems.append("errors must be an array of observable error names")
     return tuple(problems)
+
+
+def consumer_problems(entry: Any) -> Tuple[str, ...]:
+    """What one entry's ``consumed_by`` leaves unstated; empty if well-formed.
+
+    Shape only. Whether a named ``lane`` is a lane of this plan, and whether
+    it is the declaring lane itself, needs the lane graph and is judged by
+    ``plan_validate`` (``INTERFACE_UNCONSUMED``). No prose is inspected: a
+    ``deferred_to`` is required to be nonempty, not to be true.
+    """
+    if not isinstance(entry, dict):
+        return ()
+    declared = entry.get("consumed_by")
+    if declared is None:
+        return (
+            "consumed_by is required: name the lane in this plan whose "
+            "declared outputs contain the call site, or the sibling work "
+            "package the consumption is deferred to",
+        )
+    if not isinstance(declared, dict):
+        return ("consumed_by must be an object",)
+    extra = set(declared) - CONSUMED_BY_KEYS
+    if extra:
+        return (
+            "consumed_by has unknown field(s): {0}".format(
+                ", ".join(sorted(extra))
+            ),
+        )
+    if len(declared) != 1:
+        return ("consumed_by must carry exactly one of lane or deferred_to",)
+    if "lane" in declared:
+        lane = declared["lane"]
+        if not isinstance(lane, str) or not lane.strip():
+            return ("consumed_by.lane must be a nonempty lane id",)
+        return ()
+    deferral = declared["deferred_to"]
+    if not isinstance(deferral, str) or not deferral.strip():
+        return (
+            "consumed_by.deferred_to must name the sibling work package or "
+            "plan that will consume this interface",
+        )
+    return ()
 
 
 def interface_problems(value: Any) -> Tuple[str, ...]:

@@ -57,7 +57,8 @@ produced-symbol reachability, narrative quality, or other generic semantics.
   are that lane's accepted suite (`OUTPUT_OVERLAPS_TEST_SUITE`). A lane may not own the
   bytes it is graded against.
 - A `lane_kind=build` lane paired with a `lane_kind=tests` lane declares its public
-  interface as `spec.interface` entries (`INTERFACE_UNDECLARED`).
+  interface as `spec.interface` entries (`INTERFACE_UNDECLARED`), and every entry names
+  its consumer as `consumed_by` (`INTERFACE_UNCONSUMED`).
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -193,6 +194,24 @@ carries the runner's failure output verbatim.
   contract-adequacy findings through the existing `REVISE` path. Builders must not
   spray aliases to satisfy a name a test happens to use when the public contract does
   not declare it; a suite bound to an undeclared name is a finding against the suite.
+- **Name who will call it.** Every `spec.interface` entry carries `consumed_by`, an
+  object with exactly one of two keys: `{"lane": "<lane-id>"}`, a lane declared in this
+  plan whose declared outputs contain the call site, or
+  `{"deferred_to": "<work package or plan>"}`, an explicit deferral naming the sibling
+  work that will consume it. The compiler refuses an absent, empty, both-keys,
+  unknown-key, self-naming or unknown-lane declaration (`INTERFACE_UNCONSUMED`), under
+  exactly the conditions `INTERFACE_UNDECLARED` applies: a build lane paired with a tests
+  lane, at ship, start and amend, never re-judged against a revision a run already holds.
+  `consumed_by` rides the same projection as the rest of the entry, so tester, test
+  reviewer, builder and code reviewer read it too.
+
+  A deferral is never refused for being a deferral. It is refused only for being silent.
+  This is a declaration the author answers, not a measurement: nothing reads the
+  repository, and no import graph is consulted. The receipt is FDAdb WP5, which
+  converged, published `5ebb652c3037`, and shipped a module nothing calls — no producer,
+  no mount, nothing importing `RegulatorySection`. Every gate passed, because no gate
+  asked who consumes the interface. The deferral to WP5b was legitimate; it was silent,
+  and therefore unreviewable.
 - **Keep tests out of the build lane's declared outputs.** A path the builder is allowed to write
   cannot also be the suite it is graded against (`OUTPUT_OVERLAPS_TEST_SUITE`).
 - **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.

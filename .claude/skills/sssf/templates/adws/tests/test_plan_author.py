@@ -16,6 +16,7 @@ def _lane(lane_id: str, *, needs=(), outputs=None, lane_kind: str) -> dict:
         spec["interface"] = [
             {
                 "kind": "callable",
+                "consumed_by": {"deferred_to": "WP-next wires this"},
                 "module": "src/{0}.py".format(lane_id),
                 "name": "build_{0}".format(lane_id.replace("-", "_")),
                 "signature": {

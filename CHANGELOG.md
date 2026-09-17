@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change: a declared interface names its consumer
+
+- New objective-compiler refusal `INTERFACE_UNCONSUMED`. Every `spec.interface`
+  entry on a `lane_kind=build` lane paired with a `lane_kind=tests` lane carries
+  `consumed_by`, an object with exactly one of `lane` (a lane declared in this
+  plan whose declared outputs contain the call site) or `deferred_to` (a nonempty
+  name for the sibling work package or plan that will consume it). Absent, empty,
+  both keys, an unknown key, an undeclared lane, or the declaring lane itself is
+  refused. The check applies under exactly the conditions `INTERFACE_UNDECLARED`
+  applies: paired build lanes only, judged at ship, start and amend, inert on
+  tests / untyped / unpaired lanes, and never re-judged against a revision a run
+  is already bound to.
+- `consumed_by` is carried by the entry's existing projection into
+  `public_contract.interface`, `obligations.for_build_lanes[].interface` and
+  `public_interface_json` — no second path — so tester, test reviewer, builder
+  and code reviewer read the same bytes.
+- This is a new obligation, not a weakened check. Plans authored before it, and
+  runs already bound to a revision, are unaffected; a plan shipped after it must
+  answer the question.
+- **Why.** FDAdb WP5 converged, published `5ebb652c3037`, and shipped code
+  nothing calls: no producer, no mount, nothing importing `RegulatorySection`.
+  Every existing gate passed. A plan could declare an interface, have its tests
+  bind to it, merge every lane and publish a module with no caller, because no
+  check ever asked who consumes it. The deferral to WP5b was legitimate; it was
+  silent, and therefore unreviewable. `consumed_by` does not forbid deferral — it
+  forbids silence, and it is a declaration the author answers, never a
+  measurement of the repository.
+
 ### Changed — contract change: plan review question surface v3, findings v2
 
 - `plan_approval.QUESTION_SURFACE_ALGORITHM` is now

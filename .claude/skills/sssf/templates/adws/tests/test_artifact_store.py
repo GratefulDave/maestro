@@ -703,6 +703,7 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_public_interface_round_trips_through_active_projection(self) -> None:
         entry = {
             "kind": "callable",
+            "consumed_by": {"deferred_to": "WP-next wires this"},
             "module": "src/a.py",
             "name": "build_a",
             "signature": {
