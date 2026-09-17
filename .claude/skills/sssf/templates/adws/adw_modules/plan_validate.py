@@ -428,11 +428,21 @@ def _validate_interface(
     tester, the test reviewer, the builder and the code reviewer all read the
     same bytes.
 
-    Like the obligation checks this is an authoring obligation: it is judged
-    when a plan is shipped, started, or amended, and never re-judged against
-    a revision a run already holds.
+    The refusal applies exactly to a build lane paired with a tests lane:
+    presence and shape are judged only there, so an interface-shaped value on
+    a tests, untyped or unpaired lane is inert data, not a refusal. Like the
+    obligation checks this is an authoring obligation: it is judged when a
+    plan is shipped, started, or amended, and never re-judged against a
+    revision a run already holds.
     """
     if bound_run:
+        return
+    if kinds.get(lane_id) != "build":
+        return
+    paired = any(
+        isinstance(need, str) and kinds.get(need) == "tests" for need in needs
+    )
+    if not paired:
         return
     interface = spec.get("interface") if isinstance(spec, Mapping) else None
     for problem in interface_problems(interface):
@@ -443,12 +453,7 @@ def _validate_interface(
                 problem,
             )
         )
-    if kinds.get(lane_id) != "build":
-        return
-    paired = any(
-        isinstance(need, str) and kinds.get(need) == "tests" for need in needs
-    )
-    if paired and not interface:
+    if not interface:
         refusals.append(
             PlanRefusal(
                 INTERFACE_UNDECLARED,

@@ -287,19 +287,12 @@ def interface_entry_problems(entry: Any) -> Tuple[str, ...]:
     if kind not in INTERFACE_KINDS:
         return ("kind must be callable, route or component",)
     problems = []
-    if kind in ("callable", "component"):
-        module = entry.get("module")
-        if not isinstance(module, str) or not module.strip():
-            problems.append("module must be a nonempty module path")
-        name = entry.get("name")
-        if not isinstance(name, str) or not name.strip():
-            problems.append("name must be a nonempty export name")
-    else:
-        for field in ("module", "name"):
-            if field in entry and (
-                not isinstance(entry[field], str) or not entry[field].strip()
-            ):
-                problems.append("{0} must be a nonempty string".format(field))
+    module = entry.get("module")
+    if not isinstance(module, str) or not module.strip():
+        problems.append("module must be a nonempty module path")
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip():
+        problems.append("name must be a nonempty export name")
     problems.extend(_signature_problems(kind, entry.get("signature")))
     errors = entry.get("errors")
     if errors is not None and (

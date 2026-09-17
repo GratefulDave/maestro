@@ -2118,6 +2118,9 @@ class HerdrStageActor:
         extra: dict[str, Any] = {
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_acceptance": list(ctx.lane.public_acceptance),
+            # The declared interface the suite binds to; the same bytes the
+            # test reviewer, builder and code reviewer are graded against.
+            "public_contract": ctx.public_contract,
         }
         findings = list(ctx.draft_correction or ())
         if not findings:

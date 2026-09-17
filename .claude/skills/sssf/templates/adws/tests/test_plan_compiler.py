@@ -515,6 +515,8 @@ class InterfaceDeclaredTests(unittest.TestCase):
     def test_route_entry_needs_method_path_response(self):
         bad = {
             "kind": "route",
+            "module": "src/bff.py",
+            "name": "list_items",
             "signature": {"method": "GET", "path": "/items"},
         }
         with self.assertRaises(PlanCompileError) as caught:
@@ -522,6 +524,75 @@ class InterfaceDeclaredTests(unittest.TestCase):
                 _dump(self._paired(build_spec={"intent": "b", "interface": [bad]}))
             )
         self.assertIn(pv.INTERFACE_UNDECLARED, _codes(caught.exception))
+
+    def test_route_entry_needs_module_and_name(self):
+        # A route that names only its HTTP surface leaves the suite guessing
+        # which module and export serves it -- the WP5 failure class.
+        bad = {
+            "kind": "route",
+            "signature": {
+                "method": "GET",
+                "path": "/items",
+                "response": {"status": 200},
+            },
+        }
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(
+                _dump(self._paired(build_spec={"intent": "b", "interface": [bad]}))
+            )
+        self.assertIn(pv.INTERFACE_UNDECLARED, _codes(caught.exception))
+
+    def test_malformed_interface_on_tests_lane_compiles(self):
+        compiled = compile_plan(
+            _dump(
+                self._paired(
+                    tests_spec={"intent": "t", "interface": [{"kind": "widget"}]},
+                    build_spec={"intent": "b", "interface": [_INTERFACE_ENTRY]},
+                )
+            )
+        )
+        self.assertEqual(
+            tuple([_INTERFACE_ENTRY]),
+            tuple(_lane_of(compiled, "lane-build").public_interface),
+        )
+
+    def test_malformed_interface_on_untyped_lane_compiles(self):
+        compiled = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-tests",
+                        lane_kind="tests",
+                        outputs=["tests/test_b.py"],
+                    ),
+                    _lane(
+                        "lane-untyped",
+                        needs=("lane-tests",),
+                        outputs=["src/b.py"],
+                        spec={"intent": "u", "interface": [{"kind": "widget"}]},
+                    ),
+                )
+            )
+        )
+        self.assertEqual((), _lane_of(compiled, "lane-tests").public_interface)
+
+    def test_malformed_interface_on_unpaired_lane_compiles(self):
+        # Inert data: the projection carries the lane's own spec verbatim and
+        # the refusal never fires, because nothing binds to this lane.
+        compiled = compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-solo",
+                        spec={"intent": "s", "interface": [{"kind": "widget"}]},
+                    ),
+                )
+            )
+        )
+        self.assertEqual(
+            ({"kind": "widget"},),
+            tuple(_lane_of(compiled, "lane-solo").public_interface),
+        )
 
     def test_untyped_lane_needing_tests_needs_no_interface(self):
         compiled = compile_plan(

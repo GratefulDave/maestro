@@ -2430,6 +2430,11 @@ class FactoryScheduler:
         artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
         if review is not None:
             artifacts["TEST_REVIEW"] = review
+        contract = rc.public_contract(
+            acceptance_criteria=lane.public_acceptance,
+            declared_outputs=lane.declared_outputs,
+            interface=lane.public_interface,
+        )
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -2440,6 +2445,7 @@ class FactoryScheduler:
             stage=st.LaneStage.WRITING_TESTS,
             artifacts=artifacts,
             integration_head=tip,
+            public_contract=contract,
         )
         self._say(lane_id, "asking tester for a test draft")
         extra = dict(self.actor.write_tests(ctx))
@@ -2456,11 +2462,6 @@ class FactoryScheduler:
         files = _write_test_files(extra)
         self._require_typed_test_outputs(lane, files)
         self._refuse_test_files_on_outputs(lane, files)
-        contract = rc.public_contract(
-            acceptance_criteria=lane.public_acceptance,
-            declared_outputs=lane.declared_outputs,
-            interface=lane.public_interface,
-        )
         artifact = tc.write_test_draft(
             request=_request(ctx),
             binding=self.target,

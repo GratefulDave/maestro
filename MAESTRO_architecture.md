@@ -492,6 +492,16 @@ Procedure before mirroring the runtime into a deployment:
 
 Opening an `artifact-factory.v5` ledger with a runtime that ships v6 migrates it in place, forward-only: `dag_lanes` gains `public_interface_json`, defaulting to `[]` for lanes already recorded. The previous runtime cannot reopen the migrated ledger, and there is no rollback.
 
+Migration is not deferred: constructing `ArtifactStore` rewrites the ledger immediately, and `run status` opens one. A v5 scheduler still holding that ledger cannot safely continue against the migrated file. The safe order, before any v6 command touches a deployment ledger:
+
+1. Stop or quiesce every v5 Maestro scheduler and process that can open the deployment ledger.
+2. Copy `<runtime_state_root>/lifecycle.sqlite3` to a backup outside the runtime state root.
+3. Mirror the complete v6 runtime into the deployment; do not leave a mixed v5/v6 runtime.
+4. Only then let the first v6 command that opens `ArtifactStore` — including `run status` — perform the migration.
+5. Never run a v5 runtime against that ledger afterwards.
+
+Until the v5 run is stopped, inspect it only with tools that open SQLite read-only and never construct `ArtifactStore`, such as `tools/lane_gates.py`.
+
 ---
 
 ## 15. Removed authorities (historical)
