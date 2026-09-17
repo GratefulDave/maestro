@@ -23,6 +23,7 @@ from typing import Any, Optional, Protocol
 from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
+from . import plan_model
 from . import provisioning as prov
 from . import review_contract as rc
 from . import runner_resolution as rr
@@ -2498,8 +2499,15 @@ class FactoryScheduler:
         """
         if lane.lane_kind is not None:
             return
+        # Ancestry, not equality: a test file `pkg` and an output `pkg/mod.py`
+        # cannot both exist in one tree, in either direction.
         collisions = sorted(
-            {rc.normalize_repo_path(path) for path in files} & set(lane.declared_outputs)
+            path
+            for path in {rc.normalize_repo_path(path) for path in files}
+            if any(
+                plan_model.outputs_conflict(path, output)
+                for output in lane.declared_outputs
+            )
         )
         if collisions:
             raise TestFileOnDeclaredOutput(", ".join(collisions))

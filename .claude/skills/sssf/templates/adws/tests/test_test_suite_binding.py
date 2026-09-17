@@ -35,6 +35,7 @@ sys.path.insert(0, str(ADWS))
 from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import git_publication as gp  # noqa: E402
 from adw_modules import review_contract as rc  # noqa: E402
+from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import test_binding as tb  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
@@ -187,6 +188,48 @@ class VerifySuiteHashesTheTree(unittest.TestCase):
 
         self.assertIn("SYMLINK", str(caught.exception))
 
+    def test_a_symlinked_ancestor_directory_is_refused(self):
+        """The leaf is a regular file; the directory it is reached through is not.
+
+        `tests` -> `elsewhere/` holding byte-identical content hashes to the
+        accepted blob, yet the runner would read a path the tree does not own.
+        """
+        moved = self.tree / "elsewhere"
+        (self.tree / "tests").rename(moved)
+        (self.tree / "tests").symlink_to(moved, target_is_directory=True)
+        self.assertEqual(
+            self.blob, tb.blob_id((self.tree / self.path).read_bytes())
+        )
+
+        with self.assertRaises(tb.TestSuiteTampered) as caught:
+            tb.verify_suite(self.expected, self.tree)
+
+        self.assertEqual(self.path, caught.exception.path)
+        self.assertEqual(tb.SYMLINK, caught.exception.actual)
+
+    def test_a_symlinked_ancestor_escaping_the_tree_is_refused(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        moved = Path(outside.name) / "tests"
+        (self.tree / "tests").rename(moved)
+        (self.tree / "tests").symlink_to(moved, target_is_directory=True)
+
+        with self.assertRaises(tb.TestSuiteTampered) as caught:
+            tb.verify_suite(self.expected, self.tree)
+
+        self.assertEqual(tb.SYMLINK, caught.exception.actual)
+
+    def test_a_directory_at_a_suite_path_is_refused(self):
+        target = self.tree / self.path
+        target.unlink()
+        target.mkdir()
+
+        with self.assertRaises(tb.TestSuiteTampered) as caught:
+            tb.verify_suite(self.expected, self.tree)
+
+        self.assertEqual(self.path, caught.exception.path)
+        self.assertEqual(tb.ABSENT, caught.exception.actual)
+
     def test_a_refusal_never_carries_the_file_contents(self):
         target = self.tree / self.path
         target.write_text("def test_one():\n    assert {0!r}\n".format(SECRET_LITERAL))
@@ -202,6 +245,41 @@ class VerifySuiteHashesTheTree(unittest.TestCase):
 
         self.assertIsInstance(error, rc.SuiteEnvironmentError)
         self.assertIsNotNone(cr.suite_environment_detail(error))
+
+
+class UntypedTestsMayNotSitOnProductOutputs(unittest.TestCase):
+    """`TEST_FILE_ON_DECLARED_OUTPUT` is ancestry-aware, not string equality.
+
+    A test file `pkg` and a product output `pkg/mod.py` cannot both exist in
+    one Git tree, in either direction, so each is the same collision as an
+    exact match and refuses at admission rather than at tree construction.
+    """
+
+    def _refuse(self, outputs, files):
+        from types import SimpleNamespace
+
+        lane = SimpleNamespace(lane_kind=None, declared_outputs=tuple(outputs))
+        sch.FactoryScheduler._refuse_test_files_on_outputs(
+            None, lane, {path: "x" for path in files}
+        )
+
+    def test_an_exact_match_refuses(self):
+        with self.assertRaises(sch.TestFileOnDeclaredOutput) as caught:
+            self._refuse(["pkg/mod.py"], ["pkg/mod.py"])
+        self.assertEqual("TEST_FILE_ON_DECLARED_OUTPUT", caught.exception.code)
+
+    def test_a_test_file_at_an_output_ancestor_refuses(self):
+        with self.assertRaises(sch.TestFileOnDeclaredOutput) as caught:
+            self._refuse(["pkg/mod.py"], ["pkg"])
+        self.assertIn("pkg", str(caught.exception))
+
+    def test_a_test_file_under_an_output_directory_refuses(self):
+        with self.assertRaises(sch.TestFileOnDeclaredOutput) as caught:
+            self._refuse(["pkg"], ["pkg/test_mod.py"])
+        self.assertIn("pkg/test_mod.py", str(caught.exception))
+
+    def test_a_shared_name_prefix_is_not_ancestry(self):
+        self.assertIsNone(self._refuse(["pkg/mod.py"], ["pkg/mod.py_test.py", "pk"]))
 
 
 class ProtectedPathsAreNotOwnable(unittest.TestCase):
@@ -514,6 +592,37 @@ class TheReviewRunsTheAcceptedSuite(unittest.TestCase):
             return tree
 
         return _tamper
+
+    def _ancestor_symlink_tree(self):
+        """Materialize, then reach the unchanged suite through a symlinked directory.
+
+        Every byte the runner would read hashes to the accepted blob; only the
+        route to it changed.
+        """
+        real_tree = cr._review_tree
+
+        def _relink(repo, sha, dest, *args, **kwargs):
+            tree = Path(real_tree(repo, sha, dest, *args, **kwargs))
+            top = TEST_PATH.split("/")[0]
+            moved = tree / ("relinked-" + top)
+            (tree / top).rename(moved)
+            (tree / top).symlink_to(moved, target_is_directory=True)
+            return tree
+
+        return _relink
+
+    def test_a_symlinked_suite_ancestor_refuses_before_the_runner(self):
+        runner = mock.Mock(name="run_suite")
+        with mock.patch.object(
+            cr, "_review_tree", side_effect=self._ancestor_symlink_tree()
+        ):
+            with mock.patch.object(cr.tc, "run_suite", runner):
+                with self.assertRaises(tb.TestSuiteTampered) as caught:
+                    self._review("ancestor-symlink")
+
+        runner.assert_not_called()
+        self.assertEqual(TEST_PATH, caught.exception.path)
+        self.assertEqual(tb.SYMLINK, caught.exception.actual)
 
     def test_a_tampered_base_tree_refuses_rather_than_absolving_the_builder(self):
         """`_collect_at_base` must not swallow this into "not the candidate's".
