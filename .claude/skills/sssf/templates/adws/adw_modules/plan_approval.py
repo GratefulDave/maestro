@@ -38,9 +38,10 @@ _SHA256_HEX = frozenset("0123456789abcdef")
 
 
 #: The question-surface algorithm this module and planctl share. v2 added the
-#: tests-lane discharge relation to v1's claims-only digest; a receipt signed
-#: over a v1 digest describes a question that no longer is the reviewed one.
-QUESTION_SURFACE_ALGORITHM = "plan-contract-question-surface.v2"
+#: tests-lane discharge relation to v1's claims-only digest; v3 binds the
+#: declared interfaces and each lane's depends_on pairing, so a receipt signed
+#: over a v2 digest describes a question that no longer is the reviewed one.
+QUESTION_SURFACE_ALGORITHM = "plan-contract-question-surface.v3"
 
 
 class ApprovalRefused(ValueError):
@@ -78,12 +79,14 @@ def _records(ir: Mapping[str, Any], name: str) -> list:
 
 
 def question_surface_sha256(ir: Mapping[str, Any]) -> str:
-    """planctl's `question_surface_sha256`, v2 (`QUESTION_SURFACE_ALGORITHM`).
+    """planctl's `question_surface_sha256`, v3 (`QUESTION_SURFACE_ALGORITHM`).
 
     Claims with everything except `decided_by`, plus the tests-lane discharge
-    relation: each lane's id, kind, claim_ids and verifier_ids; each verifier's
-    lane_ids and claim_ids; each traceability record's lane, verifier and claim
-    ids. Every part is sorted by its id.
+    relation: each lane's id, kind, claim_ids, verifier_ids and depends_on;
+    each verifier's lane_ids and claim_ids; each traceability record's lane,
+    verifier and claim ids; and the canonical `extensions.maestro.interfaces`
+    mapping the interface question is asked of. Every part is sorted by its
+    id.
     """
 
     def part(name: str, key: str, fields: Optional[tuple] = None) -> list:
@@ -95,9 +98,15 @@ def question_surface_sha256(ir: Mapping[str, Any]) -> str:
         ]
         return sorted(kept, key=lambda item: str(item.get(key)))
 
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, Mapping) else None
     surface = {
         "claims": part("claims", "claim_id"),
-        "lanes": part("lanes", "lane_id", ("lane_id", "lane_kind", "claim_ids", "verifier_ids")),
+        "interfaces": maestro.get("interfaces") if isinstance(maestro, Mapping) else None,
+        "lanes": part(
+            "lanes", "lane_id",
+            ("lane_id", "lane_kind", "claim_ids", "verifier_ids", "depends_on"),
+        ),
         "verifiers": part("verifiers", "verifier_id", ("verifier_id", "lane_ids", "claim_ids")),
         "traceability": part(
             "traceability", "requirement_id",

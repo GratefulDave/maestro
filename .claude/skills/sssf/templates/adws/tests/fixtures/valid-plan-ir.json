@@ -1,0 +1,145 @@
+{
+  "schema_version": "plan-contract.v1",
+  "plan_id": "fixture-plan",
+  "title": "Plan contract fixture",
+  "plan_kind": "implementation",
+  "author": {
+    "id": "fixture-author",
+    "vendor": "author-vendor"
+  },
+  "source_artifacts": [
+    {
+      "source_id": "source-schema",
+      "path": "../schemas/plan-ir-v1.schema.json",
+      "sha256": "b2a6b920997835a2c8527f37d77115c6534f53580ab9bd76b4355c8419910b36",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-owner",
+      "text": "Deployment authority is owned by the platform team.",
+      "source_ids": ["source-schema"],
+      "surface": [
+        {"path": "skills/plan-contract/schemas/plan-ir-v1.schema.json", "mutation": "unmodified"},
+        {"path": "tests/test_plan_contract.py", "mutation": "written"}
+      ],
+      "effects": [
+        {"effect": "migration_execution", "disposition": "none"}
+      ]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim-owner",
+      "kind": "actor_ownership",
+      "subject": "deployment authority",
+      "predicate": "is owned by",
+      "object": "platform team",
+      "polarity": "positive",
+      "source_requirement_ids": ["req-owner"],
+      "source_ids": ["source-schema"],
+      "verifier_ids": ["verify-owner"],
+      "rendered_binding_ids": ["bind-owner"],
+      "witness": {"scope": "in_process", "store": "none"},
+      "mutation_kinds": ["actor-replacement", "predicate-replacement", "object-replacement", "polarity-inversion"]
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "fixture-owner",
+      "source_id": "source-schema",
+      "path": "../schemas/plan-ir-v1.schema.json",
+      "record_selector": "/$id",
+      "observed_value": "https://library.local/schemas/plan-ir-v1.schema.json",
+      "producer_metadata": {
+        "schema_id": "https://library.local/schemas/plan-ir-v1.schema.json"
+      },
+      "meaning": "The fixture proves the schema source is pinned and resolvable.",
+      "consumer_obligation": "Reviewers must confirm the pinned schema source remains available to the plan consumer.",
+      "prohibited_behavior": "Consumers must not replace the pinned schema identity with an unverified local schema.",
+      "seam_ids": ["seam-owner"],
+      "affected_lane_ids": ["lane-owner"],
+      "verifier_ids": ["verify-owner"]
+    }
+  ],
+  "seams": [
+    {
+      "seam_id": "seam-owner",
+      "producer": "plan author",
+      "consumer": "plan reviewer",
+      "contract": "The bound claim and source pin are reviewed together.",
+      "requirement_ids": ["req-owner"],
+      "source_ids": ["source-schema"],
+      "fixture_ids": ["fixture-owner"],
+      "claim_ids": ["claim-owner"],
+      "verifier_ids": ["verify-owner"]
+    }
+  ],
+  "lanes": [
+    {
+      "lane_id": "lane-owner",
+      "title": "Verify deployment ownership",
+      "execution_context": ".",
+      "requirement_ids": ["req-owner"],
+      "claim_ids": ["claim-owner"],
+      "seam_ids": ["seam-owner"],
+      "fixture_ids": ["fixture-owner"],
+      "verifier_ids": ["verify-owner"],
+      "depends_on": []
+    }
+  ],
+  "verifiers": [
+    {
+      "verifier_id": "verify-owner",
+      "lane_ids": ["lane-owner"],
+      "requirement_ids": ["req-owner"],
+      "source_ids": ["source-schema"],
+      "fixture_ids": ["fixture-owner"],
+      "seam_ids": ["seam-owner"],
+      "claim_ids": ["claim-owner"],
+      "command": "python3 -m pytest tests/test_plan_contract.py",
+      "min_executed": 1,
+      "oracle": "The required source and bound rendered claim agree on platform ownership.",
+      "falsifiability": {
+        "mutation": "replace the platform owner",
+        "expected_failure": "claim binding validation fails"
+      },
+      "independent": true
+    }
+  ],
+  "traceability": [
+    {
+      "requirement_id": "req-owner",
+      "lane_ids": ["lane-owner"],
+      "verifier_ids": ["verify-owner"],
+      "claim_ids": ["claim-owner"],
+      "source_ids": ["source-schema"]
+    }
+  ],
+  "rendered_bindings": [
+    {
+      "binding_id": "bind-owner",
+      "claim_id": "claim-owner",
+      "element_id": "claim-owner",
+      "text": "Deployment authority is owned by the platform team.",
+      "text_sha256": "bd9f2bbf1f6b8cac3e5b711723ee2480d20437022b45adb0e1ce8903d93d7f04",
+      "claim_sha256": "5b6a615cbcf7ac635ae29ef81a92f1ae5452213edd714520351a971197c5334b"
+    }
+  ],
+  "links": [
+    {
+      "link_id": "link-rendered",
+      "source_path": "../schemas/plan-ir-v1.schema.json",
+      "href": "../fixtures/valid-plan.html",
+      "canonical_target": "valid-plan.html"
+    }
+  ],
+  "approval": {
+    "required": false,
+    "receipt_path": "plan-review.json"
+  }
+}

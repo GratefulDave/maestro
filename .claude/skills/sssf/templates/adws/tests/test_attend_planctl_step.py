@@ -242,7 +242,7 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
         self.assertEqual(self.plans / "run.r2.review-findings.json", passed)
         self.assertEqual(
             {
-                "schema_version": "plan-contract-review-findings.v1",
+                "schema_version": "plan-contract-review-findings.v2",
                 "plan_id": "p-1",
                 "question_surface_sha256": "a" * 64,
                 "reviewer_id": review[review.index("--reviewer") + 1],

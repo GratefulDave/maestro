@@ -3504,7 +3504,7 @@ def _attend_project(
         findings.write_text(
             json.dumps(
                 {
-                    "schema_version": "plan-contract-review-findings.v1",
+                    "schema_version": "plan-contract-review-findings.v2",
                     "plan_id": surface.get("plan_id"),
                     "question_surface_sha256": surface.get("question_surface_sha256"),
                     "reviewer_id": policy.reviewer_id,

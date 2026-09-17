@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change: plan review question surface v3, findings v2
+
+- `plan_approval.QUESTION_SURFACE_ALGORITHM` is now
+  `plan-contract-question-surface.v3`: the digest additionally binds the
+  canonical `extensions.maestro.interfaces` mapping and each lane's
+  `depends_on` pairing. Only v3 verifies — a receipt signed over a v2 digest
+  is refused `RECEIPT_QUESTION_SURFACE` as stale. No approved plan is left
+  unverifiable: the only plan approved under v2 (WP5 r6) had its receipt
+  verified and its run bound before this change.
+- The attended-review findings file is `plan-contract-review-findings.v2`:
+  findings are discriminated by `kind` (`two_implementations`, `interface`),
+  and the operator's review question now also asks whether every tests lane's
+  cases can be written from the declared interface.
+
 ### Fixed — immutability boundary gaps found in review of #288/#289
 
 - `verify_suite` now `lstat`s every path component from the review tree root to
