@@ -27,11 +27,12 @@ INTERFACE_ENTRY_KEYS = frozenset(
     {"kind", "module", "name", "signature", "errors", "consumed_by"}
 )
 INTERFACE_KINDS = frozenset({"callable", "route", "component"})
-#: A consumer declaration is exactly one of these, never both and never
-#: neither: ``lane`` names a lane in this plan whose declared outputs contain
+#: A consumer declaration is exactly one of these, never two and never
+#: none: ``lane`` names a lane in this plan whose declared outputs contain
 #: the call site, ``deferred_to`` names the sibling work package or plan that
-#: will consume the interface.
-CONSUMED_BY_KEYS = frozenset({"lane", "deferred_to"})
+#: *will* consume the interface, and ``existing_call_sites`` names the
+#: repo-relative paths of call sites that already exist today.
+CONSUMED_BY_KEYS = frozenset({"lane", "deferred_to", "existing_call_sites"})
 _INTERFACE_HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 )
@@ -315,6 +316,23 @@ def consumer_problems(entry: Any) -> Tuple[str, ...]:
     it is the declaring lane itself, needs the lane graph and is judged by
     ``plan_validate`` (``INTERFACE_UNCONSUMED``). No prose is inspected: a
     ``deferred_to`` is required to be nonempty, not to be true.
+
+    ``existing_call_sites`` exists because the first plan authored under this
+    rule used ``deferred_to`` to describe the past. FDAdb's WP5b declared
+    three of its four entries as ``{"deferred_to": "WP5"}`` and
+    ``{"deferred_to": "WP7"}`` -- both MERGED, both with call sites in the
+    repository already (``src/lib/api/maude-device.ts`` constructs the route;
+    ten shipped page modules import ``loadEntityRoute`` and render
+    ``EntityRoute.astro``). A statement about the past was being recorded in
+    the field whose other reading is a promise about the future, and nothing
+    could tell them apart: a plan deferring to work that will never happen
+    read identically to one whose consumer shipped months ago. So
+    ``deferred_to`` is now strictly future work, and a consumer that already
+    exists is named by its paths.
+
+    Those paths are checked for being paths, never for existing. Nothing here
+    reads the repository or an import graph, which is what lets this check
+    answer identically at ship, start and amend.
     """
     if not isinstance(entry, dict):
         return ()
@@ -322,8 +340,9 @@ def consumer_problems(entry: Any) -> Tuple[str, ...]:
     if declared is None:
         return (
             "consumed_by is required: name the lane in this plan whose "
-            "declared outputs contain the call site, or the sibling work "
-            "package the consumption is deferred to",
+            "declared outputs contain the call site, the sibling work "
+            "package the consumption is deferred to, or the repo-relative "
+            "paths of the call sites that already exist",
         )
     if not isinstance(declared, dict):
         return ("consumed_by must be an object",)
@@ -335,19 +354,64 @@ def consumer_problems(entry: Any) -> Tuple[str, ...]:
             ),
         )
     if len(declared) != 1:
-        return ("consumed_by must carry exactly one of lane or deferred_to",)
+        return (
+            "consumed_by must carry exactly one of lane, deferred_to or "
+            "existing_call_sites",
+        )
     if "lane" in declared:
         lane = declared["lane"]
         if not isinstance(lane, str) or not lane.strip():
             return ("consumed_by.lane must be a nonempty lane id",)
         return ()
+    if "existing_call_sites" in declared:
+        return _existing_call_site_problems(declared["existing_call_sites"])
     deferral = declared["deferred_to"]
     if not isinstance(deferral, str) or not deferral.strip():
         return (
             "consumed_by.deferred_to must name the sibling work package or "
-            "plan that will consume this interface",
+            "plan that will consume this interface; it is future work only, "
+            "so use existing_call_sites for a consumer that already exists",
         )
     return ()
+
+
+def _existing_call_site_problems(value: Any) -> Tuple[str, ...]:
+    """Whether ``existing_call_sites`` is a nonempty list of relative paths.
+
+    A declaration, never a measurement: a path is refused for not being a
+    repo-relative path, and never for naming a file that is not there.
+    """
+    if not isinstance(value, list):
+        return (
+            "consumed_by.existing_call_sites must be an array of "
+            "repo-relative paths to the call sites that already exist",
+        )
+    if not value:
+        return (
+            "consumed_by.existing_call_sites must name at least one existing "
+            "call site",
+        )
+    problems = []
+    for index, item in enumerate(value):
+        label = "consumed_by.existing_call_sites[{0}]".format(index)
+        if not isinstance(item, str) or not item.strip():
+            problems.append(
+                "{0} must be a nonempty repo-relative path".format(label)
+            )
+            continue
+        if item.startswith("/"):
+            problems.append(
+                "{0} must be repo-relative; it may not begin with '/'".format(
+                    label
+                )
+            )
+            continue
+        if ".." in item.split("/"):
+            problems.append(
+                "{0} must be repo-relative; it may not contain a '..' "
+                "segment".format(label)
+            )
+    return tuple(problems)
 
 
 def interface_problems(value: Any) -> Tuple[str, ...]:

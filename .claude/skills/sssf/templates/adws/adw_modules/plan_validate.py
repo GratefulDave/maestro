@@ -486,13 +486,25 @@ def _validate_consumers(
     consumes the interface. The deferral was legitimate -- WP5b does the
     wiring -- but it was silent, so it was unreviewable.
 
-    ``consumed_by`` is that answer, and it admits exactly two shapes:
+    ``consumed_by`` is that answer, and it admits exactly three shapes:
     ``{"lane": "<lane-id>"}``, a lane of this plan whose declared outputs
-    contain the call site, or ``{"deferred_to": "<work package>"}``, an
-    explicit deferral naming the sibling work that will consume it. This is a
-    declaration obligation the author answers, not a measurement: nothing
-    here reads the repository or an import graph. A deferral is never refused
-    for being a deferral -- it is refused only for being absent.
+    contain the call site; ``{"deferred_to": "<work package>"}``, an explicit
+    deferral naming the sibling work that *will* consume it; and
+    ``{"existing_call_sites": ["<path>", ...]}``, the repo-relative paths of
+    consumers that already exist. This is a declaration obligation the author
+    answers, not a measurement: nothing here reads the repository or an import
+    graph. A deferral is never refused for being a deferral -- it is refused
+    only for being absent.
+
+    The third shape exists because ``deferred_to`` was doing two jobs. FDAdb's
+    WP5b, the first plan authored under this rule, declared three of its four
+    entries as ``{"deferred_to": "WP5"}`` and ``{"deferred_to": "WP7"}`` --
+    work packages that were already MERGED, whose call sites are in the
+    repository today. A statement about the past is not reviewable in a field
+    whose other reading is a promise about the future: a plan deferring to
+    work that will never happen read identically to one whose consumer shipped
+    months ago. ``deferred_to`` is now strictly future work; a consumer that
+    already exists is named by its paths.
 
     A named lane may not be the paired tests lane. That lane is already in the
     build lane's ``needs``, so it is the cheapest string an author under review
@@ -536,7 +548,8 @@ def _validate_consumers(
                     INTERFACE_UNCONSUMED,
                     entry_ptr,
                     "consumed_by.lane must name a lane declared in this plan; "
-                    "use deferred_to for work outside it",
+                    "use deferred_to for future work outside it, or "
+                    "existing_call_sites for a consumer that already exists",
                 )
             )
         elif kinds.get(named) == "tests":
@@ -548,7 +561,7 @@ def _validate_consumers(
                     "the interface, it does not consume it, and its declared "
                     "outputs are the accepted suite rather than a call site. "
                     "Name the lane that calls this export, or declare "
-                    "deferred_to",
+                    "deferred_to or existing_call_sites",
                 )
             )
 

@@ -670,6 +670,13 @@ class InterfaceConsumedTests(unittest.TestCase):
             compile_plan(_dump(payload))
         return caught.exception
 
+    def _message(self, caught):
+        return " ".join(
+            item.message
+            for item in caught.refusals
+            if item.code == pv.INTERFACE_UNCONSUMED
+        )
+
     def test_entry_without_consumed_by_is_refused(self):
         caught = self._refusals(self._paired(self._entry()))
         self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
@@ -836,6 +843,124 @@ class InterfaceConsumedTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_existing_call_sites_compiles(self):
+        """A consumer that already shipped is named by its paths, not deferred.
+
+        FDAdb's WP5b declared three of four entries as `deferred_to` WP5 and
+        WP7 -- both MERGED, both with call sites in the repository already.
+        This is the shape that says so, and it must reach every role as the
+        same bytes the author wrote.
+        """
+        sites = [
+            "src/lib/api/maude-device.ts",
+            "src/pages/device/[key].astro",
+        ]
+        compiled = compile_plan(
+            _dump(self._paired(self._entry({"existing_call_sites": sites})))
+        )
+        build = _lane_of(compiled, "lane-build")
+        self.assertEqual(
+            {"existing_call_sites": sites},
+            build.public_interface[0]["consumed_by"],
+        )
+        tests = _lane_of(compiled, "lane-tests")
+        self.assertEqual(
+            {"existing_call_sites": sites},
+            tests.public_interface[0]["consumed_by"],
+        )
+
+    def test_existing_call_sites_is_not_measured_against_the_repository(self):
+        """A declaration the author answers, never a measurement.
+
+        Nothing here opens the repository, so a path that names no file today
+        compiles exactly as one that does. That is what lets the check answer
+        identically at ship, start and amend.
+        """
+        compile_plan(
+            _dump(
+                self._paired(
+                    self._entry(
+                        {"existing_call_sites": ["src/no/such/file.ts"]}
+                    )
+                )
+            )
+        )
+
+    def test_existing_call_sites_must_be_a_list(self):
+        for value in ("src/app.ts", {"path": "src/app.ts"}, 3, None):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "must be an array of repo-relative paths",
+                    self._message(caught),
+                )
+
+    def test_empty_existing_call_sites_is_refused(self):
+        """An empty list answers the question with silence.
+
+        It is the WP5 shape wearing the new key: an entry that claims a
+        consumer exists and names none.
+        """
+        caught = self._refusals(
+            self._paired(self._entry({"existing_call_sites": []}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        self.assertIn("at least one existing call site", self._message(caught))
+
+    def test_non_string_or_blank_call_site_is_refused(self):
+        for value in ([None], [3], [""], ["   "], ["src/a.ts", ""]):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "must be a nonempty repo-relative path",
+                    self._message(caught),
+                )
+
+    def test_absolute_call_site_is_refused(self):
+        caught = self._refusals(
+            self._paired(
+                self._entry(
+                    {"existing_call_sites": ["/Users/me/repo/src/app.ts"]}
+                )
+            )
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        self.assertIn("may not begin with", self._message(caught))
+
+    def test_call_site_with_parent_segment_is_refused(self):
+        for value in (["../sibling/src/app.ts"], ["src/../../etc/passwd"]):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn("'..' segment", self._message(caught))
+
+    def test_all_three_consumer_keys_together_are_refused(self):
+        """Exactly one, still. A third shape does not loosen `len != 1`."""
+        for value in (
+            {
+                "lane": "lane-app",
+                "deferred_to": "WP2",
+                "existing_call_sites": ["src/app.ts"],
+            },
+            {"deferred_to": "WP2", "existing_call_sites": ["src/app.ts"]},
+            {"lane": "lane-app", "existing_call_sites": ["src/app.ts"]},
+        ):
+            with self.subTest(value=value):
+                caught = self._refusals(self._paired(self._entry(value)))
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "exactly one of lane, deferred_to or existing_call_sites",
+                    self._message(caught),
+                )
 
     def test_bound_run_does_not_refuse_unconsumed_interface(self):
         refusals = pv.validate_objective_plan(

@@ -6,6 +6,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change: a consumer that already exists is not a deferral
+
+- `consumed_by` now admits a third shape, `existing_call_sites`: a nonempty
+  array of repo-relative paths naming call sites that already exist. It carries
+  exactly one of `lane`, `deferred_to` or `existing_call_sites` — more than one
+  key still refuses `INTERFACE_UNCONSUMED`, and the key set is still closed.
+  `deferred_to` is now strictly future work.
+- `existing_call_sites` refuses a non-array, an empty array, a non-string or
+  blank element, an absolute path, and a path containing a `..` segment. It does
+  **not** check that a named file exists. Nothing in this check reads the
+  repository or an import graph, which is what lets it answer identically at
+  ship, start and amend; the reviewer judges the paths, the compiler only makes
+  the author state them.
+- Same code, same conditions, same projection: `INTERFACE_UNCONSUMED`, on a
+  build lane paired with a tests lane, at ship, start and amend, inert on
+  tests / untyped / unpaired lanes, and riding the entry's existing path into
+  `public_contract.interface`, `obligations.for_build_lanes[].interface` and
+  `public_interface_json` with no second code path.
+- **Why.** The first plan authored under the consumer rule used `deferred_to` to
+  describe the past. FDAdb's WP5b declared three of its four interface entries as
+  `{"deferred_to": "WP5"}` and `{"deferred_to": "WP7"}` — both work packages
+  MERGED, both with call sites in the repository at the time of writing
+  (`src/lib/api/maude-device.ts` constructs the route; ten shipped page modules
+  import `loadEntityRoute` and render `EntityRoute.astro`). A statement about the
+  past is unreviewable in a field whose other reading is a promise about the
+  future: a plan deferring to work that will never happen read identically to one
+  whose consumer shipped months ago. This is a new shape, not a weakened check —
+  it takes the retrospective claims out of `deferred_to` and makes them say what
+  they are.
+
 ### Changed — contract change: a declared interface names its consumer
 
 - New objective-compiler refusal `INTERFACE_UNCONSUMED`. Every `spec.interface`
