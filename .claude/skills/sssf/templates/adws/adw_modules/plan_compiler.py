@@ -67,12 +67,32 @@ def compile_plan(
 def _lane_projections(
     raw_lanes: Sequence[Mapping[str, Any]],
 ) -> Tuple[LaneProjection, ...]:
+    paired_interface: dict = {}
+    for raw in raw_lanes:
+        if raw.get("lane_kind") != "tests":
+            continue
+        entries: List[Mapping[str, Any]] = []
+        for build in raw_lanes:
+            if build.get("lane_kind") != "build":
+                continue
+            if raw["id"] not in build.get("needs") or ():
+                continue
+            spec = build.get("spec")
+            if isinstance(spec, Mapping):
+                entries.extend(spec.get("interface") or ())
+        paired_interface[raw["id"]] = tuple(entries)
     compiled: List[LaneProjection] = []
     for raw in raw_lanes:
         needs = tuple(sorted(str(item) for item in raw["needs"]))
         outputs = tuple(sorted(_required_output(item) for item in raw["outputs"]))
         spec_digest = digest_canonical(raw["spec"])
         lane_kind = raw.get("lane_kind")
+        if lane_kind == "tests":
+            public_interface = paired_interface.get(raw["id"], ())
+        else:
+            spec = raw.get("spec")
+            declared = spec.get("interface") if isinstance(spec, Mapping) else None
+            public_interface = tuple(declared or ())
         compiled.append(
             LaneProjection(
                 lane_id=raw["id"],
@@ -85,6 +105,7 @@ def _lane_projections(
                 public_acceptance=tuple(
                     _criterion(item).public_text for item in raw["acceptance"]
                 ),
+                public_interface=public_interface,
                 lane_kind=lane_kind,
             )
         )

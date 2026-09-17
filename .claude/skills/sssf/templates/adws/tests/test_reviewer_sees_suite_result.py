@@ -109,6 +109,7 @@ def _scheduler(actor):
         spec_digest=_digest("spec"),
         lane_projection_digest=_digest("projection"),
         public_acceptance=("negative amounts are refused",),
+        public_interface=(),
         declared_outputs=("services/api/app.py",),
         lane_kind=st.LANE_KIND_BUILD,
         needs=(),

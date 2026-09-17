@@ -82,6 +82,17 @@ def _plan_bytes(
                 "spec": {
                     "goal": build_goal,
                     "integration": {"integration_branch": "refs/heads/main"},
+                    "interface": [
+                        {
+                            "kind": "callable",
+                            "module": "product.py",
+                            "name": "product",
+                            "signature": {
+                                "parameters": [{"name": "record", "type": "Mapping"}],
+                                "returns": "dict",
+                            },
+                        }
+                    ],
                 },
                 "acceptance": ["product.py is written"],
             },
@@ -444,6 +455,17 @@ class TestsLaneHandoffTests(unittest.TestCase):
                     "spec": {
                         "goal": "implement product.py",
                         "integration": {"integration_branch": "refs/heads/main"},
+                        "interface": [
+                            {
+                                "kind": "callable",
+                                "module": "product.py",
+                                "name": "product",
+                                "signature": {
+                                    "parameters": [{"name": "record", "type": "Mapping"}],
+                                    "returns": "dict",
+                                },
+                            }
+                        ],
                         "gate": {
                             "runner": "pytest",
                             "argv": ["build-wrong.py"],
@@ -987,7 +1009,8 @@ class TestsLaneHandoffTests(unittest.TestCase):
         self.assertTrue(V2_PLAN.is_file())
         self.assertTrue(V3_PLAN.is_file())
         compiled = plan_compiler.compile_plan(
-            V3_PLAN.read_bytes(), plan_revision=1, plan_artifact_ref=str(V3_PLAN)
+            V3_PLAN.read_bytes(), plan_revision=1, plan_artifact_ref=str(V3_PLAN),
+            bound_run=True,
         )
         kinds = [(lane.lane_id, lane.lane_kind) for lane in compiled.lanes]
         self.assertEqual(kinds, [("lane-wp6-build", "build"), ("lane-wp6-tests", "tests")])

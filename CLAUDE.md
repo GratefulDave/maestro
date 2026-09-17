@@ -638,3 +638,19 @@ embeds, and the ingress totality check refuses any other set, because a projecti
 silently drops something has cost this factory runs before. **A digest is only as narrow as
 the thing it digests: before trusting a reset policy that reads one, ask what else rides in
 the payload.**
+
+## Historical — 2026-09-17 run 872123da (a tests lane cannot bind to an interface nobody declared)
+
+All three WP5 tests lanes parked `NO_PROGRESS` after 3–7 rounds. Each build lane declared
+only its output paths — no export name, signature, props, or route shape — so the tester
+had to invent the bindings it was testing against, and `_PUBLIC_INTERFACE_RULE` correctly
+made the reviewer REVISE every invented binding. Nothing was wrong in the loop; the plan
+was missing a fact, and two LLM plan reviews had passed it anyway. The plan now declares
+`extensions.maestro.interfaces` — a structured entry per binding (kind, module, name,
+signature, errors) — the ingress projects it onto the paired build lane's `spec.interface`,
+and the objective compiler refuses `INTERFACE_UNDECLARED` when a build lane paired with a
+tests lane declares none. The declared entries ride the lane projection into
+`public_contract`, so tester, test reviewer, and builder read the same bytes. **A rule that
+punishes guessing only works when the truth is written down somewhere the guesser can read
+— if review keeps rejecting what the author never stated, the missing artifact is the
+declaration, not the reviewer.**

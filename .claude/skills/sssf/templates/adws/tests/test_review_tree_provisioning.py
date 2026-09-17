@@ -1159,6 +1159,7 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
             spec_digest=_digest("spec"),
             lane_projection_digest=_digest("projection"),
             public_acceptance=("negative amounts are refused",),
+            public_interface=(),
             declared_outputs=(TEST_PATH,),
             lane_kind=st.LANE_KIND_BUILD,
             needs=(),

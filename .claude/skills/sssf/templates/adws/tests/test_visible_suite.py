@@ -111,6 +111,17 @@ def _plan_bytes() -> bytes:
                 "spec": {
                     "goal": "implement refund",
                     "integration": {"integration_branch": "refs/heads/main"},
+                    "interface": [
+                        {
+                            "kind": "callable",
+                            "module": "product.py",
+                            "name": "refund",
+                            "signature": {
+                                "parameters": [{"name": "amount", "type": "int"}],
+                                "returns": "int",
+                            },
+                        }
+                    ],
                 },
                 "acceptance": ["negative amounts are refused"],
             },

@@ -14,7 +14,8 @@ LEDGER_SCHEMA_VERSION_V1 = "artifact-factory.v1"
 LEDGER_SCHEMA_VERSION_V2 = "artifact-factory.v2"
 LEDGER_SCHEMA_VERSION_V3 = "artifact-factory.v3"
 LEDGER_SCHEMA_VERSION_V4 = "artifact-factory.v4"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v5"
+LEDGER_SCHEMA_VERSION_V5 = "artifact-factory.v5"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v6"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
@@ -962,6 +963,7 @@ class LaneProjection:
     declared_outputs: Tuple[str, ...]
     lane_projection_digest: str
     public_acceptance: Tuple[str, ...] = ()
+    public_interface: Tuple[Mapping[str, Any], ...] = ()
     lane_kind: Optional[str] = None
 
     def __post_init__(self) -> None:

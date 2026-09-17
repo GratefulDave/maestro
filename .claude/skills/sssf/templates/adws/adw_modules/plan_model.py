@@ -23,6 +23,17 @@ RESTRICTION_KEYS = frozenset(
 )
 DECIDED_BY_EXAMPLE_KEYS = frozenset({"input", "expect", "refuses"})
 REFUSAL_KEYS = frozenset({"error", "message"})
+INTERFACE_ENTRY_KEYS = frozenset(
+    {"kind", "module", "name", "signature", "errors"}
+)
+INTERFACE_KINDS = frozenset({"callable", "route", "component"})
+_INTERFACE_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+)
+_CALLABLE_SIGNATURE_KEYS = frozenset({"parameters", "returns"})
+_ROUTE_SIGNATURE_KEYS = frozenset({"method", "path", "params", "response"})
+_COMPONENT_SIGNATURE_KEYS = frozenset({"props"})
+_PARAMETER_KEYS = frozenset({"name", "type"})
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,143 @@ def decided_by_problems(value: Any, *, refusal_required: bool) -> Tuple[str, ...
             "no refuses example stating the exact refusal, such as the source "
             "being unavailable"
         )
+    return tuple(problems)
+
+def _named_typed_list(value: Any, item_label: str) -> Optional[str]:
+    """A list of {name, type} objects; None when well-formed, else the problem."""
+    if not isinstance(value, list) or not value:
+        return "{0} must be a nonempty array".format(item_label)
+    for index, item in enumerate(value):
+        if (
+            not isinstance(item, dict)
+            or set(item) - _PARAMETER_KEYS
+            or not isinstance(item.get("name"), str)
+            or not item["name"].strip()
+            or not isinstance(item.get("type"), str)
+            or not item["type"].strip()
+        ):
+            return (
+                "{0}[{1}] must be an object with nonempty name and type".format(
+                    item_label, index
+                )
+            )
+    return None
+
+
+def _signature_problems(kind: str, signature: Any) -> Tuple[str, ...]:
+    """The per-kind signature shape an interface entry must declare."""
+    if not isinstance(signature, dict):
+        return ("signature must be an object",)
+    if kind == "callable":
+        if set(signature) != _CALLABLE_SIGNATURE_KEYS:
+            return (
+                "callable signature must be exactly parameters and returns",
+            )
+        problem = _named_typed_list(signature.get("parameters"), "parameters")
+        if problem:
+            return (problem,)
+        returns = signature.get("returns")
+        if not isinstance(returns, str) or not returns.strip():
+            return ("returns must be a nonempty return shape",)
+        return ()
+    if kind == "route":
+        if not set(signature) <= _ROUTE_SIGNATURE_KEYS:
+            return (
+                "route signature may only carry method, path, params, response",
+            )
+        method = signature.get("method")
+        if (
+            not isinstance(method, str)
+            or method.strip().upper() not in _INTERFACE_HTTP_METHODS
+        ):
+            return ("route signature.method must be an HTTP method",)
+        path = signature.get("path")
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or not path.strip().startswith("/")
+        ):
+            return ("route signature.path must be a nonempty path starting with /",)
+        if "params" in signature:
+            problem = _named_typed_list(signature.get("params"), "params")
+            if problem:
+                return (problem,)
+        response = signature.get("response")
+        if (
+            not isinstance(response, (str, dict, list))
+            or (isinstance(response, str) and not response.strip())
+            or (isinstance(response, (dict, list)) and not response)
+        ):
+            return ("route signature.response must be a nonempty shape",)
+        return ()
+    if kind == "component":
+        if set(signature) != _COMPONENT_SIGNATURE_KEYS:
+            return ("component signature must be exactly props",)
+        problem = _named_typed_list(signature.get("props"), "props")
+        if problem:
+            return (problem,)
+        return ()
+    return ("kind must be callable, route or component",)
+
+
+def interface_entry_problems(entry: Any) -> Tuple[str, ...]:
+    """What one declared interface entry leaves unstated; empty if well-formed.
+
+    Structural only: the module, the export name and kind, the signature with
+    argument names/types and return shape (method/path/params/response for a
+    route, props for a component), and optional observable errors. No prose is
+    inspected.
+    """
+    if not isinstance(entry, dict):
+        return ("interface entry must be an object",)
+    extra = set(entry) - INTERFACE_ENTRY_KEYS
+    if extra:
+        return (
+            "interface entry has unknown field(s): {0}".format(
+                ", ".join(sorted(extra))
+            ),
+        )
+    kind = entry.get("kind")
+    if kind not in INTERFACE_KINDS:
+        return ("kind must be callable, route or component",)
+    problems = []
+    if kind in ("callable", "component"):
+        module = entry.get("module")
+        if not isinstance(module, str) or not module.strip():
+            problems.append("module must be a nonempty module path")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append("name must be a nonempty export name")
+    else:
+        for field in ("module", "name"):
+            if field in entry and (
+                not isinstance(entry[field], str) or not entry[field].strip()
+            ):
+                problems.append("{0} must be a nonempty string".format(field))
+    problems.extend(_signature_problems(kind, entry.get("signature")))
+    errors = entry.get("errors")
+    if errors is not None and (
+        not isinstance(errors, list)
+        or any(not isinstance(item, str) or not item.strip() for item in errors)
+    ):
+        problems.append("errors must be an array of observable error names")
+    return tuple(problems)
+
+
+def interface_problems(value: Any) -> Tuple[str, ...]:
+    """Whether a lane's declared interface is a well-formed entry list.
+
+    ``None`` means the lane declares no interface; that is legal here and is
+    judged separately by the pairing check in ``plan_validate``.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        return ("interface must be an array of interface entries",)
+    problems = []
+    for index, entry in enumerate(value):
+        for problem in interface_entry_problems(entry):
+            problems.append("interface[{0}]: {1}".format(index, problem))
     return tuple(problems)
 
 

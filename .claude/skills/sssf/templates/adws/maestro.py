@@ -978,16 +978,19 @@ class HerdrStageActor:
         "Use the public lane spec, public_acceptance and public_contract as "
         "the authority for module/import paths, export or callable names, "
         "argument and return shapes, and observable errors. A module path "
-        "alone does not declare a callable. Tests must consume that public "
-        "interface, not invent an unstated binding or require an alias chosen "
-        "only inside a test. Test reviewers must report such a binding "
-        "or an ambiguous public interface through existing actionable REVISE "
-        "findings about contract adequacy, not prescribe product implementation "
-        "or pass a guessed binding. Builders implement the public interface; "
-        "do not spray aliases to satisfy a name the accepted suite happens to "
-        "use when the public contract does not declare it -- the reviewer "
-        "grades against the contract, and a suite that binds to an undeclared "
-        "name is a finding against the suite, not a licence."
+        "alone does not declare a callable. public_contract.interface is the "
+        "declared binding authority: each entry names the module, the export "
+        "and its signature the suite may call. Tests must consume that "
+        "declared interface, not invent an unstated binding or require an "
+        "alias chosen only inside a test. Test reviewers must report such a "
+        "binding or an ambiguous public interface through existing actionable "
+        "REVISE findings about contract adequacy, not prescribe product "
+        "implementation or pass a guessed binding. Builders implement the "
+        "public interface; do not spray aliases to satisfy a name the "
+        "accepted suite happens to use when the public contract does not "
+        "declare it -- the reviewer grades against the contract, and a suite "
+        "that binds to an undeclared name is a finding against the suite, "
+        "not a licence."
     )
 
     def _materialize_role_instructions(
@@ -1374,15 +1377,17 @@ class HerdrStageActor:
                     "with at least one finding naming a file in "
                     "declared_outputs and the concrete change it needs."
                 )
-        elif role == "integration-reviewer":
-            instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
         elif role == "operator":
             instructions += (
                 " Read current_ir_path, the accepted suite under suite/, the "
                 "lane gate table, and the reviews. Write the revised IR at "
                 "revision_out_path and return that exact path plus the "
                 "rationale. Change only lanes in allowed_lane_ids. Run no "
-                "maestro verb, no git command, and no planctl. "
+                "maestro verb, no git command, and no planctl. A tests lane "
+                "stalled on an undeclared binding is repaired by declaring "
+                "extensions.maestro.interfaces entries for the paired build "
+                "lane, naming each module, export and signature the suite "
+                "may call. "
                 + att.TWO_IMPLEMENTATIONS_QUESTION
             )
         if role in ("tester", "test-reviewer", "builder"):

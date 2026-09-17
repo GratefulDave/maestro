@@ -56,6 +56,8 @@ produced-symbol reachability, narrative quality, or other generic semantics.
 - No lane declares an output covering a `lane_kind=tests` lane's declared outputs, which
   are that lane's accepted suite (`OUTPUT_OVERLAPS_TEST_SUITE`). A lane may not own the
   bytes it is graded against.
+- A `lane_kind=build` lane paired with a `lane_kind=tests` lane declares its public
+  interface as `spec.interface` entries (`INTERFACE_UNDECLARED`).
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -178,15 +180,19 @@ carries the runner's failure output verbatim.
 
 - **Write the public acceptance as a contract, not as a case.** "Negative amounts are refused" is
   a contract. One `assert` message is a case, and the reviewer grades against the contract.
-- **Declare the public interface before tests bind to it.** In the existing public
-  acceptance criteria or `spec.instruction`, state the required module/import path, export or
-  callable name, argument and return shapes, and observable errors. The paired tests and build
-  lanes must consume that same public declaration. A module filename alone does not declare a
-  function. Test authors must not invent a private binding, and test reviewers must report
-  undeclared bindings or ambiguity as contract-adequacy findings through the existing `REVISE`
-  path. Builders must not spray aliases to satisfy a name a test happens to use when the public
-  contract does not declare it; a suite bound to an undeclared name is a finding against the
-  suite. This is an authoring obligation, not a new compiler gate or schema field.
+- **Declare the public interface before tests bind to it.** A build lane paired with a
+  tests lane declares `spec.interface`: a list of entries, each naming the `kind`
+  (`callable`, `route`, or `component`), the `module`, the export `name`, and its
+  `signature` — `parameters`/`returns` for a callable, `method`/`path`/`response` for a
+  route, `props` for a component — plus optional observable `errors`. The compiler
+  refuses a paired build lane that declares none (`INTERFACE_UNDECLARED`), and the
+  declaration is projected into `public_contract.interface` so the tester, the test
+  reviewer, the builder and the code reviewer all read the same bytes. A module
+  filename alone does not declare a function. Test authors must not invent a private
+  binding, and test reviewers must report undeclared bindings or ambiguity as
+  contract-adequacy findings through the existing `REVISE` path. Builders must not
+  spray aliases to satisfy a name a test happens to use when the public contract does
+  not declare it; a suite bound to an undeclared name is a finding against the suite.
 - **Keep tests out of the build lane's declared outputs.** A path the builder is allowed to write
   cannot also be the suite it is graded against (`OUTPUT_OVERLAPS_TEST_SUITE`).
 - **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.

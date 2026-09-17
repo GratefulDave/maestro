@@ -195,6 +195,7 @@ CREATE TABLE dag_lanes (
   declared_outputs_json TEXT NOT NULL,
   lane_projection_digest TEXT NOT NULL,
   public_acceptance_json TEXT NOT NULL,
+  public_interface_json TEXT NOT NULL,
   PRIMARY KEY (run_id, plan_revision, lane_id),
   FOREIGN KEY (run_id, plan_revision)
     REFERENCES plan_revisions(run_id, plan_revision)
@@ -380,6 +381,9 @@ class ArtifactStore:
             version = st.LEDGER_SCHEMA_VERSION_V4
         if version == st.LEDGER_SCHEMA_VERSION_V4:
             self._migrate_v4_to_v5()
+            version = st.LEDGER_SCHEMA_VERSION_V5
+        if version == st.LEDGER_SCHEMA_VERSION_V5:
+            self._migrate_v5_to_v6()
             return
         self._refuse_schema()
 
@@ -505,7 +509,47 @@ class ArtifactStore:
                 self._rebuild_lane_artifacts_current_check(_LANE_ARTIFACTS_V4_BACKUP)
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V4),
+                (st.LEDGER_SCHEMA_VERSION_V5, st.LEDGER_SCHEMA_VERSION_V4),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V5)
+            self.conn.execute("COMMIT")
+            self._end_migration()
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Persist each lane's declared public interface beside its acceptance.
+
+        A build lane paired with a tests lane now declares ``spec.interface``,
+        and the projection carries it so the tester, reviewers and builder all
+        read the same declared bindings. ``dag_lanes`` gains a
+        ``public_interface_json`` column; lanes already recorded carry no
+        declared interface, so the column defaults to ``[]``.
+        """
+        self._begin_migration()
+        try:
+            columns = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(dag_lanes)")
+            }
+            if "public_interface_json" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE dag_lanes ADD COLUMN "
+                    "public_interface_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V5),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
@@ -522,6 +566,7 @@ class ArtifactStore:
             except sqlite3.Error:
                 pass
             raise
+
 
     def _require_post_migration_integrity(self, expected: str) -> None:
         fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
@@ -542,6 +587,7 @@ class ArtifactStore:
         if expected in (
             st.LEDGER_SCHEMA_VERSION_V3,
             st.LEDGER_SCHEMA_VERSION_V4,
+            st.LEDGER_SCHEMA_VERSION_V5,
             st.LEDGER_SCHEMA_VERSION,
         ):
             run_sql = _table_create_sql(self.conn, "run_artifacts")
@@ -1536,7 +1582,8 @@ class ArtifactStore:
             self.conn.execute(
                 "INSERT INTO dag_lanes(run_id, plan_revision, lane_id, needs_json, "
                 "spec_digest, declared_outputs_json, lane_projection_digest, "
-                "public_acceptance_json) VALUES (?,?,?,?,?,?,?,?)",
+                "public_acceptance_json, public_interface_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     plan.plan_revision,
@@ -1546,6 +1593,7 @@ class ArtifactStore:
                     _dumps(list(lane.declared_outputs)),
                     lane.lane_projection_digest,
                     _dumps(list(lane.public_acceptance)),
+                    _dumps(list(lane.public_interface)),
                 ),
             )
 
@@ -2770,6 +2818,7 @@ class ArtifactStore:
                     declared_outputs=tuple(_loads(row["declared_outputs_json"])),
                     lane_projection_digest=row["lane_projection_digest"],
                     public_acceptance=tuple(_loads(row["public_acceptance_json"])),
+                    public_interface=tuple(_loads(row["public_interface_json"])),
                     lane_kind=self._kind_matching_digest(row),
                 )
             )

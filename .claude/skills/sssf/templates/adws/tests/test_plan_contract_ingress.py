@@ -92,6 +92,22 @@ class IngressProjectionTests(unittest.TestCase):
         )
         self.assertEqual(paired[0]["acceptance"], lane_b["acceptance"])
 
+    def test_interfaces_reach_build_spec_and_paired_tester(self) -> None:
+        draft = self._project()
+        declared = self.ir["extensions"]["maestro"]["interfaces"]["lane-b"]
+        lane_b = self._lane(draft, "lane-b")
+        lane_t = self._lane(draft, "lane-t")
+        self.assertEqual(lane_b["spec"]["interface"], declared)
+        paired = lane_t["spec"]["obligations"]["for_build_lanes"]
+        self.assertEqual(paired[0]["interface"], declared)
+
+    def test_interfaces_must_be_a_lane_mapping(self) -> None:
+        ir = copy.deepcopy(self.ir)
+        ir["extensions"]["maestro"]["interfaces"] = ["lane-b"]
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self._project(ir)
+        self.assertIn("UNMAPPABLE_INTERFACES", str(caught.exception))
+
     def test_no_private_keys_and_no_fixture_content_on_build_lane(self) -> None:
         from adw_modules import scheduler_types as st
 

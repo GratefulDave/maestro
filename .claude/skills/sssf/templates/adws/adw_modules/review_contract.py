@@ -108,6 +108,7 @@ def public_contract(
     *,
     acceptance_criteria: Sequence[str],
     declared_outputs: Sequence[str],
+    interface: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     criteria = tuple(
         _nonempty(item, "acceptance criterion") for item in acceptance_criteria
@@ -117,10 +118,13 @@ def public_contract(
         raise ReviewContractError("public_contract requires acceptance_criteria")
     if not outputs:
         raise ReviewContractError("public_contract requires declared_outputs")
-    return {
+    contract = {
         "acceptance_criteria": list(criteria),
         "declared_outputs": list(outputs),
     }
+    if interface:
+        contract["interface"] = [dict(entry) for entry in interface]
+    return contract
 
 
 def normalize_repo_path(path: str) -> str:
