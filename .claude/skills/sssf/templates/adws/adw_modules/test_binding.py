@@ -26,6 +26,7 @@ surface already recognises that class by name.
 from __future__ import annotations
 
 import hashlib
+import stat
 from pathlib import Path
 from typing import Mapping
 
@@ -99,22 +100,51 @@ def verify_suite(expected: Mapping[str, str], tree: Path) -> None:
 
     Raises on the first mismatch in sorted path order, so the refusal is stable
     across runs rather than dependent on mapping iteration. A symlink is a
-    mismatch whatever it points at: the accepted suite is a regular file, and a
-    link is a way to make the runner read bytes this check never hashed.
+    mismatch whatever it points at, at the leaf or at any directory on the way
+    to it: the accepted suite is a regular file reached through real
+    directories of this tree, and a link anywhere on that route is a way to
+    make the runner read bytes this tree does not own. The leaf must be a
+    regular file, and the resolved path must stay inside the tree.
     """
     root = Path(tree)
+    resolved_root = root.resolve()
     for path in sorted(expected):
         accepted = expected[path]
         algorithm = _ALGORITHM_BY_LENGTH.get(len(accepted))
         if algorithm is None:
             raise TestSuiteTampered(path, accepted, UNKNOWN_OBJECT_FORMAT)
         target = root.joinpath(*path.split("/"))
-        if target.is_symlink():
-            raise TestSuiteTampered(path, accepted, SYMLINK)
+        _verify_route(root, path, accepted)
         try:
+            if not target.resolve().is_relative_to(resolved_root):
+                raise TestSuiteTampered(path, accepted, SYMLINK)
             data = target.read_bytes()
         except OSError:
             raise TestSuiteTampered(path, accepted, ABSENT) from None
         found = blob_id(data, algorithm=algorithm)
         if found != accepted:
             raise TestSuiteTampered(path, accepted, found)
+
+
+def _verify_route(root: Path, path: str, accepted: str) -> None:
+    """`lstat` every component from `root` to the leaf; no link, leaf a file.
+
+    A missing component is ABSENT, a link anywhere is SYMLINK, and a leaf that
+    exists but is not a regular file (a directory, a fifo) is ABSENT: there is
+    no file there to hash.
+    """
+    parts = path.split("/")
+    current = root
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except OSError:
+            raise TestSuiteTampered(path, accepted, ABSENT) from None
+        if stat.S_ISLNK(mode):
+            raise TestSuiteTampered(path, accepted, SYMLINK)
+        is_leaf = index == len(parts) - 1
+        if is_leaf and not stat.S_ISREG(mode):
+            raise TestSuiteTampered(path, accepted, ABSENT)
+        if not is_leaf and not stat.S_ISDIR(mode):
+            raise TestSuiteTampered(path, accepted, ABSENT)

@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed — immutability boundary gaps found in review of #288/#289
+
+- `verify_suite` now `lstat`s every path component from the review tree root to
+  the leaf. A symlinked ancestor directory refuses `TEST_SUITE_TAMPERED` with
+  actual `SYMLINK`, a resolved path outside the tree refuses, and a leaf that is
+  not a regular file refuses `ABSENT`. Before, only a symlinked leaf refused,
+  so `tests/` -> a directory of identical bytes passed.
+- `TEST_FILE_ON_DECLARED_OUTPUT` is ancestry-aware: an untyped lane's test file
+  at an ancestor or descendant of a declared output (`pkg` vs `pkg/mod.py`,
+  either direction) refuses at admission instead of failing later at tree
+  construction.
+- Documented, not fixed: candidate code loaded by the runner at startup (a
+  `conftest.py`, a vitest setup file) can rewrite an accepted test after
+  `verify_suite` and before collection. M2 binds what was present when the run
+  began, not what the runner collected. An OS-enforced write-deny around the
+  runner is deferred (MAESTRO_architecture.md §11).
+
 ### Changed — contract change: accepted tests are visible and immutable
 
 > **Operator warning -- read before mirroring this runtime into a deployment.**
