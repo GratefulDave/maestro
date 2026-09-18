@@ -90,8 +90,9 @@ class TesterMustEnumerateItsOwnDraft(unittest.TestCase):
         hidden = _contract(None)
         self.assertIn("Author files exactly at declared_outputs", tests_lane)
         self.assertNotIn("Author files exactly at declared_outputs", hidden)
-        self.assertIn("hidden validator/meta-test files", hidden)
-        self.assertNotIn("hidden validator/meta-test files", tests_lane)
+        # "hidden" left the rule in #289, when accepted tests became visible.
+        self.assertIn("Write validator/meta-test files", hidden)
+        self.assertNotIn("Write validator/meta-test files", tests_lane)
 
 
 if __name__ == "__main__":

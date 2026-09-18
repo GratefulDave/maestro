@@ -144,8 +144,12 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
                 scheduler.rr, "collect_cases", return_value=("src/a.test.ts > a",)
             ) as collect,
         ):
-            ids = self.factory._collect_draft(ctx, gate, {"src/a.test.ts": "it()"})
+            ids, outcomes = self.factory._collect_draft(
+                ctx, gate, {"src/a.test.ts": "it()"}
+            )
         self.assertEqual(ids, ("src/a.test.ts > a",))
+        # No declared cases on this gate, so no red-at-parent outcomes are run.
+        self.assertEqual(outcomes, {})
         self.assertEqual(
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7)]
         )

@@ -1,4 +1,4 @@
-"""Frozen operator CLI: run start/resume/amend/status only."""
+"""Frozen operator CLI: run start/resume/amend/attend/status only."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ FROZEN_VERBS = (
     "run start",
     "run resume",
     "run amend",
+    "run attend",
     "run status",
 )
 
@@ -40,12 +41,18 @@ class FrozenOperatorCliTest(unittest.TestCase):
             self.assertNotIn(gone, verbs)
             self.assertFalse(any(gone in item for item in verbs))
 
-    def test_start_requires_repo_and_main_ref(self) -> None:
+    def test_start_infers_repo_and_main_ref_unless_overridden(self) -> None:
+        # MAESTRO_architecture.md: "When omitted, `--repo` is inferred from the
+        # invoking working directory and `--main-ref` from that repository's
+        # symbolic `HEAD`." (#237). The parser leaves both unset so `_run_start`
+        # does the inference, under the same validation as an explicit value.
         parser = maestro.build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["run", "start", "plan.json"])
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["run", "start", "plan.json", "--repo", "/tmp/repo"])
+        bare = parser.parse_args(["run", "start", "plan.json"])
+        self.assertIsNone(bare.repo)
+        self.assertIsNone(bare.main_ref)
+        repo_only = parser.parse_args(["run", "start", "plan.json", "--repo", "/tmp/repo"])
+        self.assertEqual(repo_only.repo, "/tmp/repo")
+        self.assertIsNone(repo_only.main_ref)
         args = parser.parse_args(
             [
                 "run",

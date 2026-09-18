@@ -658,7 +658,7 @@ violation.
 `maestro bootstrap` minted `maestro.env` and `reviewer-hmac.env` under the state root so authors
 could not sign their own review receipts. `REVIEWER_KEY_PRESENT` refused `gate` if the reviewer key
 was in the environment. Combined `maestro.env` files had to be rewritten. That key split is not the
-factory operator surface. Factory execution uses `run start|resume|amend|status` against
+factory operator surface. Factory execution uses `run start|resume|amend|attend|status` against
 `runtime_state_root`.
 
 `planctl` calls carried `--repo-root .` because IR lived in `.maestro/` while `source_artifacts`
