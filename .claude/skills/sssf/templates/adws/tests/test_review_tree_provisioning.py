@@ -127,6 +127,11 @@ def _repo(root: Path) -> Path:
     _git(repo, "config", "user.name", "Harness")
     _git(repo, "config", "core.hooksPath", str(root / "no-hooks"))
     (repo / "refund.py").write_text(FIXED)
+    # The suite imports `refund` from the tree root, so the tree says so. The
+    # runner's environment strips an ambient PYTHONPATH (`tree_env`), and a
+    # relative `PYTHONPATH=.` leaking in from the harness shell was the only
+    # thing that made this import work before.
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
     return repo

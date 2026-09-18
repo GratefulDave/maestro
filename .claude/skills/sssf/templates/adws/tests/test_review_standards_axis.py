@@ -222,6 +222,11 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         _git(self.repo, "config", "user.name", "Harness")
         _git(self.repo, "config", "core.hooksPath", str(self.root / "no-hooks"))
         (self.repo / "refund.py").write_text(PRODUCT)
+        # The suite imports `refund` from the tree root, so the tree says so.
+        # The runner's environment strips an ambient PYTHONPATH (`tree_env`),
+        # and a relative `PYTHONPATH=.` leaking in from the harness shell was
+        # the only thing that made this import work before.
+        (self.repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "base")
         self.state = self.root / "state"
