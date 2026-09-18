@@ -74,12 +74,15 @@ def _outcome(argv: list[str]) -> tuple[int, dict]:
 
 
 class RunStartBindsRepositoryStateTest(unittest.TestCase):
-    def test_start_requires_repo_and_main_ref(self) -> None:
+    def test_start_binds_explicit_repo_and_main_ref(self) -> None:
+        # Since #237 an omitted --repo / --main-ref is inferred from the
+        # invoking checkout (test_explicit_start_infers_cwd_repo_and_head);
+        # the parser leaves it unset rather than refusing.
         parser = maestro.build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(
-                ["run", "start", "plan.json", "--main-ref", "refs/heads/main"]
-            )
+        inferred = parser.parse_args(
+            ["run", "start", "plan.json", "--main-ref", "refs/heads/main"]
+        )
+        self.assertIsNone(inferred.repo)
         args = parser.parse_args(
             [
                 "run",

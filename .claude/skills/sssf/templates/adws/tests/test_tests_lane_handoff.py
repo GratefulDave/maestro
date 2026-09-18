@@ -398,7 +398,9 @@ class TestsLaneHandoffTests(unittest.TestCase):
         self.assertIn(st.ArtifactKind.TEST_REVIEW.value, tests_kinds)
         self.assertNotIn(st.ArtifactKind.BUILDER_OUTPUT.value, tests_kinds)
         self.assertNotIn(st.ArtifactKind.CODE_REVIEW.value, tests_kinds)
-        self.assertNotIn(st.ArtifactKind.INTEGRATION_MERGE.value, tests_kinds)
+        # Since #289 a tests lane merges its accepted suite through the same
+        # INTEGRATION_MERGE edge every lane takes (MAESTRO_architecture.md).
+        self.assertIn(st.ArtifactKind.INTEGRATION_MERGE.value, tests_kinds)
         build_kinds = {
             row[0]
             for row in self.store.conn.execute(

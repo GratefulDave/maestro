@@ -27,3 +27,20 @@ def _isolated_maestro_registry():
                 os.environ.pop("MAESTRO_REGISTRY", None)
             else:
                 os.environ["MAESTRO_REGISTRY"] = previous
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_from_the_invoking_herdr():
+    """Run every test as if invoked outside Herdr.
+
+    `maestro.main` binds the run's parent Space to `HERDR_WORKSPACE_ID`, and a
+    suite started from a Herdr pane inherits that pane's real workspace id.
+    The fake Herdr has no such Space, so every run the suite drove refused
+    `INVOKING_WORKSPACE_GONE:<the operator's real Space>`. A test that models
+    an invoking Space sets the variable itself.
+    """
+    saved = {key: os.environ.pop(key) for key in list(os.environ) if key.startswith("HERDR_")}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)

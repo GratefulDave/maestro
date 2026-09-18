@@ -219,7 +219,10 @@ class SimulatedPanes:
     def _tester(self, lane: str, prompt: Mapping[str, Any], cwd: Path) -> dict:
         outputs = [str(item) for item in (prompt.get("declared_outputs") or ())]
         name = lane.replace("-", "_")
-        lines = ["# secret-selector", "from pathlib import Path", ""]
+        # The nonce, like the builder's: since #289 an accepted suite is merged
+        # and published, so a second run's tester writing the first run's
+        # bytes would change nothing on the head it starts from.
+        lines = ["# run " + self.nonce, "from pathlib import Path", ""]
         for output in outputs:
             ident = Path(output).stem.replace("-", "_")
             lines.append("def test_{0}_{1}_exists():".format(name, ident))
@@ -248,7 +251,15 @@ class SimulatedPanes:
         verdict = "REVISE" if seen < revisions else "PASS"
         self.verdicts.append((lane, role, verdict))
         if verdict == "REVISE":
-            return {"verdict": "REVISE", "findings": [FINDING]}
+            # A REVISE must quote this lane's own contract (#263); a finding
+            # citing another lane's acceptance is refused and re-asked.
+            output = OUTPUTS[lane]
+            finding = dict(
+                FINDING,
+                implementation_area=output,
+                violated_requirement=output + " is written",
+            )
+            return {"verdict": "REVISE", "findings": [finding]}
         return {"verdict": "PASS", "findings": []}
 
 

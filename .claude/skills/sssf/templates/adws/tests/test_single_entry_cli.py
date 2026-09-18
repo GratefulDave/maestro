@@ -240,6 +240,10 @@ class ScriptedActor:
             "receipt_ref": st.publication_ref(ctx.run_id, fingerprint),
         }
 
+    def restore_layout(self, run_id: str, lanes) -> None:
+        # A scripted turn opens no role shells, so a resume has none to reopen.
+        del run_id, lanes
+
     def complete_run_spaces(self, run_id: str) -> None:
         del run_id
 
