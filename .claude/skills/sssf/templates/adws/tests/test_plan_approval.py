@@ -88,6 +88,25 @@ _VALID_PLAN_IR = Path(__file__).resolve().parent / "fixtures" / "valid-plan-ir.j
 _VALID_PLAN_SURFACE = "887b144d7d4a4d0dad7041572e72f20e27663ee73710035f97161921b644ca3c"
 
 
+def _shippable_ir_bytes() -> bytes:
+    """The fixture plus the consumer declaration a plan now compiles with.
+
+    The fixture's own bytes stay frozen: they are the cross-tool parity vector
+    `_FIXTURE_SURFACE` pins to planctl's output, and recomputing that digest
+    from this repository's implementation would destroy what the pin proves.
+    A test that actually ships the plan signs these derived bytes instead.
+    """
+    ir = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    for entries in (ir.get("extensions", {})
+                    .get("maestro", {})
+                    .get("interfaces") or {}).values():
+        for entry in entries:
+            entry.setdefault(
+                "consumed_by", {"deferred_to": "the next work package"}
+            )
+    return json.dumps(ir, indent=2, sort_keys=True).encode("utf-8")
+
+
 def _claims_only_surface(ir: dict) -> str:
     """The v1 algorithm planctl used before the discharge relation was added."""
     surface = sorted(
@@ -233,10 +252,11 @@ class StaleQuestionSurfaceIsRefused(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ir_path = root / "ir.json"
-            ir_path.write_bytes(_FIXTURE.read_bytes())
+            shippable = _shippable_ir_bytes()
+            ir_path.write_bytes(shippable)
             receipt = root / "receipt.json"
             receipt.write_text(
-                json.dumps(plan_receipts.signed_receipt(_FIXTURE.read_bytes())), encoding="utf-8")
+                json.dumps(plan_receipts.signed_receipt(shippable)), encoding="utf-8")
             (root / "repo").mkdir()
             out = root / "plan.json"
             ingress.author_from_plan_contract(

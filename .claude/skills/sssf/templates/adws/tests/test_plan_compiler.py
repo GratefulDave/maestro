@@ -65,6 +65,8 @@ def _lane_of(compiled: CompiledPlan, lane_id: str) -> LaneProjection:
             return lane
     raise KeyError(lane_id)
 
+_UNSET = object()
+
 _INTERFACE_ENTRY = {
     "kind": "callable",
     "module": "src/b.py",
@@ -74,6 +76,7 @@ _INTERFACE_ENTRY = {
         "returns": "dict",
     },
     "errors": ["ValueError"],
+    "consumed_by": {"deferred_to": "WP2 wires build_contract into the CLI"},
 }
 
 
@@ -502,6 +505,7 @@ class InterfaceDeclaredTests(unittest.TestCase):
     def test_interface_entry_missing_signature_field_is_refused(self):
         bad = {
             "kind": "callable",
+            "consumed_by": {"deferred_to": "WP2"},
             "module": "src/b.py",
             "name": "build_contract",
             "signature": {"parameters": [{"name": "record"}], "returns": "dict"},
@@ -515,6 +519,7 @@ class InterfaceDeclaredTests(unittest.TestCase):
     def test_route_entry_needs_method_path_response(self):
         bad = {
             "kind": "route",
+            "consumed_by": {"deferred_to": "WP2"},
             "module": "src/bff.py",
             "name": "list_items",
             "signature": {"method": "GET", "path": "/items"},
@@ -530,6 +535,7 @@ class InterfaceDeclaredTests(unittest.TestCase):
         # which module and export serves it -- the WP5 failure class.
         bad = {
             "kind": "route",
+            "consumed_by": {"deferred_to": "WP2"},
             "signature": {
                 "method": "GET",
                 "path": "/items",
@@ -619,6 +625,350 @@ class InterfaceDeclaredTests(unittest.TestCase):
             pv.INTERFACE_UNDECLARED, tuple(item.code for item in refusals)
         )
 
+
+class InterfaceConsumedTests(unittest.TestCase):
+    """A declared interface names who will call it, or does not ship.
+
+    FDAdb WP5 converged, published `5ebb652c3037` and shipped a module
+    nothing calls -- no producer, no mount, nothing importing
+    `RegulatorySection`. Every gate passed, because no gate asked who
+    consumes the interface. The deferral to WP5b was legitimate; it was
+    silent, and therefore unreviewable. `consumed_by` makes the author state
+    it: a lane of this plan, or a named deferral. It is a declaration, never
+    a measurement -- nothing here reads the repository.
+    """
+
+    def _entry(self, consumed_by=_UNSET, *, name="build_contract"):
+        entry = dict(_INTERFACE_ENTRY)
+        entry["name"] = name
+        if consumed_by is _UNSET:
+            entry.pop("consumed_by", None)
+        else:
+            entry["consumed_by"] = consumed_by
+        return entry
+
+    def _paired(self, *entries, extra_lanes=(), tests_spec=None):
+        return _plan(
+            _lane(
+                "lane-tests",
+                lane_kind="tests",
+                outputs=["tests/test_b.py"],
+                spec=tests_spec if tests_spec is not None else {"intent": "tests"},
+            ),
+            _lane(
+                "lane-build",
+                needs=("lane-tests",),
+                outputs=["src/b.py"],
+                lane_kind="build",
+                spec={"intent": "build", "interface": list(entries)},
+            ),
+            *extra_lanes,
+        )
+
+    def _refusals(self, payload):
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(_dump(payload))
+        return caught.exception
+
+    def _message(self, caught):
+        return " ".join(
+            item.message
+            for item in caught.refusals
+            if item.code == pv.INTERFACE_UNCONSUMED
+        )
+
+    def test_entry_without_consumed_by_is_refused(self):
+        caught = self._refusals(self._paired(self._entry()))
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        refusal = [
+            item for item in caught.refusals
+            if item.code == pv.INTERFACE_UNCONSUMED
+        ][0]
+        self.assertEqual(
+            refusal.pointer, "/lanes/1/spec/interface/0/consumed_by"
+        )
+
+    def test_empty_consumed_by_is_refused(self):
+        for value in ({}, None, "", [], {"lane": ""}, {"deferred_to": "   "}):
+            with self.subTest(value=value):
+                caught = self._refusals(self._paired(self._entry(value)))
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+
+    def test_both_or_unknown_keys_are_refused(self):
+        for value in (
+            {"lane": "lane-app", "deferred_to": "WP2"},
+            {"consumer": "lane-app"},
+            {"lane": "lane-app", "note": "x"},
+        ):
+            with self.subTest(value=value):
+                caught = self._refusals(self._paired(self._entry(value)))
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+
+    def test_unknown_consumer_lane_is_refused(self):
+        caught = self._refusals(
+            self._paired(self._entry({"lane": "lane-nowhere"}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+
+    def test_paired_tests_lane_as_consumer_is_refused(self):
+        """The cheapest wrong answer, and the WP5 shape itself.
+
+        `lane-tests` is already in the build lane's `needs`, so it is the
+        first string an author under review pressure reaches for -- and a
+        tests lane's declared outputs are its accepted suite, never a call
+        site. Accepting it would certify a published export with no caller,
+        which is the defect `consumed_by` exists to name.
+        """
+        caught = self._refusals(
+            self._paired(self._entry({"lane": "lane-tests"}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        refusal = [
+            item for item in caught.refusals
+            if item.code == pv.INTERFACE_UNCONSUMED
+        ][0]
+        self.assertIn("tests lane", refusal.message)
+
+    def test_a_distinct_build_lane_with_its_own_outputs_is_a_consumer(self):
+        """The accepting case the tests-lane refusal has to be told apart from.
+
+        Same plan, same `needs` edge back to the tests lane, but the consumer
+        is a build lane declaring a file of its own for the call to live in.
+        """
+        compiled = compile_plan(
+            _dump(
+                self._paired(
+                    self._entry({"lane": "lane-app"}),
+                    extra_lanes=(
+                        _lane(
+                            "lane-app",
+                            needs=("lane-tests", "lane-build"),
+                            outputs=["src/app.py"],
+                            lane_kind="build",
+                            spec={
+                                "intent": "app",
+                                "interface": [
+                                    dict(
+                                        _INTERFACE_ENTRY,
+                                        module="src/app.py",
+                                        name="main",
+                                    )
+                                ],
+                            },
+                        ),
+                    ),
+                )
+            )
+        )
+        self.assertEqual(
+            {"lane": "lane-app"},
+            _lane_of(compiled, "lane-build").public_interface[0]["consumed_by"],
+        )
+
+    def test_self_consumption_is_refused(self):
+        caught = self._refusals(
+            self._paired(self._entry({"lane": "lane-build"}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+
+    def test_consumer_lane_in_this_plan_compiles(self):
+        compiled = compile_plan(
+            _dump(
+                self._paired(
+                    self._entry({"lane": "lane-app"}),
+                    extra_lanes=(
+                        _lane(
+                            "lane-app",
+                            needs=("lane-build",),
+                            outputs=["src/app.py"],
+                        ),
+                    ),
+                )
+            )
+        )
+        build = _lane_of(compiled, "lane-build")
+        self.assertEqual(
+            {"lane": "lane-app"}, build.public_interface[0]["consumed_by"]
+        )
+
+    def test_named_deferral_compiles(self):
+        deferral = "WP5b mounts RegulatorySection in the app shell"
+        compiled = compile_plan(
+            _dump(self._paired(self._entry({"deferred_to": deferral})))
+        )
+        build = _lane_of(compiled, "lane-build")
+        self.assertEqual(
+            {"deferred_to": deferral}, build.public_interface[0]["consumed_by"]
+        )
+        # The tests lane reads its paired build lane's entries, so the
+        # consumer declaration reaches the tester as the same bytes.
+        tests = _lane_of(compiled, "lane-tests")
+        self.assertEqual(
+            {"deferred_to": deferral}, tests.public_interface[0]["consumed_by"]
+        )
+
+    def test_unconsumed_interface_on_tests_lane_compiles(self):
+        compile_plan(
+            _dump(
+                self._paired(
+                    _INTERFACE_ENTRY,
+                    tests_spec={"intent": "t", "interface": [self._entry()]},
+                )
+            )
+        )
+
+    def test_unconsumed_interface_on_untyped_lane_compiles(self):
+        compile_plan(
+            _dump(
+                _plan(
+                    _lane("lane-tests", lane_kind="tests", outputs=["tests/t.py"]),
+                    _lane(
+                        "lane-untyped",
+                        needs=("lane-tests",),
+                        outputs=["src/b.py"],
+                        spec={"intent": "u", "interface": [self._entry()]},
+                    ),
+                )
+            )
+        )
+
+    def test_unconsumed_interface_on_unpaired_lane_compiles(self):
+        compile_plan(
+            _dump(
+                _plan(
+                    _lane(
+                        "lane-solo",
+                        spec={"intent": "s", "interface": [self._entry()]},
+                    ),
+                )
+            )
+        )
+
+    def test_existing_call_sites_compiles(self):
+        """A consumer that already shipped is named by its paths, not deferred.
+
+        FDAdb's WP5b declared three of four entries as `deferred_to` WP5 and
+        WP7 -- both MERGED, both with call sites in the repository already.
+        This is the shape that says so, and it must reach every role as the
+        same bytes the author wrote.
+        """
+        sites = [
+            "src/lib/api/maude-device.ts",
+            "src/pages/device/[key].astro",
+        ]
+        compiled = compile_plan(
+            _dump(self._paired(self._entry({"existing_call_sites": sites})))
+        )
+        build = _lane_of(compiled, "lane-build")
+        self.assertEqual(
+            {"existing_call_sites": sites},
+            build.public_interface[0]["consumed_by"],
+        )
+        tests = _lane_of(compiled, "lane-tests")
+        self.assertEqual(
+            {"existing_call_sites": sites},
+            tests.public_interface[0]["consumed_by"],
+        )
+
+    def test_existing_call_sites_is_not_measured_against_the_repository(self):
+        """A declaration the author answers, never a measurement.
+
+        Nothing here opens the repository, so a path that names no file today
+        compiles exactly as one that does. That is what lets the check answer
+        identically at ship, start and amend.
+        """
+        compile_plan(
+            _dump(
+                self._paired(
+                    self._entry(
+                        {"existing_call_sites": ["src/no/such/file.ts"]}
+                    )
+                )
+            )
+        )
+
+    def test_existing_call_sites_must_be_a_list(self):
+        for value in ("src/app.ts", {"path": "src/app.ts"}, 3, None):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "must be an array of repo-relative paths",
+                    self._message(caught),
+                )
+
+    def test_empty_existing_call_sites_is_refused(self):
+        """An empty list answers the question with silence.
+
+        It is the WP5 shape wearing the new key: an entry that claims a
+        consumer exists and names none.
+        """
+        caught = self._refusals(
+            self._paired(self._entry({"existing_call_sites": []}))
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        self.assertIn("at least one existing call site", self._message(caught))
+
+    def test_non_string_or_blank_call_site_is_refused(self):
+        for value in ([None], [3], [""], ["   "], ["src/a.ts", ""]):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "must be a nonempty repo-relative path",
+                    self._message(caught),
+                )
+
+    def test_absolute_call_site_is_refused(self):
+        caught = self._refusals(
+            self._paired(
+                self._entry(
+                    {"existing_call_sites": ["/Users/me/repo/src/app.ts"]}
+                )
+            )
+        )
+        self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+        self.assertIn("may not begin with", self._message(caught))
+
+    def test_call_site_with_parent_segment_is_refused(self):
+        for value in (["../sibling/src/app.ts"], ["src/../../etc/passwd"]):
+            with self.subTest(value=value):
+                caught = self._refusals(
+                    self._paired(self._entry({"existing_call_sites": value}))
+                )
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn("'..' segment", self._message(caught))
+
+    def test_all_three_consumer_keys_together_are_refused(self):
+        """Exactly one, still. A third shape does not loosen `len != 1`."""
+        for value in (
+            {
+                "lane": "lane-app",
+                "deferred_to": "WP2",
+                "existing_call_sites": ["src/app.ts"],
+            },
+            {"deferred_to": "WP2", "existing_call_sites": ["src/app.ts"]},
+            {"lane": "lane-app", "existing_call_sites": ["src/app.ts"]},
+        ):
+            with self.subTest(value=value):
+                caught = self._refusals(self._paired(self._entry(value)))
+                self.assertIn(pv.INTERFACE_UNCONSUMED, _codes(caught))
+                self.assertIn(
+                    "exactly one of lane, deferred_to or existing_call_sites",
+                    self._message(caught),
+                )
+
+    def test_bound_run_does_not_refuse_unconsumed_interface(self):
+        refusals = pv.validate_objective_plan(
+            self._paired(self._entry()), bound_run=True
+        )
+        self.assertNotIn(
+            pv.INTERFACE_UNCONSUMED, tuple(item.code for item in refusals)
+        )
 
 
 class ObservationSeamTests(unittest.TestCase):

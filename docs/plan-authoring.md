@@ -57,7 +57,8 @@ produced-symbol reachability, narrative quality, or other generic semantics.
   are that lane's accepted suite (`OUTPUT_OVERLAPS_TEST_SUITE`). A lane may not own the
   bytes it is graded against.
 - A `lane_kind=build` lane paired with a `lane_kind=tests` lane declares its public
-  interface as `spec.interface` entries (`INTERFACE_UNDECLARED`).
+  interface as `spec.interface` entries (`INTERFACE_UNDECLARED`), and every entry names
+  its consumer as `consumed_by` (`INTERFACE_UNCONSUMED`).
 - Integration order is deterministic from the DAG.
 
 Runtime path comparison is byte-exact after that normalization. It never follows a candidate
@@ -193,6 +194,49 @@ carries the runner's failure output verbatim.
   contract-adequacy findings through the existing `REVISE` path. Builders must not
   spray aliases to satisfy a name a test happens to use when the public contract does
   not declare it; a suite bound to an undeclared name is a finding against the suite.
+- **Name who will call it.** Every `spec.interface` entry carries `consumed_by`, an
+  object with exactly one of three keys: `{"lane": "<lane-id>"}`, a lane declared in this
+  plan whose declared outputs contain the call site;
+  `{"deferred_to": "<work package or plan>"}`, an explicit deferral naming the sibling
+  work that *will* consume it; or
+  `{"existing_call_sites": ["<repo-relative path>", ...]}`, the paths of consumers that
+  already exist. The compiler refuses an absent, empty, multi-key,
+  unknown-key, self-naming, unknown-lane or tests-lane declaration
+  (`INTERFACE_UNCONSUMED`), under
+  exactly the conditions `INTERFACE_UNDECLARED` applies: a build lane paired with a tests
+  lane, at ship, start and amend, never re-judged against a revision a run already holds.
+  `consumed_by` rides the same projection as the rest of the entry, so tester, test
+  reviewer, builder and code reviewer read it too.
+
+  **`deferred_to` is strictly future work.** A consumer that already exists in the
+  repository is named by its paths, as `existing_call_sites`: a nonempty array of
+  repo-relative strings. The compiler refuses a non-array, an empty array, a non-string
+  or blank element, an absolute path, and a path containing a `..` segment — and it never
+  checks that a named file exists. Nothing here reads the repository or an import graph,
+  which is what lets the check answer identically at ship, start and amend. The reviewer
+  reads the paths and judges them; the compiler only makes the author state them.
+
+  This shape exists because the first plan authored under this rule used `deferred_to` to
+  describe the past. FDAdb's WP5b declared three of its four entries as
+  `{"deferred_to": "WP5"}` and `{"deferred_to": "WP7"}` — both work packages MERGED, both
+  with call sites in the repository at the time of writing. A statement about the past is
+  unreviewable in a field whose other reading is a promise about the future: a plan
+  deferring to work that will never happen reads identically to one whose consumer shipped
+  months ago.
+
+  The named lane may not be the paired tests lane. That lane is already in the build
+  lane's `needs`, so it is the cheapest string to reach for — and a tests lane's declared
+  outputs are its accepted suite, never a call site, so accepting it would certify
+  precisely the published-export-with-no-caller shape this obligation exists to refuse.
+  Name the lane that calls the export, or declare `deferred_to`.
+
+  A deferral is never refused for being a deferral. It is refused only for being silent.
+  This is a declaration the author answers, not a measurement: nothing reads the
+  repository, and no import graph is consulted. The receipt is FDAdb WP5, which
+  converged, published `5ebb652c3037`, and shipped a module nothing calls — no producer,
+  no mount, nothing importing `RegulatorySection`. Every gate passed, because no gate
+  asked who consumes the interface. The deferral to WP5b was legitimate; it was silent,
+  and therefore unreviewable.
 - **Keep tests out of the build lane's declared outputs.** A path the builder is allowed to write
   cannot also be the suite it is graded against (`OUTPUT_OVERLAPS_TEST_SUITE`).
 - **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.

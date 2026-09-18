@@ -85,6 +85,7 @@ def _plan_bytes(
                     "interface": [
                         {
                             "kind": "callable",
+                            "consumed_by": {"deferred_to": "WP-next wires this"},
                             "module": "product.py",
                             "name": "product",
                             "signature": {
@@ -458,6 +459,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
                         "interface": [
                             {
                                 "kind": "callable",
+                                "consumed_by": {"deferred_to": "WP-next wires this"},
                                 "module": "product.py",
                                 "name": "product",
                                 "signature": {

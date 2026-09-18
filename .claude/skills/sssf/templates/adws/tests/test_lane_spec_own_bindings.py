@@ -202,6 +202,7 @@ def _two_pair_ir() -> dict:
         "lane-b": [
             {
                 "kind": "callable",
+                "consumed_by": {"deferred_to": "WP-next wires this"},
                 "module": "src/b.py",
                 "name": "build_contract",
                 "signature": {
@@ -213,6 +214,7 @@ def _two_pair_ir() -> dict:
         "lane-b2": [
             {
                 "kind": "callable",
+                "consumed_by": {"deferred_to": "WP-next wires this"},
                 "module": "src/c.py",
                 "name": "build_second",
                 "signature": {

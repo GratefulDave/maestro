@@ -9,6 +9,7 @@ from .plan_model import (
     PLAN_KEYS,
     SCHEMA_VERSION,
     PlanRefusal,
+    consumer_problems,
     decided_by_problems,
     interface_problems,
     restriction_problems,
@@ -30,6 +31,7 @@ OBLIGATION_UNOBSERVABLE = "OBLIGATION_UNOBSERVABLE"
 OBLIGATION_UNDECIDED = "OBLIGATION_UNDECIDED"
 CASE_FALSIFICATION_UNDECLARED = "CASE_FALSIFICATION_UNDECLARED"
 INTERFACE_UNDECLARED = "INTERFACE_UNDECLARED"
+INTERFACE_UNCONSUMED = "INTERFACE_UNCONSUMED"
 
 
 def validate_objective_plan(
@@ -426,7 +428,8 @@ def _validate_interface(
     keeps failing on a name that was never promised). ``spec.interface`` is
     the authored declaration; it is projected into ``public_contract`` so the
     tester, the test reviewer, the builder and the code reviewer all read the
-    same bytes.
+    same bytes. Each entry also names its consumer (``consumed_by``); see
+    ``_validate_consumers`` for why an unconsumed interface is a defect.
 
     The refusal applies exactly to a build lane paired with a tests lane:
     presence and shape are judged only there, so an interface-shaped value on
@@ -453,6 +456,8 @@ def _validate_interface(
                 problem,
             )
         )
+    if isinstance(interface, list):
+        _validate_consumers(pointer, interface, kinds, lane_id, refusals)
     if not interface:
         refusals.append(
             PlanRefusal(
@@ -464,6 +469,101 @@ def _validate_interface(
                 "may call",
             )
         )
+
+
+def _validate_consumers(
+    pointer: str,
+    interface: Sequence[Any],
+    kinds: Mapping[str, Any],
+    lane_id: str,
+    refusals: List[PlanRefusal],
+) -> None:
+    """Every declared interface entry names who will call it.
+
+    FDAdb WP5 converged, published ``5ebb652c3037`` and shipped a module
+    nothing calls: no producer, no mount, nothing importing
+    ``RegulatorySection``. Every gate passed, because no gate ever asked who
+    consumes the interface. The deferral was legitimate -- WP5b does the
+    wiring -- but it was silent, so it was unreviewable.
+
+    ``consumed_by`` is that answer, and it admits exactly three shapes:
+    ``{"lane": "<lane-id>"}``, a lane of this plan whose declared outputs
+    contain the call site; ``{"deferred_to": "<work package>"}``, an explicit
+    deferral naming the sibling work that *will* consume it; and
+    ``{"existing_call_sites": ["<path>", ...]}``, the repo-relative paths of
+    consumers that already exist. This is a declaration obligation the author
+    answers, not a measurement: nothing here reads the repository or an import
+    graph. A deferral is never refused for being a deferral -- it is refused
+    only for being absent.
+
+    The third shape exists because ``deferred_to`` was doing two jobs. FDAdb's
+    WP5b, the first plan authored under this rule, declared three of its four
+    entries as ``{"deferred_to": "WP5"}`` and ``{"deferred_to": "WP7"}`` --
+    work packages that were already MERGED, whose call sites are in the
+    repository today. A statement about the past is not reviewable in a field
+    whose other reading is a promise about the future: a plan deferring to
+    work that will never happen read identically to one whose consumer shipped
+    months ago. ``deferred_to`` is now strictly future work; a consumer that
+    already exists is named by its paths.
+
+    A named lane may not be the paired tests lane. That lane is already in the
+    build lane's ``needs``, so it is the cheapest string an author under review
+    pressure writes -- and it certifies exactly the WP5 shape this check exists
+    to refuse, because a tests lane's declared outputs are its accepted suite,
+    never a call site. A lane with no declared outputs is refused earlier and
+    harder: ``outputs`` must be a nonempty array (``SCHEMA_INVALID``), so no
+    such lane reaches here in a plan that could otherwise compile.
+
+    Judged exactly where ``_validate_interface`` judges presence and shape:
+    on a build lane paired with a tests lane, at ship, start and amend only.
+    """
+    declared_lanes = set(kinds)
+    for index, entry in enumerate(interface):
+        entry_ptr = pointer + "/spec/interface/{0}/consumed_by".format(index)
+        problems = consumer_problems(entry)
+        if problems:
+            for problem in problems:
+                refusals.append(
+                    PlanRefusal(INTERFACE_UNCONSUMED, entry_ptr, problem)
+                )
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        consumer = entry.get("consumed_by")
+        if not isinstance(consumer, Mapping) or "lane" not in consumer:
+            continue
+        named = str(consumer["lane"])
+        if named == lane_id:
+            refusals.append(
+                PlanRefusal(
+                    INTERFACE_UNCONSUMED,
+                    entry_ptr,
+                    "consumed_by.lane names the declaring lane itself; a lane "
+                    "calling its own export is not a consumer",
+                )
+            )
+        elif named not in declared_lanes:
+            refusals.append(
+                PlanRefusal(
+                    INTERFACE_UNCONSUMED,
+                    entry_ptr,
+                    "consumed_by.lane must name a lane declared in this plan; "
+                    "use deferred_to for future work outside it, or "
+                    "existing_call_sites for a consumer that already exists",
+                )
+            )
+        elif kinds.get(named) == "tests":
+            refusals.append(
+                PlanRefusal(
+                    INTERFACE_UNCONSUMED,
+                    entry_ptr,
+                    "consumed_by.lane names a tests lane; a tests lane asserts "
+                    "the interface, it does not consume it, and its declared "
+                    "outputs are the accepted suite rather than a call site. "
+                    "Name the lane that calls this export, or declare "
+                    "deferred_to or existing_call_sites",
+                )
+            )
 
 
 def _validate_ownership(

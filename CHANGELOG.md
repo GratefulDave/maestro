@@ -6,6 +6,69 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change: a consumer that already exists is not a deferral
+
+- `consumed_by` now admits a third shape, `existing_call_sites`: a nonempty
+  array of repo-relative paths naming call sites that already exist. It carries
+  exactly one of `lane`, `deferred_to` or `existing_call_sites` — more than one
+  key still refuses `INTERFACE_UNCONSUMED`, and the key set is still closed.
+  `deferred_to` is now strictly future work.
+- `existing_call_sites` refuses a non-array, an empty array, a non-string or
+  blank element, an absolute path, and a path containing a `..` segment. It does
+  **not** check that a named file exists. Nothing in this check reads the
+  repository or an import graph, which is what lets it answer identically at
+  ship, start and amend; the reviewer judges the paths, the compiler only makes
+  the author state them.
+- Same code, same conditions, same projection: `INTERFACE_UNCONSUMED`, on a
+  build lane paired with a tests lane, at ship, start and amend, inert on
+  tests / untyped / unpaired lanes, and riding the entry's existing path into
+  `public_contract.interface`, `obligations.for_build_lanes[].interface` and
+  `public_interface_json` with no second code path.
+- **Why.** The first plan authored under the consumer rule used `deferred_to` to
+  describe the past. FDAdb's WP5b declared three of its four interface entries as
+  `{"deferred_to": "WP5"}` and `{"deferred_to": "WP7"}` — both work packages
+  MERGED, both with call sites in the repository at the time of writing
+  (`src/lib/api/maude-device.ts` constructs the route; ten shipped page modules
+  import `loadEntityRoute` and render `EntityRoute.astro`). A statement about the
+  past is unreviewable in a field whose other reading is a promise about the
+  future: a plan deferring to work that will never happen read identically to one
+  whose consumer shipped months ago. This is a new shape, not a weakened check —
+  it takes the retrospective claims out of `deferred_to` and makes them say what
+  they are.
+
+### Changed — contract change: a declared interface names its consumer
+
+- New objective-compiler refusal `INTERFACE_UNCONSUMED`. Every `spec.interface`
+  entry on a `lane_kind=build` lane paired with a `lane_kind=tests` lane carries
+  `consumed_by`, an object with exactly one of `lane` (a lane declared in this
+  plan whose declared outputs contain the call site) or `deferred_to` (a nonempty
+  name for the sibling work package or plan that will consume it). Absent, empty,
+  both keys, an unknown key, an undeclared lane, the declaring lane itself, or
+  a lane whose kind is `tests` is refused. A tests lane asserts the interface
+  rather than consuming it, and its declared outputs are the accepted suite
+  rather than a call site, so naming it — the cheapest answer, since it is
+  already in the build lane's `needs` — would certify exactly the
+  published-export-with-no-caller shape this check exists to refuse. The check
+  applies under exactly the conditions `INTERFACE_UNDECLARED`
+  applies: paired build lanes only, judged at ship, start and amend, inert on
+  tests / untyped / unpaired lanes, and never re-judged against a revision a run
+  is already bound to.
+- `consumed_by` is carried by the entry's existing projection into
+  `public_contract.interface`, `obligations.for_build_lanes[].interface` and
+  `public_interface_json` — no second path — so tester, test reviewer, builder
+  and code reviewer read the same bytes.
+- This is a new obligation, not a weakened check. Plans authored before it, and
+  runs already bound to a revision, are unaffected; a plan shipped after it must
+  answer the question.
+- **Why.** FDAdb WP5 converged, published `5ebb652c3037`, and shipped code
+  nothing calls: no producer, no mount, nothing importing `RegulatorySection`.
+  Every existing gate passed. A plan could declare an interface, have its tests
+  bind to it, merge every lane and publish a module with no caller, because no
+  check ever asked who consumes it. The deferral to WP5b was legitimate; it was
+  silent, and therefore unreviewable. `consumed_by` does not forbid deferral — it
+  forbids silence, and it is a declaration the author answers, never a
+  measurement of the repository.
+
 ### Changed — contract change: plan review question surface v3, findings v2
 
 - `plan_approval.QUESTION_SURFACE_ALGORITHM` is now

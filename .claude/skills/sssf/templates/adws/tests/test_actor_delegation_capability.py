@@ -1619,6 +1619,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
         """
         interface_entry = {
             "kind": "route",
+            "consumed_by": {"deferred_to": "WP-next wires this"},
             "module": "src/bff/widgets.py",
             "name": "list_widgets",
             "signature": {
