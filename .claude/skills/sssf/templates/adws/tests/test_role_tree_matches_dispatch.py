@@ -148,6 +148,11 @@ class _Launcher:
         self._live: dict[tuple[str, str], SimpleNamespace] = {}
         self._by_token: dict[str, SimpleNamespace] = {}
 
+    @staticmethod
+    def invoking_repository(_env: object) -> None:
+        # No invoking Herdr Space in a test: the actor anchors on the target.
+        return None
+
     def _observe(self, worktree: Path) -> None:
         suite = Path(worktree) / _SUITE
         self.seen.append(suite.read_text(encoding="utf-8") if suite.is_file() else None)
