@@ -30,7 +30,7 @@ sys.path.insert(0, str(ADWS))
 import maestro
 from adw_modules import git_publication as gitpub
 from adw_modules import launcher as lch
-from adw_modules.scheduler import FactoryRefused
+from adw_modules.scheduler import FactoryRefused, _write_test_files
 
 _ROLE_ROUTES: Mapping[str, Mapping[str, str]] = {
     "tester": {"route": "omp", "profile": "grok"},
@@ -262,6 +262,31 @@ class ScopedTesterCollectionTest(_RoleOutputCase):
     def test_undeclared_output_absent_reports_as_missing(self) -> None:
         self.write("bun.lock", "lock\n")
         self.assertEqual(self.collect(("tests/architecture/test_wp7.py",)), {})
+
+    def test_byte_identical_tracked_declared_output_is_collected(self) -> None:
+        # The zero-delta edge: a repeat run, or an amendment that resets a
+        # merged tests lane, rewrites the suite the head already carries.
+        # Nothing is untracked or modified, and the draft is still the file.
+        self.write("tests/architecture/test_wp7.py", "def test_x():\n    pass\n")
+        self.write("tests/architecture/other.py", "other = 1\n")
+        self.track("tests/architecture/test_wp7.py", "tests/architecture/other.py")
+        self.write("tests/architecture/test_wp7.py", "def test_x():\n    pass\n")
+        self.assertEqual(
+            self.collect(("tests/architecture/test_wp7.py",)),
+            {"tests/architecture/test_wp7.py": "def test_x():\n    pass\n"},
+        )
+
+    def test_empty_draft_is_still_refused(self) -> None:
+        # Tracked files elsewhere do not stand in for a declared output that
+        # exists nowhere: the harvest is empty and the scheduler refuses it.
+        self.write("tests/architecture/other.py", "other = 1\n")
+        self.track("tests/architecture/other.py")
+        files = self.collect(("tests/architecture/test_wp7.py",))
+        self.assertEqual(files, {})
+        with self.assertRaisesRegex(
+            FactoryRefused, "write_tests produced no test files"
+        ):
+            _write_test_files({"test_files": files})
 
     def test_deleted_declared_output_still_refuses(self) -> None:
         self.write("tests/architecture/test_wp7.py", "x = 1\n")

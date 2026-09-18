@@ -1460,12 +1460,22 @@ class HerdrStageActor:
         An untyped lane declares product paths its tester does not write to,
         and the unscoped sweep is how that lane's tests are delivered, so it
         passes no scope and keeps the whole-tree behaviour.
+
+        A scope also reads its tracked, clean paths (`-c`). The declared
+        outputs are the draft, whatever git thinks changed: a tester that
+        rewrites an already-merged suite byte for byte leaves nothing
+        modified, and dropping those paths refused the draft as empty before
+        `write_test_draft` could admit it as the zero-delta `changed=false`
+        edge. A declared path that exists nowhere is still absent, so a
+        tester that wrote nothing still yields no files.
         """
         requested = tuple(str(item) for item in outputs)
         pathspec = ("--",) + requested if requested else ()
+        tracked = ("-c",) if requested else ()
         listed = self._git(
             checkout,
             "ls-files",
+            *tracked,
             "-o",
             "-m",
             "--exclude-standard",
