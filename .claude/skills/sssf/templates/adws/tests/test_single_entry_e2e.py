@@ -225,10 +225,15 @@ class SimulatedPanes:
             lines.append("def test_{0}_{1}_exists():".format(name, ident))
             lines.append("    assert Path({0!r}).is_file()".format(output))
             lines.append("")
-        path = cwd / "tests" / "test_{0}_private.py".format(name)
+        relative = "tests/test_{0}_private.py".format(name)
+        body = "\n".join(lines)
+        path = cwd / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines), encoding="utf-8")
-        return {"private_files": {}}
+        path.write_text(body, encoding="utf-8")
+        # Run-invariant bytes, named in the envelope the tester schema asks
+        # for: a repeat run rewrites a suite main already carries, which the
+        # draft admits as the zero-delta `changed=false` edge.
+        return {"test_files": {relative: body}}
 
     def _builder(self, prompt: Mapping[str, Any], cwd: Path) -> dict:
         lane = str(prompt.get("lane_id") or "")
@@ -248,7 +253,15 @@ class SimulatedPanes:
         verdict = "REVISE" if seen < revisions else "PASS"
         self.verdicts.append((lane, role, verdict))
         if verdict == "REVISE":
-            return {"verdict": "REVISE", "findings": [FINDING]}
+            # A REVISE must quote this lane's own contract (#263); a finding
+            # citing another lane's acceptance is refused and re-asked.
+            output = OUTPUTS[lane]
+            finding = dict(
+                FINDING,
+                implementation_area=output,
+                violated_requirement=output + " is written",
+            )
+            return {"verdict": "REVISE", "findings": [finding]}
         return {"verdict": "PASS", "findings": []}
 
 
@@ -635,6 +648,21 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
         self.assertEqual(set(first) - set(second), set())
         for run_id in second:
             self.assertEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
+        # The second run's testers rewrote the suite main already carries, so
+        # every draft took the zero-delta edge: the candidate is the head.
+        (repeat,) = set(second) - set(first)
+        with self.ledger() as store:
+            drafts = [
+                json.loads(row[0])
+                for row in store.conn.execute(
+                    "SELECT payload_json FROM lane_artifacts "
+                    "WHERE run_id=? AND artifact_kind='TEST_DRAFT'",
+                    (repeat,),
+                ).fetchall()
+            ]
+        self.assertTrue(drafts)
+        for draft in drafts:
+            self.assertEqual(draft["candidate_sha"], draft["builder_base_sha"])
         # The second run reused the same operator Space and left it as it was.
         self.assert_shape_a()
 

@@ -7,6 +7,8 @@ what it is asked and the shape of what its answer is allowed to do:
 * the rubric it is handed names every baseline item and every bounding rule;
 * a standards finding rides in `advisory_findings`, keeps its axis, and leaves
   `findings` empty, so nothing sends a passing candidate back to `BUILDING`;
+* a REVISE whose findings were all standards stays REVISE -- never rewritten
+  to PASS -- and carries the harness's own sentence, not the standards row;
 * a standards finding submitted as ERROR arrives as WARNING.
 """
 
@@ -222,6 +224,11 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         _git(self.repo, "config", "user.name", "Harness")
         _git(self.repo, "config", "core.hooksPath", str(self.root / "no-hooks"))
         (self.repo / "refund.py").write_text(PRODUCT)
+        # The suite imports `refund` from the tree root, so the tree says so.
+        # The runner's environment strips an ambient PYTHONPATH (`tree_env`),
+        # and a relative `PYTHONPATH=.` leaking in from the harness shell was
+        # the only thing that made this import work before.
+        (self.repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "base")
         self.state = self.root / "state"
@@ -352,7 +359,15 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         self.assertNotIn(SECRET_SELECTOR, public)
         self.assertNotIn(TEST_PATH, public)
 
-    def test_a_standards_error_is_capped_and_does_not_return_the_lane(self):
+    def test_a_standards_only_revise_stays_revise_and_keeps_its_standards_row(self):
+        """The scheduler has already asked a second time by now (see
+        test_reviewer_sees_suite_result). What reaches the artifact is the
+        reviewer's REVISE, not a PASS; the standards row is recorded, capped,
+        in `advisory_findings` and never in the `findings` the builder reads.
+
+        This asserted a PASS until #208 made a REVISE stand, then crashed on
+        CANONICAL_IDENTITY_INVALID: REVISE requires actionable findings.
+        """
         artifact = self._review_candidate(
             "standards-error-capped",
             st.ReviewerVerdict.REVISE,
@@ -360,14 +375,16 @@ class StandardsAxisAgainstAGreenSuite(unittest.TestCase):
         )
 
         self.assertEqual(artifact.payload["public_result_summary"]["failed"], 0)
-        self.assertIs(artifact.verdict, st.ReviewerVerdict.PASS)
-        self.assertNotEqual(artifact.payload["verdict"], st.ReviewerVerdict.REVISE.value)
-        self.assertEqual(artifact.payload["findings"], [])
+        self.assertIs(artifact.verdict, st.ReviewerVerdict.REVISE)
+        self.assertEqual(artifact.payload["verdict"], st.ReviewerVerdict.REVISE.value)
+        self.assertEqual(
+            [dict(row) for row in artifact.payload["findings"]],
+            [dict(cr._UNGATED_REVISE)],
+        )
         advisory = artifact.payload["advisory_findings"]
         self.assertEqual(len(advisory), 1)
         self.assertEqual(advisory[0]["severity"], st.SEVERITY_WARNING)
         self.assertEqual(advisory[0]["axis"], st.FINDING_AXIS_STANDARDS)
-
 
 if __name__ == "__main__":
     unittest.main()

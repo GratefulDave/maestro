@@ -6,6 +6,64 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed — the code reviewer's findings example was flattened again
+
+- #200 appended the optional `axis` and `severity` keys to the code
+  reviewer's envelope schema as bare strings beside the one example object,
+  re-creating the list-of-key-names shape #203 removed. They now sit inside
+  the example object with their allowed values; the other reviewers' schemas
+  are unchanged.
+
+### Fixed — a standards-only code-review REVISE crashed the review
+
+- `review_builder_output` (`adw_modules/code_review.py`) drops standards-axis
+  findings from the gating set. When a reviewer returned REVISE and every
+  finding was a standards finding, nothing gating was left and
+  `actionable_findings` raised `CANONICAL_IDENTITY_INVALID: REVISE requires
+  actionable findings`, ending the review. Such a REVISE now takes the one
+  existing path for a REVISE with nothing locatable: `_reviewing_code` asks the
+  reviewer once more (`suite_findings_required`, whose prompt on a green suite
+  asks for PASS or a finding off the standards axis). If the second answer is
+  still a REVISE with nothing gating, the REVISE stands with a harness finding
+  (`_UNGATED_REVISE`) saying so, the same as the red-suite last resort. No code
+  rewrites the reviewer's REVISE to PASS.
+- Standards findings are recorded again. #289 deleted `_redacted_advisory`
+  with the vault's redaction, and the `advisory_findings` key went with it, so
+  since then standards findings were partitioned off and discarded -- the
+  artifact kept nothing the reviewer said on that axis, contrary to
+  `MAESTRO_architecture.md`. The CODE_REVIEW payload now carries them, with
+  their axis and WARNING-capped severity, under `advisory_findings` whenever
+  there are any. They still never gate and never reach a builder, which reads
+  only `findings`.
+
+||||||| parent of 054cc32 (A tests lane's byte-identical redraft reaches the zero-delta edge instead of refusing "no test files")
+### Fixed — a tests lane's byte-identical redraft reaches the zero-delta edge
+
+- #289 admits a tests-lane draft that matches the integration head as
+  `changed=false` (`tests_chain.write_test_draft`). A draft delivered only as
+  bytes on disk never got that far. `HerdrStageActor._collect_uncommitted`
+  swept `git ls-files -o -m`, and rewriting a tracked file with the same bytes
+  leaves it neither untracked nor modified. The harvest came back empty and
+  the scheduler refused `write_tests produced no test files` before the draft
+  was compared with the head. Two real cases: a second run of a plan whose
+  suite is already merged, and an amendment that resets a merged tests lane
+  whose accepted suite is still correct.
+- A scoped harvest (a tests lane, scoped to its `declared_outputs`) now also
+  lists tracked, clean files (`-c`). The declared outputs are the draft, so a
+  clean declared file is read from the tree. A declared path that exists
+  nowhere is still absent, and a tester that wrote nothing is still refused.
+- `tests/test_single_entry_e2e.py`: the fake tester writes run-invariant
+  bytes again and names them in the envelope's `test_files`, which the tester
+  schema asks for. The repeat-run test now asserts that every second-run
+  `TEST_DRAFT` took the zero-delta edge (`candidate_sha == builder_base_sha`).
+  Regression tests in `tests/test_role_output_safety.py` cover the
+  byte-identical harvest and confirm that an empty draft is still refused.
+- Known limitation, not fixed: an **untyped** lane declares no test paths, so
+  its harvest stays the unscoped `-o -m` sweep. If its tester delivers only
+  on disk and rewrites an already-merged suite byte for byte, the draft is
+  still refused `write_tests produced no test files`. Naming the files in the
+  envelope's `test_files` reaches the zero-delta edge.
+
 ### Changed — contract change: a consumer that already exists is not a deferral
 
 - `consumed_by` now admits a third shape, `existing_call_sites`: a nonempty

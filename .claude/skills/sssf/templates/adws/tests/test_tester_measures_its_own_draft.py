@@ -19,6 +19,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import maestro
 from adw_modules import launcher as lch
@@ -29,6 +30,9 @@ def _contract(lane_kind: str | None) -> str:
     actor = object.__new__(maestro.HerdrStageActor)
     with TemporaryDirectory() as tmp:
         cwd = Path(tmp)
+        # The reviewer contract reads the target's standards files (#200), so
+        # the bare actor needs a target root; an empty one declares none.
+        actor.target = SimpleNamespace(target_repository_root=cwd)
         path = maestro.HerdrStageActor._materialize_role_instructions(
             actor, cwd, "tester", "omp", lane_kind
         )
@@ -90,8 +94,9 @@ class TesterMustEnumerateItsOwnDraft(unittest.TestCase):
         hidden = _contract(None)
         self.assertIn("Author files exactly at declared_outputs", tests_lane)
         self.assertNotIn("Author files exactly at declared_outputs", hidden)
-        self.assertIn("hidden validator/meta-test files", hidden)
-        self.assertNotIn("hidden validator/meta-test files", tests_lane)
+        # "hidden" left the rule in #289, when accepted tests became visible.
+        self.assertIn("Write validator/meta-test files", hidden)
+        self.assertNotIn("Write validator/meta-test files", tests_lane)
 
 
 if __name__ == "__main__":

@@ -74,12 +74,15 @@ def _outcome(argv: list[str]) -> tuple[int, dict]:
 
 
 class RunStartBindsRepositoryStateTest(unittest.TestCase):
-    def test_start_requires_repo_and_main_ref(self) -> None:
+    def test_start_infers_repo_unless_overridden(self) -> None:
+        # `--repo` is optional since #237: omitted, `_run_start` infers it from
+        # the invoking working directory (MAESTRO_architecture.md, run start).
         parser = maestro.build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(
-                ["run", "start", "plan.json", "--main-ref", "refs/heads/main"]
-            )
+        inferred = parser.parse_args(
+            ["run", "start", "plan.json", "--main-ref", "refs/heads/main"]
+        )
+        self.assertIsNone(inferred.repo)
+        self.assertEqual(inferred.main_ref, "refs/heads/main")
         args = parser.parse_args(
             [
                 "run",

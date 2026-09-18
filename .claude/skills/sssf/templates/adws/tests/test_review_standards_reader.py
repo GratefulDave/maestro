@@ -108,10 +108,10 @@ class StandardsRubricReaderTests(unittest.TestCase):
     def test_code_reviewer_schema_advertises_axis_and_severity(self):
         schema = self.actor._schema("code-reviewer")
         for key in st.FINDING_OPTIONAL_KEYS:
-            self.assertIn(key, schema["findings"])
+            self.assertIn(key, schema["findings"][0])
         self.assertNotIn(
             list(st.FINDING_OPTIONAL_KEYS)[0],
-            self.actor._schema("test-reviewer")["findings"],
+            self.actor._schema("test-reviewer")["findings"][0],
         )
 
 

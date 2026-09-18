@@ -69,6 +69,7 @@ def _bind_tuple(layout: dict) -> tuple:
     runtime.path = root
     store = mock.Mock()
     store.active_projection.return_value = ()
+    store.run_artifacts_of_kind.return_value = ()
     row = {
         "target_repository_root": "/product",
         "target_main_ref": "refs/heads/main",
@@ -321,6 +322,7 @@ class DashboardCallPlacementTest(unittest.TestCase):
             mock.patch.object(maestro, "require_deployment"),
             mock.patch.object(maestro, "_open_runtime", return_value=runtime),
             mock.patch.object(maestro, "_compile_plan", return_value=compiled),
+            mock.patch.object(maestro, "_require_approved_plan"),
             mock.patch.object(
                 maestro.gitpub, "bind_target_worktree", return_value=target
             ),

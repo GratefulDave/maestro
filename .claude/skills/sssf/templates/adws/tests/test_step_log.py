@@ -281,8 +281,9 @@ class TheCliWiresIt(unittest.TestCase):
         import maestro  # noqa: F401 - imported for the wiring check below
 
         source = (ADWS / "maestro.py").read_text(encoding="utf-8")
+        # start, resume, amend and attend (#258) each open one reporter.
         self.assertEqual(
-            source.count("step_log.RunReporter(run_id, runtime.path)"), 3
+            source.count("step_log.RunReporter(run_id, runtime.path)"), 4
         )
         self.assertNotIn("fconsole.FactoryConsole()", source)
 

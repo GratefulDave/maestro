@@ -896,10 +896,14 @@ class HerdrStageActor:
         if role == "builder":
             return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
         if role == "code-reviewer":
-            return {
-                "verdict": "PASS|REVISE",
-                "findings": findings + list(st.FINDING_OPTIONAL_KEYS),
-            }
+            # The optional keys ride inside the one example object; appended
+            # as bare strings they re-create the flattening described above.
+            example = dict(findings[0])
+            example["axis"] = "<optional: {0}>".format("|".join(st.FINDING_AXES))
+            example["severity"] = "<optional: {0}>".format(
+                "|".join(st.FINDING_SEVERITIES)
+            )
+            return {"verdict": "PASS|REVISE", "findings": [example]}
         if role == "test-reviewer":
             return {"verdict": "PASS|REVISE", "findings": findings}
         if role == "operator":
@@ -1348,7 +1352,8 @@ class HerdrStageActor:
                 "public_contract, not against the suite."
             )
             counts = extra.get("suite_result_summary")
-            if isinstance(counts, Mapping) and self._suite_counts_red(counts):
+            red = isinstance(counts, Mapping) and self._suite_counts_red(counts)
+            if red:
                 instructions += (
                     " suite_result_summary is the already-measured result of "
                     "the accepted suite against THIS candidate: "
@@ -1369,7 +1374,16 @@ class HerdrStageActor:
                     counts.get("failed", 0),
                     counts.get("errored", 0),
                 )
-            if extra.get("suite_findings_required"):
+            if extra.get("suite_findings_required") and not red:
+                instructions += (
+                    " Your previous answer for this candidate was REVISE "
+                    "with no finding against public_contract; standards "
+                    "findings cannot send a lane back. Return PASS, or "
+                    "REVISE with at least one finding that is not on the "
+                    "standards axis, naming a file in declared_outputs and "
+                    "the public_contract clause it violates."
+                )
+            elif extra.get("suite_findings_required"):
                 instructions += (
                     " Your previous answer for this candidate carried no "
                     "actionable finding while the suite was red. That "
@@ -1446,12 +1460,22 @@ class HerdrStageActor:
         An untyped lane declares product paths its tester does not write to,
         and the unscoped sweep is how that lane's tests are delivered, so it
         passes no scope and keeps the whole-tree behaviour.
+
+        A scope also reads its tracked, clean paths (`-c`). The declared
+        outputs are the draft, whatever git thinks changed: a tester that
+        rewrites an already-merged suite byte for byte leaves nothing
+        modified, and dropping those paths refused the draft as empty before
+        `write_test_draft` could admit it as the zero-delta `changed=false`
+        edge. A declared path that exists nowhere is still absent, so a
+        tester that wrote nothing still yields no files.
         """
         requested = tuple(str(item) for item in outputs)
         pathspec = ("--",) + requested if requested else ()
+        tracked = ("-c",) if requested else ()
         listed = self._git(
             checkout,
             "ls-files",
+            *tracked,
             "-o",
             "-m",
             "--exclude-standard",
