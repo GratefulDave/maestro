@@ -896,10 +896,14 @@ class HerdrStageActor:
         if role == "builder":
             return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
         if role == "code-reviewer":
-            return {
-                "verdict": "PASS|REVISE",
-                "findings": findings + list(st.FINDING_OPTIONAL_KEYS),
-            }
+            # The optional keys ride inside the one example object; appended
+            # as bare strings they re-create the flattening described above.
+            example = dict(findings[0])
+            example["axis"] = "<optional: {0}>".format("|".join(st.FINDING_AXES))
+            example["severity"] = "<optional: {0}>".format(
+                "|".join(st.FINDING_SEVERITIES)
+            )
+            return {"verdict": "PASS|REVISE", "findings": [example]}
         if role == "test-reviewer":
             return {"verdict": "PASS|REVISE", "findings": findings}
         if role == "operator":

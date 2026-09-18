@@ -68,7 +68,12 @@ class FindingsSchemaShape(unittest.TestCase):
                 self.assertIsInstance(
                     findings[0], dict, "a string here is what caused the flattening"
                 )
-                self.assertEqual(set(findings[0]), set(st.REVISE_FINDING_KEYS))
+                expected = set(st.REVISE_FINDING_KEYS)
+                if role == "code-reviewer":
+                    # The Standards axis (#200) adds its optional keys inside
+                    # the same example object, never beside it.
+                    expected |= set(st.FINDING_OPTIONAL_KEYS)
+                self.assertEqual(set(findings[0]), expected)
 
     def test_no_reviewer_schema_serializes_findings_as_bare_strings(self) -> None:
         """The exact rendering the reviewer read off its prompt."""

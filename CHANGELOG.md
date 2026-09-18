@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed — the code reviewer's findings example was flattened again
+
+- #200 appended the optional `axis` and `severity` keys to the code
+  reviewer's envelope schema as bare strings beside the one example object,
+  re-creating the list-of-key-names shape #203 removed. They now sit inside
+  the example object with their allowed values; the other reviewers' schemas
+  are unchanged.
+
 ### Fixed — a standards-only code-review REVISE crashed the review
 
 - `review_builder_output` (`adw_modules/code_review.py`) drops standards-axis
