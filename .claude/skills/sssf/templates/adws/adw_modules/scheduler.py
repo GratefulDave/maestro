@@ -1617,6 +1617,7 @@ HARNESS_VIOLATED_REQUIREMENTS = frozenset(
         "gate.declared_cases",
         cr._RUNNER_REVISE["violated_requirement"],
         cr._COLLECTION_REVISE["violated_requirement"],
+        cr._UNGATED_REVISE["violated_requirement"],
         cr._INTEGRATION_GATE_REVISE["violated_requirement"],
     }
 )
@@ -3212,13 +3213,19 @@ class FactoryScheduler:
             "code reviewer answered {0}".format(verdict.value),
             "{0} finding(s)".format(len(findings)),
         )
-        if measurement.runner_failed and not findings:
-            # It saw the counts and still had nothing locatable to say. Ask
-            # once more, saying so. One extra reviewer turn is cheap next to
-            # a builder round spent guessing which of five cases failed.
+        gating, _standards = st.partition_findings_by_axis(findings)
+        if not gating and (
+            measurement.runner_failed or verdict is st.ReviewerVerdict.REVISE
+        ):
+            # It had nothing locatable to say: against a red suite, or as a
+            # REVISE whose findings were all standards (which cannot gate).
+            # Ask once more, saying so. One extra reviewer turn is cheap next
+            # to a builder round spent guessing what to change.
             self._say(
                 lane_id,
-                "no actionable finding against a red suite, asking again",
+                "no actionable finding against a red suite, asking again"
+                if measurement.runner_failed
+                else "REVISE carried no gating finding, asking again",
             )
             verdict, findings = self.actor.review_code(
                 dataclasses.replace(ctx, suite_findings_required=True)

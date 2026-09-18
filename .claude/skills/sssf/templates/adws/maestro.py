@@ -1348,7 +1348,8 @@ class HerdrStageActor:
                 "public_contract, not against the suite."
             )
             counts = extra.get("suite_result_summary")
-            if isinstance(counts, Mapping) and self._suite_counts_red(counts):
+            red = isinstance(counts, Mapping) and self._suite_counts_red(counts)
+            if red:
                 instructions += (
                     " suite_result_summary is the already-measured result of "
                     "the accepted suite against THIS candidate: "
@@ -1369,7 +1370,16 @@ class HerdrStageActor:
                     counts.get("failed", 0),
                     counts.get("errored", 0),
                 )
-            if extra.get("suite_findings_required"):
+            if extra.get("suite_findings_required") and not red:
+                instructions += (
+                    " Your previous answer for this candidate was REVISE "
+                    "with no finding against public_contract; standards "
+                    "findings cannot send a lane back. Return PASS, or "
+                    "REVISE with at least one finding that is not on the "
+                    "standards axis, naming a file in declared_outputs and "
+                    "the public_contract clause it violates."
+                )
+            elif extra.get("suite_findings_required"):
                 instructions += (
                     " Your previous answer for this candidate carried no "
                     "actionable finding while the suite was red. That "

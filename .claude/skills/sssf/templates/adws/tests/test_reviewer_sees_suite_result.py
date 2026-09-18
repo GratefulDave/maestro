@@ -279,6 +279,38 @@ class ReviewerSeesTheSuiteResult(unittest.TestCase):
 
         self.assertEqual(blocked, ["lane-a"])
 
+    def test_a_standards_only_revise_is_asked_a_second_time(self):
+        """Standards findings cannot gate, so a REVISE carrying only them
+        carries nothing locatable. It takes the same second ask as a red
+        suite with no finding, and its verdict is never rewritten to PASS."""
+        standards = dict(LOCATED, axis=st.FINDING_AXIS_STANDARDS)
+        actor = _RecordingActor(
+            [
+                (st.ReviewerVerdict.REVISE, (standards,)),
+                (st.ReviewerVerdict.REVISE, (standards,)),
+            ]
+        )
+        scheduler, artifact = _scheduler(actor)
+
+        _, review = _drive(scheduler, artifact, _measurement(runner_failed=False))
+
+        self.assertEqual(len(actor.seen), 2)
+        self.assertFalse(actor.seen[0].suite_findings_required)
+        self.assertTrue(actor.seen[1].suite_findings_required)
+        self.assertIs(review.call_args.kwargs["verdict"], st.ReviewerVerdict.REVISE)
+
+    def test_a_standards_only_revise_may_become_pass_on_the_second_ask(self):
+        standards = dict(LOCATED, axis=st.FINDING_AXIS_STANDARDS)
+        actor = _RecordingActor(
+            [(st.ReviewerVerdict.REVISE, (standards,)), (st.ReviewerVerdict.PASS, ())]
+        )
+        scheduler, artifact = _scheduler(actor)
+
+        _, review = _drive(scheduler, artifact, _measurement(runner_failed=False))
+
+        self.assertEqual(len(actor.seen), 2)
+        self.assertIs(review.call_args.kwargs["verdict"], st.ReviewerVerdict.PASS)
+
     def test_a_green_suite_never_triggers_a_second_ask(self):
         actor = _RecordingActor([(st.ReviewerVerdict.PASS, ())])
         scheduler, artifact = _scheduler(actor)
@@ -343,6 +375,15 @@ class TheReviewerPromptCarriesTheCounts(unittest.TestCase):
             required=True,
         )
         self.assertIn("carried no actionable finding", text)
+
+    def test_the_green_second_ask_offers_pass_or_a_gating_finding(self):
+        text = self._instructions(
+            {"errored": 0, "executed": 12, "failed": 0, "passed": 12, "skipped": 0},
+            required=True,
+        )
+        self.assertIn("Return PASS, or", text)
+        self.assertIn("standards findings cannot send a lane back", text)
+        self.assertNotIn("while the suite was red", text)
 
     def test_the_counts_reach_the_prompt_body(self):
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)

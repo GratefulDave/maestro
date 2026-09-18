@@ -46,6 +46,22 @@ _COLLECTION_REVISE = {
     "violated_requirement": "accepted tests bind the candidate",
 }
 
+#: A green-suite REVISE whose findings were all on the standards axis, or
+#: absent, after the scheduler's second ask. The standards findings cannot
+#: gate, so they are gone; the reviewer's REVISE stands, and this says why
+#: the builder is holding no finding of the reviewer's own.
+_UNGATED_REVISE = {
+    "implementation_area": "declared product outputs",
+    "observed_behavior": (
+        "the code reviewer returned REVISE twice with no finding against the "
+        "public contract; standards findings cannot send a lane back"
+    ),
+    "required_behavior": (
+        "the candidate must satisfy every public_contract acceptance criterion"
+    ),
+    "violated_requirement": "the code reviewer grades against public_contract",
+}
+
 _INTEGRATION_GATE_REVISE = {
     "implementation_area": "merged integration surface",
     "observed_behavior": "a run-level accepted suite failed against the merged integration",
@@ -650,21 +666,25 @@ def review_builder_output(
     run = measurement.run
     summary = measurement.summary
     # The two axes are separated before anything reads a verdict off them. A
-    # standards finding is a hygiene judgement call: it is capped at WARNING
-    # and it is not in the set that decides whether this lane goes back to
-    # BUILDING. Nothing below ranks one axis against the other -- they simply
-    # never meet again.
-    findings, _standards = st.partition_findings_by_axis(findings)
-    if measurement.runner_failed:
-        if verdict is st.ReviewerVerdict.PASS:
-            verdict = st.ReviewerVerdict.REVISE
-        if not findings:
-            # The reviewer saw the counts and still said nothing locatable.
-            # Say what happened rather than nothing; the scheduler has
-            # already asked it a second time by the time this fires.
+    # standards finding is a hygiene judgement call: it is capped at WARNING,
+    # it is recorded in `advisory_findings`, and it is not in the set that
+    # decides whether this lane goes back to BUILDING. Nothing below ranks one
+    # axis against the other -- they simply never meet again.
+    findings, standards = st.partition_findings_by_axis(findings)
+    if measurement.runner_failed and verdict is st.ReviewerVerdict.PASS:
+        verdict = st.ReviewerVerdict.REVISE
+    if verdict is st.ReviewerVerdict.REVISE and not findings:
+        # A REVISE with nothing locatable left: a red suite the reviewer did
+        # not locate, or a REVISE whose findings were all standards. Say what
+        # happened rather than nothing; the scheduler has already asked it a
+        # second time by the time this fires. The reviewer's REVISE is never
+        # rewritten to PASS here.
+        if measurement.runner_failed:
             findings = (
                 _COLLECTION_REVISE if measurement.collection_broken else _RUNNER_REVISE,
             )
+        else:
+            findings = (_UNGATED_REVISE,)
     results_digest = st.digest_bytes(
         st.canonical_bytes(
             {
@@ -692,6 +712,18 @@ def review_builder_output(
         "test_suite_digest": tb.suite_digest(files),
         "verdict": verdict.value,
     }
+    if standards:
+        # Recorded, never dropped: the builder reads only `findings`, so
+        # these reach no builder and cause no transition, but the review
+        # keeps what its reviewer said.
+        payload["advisory_findings"] = [
+            {
+                key: str(item[key])
+                for key in (*st.REVISE_FINDING_KEYS, *st.FINDING_OPTIONAL_KEYS)
+                if key in item
+            }
+            for item in standards
+        ]
     if payload["test_suite_digest"] != test_suite_digest:
         raise rc.ReviewContractError("measured suite is not the accepted suite")
     # The ref is keyed on the digest of the runner's own result bytes, not on
