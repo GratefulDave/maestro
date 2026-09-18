@@ -265,7 +265,7 @@ class PrivateDraftCollection(unittest.TestCase):
                 patch.object(scheduler, "_remove_collect_tree"),
                 patch.dict("os.environ", {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}),
             ):
-                cases = scheduler.FactoryScheduler._collect_draft(
+                cases, _ = scheduler.FactoryScheduler._collect_draft(
                     owner, ctx, gate, files
                 )
             self.assertEqual(
