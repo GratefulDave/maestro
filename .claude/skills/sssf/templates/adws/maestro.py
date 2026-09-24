@@ -1793,15 +1793,18 @@ class HerdrStageActor:
                 if wait is not None:
                     try:
                         wait(handle)
-                    except lch.AgentNotInteractive as exc:
+                    except (
+                        lch.AgentNotInteractive,
+                        lch.HerdrCallError,
+                        lch.LaunchRefused,
+                    ) as exc:
                         # The declaration is already on disk and already valid;
-                        # this wait only lets the composer finish rendering so
-                        # the next prompt is not typed into a busy one. The
-                        # correction path re-checks that itself before it
-                        # submits, so a slow render is not this run's answer.
+                        # this wait merely leaves the composer ready for a
+                        # possible correction. A vanished or unreadable agent
+                        # cannot invalidate the declaration it already wrote.
                         self._say(
                             lane_id or "-",
-                            "{0} composer still rendering".format(role),
+                            "{0} completion could not be confirmed".format(role),
                             str(exc),
                         )
                 return payload
@@ -1854,7 +1857,7 @@ class HerdrStageActor:
             return
         try:
             retain(handle)
-        except lch.LaunchRefused:
+        except (lch.HerdrCallError, lch.LaunchRefused):
             self._roles.pop(key, None)
 
     def _release_superseded(self, key: tuple[str, str, str]) -> bool:
