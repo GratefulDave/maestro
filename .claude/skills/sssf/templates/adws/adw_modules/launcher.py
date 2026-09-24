@@ -5201,11 +5201,10 @@ class HerdrLauncher:
             ) from exc
         try:
             self._submit_resubmission(handle, prompt, timeout_s)
-        except PromptNotSubmitted as exc:
-            # A composer still holding this offer is a fact about the pane,
-            # not about the budget, so it reaches the lane as the typed
-            # refusal this path already declares instead of as a bare
-            # RuntimeError nobody catches.
+        except (PromptNotSubmitted, PromptSubmissionUnobservable) as exc:
+            # A failed correction submission must leave through the lane's
+            # declared refusal type rather than as a bare RuntimeError nobody
+            # catches.
             raise LaunchRefused(
                 LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
                 str(exc),
