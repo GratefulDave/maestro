@@ -364,6 +364,21 @@ class PlanAuthorCliTests(unittest.TestCase):
             compile_plan(stored)
             self.assertTrue(plan_canonical.is_canonical(stored))
 
+    def test_cli_authors_requirement_text_with_trailing_hyphen_near_match(self) -> None:
+        ir = _ir()
+        for requirement in ir["requirements"]:
+            if requirement["requirement_id"] == "req-t":
+                requirement["text"] = "Cover req-b- with a suffix."
+                break
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo").mkdir()
+            out = root / "plan"
+            result = self._author(root, out, ir)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(json.loads(result.stdout)["outcome"], "PLAN_AUTHORED")
+            self.assertTrue(out.is_file())
+
     def test_cli_second_run_reports_plan_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -622,13 +637,16 @@ class RequirementReferenceClosureTests(unittest.TestCase):
         self.assertIn(
             "req-t is discharged", lane_t["spec"]["instruction"])
 
-    def test_a_near_match_is_not_a_reference(self) -> None:
-        ir = self._ir_with_text(
-            "req-t",
-            "Cover req-b-baseline and x-req-b; neither names a requirement.")
-        draft = self.ingress.project_draft(ir, self.repo)
-        lane_t = [lane for lane in draft["lanes"] if lane["id"] == "lane-t"][0]
-        self.assertIn("req-b-baseline", lane_t["spec"]["instruction"])
+    def test_near_matches_are_not_references(self) -> None:
+        for near_match in ("req-b-", "req-b-baseline", "xreq-b", "x-req-b"):
+            with self.subTest(near_match=near_match):
+                text = "Cover {} with a suffix.".format(near_match)
+                ir = self._ir_with_text("req-t", text)
+                draft = self.ingress.project_draft(ir, self.repo)
+                lane_t = next(lane for lane in draft["lanes"]
+                              if lane["id"] == "lane-t")
+                self.assertIn(text, lane_t["spec"]["instruction"])
+
 
     def test_prose_and_unknown_ids_are_not_this_predicates_business(self) -> None:
         ir = self._ir_with_text(
@@ -636,14 +654,15 @@ class RequirementReferenceClosureTests(unittest.TestCase):
             "Honour the release contract and req-wp9-absent as written.")
         self.ingress.project_draft(ir, self.repo)
 
-    def test_punctuation_does_not_hide_a_reference(self) -> None:
-        ir = self._ir_with_text(
-            "req-t", "Assert the payload (req-b), byte for byte.")
-        with self.assertRaises(self.ingress.IngressError) as caught:
-            self.ingress.project_draft(ir, self.repo)
-        self.assertEqual(
-            "REQUIREMENT_REFERENCE_OUTSIDE_LANE:lane-t:req-t:req-b",
-            str(caught.exception))
+    def test_sentence_punctuation_does_not_hide_a_reference(self) -> None:
+        for text in ("Cover req-b.", "Cover req-b, now.", "Cover (req-b)."):
+            with self.subTest(text=text):
+                ir = self._ir_with_text("req-t", text)
+                with self.assertRaises(self.ingress.IngressError) as caught:
+                    self.ingress.project_draft(ir, self.repo)
+                self.assertEqual(
+                    "REQUIREMENT_REFERENCE_OUTSIDE_LANE:lane-t:req-t:req-b",
+                    str(caught.exception))
 
 
 if __name__ == "__main__":

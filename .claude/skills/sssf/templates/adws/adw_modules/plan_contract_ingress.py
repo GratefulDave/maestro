@@ -155,7 +155,7 @@ def _referenced_requirement_ids(text: str, index: Mapping[str, Any]) -> list:
     found: list = []
     seen: set = set()
     for match in _ID_TOKEN.finditer(text):
-        token = match.group(0).rstrip(".-")
+        token = match.group(0).rstrip(".,;:!?)]'\"")
         if token in index and token not in seen:
             seen.add(token)
             found.append(token)
