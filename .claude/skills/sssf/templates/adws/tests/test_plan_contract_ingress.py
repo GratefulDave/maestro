@@ -129,6 +129,57 @@ class IngressProjectionTests(unittest.TestCase):
             self._project(ir)
         self.assertIn("UNMAPPABLE_INTERFACES", str(caught.exception))
 
+    def _with_requires(self) -> tuple[dict, list]:
+        ir = copy.deepcopy(self.ir)
+        produced = ir["extensions"]["maestro"]["interfaces"]["lane-b"][0]
+        requires = [{
+            "lane": "lane-b",
+            "module": produced["module"],
+            "name": produced["name"],
+            "signature": copy.deepcopy(produced["signature"]),
+        }]
+        ir["extensions"]["maestro"]["requires"] = {"lane-b": requires}
+        return ir, requires
+
+    def test_requires_is_carried_onto_the_consumer_lane_spec(self) -> None:
+        """planctl compares requires with the producer; ingress only carries it."""
+        from adw_modules import plan_canonical
+        from adw_modules.plan_compiler import compile_plan
+
+        ir, requires = self._with_requires()
+        draft = self._project(ir)
+        self.assertEqual(self._lane(draft, "lane-b")["spec"]["requires"], requires)
+        self.assertNotIn("requires", self._lane(draft, "lane-t")["spec"])
+        compile_plan(plan_canonical.canonicalize(draft))
+        without = self._project()
+        self.assertNotEqual(
+            self._lane(draft, "lane-b")["spec"], self._lane(without, "lane-b")["spec"]
+        )
+
+    def test_requires_must_be_a_lane_mapping(self) -> None:
+        ir = copy.deepcopy(self.ir)
+        ir["extensions"]["maestro"]["requires"] = ["lane-b"]
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self._project(ir)
+        self.assertIn("UNMAPPABLE_REQUIRES", str(caught.exception))
+
+    def test_fixture_observed_by_is_carried_like_every_fixture_field(self) -> None:
+        """planctl executes observed_by; ingress only carries the declaration."""
+        ir = copy.deepcopy(self.ir)
+        observed_by = {
+            "argv": ["python3", "-c", "print(1)"],
+            "cwd": ".",
+            "timeout_seconds": 5,
+            "expect_stdout": "1\n",
+        }
+        for fixture in ir["fixtures"]:
+            fixture["observed_by"] = observed_by
+        draft = self._project(ir)
+        baseline = self._lane(draft, "lane-t")["spec"]["obligations"][
+            "observed_baseline"
+        ]
+        self.assertEqual(baseline[0]["observed_by"], observed_by)
+
     def test_no_private_keys_and_no_fixture_content_on_build_lane(self) -> None:
         from adw_modules import scheduler_types as st
 

@@ -445,6 +445,7 @@ _FIXTURE_FIELDS = (
     "affected_lane_ids",
     "consumer_obligation",
     "meaning",
+    "observed_by",
     "observed_value",
     "path",
     "producer_metadata",
@@ -471,6 +472,7 @@ _EXTENSION_PROJECTION: Dict[str, Optional[str]] = {
     "integration_branch": "spec.integration.integration_branch",
     "prohibited_effects": "spec.effects",
     "interfaces": "spec.interface, spec.obligations.for_build_lanes",
+    "requires": "spec.requires",
     "repo": None,
     "integration_gate": None,
 }
@@ -1161,6 +1163,9 @@ def _assert_ingress_projection_is_total(
     declared_interface = (maestro.get("interfaces") or {}).get(lane_id)
     if list(spec.get("interface") or []) != list(declared_interface or []):
         _fail("spec.interface", declared_interface, spec.get("interface"))
+    declared_requires = (maestro.get("requires") or {}).get(lane_id)
+    if list(spec.get("requires") or []) != list(declared_requires or []):
+        _fail("spec.requires", declared_requires, spec.get("requires"))
     if kind == "tests":
         obligations = spec.get("obligations") or {}
         if [item.get("claim_id") for item in obligations.get("claims") or []] != claim_ids:
@@ -1245,6 +1250,12 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     if interfaces_by_lane is not None and not isinstance(
             interfaces_by_lane, dict):
         raise IngressError("UNMAPPABLE_INTERFACES")
+    # Plan Contract (planctl) owns the check that each entry equals the
+    # producer's declared signature; ingress only carries the consumer's
+    # declaration onto its lane spec, so spec_digest covers it.
+    requires_by_lane = maestro.get("requires")
+    if requires_by_lane is not None and not isinstance(requires_by_lane, dict):
+        raise IngressError("UNMAPPABLE_REQUIRES")
     integration = maestro.get("integration_gate")
     branch = maestro.get("integration_branch")
     if not isinstance(branch, str) or not branch:
@@ -1353,6 +1364,8 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             and lane_id in interfaces_by_lane
         ):
             spec["interface"] = interfaces_by_lane[lane_id]
+        if isinstance(requires_by_lane, dict) and lane_id in requires_by_lane:
+            spec["requires"] = requires_by_lane[lane_id]
         projected = {
             "id": lane_id,
             "needs": needs,
