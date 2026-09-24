@@ -2745,6 +2745,10 @@ class HerdrLauncher:
                 timeout=timeout,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrCallError(
+                "LAUNCH_REFUSED:timeout: {}".format(exc), "timeout"
+            ) from exc
         except (OSError, ValueError) as exc:
             raise LaunchRefused(
                 LaunchRefusal.HERDR_UNAVAILABLE,

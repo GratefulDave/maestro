@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from io import StringIO
@@ -86,6 +87,23 @@ class LaunchFailedIsTransportOnlyTest(unittest.TestCase):
         self.assertNotIn("('", payload["detail"])
         self.assertIn("no-such-herdr", payload["detail"])
         self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+
+    def test_timed_out_herdr_calls_raise_typed_errors(self) -> None:
+        """Direct pane and focus calls retain Herdr's catchable error type."""
+        launcher = lch.HerdrLauncher.__new__(lch.HerdrLauncher)
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = Path(tmp) / "herdr-timeout"
+            herdr.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
+            herdr.chmod(0o700)
+            launcher.herdr_path = herdr
+            for args in (("pane", "get", "w9:p1"), ("agent", "focus", "maestro-a")):
+                with self.subTest(args=args):
+                    with self.assertRaises(lch.HerdrCallError) as raised:
+                        launcher._herdr(*args, timeout=0.01)
+                    self.assertEqual(raised.exception.code, "timeout")
+                    self.assertIsInstance(
+                        raised.exception.__cause__, subprocess.TimeoutExpired
+                    )
 
 
 if __name__ == "__main__":
