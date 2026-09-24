@@ -45,6 +45,19 @@ TEMPLATE_MARKERS = (
     "/skills/sssf/templates/adws",
 )
 
+# These are actor/transport failures whose effects belong to the current lane.
+# They are caught only while invoking an actor; ledger and repository failures
+# must remain fatal run-level errors even when they share a base exception.
+ACTOR_TRANSPORT_EXCEPTIONS = (
+    OSError,
+    subprocess.SubprocessError,
+    RuntimeError,
+)
+
+
+class _ActorFaultParked(Exception):
+    """An actor fault has already been durably parked on its lane."""
+
 
 class RunRepositoryMismatch(st.KernelError):
     code = "RUN_REPOSITORY_MISMATCH"
@@ -1860,15 +1873,12 @@ class FactoryScheduler:
         batch returns. Waiting for the whole batch is what let three
         admissible lanes sit behind one builder turn with two workers free.
 
-        Nothing new is submitted once a lane fails; the first failure, in
-        submission order, is re-raised after every lane that was already
-        running has finished its stage, so a failing lane ends the run the way
-        an inline failure does. A lane that parks is not a failure and stops
-        nothing but itself: `ready_lane_ids` skips a WAITING_FOR_USER lane and
-        anything downstream of it, so the refill simply stops offering that
-        lane while every independent lane keeps advancing. Merges never come
-        through here, so this returns with the pool empty and the outer loop
-        still sees the run between stages, as before.
+        A lane execution fault parks that lane through the same USER_WAIT path
+        as an operator pause; `ready_lane_ids` then skips it and anything
+        downstream while every independent lane keeps advancing. Integrity
+        failures still leave this method and drain the concurrent batch.
+        Merges never come through here, so this returns with the pool empty
+        and the outer loop still sees the run between stages, as before.
         """
         if self.concurrency == 1:
             for lane_id in lane_ids:
@@ -2188,6 +2198,33 @@ class FactoryScheduler:
         except Exception:
             pass
 
+    def _call_actor(
+        self, ctx: LaneContext, call: Callable[..., Any], /, *args: Any
+    ) -> Any:
+        """Invoke one lane actor and turn its transport failure into a wait."""
+        try:
+            return call(*args)
+        except (st.KernelError, gitpub.GitPublicationRefused):
+            raise
+        except ACTOR_TRANSPORT_EXCEPTIONS as exc:
+            with self._inflight_lock:
+                inflight = self._inflight.get(ctx.lane.lane_id)
+            if inflight is not None and inflight[1] is ctx.stage:
+                _, _, digest, observed = inflight
+            else:
+                digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
+            self.store.pause_lane(
+                self.run_id,
+                ctx.lane.lane_id,
+                ctx.stage,
+                digest,
+                observed=observed,
+                reason=st.WaitReason.LANE_FAULT,
+                fault=st.LaneFault(type(exc).__name__, str(exc)),
+            )
+            raise _ActorFaultParked from exc
+
+
     def _advance(self, lane_id: str) -> None:
         stage = self.store.lane_stage(self.run_id, lane_id)
         if stage is st.LaneStage.WRITING_TESTS:
@@ -2223,6 +2260,8 @@ class FactoryScheduler:
                 self.stage_completed(
                     lane_id, stage, self.store.lane_stage(self.run_id, lane_id)
                 )
+        except _ActorFaultParked:
+            return
         finally:
             with self._inflight_lock:
                 self._inflight.pop(lane_id, None)
@@ -2449,7 +2488,7 @@ class FactoryScheduler:
             public_contract=contract,
         )
         self._say(lane_id, "asking tester for a test draft")
-        extra = dict(self.actor.write_tests(ctx))
+        extra = dict(self._call_actor(ctx, self.actor.write_tests, ctx))
         self._say(lane_id, "tester returned a draft")
         # The draft is recorded first and measured at REVIEWING_TESTS, where a
         # verdict about it can be recorded beside it. Measuring here and
@@ -2806,7 +2845,9 @@ class FactoryScheduler:
             )
         else:
             self._say(lane_id, "asking test reviewer")
-            verdict, findings = self.actor.review_tests(ctx)
+            verdict, findings = self._call_actor(
+                ctx, self.actor.review_tests, ctx
+            )
             self._say(
                 lane_id,
                 "test reviewer answered {0}".format(verdict.value),
@@ -2822,10 +2863,12 @@ class FactoryScheduler:
                     lane_id,
                     "reviewer finding does not cite the contract, asking again",
                 )
-                verdict, findings = self.actor.review_tests(
+                verdict, findings = self._call_actor(
+                    ctx,
+                    self.actor.review_tests,
                     dataclasses.replace(
                         ctx, rejected_citation=_rejected_citation(first)
-                    )
+                    ),
                 )
                 self._say(
                     lane_id,
@@ -3073,7 +3116,7 @@ class FactoryScheduler:
                 ),
             )
         self._say(lane_id, "asking builder for a candidate")
-        extra = dict(self.actor.build(ctx))
+        extra = dict(self._call_actor(ctx, self.actor.build, ctx))
         self._say(lane_id, "builder returned a candidate")
         candidate_sha = extra["candidate_sha"]
         changed = bool(extra.get("changed", True))
@@ -3207,7 +3250,7 @@ class FactoryScheduler:
             ctx, suite_result_summary=dict(measurement.summary)
         )
         self._say(lane_id, "asking code reviewer")
-        verdict, findings = self.actor.review_code(ctx)
+        verdict, findings = self._call_actor(ctx, self.actor.review_code, ctx)
         self._say(
             lane_id,
             "code reviewer answered {0}".format(verdict.value),
@@ -3227,8 +3270,10 @@ class FactoryScheduler:
                 if measurement.runner_failed
                 else "REVISE carried no gating finding, asking again",
             )
-            verdict, findings = self.actor.review_code(
-                dataclasses.replace(ctx, suite_findings_required=True)
+            verdict, findings = self._call_actor(
+                ctx,
+                self.actor.review_code,
+                dataclasses.replace(ctx, suite_findings_required=True),
             )
             self._say(
                 lane_id,
@@ -3247,10 +3292,12 @@ class FactoryScheduler:
                 lane_id,
                 "reviewer finding does not cite the contract, asking again",
             )
-            verdict, findings = self.actor.review_code(
+            verdict, findings = self._call_actor(
+                ctx,
+                self.actor.review_code,
                 dataclasses.replace(
                     ctx, rejected_citation=_rejected_citation(first)
-                )
+                ),
             )
             self._say(
                 lane_id,

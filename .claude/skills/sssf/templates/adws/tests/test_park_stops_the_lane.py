@@ -17,11 +17,20 @@ can move, instead of before anything has been tried.
 
 from __future__ import annotations
 
+import json
+import tempfile
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
 
+from adw_modules import git_publication as gitpub
+from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
+from adw_modules.lifecycle import ArtifactStore
+from adw_modules.runtime_state import RuntimeStateRoot
+from tests import test_factory_cutover as cutover
 from tests.test_lane_concurrency import LANES, RUN_ID, _PassingActor, _Run
 
 
@@ -105,6 +114,167 @@ class ParkedLaneDoesNotStopTheRun(_Run):
         scheduler.run()
         self.assertEqual(self.store.ready_lane_ids(RUN_ID), ())
         self.assertEqual(len(LANES), 2)
+
+
+FAULT_RUN_ID = "run-lane-fault"
+FAULTED_LANE = "lane-faulted"
+INDEPENDENT_LANE = "lane-independent"
+DEPENDENT_LANE = "lane-dependent"
+
+
+def _fault_plan() -> bytes:
+    lanes = (
+        (FAULTED_LANE, ()),
+        (INDEPENDENT_LANE, ()),
+        (DEPENDENT_LANE, (FAULTED_LANE,)),
+    )
+    return json.dumps(
+        {
+            "schema_version": "maestro-plan.artifact-factory.v1",
+            "lanes": [
+                {
+                    "id": lane_id,
+                    "needs": needs,
+                    "outputs": [f"{lane_id}.txt"],
+                    "spec": {
+                        "goal": f"emit {lane_id}.txt",
+                        "integration": {"integration_branch": "refs/heads/main"},
+                    },
+                    "acceptance": [f"{lane_id}.txt is written"],
+                }
+                for lane_id, needs in lanes
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class _FaultingActor(_PassingActor):
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            raise RuntimeError("agent transport disconnected")
+        return super().write_tests(ctx)
+
+
+class _IntegrityFailingActor(_PassingActor):
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            raise sch.FactoryRefused("ledger invariant failed")
+        return super().write_tests(ctx)
+
+
+class LaneExecutionFaultsDoNotStopTheRun(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo = root / "product"
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        cutover._init_repo(self.repo)
+        self.runtime = RuntimeStateRoot(state, overlap_paths=(self.repo,))
+        self.runtime.ensure_layout()
+        self.store = ArtifactStore(self.runtime.ledger_path())
+        self.addCleanup(self.store.close)
+        self.addCleanup(self.runtime.close)
+        self.addCleanup(self.tmp.cleanup)
+        compiled = plan_compiler.compile_plan(
+            _fault_plan(), plan_revision=1, plan_artifact_ref="plan:lane-fault"
+        )
+        self.target = gitpub.bind_target_worktree(self.repo, "refs/heads/main")
+        sch.create_factory_run(
+            store=self.store,
+            run_id=FAULT_RUN_ID,
+            compiled=compiled,
+            runtime=self.runtime,
+            target=self.target,
+        )
+
+    def scheduler(self, actor: cutover.ScriptedActor) -> sch.FactoryScheduler:
+        return sch.FactoryScheduler(
+            self.store, FAULT_RUN_ID, actor, self.runtime, self.target
+        )
+
+    def test_lane_fault_waits_while_an_independent_lane_merges(self) -> None:
+        status = self.scheduler(
+            _FaultingActor(self.repo, self.runtime.path / "worktrees")
+        ).run()
+
+        self.assertIs(status, st.RunStatus.WAITING)
+        self.assertEqual(
+            {
+                lane: self.store.lane_stage(FAULT_RUN_ID, lane)
+                for lane in (FAULTED_LANE, INDEPENDENT_LANE, DEPENDENT_LANE)
+            },
+            {
+                FAULTED_LANE: st.LaneStage.WAITING_FOR_USER,
+                INDEPENDENT_LANE: st.LaneStage.MERGED,
+                DEPENDENT_LANE: st.LaneStage.PLANNED,
+            },
+        )
+        wait = sch._latest(
+            self.store, FAULT_RUN_ID, FAULTED_LANE, st.ArtifactKind.USER_WAIT
+        )
+        assert wait is not None
+        self.assertEqual(wait.payload["wait_reason"], st.WaitReason.LANE_FAULT.value)
+        self.assertEqual(
+            wait.payload["fault"],
+            {
+                "exception_type": "RuntimeError",
+                "message": "agent transport disconnected",
+            },
+        )
+        self.assertEqual(self.store.ready_lane_ids(FAULT_RUN_ID), ())
+
+    def test_run_integrity_errors_still_propagate(self) -> None:
+        scheduler = self.scheduler(
+            _IntegrityFailingActor(self.repo, self.runtime.path / "worktrees")
+        )
+
+        with self.assertRaisesRegex(sch.FactoryRefused, "ledger invariant failed"):
+            scheduler.run()
+
+        self.assertEqual(
+            self.store.lane_stage(FAULT_RUN_ID, FAULTED_LANE),
+            st.LaneStage.WRITING_TESTS,
+        )
+        self.assertIsNone(
+            sch._latest(
+                self.store,
+                FAULT_RUN_ID,
+                FAULTED_LANE,
+                st.ArtifactKind.USER_WAIT,
+            )
+        )
+
+    def test_repository_binding_file_not_found_propagates(self) -> None:
+        scheduler = self.scheduler(
+            _PassingActor(self.repo, self.runtime.path / "worktrees")
+        )
+        scheduler._advance(FAULTED_LANE)
+
+        with mock.patch.object(
+            sch.gitpub,
+            "revalidate_binding",
+            side_effect=FileNotFoundError("repository binding disappeared"),
+        ):
+            with self.assertRaisesRegex(
+                FileNotFoundError, "repository binding disappeared"
+            ):
+                scheduler._advance(FAULTED_LANE)
+
+        self.assertEqual(
+            self.store.lane_stage(FAULT_RUN_ID, FAULTED_LANE),
+            st.LaneStage.WRITING_TESTS,
+        )
+        self.assertIsNone(
+            sch._latest(
+                self.store,
+                FAULT_RUN_ID,
+                FAULTED_LANE,
+                st.ArtifactKind.USER_WAIT,
+            )
+        )
 
 
 if __name__ == "__main__":

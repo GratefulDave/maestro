@@ -841,12 +841,16 @@ class TestsLaneHandoffTests(unittest.TestCase):
 
         actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = self._start(compiled, actor, "run-stale-bundle")
-        with self.assertRaisesRegex(RuntimeError, "stop-before-build"):
-            scheduler.run()
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
         self.assertEqual(
             self.store.lane_stage("run-stale-bundle", "lane-tests"),
             st.LaneStage.MERGED,
         )
+        self.assertEqual(
+            self.store.lane_stage("run-stale-bundle", "lane-build"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        scheduler.resume_waiting()
         stale = self.store.conn.execute(
             "SELECT artifact_id, plan_revision FROM lane_artifacts "
             "WHERE run_id=? AND lane_id=? AND artifact_kind=?",
@@ -896,12 +900,16 @@ class TestsLaneHandoffTests(unittest.TestCase):
 
         actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = self._start(compiled, actor, "run-reseal")
-        with self.assertRaisesRegex(RuntimeError, "stop-before-build"):
-            scheduler.run()
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
         self.assertEqual(
             self.store.lane_stage("run-reseal", "lane-tests"),
             st.LaneStage.MERGED,
         )
+        self.assertEqual(
+            self.store.lane_stage("run-reseal", "lane-build"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        scheduler.resume_waiting()
         stale = self.store.conn.execute(
             "SELECT artifact_id, plan_revision FROM lane_artifacts "
             "WHERE run_id=? AND lane_id=? AND artifact_kind=? "

@@ -1851,11 +1851,17 @@ class ArtifactStore:
         *,
         observed: Optional[Mapping[str, Any]] = None,
         reason: st.WaitReason = st.WaitReason.PAUSE,
+        fault: st.LaneFault | None = None,
     ) -> ArtifactRecord:
         if expected_stage not in st.PAUSEABLE_STAGES:
             raise st.IllegalStageEdge(expected_stage.value)
         if reason not in st.RESUMABLE_WAIT_REASONS:
             raise st.IllegalStageEdge(reason.value)
+        if reason is st.WaitReason.LANE_FAULT:
+            if fault is None:
+                raise st.IllegalStageEdge("LANE_FAULT requires fault")
+        elif fault is not None:
+            raise st.IllegalStageEdge("fault requires LANE_FAULT")
         now = now_iso()
         self._begin()
         try:
@@ -1877,6 +1883,7 @@ class ArtifactStore:
                 run_id=run_id,
                 lane_id=lane_id,
                 plan_revision=run["plan_revision"],
+                fault=fault,
             )
             payload = {
                 "input_digest": wait_digest,
@@ -1886,6 +1893,8 @@ class ArtifactStore:
                 "resume_stage": expected_stage.value,
                 "wait_reason": reason.value,
             }
+            if fault is not None:
+                payload["fault"] = fault.payload()
             artifact = st.LaneArtifact(
                 kind=st.ArtifactKind.USER_WAIT,
                 plan_revision=run["plan_revision"],

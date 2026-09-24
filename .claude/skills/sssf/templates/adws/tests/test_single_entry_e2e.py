@@ -10,8 +10,8 @@ Assertions are durable ledger rows, Git refs, and the Herdr resource graph.
 The Herdr topology asserted here is Shape A: the operator's own Space is open
 on the repository, every lane is a linked child of it, and Maestro neither
 creates, tags, renames nor closes that Space -- completion closes the lane
-children only. `NoOperatorSpaceTest` covers the one case where no Space is
-open and Maestro creates the parent itself, which it then also keeps.
+children only. `NoOperatorSpaceTest` covers the typed lane wait when no
+operator Space is available to anchor a lane child.
 """
 
 from __future__ import annotations
@@ -386,8 +386,8 @@ class FactoryEndToEndBase(SingleEntryBase):
     plan_name = "two-lane"
 
     #: Shape A: lanes hang under the operator's own Space on the repository.
-    #: `False` models the repository with no Space open, the one case where
-    #: Maestro creates the parent itself.
+    #: `False` models the repository with no Space open, which prevents the
+    #: first lane from acquiring a child workspace.
     operator_space = True
 
     def setUp(self) -> None:
@@ -794,12 +794,9 @@ class ReconstructionBase(FactoryEndToEndBase):
     def _crash_then_resume(
         self, verb: tuple[str, str], nth: int = 1, *, before: bool = False
     ) -> None:
-        """Terminate right after one external side effect, then re-invoke.
+        """Terminate after one external effect, then re-invoke the same run.
 
-        The termination surfaces either as the injected `FakeHerdrStopped`
-        escaping or as a nonzero exit — the launcher converts some of them
-        into a typed launch refusal. Both are "this process stopped there";
-        what the row asserts is what the *next* plain invocation does.
+        A typed launch refusal may instead park the lane with LANE_FAULT.
         """
         if before:
             self.herdr.crash_before(verb, nth)
@@ -810,7 +807,12 @@ class ReconstructionBase(FactoryEndToEndBase):
         except FakeHerdrStopped:
             pass
         else:
-            self.assertNotEqual(code, 0, payload)
+            if code == 0:
+                self.assertEqual(payload["status"], st.RunStatus.WAITING.value)
+                self.assertIn(
+                    st.LaneStage.WAITING_FOR_USER.value,
+                    self.lane_stages(payload["run_id"]).values(),
+                )
         created = self.run_ids()
         self.assertEqual(len(created), 1, "a stopped process created no second run")
         self.run_cli()
@@ -841,27 +843,47 @@ class ReconstructionTest(ReconstructionBase):
 
 
 class NoOperatorSpaceTest(ReconstructionBase):
-    """No Space is open on the repository, so the run has no parent.
+    """Without the operator's repository Space, ready lanes cannot open children.
 
-    Herdr fixes a lane's placement at `worktree open` and cannot move it
-    afterwards, so a parent Maestro built for itself would orphan every lane
-    under it the moment it went. There is no such parent to build: the run
-    refuses and waits for the operator to open the repository.
+    Each lane receives a typed wait; no disposable parent is created.
     """
 
     operator_space = False
 
-    def test_the_run_refuses_and_creates_no_space(self) -> None:
-        code, _ = self.run_cli(expect=None)
-        self.assertNotEqual(code, 0)
+    def test_ready_lanes_wait_without_creating_resources(self) -> None:
+        _code, payload = self.run_cli()
         run_ids = self.run_ids()
-        for run_id in run_ids:
-            self.assertNotEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
+        self.assertEqual(len(run_ids), 1)
+        run_id = run_ids[0]
+        self.assertEqual(payload["status"], st.RunStatus.WAITING.value)
+        self.assertEqual(self.run_status(run_id), st.RunStatus.WAITING)
         self.assertEqual(
-            [call for call in self.herdr.calls if call[:2] == ("workspace", "create")],
-            [],
+            set(self.lane_stages(run_id).values()),
+            {st.LaneStage.WAITING_FOR_USER.value},
         )
-        self.assertEqual(herdr_graph(self.herdr)["parents"], [])
+        with self.ledger() as store:
+            waits = [
+                (str(lane_id), json.loads(payload_json))
+                for lane_id, payload_json in store.conn.execute(
+                    "SELECT lane_id, payload_json FROM lane_artifacts "
+                    "WHERE run_id=? AND artifact_kind=? ORDER BY sequence",
+                    (run_id, st.ArtifactKind.USER_WAIT.value),
+                )
+            ]
+        self.assertEqual({lane_id for lane_id, _ in waits}, set(LANES))
+        for _, wait in waits:
+            self.assertEqual(wait["wait_reason"], st.WaitReason.LANE_FAULT.value)
+            self.assertEqual(
+                wait["fault"]["exception_type"], sch.LaunchFailed.__name__
+            )
+        self.assertEqual(self.calls_of("workspace", "create"), [])
+        graph = herdr_graph(self.herdr)
+        self.assertEqual(graph["live_workspaces"], [])
+        self.assertEqual(graph["parents"], [])
+        self.assertEqual(graph["children"], {})
+        self.assertEqual(graph["child_ids"], {})
+        self.assertEqual(graph["panes"], {})
+        self.assertEqual(graph["agents"], {})
 
 
 if __name__ == "__main__":

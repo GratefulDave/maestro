@@ -116,13 +116,33 @@ class WaitReason(str, Enum):
     PAUSE = "PAUSE"
     AMENDMENT_REQUIRED = "AMENDMENT_REQUIRED"
     NO_PROGRESS = "NO_PROGRESS"
+    LANE_FAULT = "LANE_FAULT"
 
 
-# A lane blocked for NO_PROGRESS resumes exactly like a paused one: the operator
-# is the only thing that clears it, and clearing it grants another window.
+@dataclass(frozen=True)
+class LaneFault:
+    exception_type: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.exception_type, str) or not self.exception_type:
+            raise CanonicalIdentityError("fault exception_type is empty")
+        if not isinstance(self.message, str):
+            raise CanonicalIdentityError("fault message is not text")
+
+    def payload(self) -> Mapping[str, str]:
+        return {
+            "exception_type": self.exception_type,
+            "message": self.message,
+        }
+
+
+# A stalled or faulted lane resumes only when the operator explicitly retries
+# it; meanwhile its independent siblings remain eligible to advance.
 RESUMABLE_WAIT_REASONS: Tuple[WaitReason, ...] = (
     WaitReason.PAUSE,
     WaitReason.NO_PROGRESS,
+    WaitReason.LANE_FAULT,
 )
 
 # Reviewed attempts before a measured plateau or substantive repeat blocks.
@@ -758,6 +778,7 @@ def user_wait_input_digest(
     run_id: str,
     lane_id: str,
     plan_revision: int,
+    fault: LaneFault | None = None,
 ) -> str:
     payload = {
         "lane_id": lane_id,
@@ -770,6 +791,8 @@ def user_wait_input_digest(
         "schema_version": CANONICAL_SCHEMA_VERSION,
         "wait_reason": wait_reason.value,
     }
+    if fault is not None:
+        payload["fault"] = fault.payload()
     return digest_canonical(payload)
 
 

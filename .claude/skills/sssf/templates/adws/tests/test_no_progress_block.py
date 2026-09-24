@@ -282,8 +282,9 @@ class ReviewedContentTest(unittest.TestCase):
 
 
 class WaitReasonTest(unittest.TestCase):
-    def test_no_progress_is_resumable_like_a_pause(self) -> None:
+    def test_no_progress_and_lane_fault_are_resumable_like_a_pause(self) -> None:
         self.assertIn(st.WaitReason.NO_PROGRESS, st.RESUMABLE_WAIT_REASONS)
+        self.assertIn(st.WaitReason.LANE_FAULT, st.RESUMABLE_WAIT_REASONS)
         self.assertIn(st.WaitReason.PAUSE, st.RESUMABLE_WAIT_REASONS)
 
     def test_amendment_required_is_not_resumable_by_a_plain_resume(self) -> None:
