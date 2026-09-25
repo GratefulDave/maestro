@@ -2392,3 +2392,76 @@ class ComposerHoldsOfferTests(unittest.TestCase):
             raised.exception.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
         )
         self.assertIn("AGENT_PROMPT_HELD_IN_COMPOSER", raised.exception.detail)
+
+    def test_resubmit_reports_an_unobservable_submission_as_a_typed_refusal(
+        self,
+    ) -> None:
+        launcher = _bare_launcher("product run-1")
+        token = lch.role_session_token(RUN_HASH, LANE, "test-reviewer")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt-1.json"
+            prompt.write_text("{}", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            handle = lch.LaunchHandle(
+                token,
+                self.PANE,
+                lch._agent_name(token),
+                root,
+                transcript_path=transcript,
+                environment={},
+                pane_role="test-reviewer",
+                lane_key=LANE,
+            )
+
+            def herdr(*args: str, **kwargs: object) -> dict:
+                del kwargs
+                if args[:2] == ("agent", "focus"):
+                    return {}
+                if args[:2] == ("agent", "get"):
+                    return {
+                        "result": {
+                            "agent": {
+                                "name": handle.agent_name,
+                                "agent_status": "idle",
+                            }
+                        }
+                    }
+                if args[:2] == ("pane", "get"):
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": self.PANE,
+                                "cwd": str(root),
+                                "revision": 1,
+                            }
+                        }
+                    }
+                if args[:2] in (
+                    ("pane", "send-text"),
+                    ("pane", "send-keys"),
+                ):
+                    if args[-1] == "enter":
+                        raise lch.HerdrCallError("enter timeout", code="timeout")
+                    return {}
+                if args[:2] == ("agent", "send-keys"):
+                    raise lch.HerdrCallError("enter timeout", code="timeout")
+                if args[:2] == ("agent", "wait"):
+                    raise lch.HerdrCallError("wait timeout", code="timeout")
+                if args[:2] == ("pane", "read"):
+                    return {"result": {"text": ""}}
+                raise AssertionError(args)
+
+            launcher._herdr = herdr  # type: ignore[method-assign]
+            launcher._handles[token] = handle
+            with mock.patch.object(lch, "PASTE_SETTLE_S", 0.0):
+                with self.assertRaises(lch.LaunchRefused) as raised:
+                    launcher.resubmit(handle, prompt, timeout_s=5.1)
+        self.assertIs(
+            raised.exception.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
+        )
+        self.assertIn("AGENT_PROMPT_UNDELIVERED", raised.exception.detail)
+        self.assertIsInstance(
+            raised.exception.__cause__, lch.PromptSubmissionUnobservable
+        )

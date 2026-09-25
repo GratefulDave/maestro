@@ -1793,15 +1793,18 @@ class HerdrStageActor:
                 if wait is not None:
                     try:
                         wait(handle)
-                    except lch.AgentNotInteractive as exc:
+                    except (
+                        lch.AgentNotInteractive,
+                        lch.HerdrCallError,
+                        lch.LaunchRefused,
+                    ) as exc:
                         # The declaration is already on disk and already valid;
-                        # this wait only lets the composer finish rendering so
-                        # the next prompt is not typed into a busy one. The
-                        # correction path re-checks that itself before it
-                        # submits, so a slow render is not this run's answer.
+                        # this wait merely leaves the composer ready for a
+                        # possible correction. A vanished or unreadable agent
+                        # cannot invalidate the declaration it already wrote.
                         self._say(
                             lane_id or "-",
-                            "{0} composer still rendering".format(role),
+                            "{0} completion could not be confirmed".format(role),
                             str(exc),
                         )
                 return payload
@@ -1854,7 +1857,7 @@ class HerdrStageActor:
             return
         try:
             retain(handle)
-        except lch.LaunchRefused:
+        except (lch.HerdrCallError, lch.LaunchRefused):
             self._roles.pop(key, None)
 
     def _release_superseded(self, key: tuple[str, str, str]) -> bool:
@@ -2110,7 +2113,6 @@ class HerdrStageActor:
         checkout: Path | None,
         cwd_used: Path,
     ) -> Path:
-        stored = self._roles[key]
         used = cwd_used.resolve()
         prepared = checkout or attempt / "checkout"
         if prepared.resolve() != used:
@@ -2118,6 +2120,9 @@ class HerdrStageActor:
                 used.relative_to(attempt.resolve())
             except ValueError:
                 self._safe_remove_attempt(attempt, checkout)
+        stored = self._roles.get(key)
+        if stored is None:
+            return used
         stored.cwd = used
         stored.attempt = used.parent if used.name == "checkout" else used
         stored.checkout = used if (used / ".git").exists() else None
@@ -2441,7 +2446,6 @@ class HerdrStageActor:
             extra,
             prepare_cwd=lambda path: self._write_operator_tree(path, request),
         )
-        del cwd_used
         return payload
 
     def publish(

@@ -415,7 +415,7 @@ class FactoryCutoverTests(unittest.TestCase):
         self._assert_accepted_tests_executed(run_id, "lane-a")
         self._assert_accepted_tests_executed(run_id, "lane-b")
 
-    def test_death_before_building_resumes_from_sealed_stage(self) -> None:
+    def test_actor_fault_waits_and_resumes_from_sealed_stage(self) -> None:
         compiled = plan_compiler.compile_plan(
             _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:resume"
         )
@@ -431,15 +431,25 @@ class FactoryCutoverTests(unittest.TestCase):
 
         class StopBeforeBuild(ScriptedActor):
             def build(self, ctx):
-                raise RuntimeError("simulated death")
+                raise sch.LaunchFailed("simulated death")
 
         actor = StopBeforeBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = sch.FactoryScheduler(
             self.store, run_id, actor, self.runtime, target
         )
-        with self.assertRaises(RuntimeError):
-            scheduler.run()
-        self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.BUILDING)
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
+        self.assertEqual(
+            self.store.lane_stage(run_id, "lane-a"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        waits = self._lane_rows(run_id, st.ArtifactKind.USER_WAIT, "lane-a")
+        self.assertEqual(len(waits), 1)
+        wait = waits[0][2]
+        self.assertEqual(wait["wait_reason"], st.WaitReason.LANE_FAULT.value)
+        self.assertEqual(
+            wait["fault"],
+            {"exception_type": "LaunchFailed", "message": "simulated death"},
+        )
         resumed = sch.FactoryScheduler(
             self.store,
             run_id,
@@ -447,6 +457,7 @@ class FactoryCutoverTests(unittest.TestCase):
             self.runtime,
             target,
         )
+        resumed.resume_waiting()
         self.assertEqual(resumed.run(), st.RunStatus.COMPLETE)
         self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.MERGED)
 
@@ -734,17 +745,19 @@ class FactoryCutoverTests(unittest.TestCase):
                     and ctx.entry_kind is st.BuildingEntryKind.CODE_REVISE
                     and ctx.plan_revision == 1
                 ):
-                    raise RuntimeError("stop before second build")
+                    raise sch.LaunchFailed("stop before second build")
                 return super().build(ctx)
 
         actor = StopAfterRevise(self.repo, self.runtime.path / "worktrees")
         scheduler = sch.FactoryScheduler(
             self.store, run_id, actor, self.runtime, target
         )
-        with self.assertRaises(RuntimeError):
-            scheduler.run()
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
         self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.MERGED)
-        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.BUILDING)
+        self.assertEqual(
+            self.store.lane_stage(run_id, "lane-b"), st.LaneStage.WAITING_FOR_USER
+        )
+        scheduler.resume_waiting()
         sch.apply_factory_amendment(
             self.store,
             run_id,
@@ -824,6 +837,9 @@ class FactoryCutoverTests(unittest.TestCase):
             sch.gitpub.merge_or_reconcile = original  # type: ignore[method-assign]
         self.assertEqual(
             self.store.lane_stage(run_id, "lane-a"), st.LaneStage.READY_TO_MERGE
+        )
+        self.assertEqual(
+            self._lane_rows(run_id, st.ArtifactKind.USER_WAIT, "lane-a"), []
         )
         ref = st.integration_ref(run_id)
         git_head = _git(self.repo, "rev-parse", ref)
@@ -1035,14 +1051,20 @@ class FactoryCutoverTests(unittest.TestCase):
 
             def build(self, ctx: sch.LaneContext) -> dict:
                 if ctx.lane.lane_id == "lane-b" and self.fail_b:
-                    raise RuntimeError("interrupt B before builder output")
+                    raise sch.LaunchFailed("interrupt B before builder output")
                 return super().build(ctx)
 
-        first = TwelveStepActor(self.repo, self.runtime.path / "worktrees", fail_b=True)
-        with self.assertRaises(RuntimeError):
-            sch.FactoryScheduler(self.store, run_id, first, self.runtime, target).run()
+        first = TwelveStepActor(
+            self.repo, self.runtime.path / "worktrees", fail_b=True
+        )
+        scheduler = sch.FactoryScheduler(
+            self.store, run_id, first, self.runtime, target
+        )
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
         self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.MERGED)
-        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.BUILDING)
+        self.assertEqual(
+            self.store.lane_stage(run_id, "lane-b"), st.LaneStage.WAITING_FOR_USER
+        )
         self.assertEqual(
             self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-b"), []
         )
@@ -1093,6 +1115,7 @@ class FactoryCutoverTests(unittest.TestCase):
         scheduler = sch.FactoryScheduler(
             self.store, run_id, resumed, self.runtime, target
         )
+        scheduler.resume_waiting()
         self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
         b_builders = self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-b")
         self.assertEqual(len(b_builders), 1)
