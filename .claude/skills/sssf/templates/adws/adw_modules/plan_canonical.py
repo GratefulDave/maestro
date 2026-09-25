@@ -5,11 +5,11 @@ disjoint functions with disjoint call sites**. This module holds the first
 and is imported by authoring (`plan_author.py`), which writes the file, and
 validation, which checks the stored file is already in canonical form.
 
-Nothing on the runtime path may import this module. `plan_digest` is what
-the scheduler, replay lookup, and publication use, and it cannot reach a
-model to re-serialise one. The boundary is asserted by parsing every module
-in the tree in `tests/test_step2_plan_model.py` — Step 2's shipped invariant
-(§12.2): *the runtime never re-canonicalizes.*
+Nothing on the runtime path may import this module. The scheduler, replay
+lookup, and publication work from the stored digest
+(``scheduler_types.digest_bytes``), which cannot reach a model to
+re-serialise one. The boundary is Step 2's shipped invariant (§12.2): *the
+runtime never re-canonicalizes.*
 
 Canonical form is UTF-8 JSON, keys sorted, no insignificant whitespace, one
 trailing newline. It is a property of the bytes on disk rather than a step
