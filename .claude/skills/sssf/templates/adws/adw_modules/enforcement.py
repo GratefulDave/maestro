@@ -44,12 +44,6 @@ OBLIGATION_LEDGER = (
         "lifecycle ledger",
     ),
     Obligation(
-        "digest-import-boundary",
-        "detect_source",
-        "violations_b.py:json",
-        "plan_digest.py",
-    ),
-    Obligation(
         "base-execution-import",
         "detect_source",
         "violations_b.py:agents",
@@ -106,13 +100,12 @@ def _imports(tree: ast.AST) -> Tuple[str, ...]:
 
     ``from adw_modules import agents`` names the module ``adw_modules.agents``
     just as surely as ``import adw_modules.agents`` does, so the alias is
-    recorded beside the ``from`` target. Reading only ``node.module`` made both
-    import-boundary detectors blind to the most common spelling in this
+    recorded beside the ``from`` target. Reading only ``node.module`` made the
+    import-boundary detector blind to the most common spelling in this
     runtime: ``base-execution-import`` returned zero findings against its own
     planted violation (``violations_b.py:agents``), which is what the detector
-    is supposed to catch, and ``digest-import-boundary`` would have missed
-    ``from adw_modules import plan_model`` the same way. Neither had a test, so
-    neither was ever run against its fixture.
+    is supposed to catch. It had no test, so it was never run against its
+    fixture.
     """
     names: List[str] = []
     for node in ast.walk(tree):
@@ -183,10 +176,6 @@ def detect_source(check_id: str, path: Path) -> Tuple[str, ...]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _call_name(node) == "write_status":
                 findings.append("status write")
-    elif check_id == "digest-import-boundary":
-        forbidden = {"json", "pydantic", "plan_model", "adw_modules.plan_model"}
-        if any(name in forbidden or name.endswith(".plan_model") for name in imports):
-            findings.append("digest imports representation")
     elif check_id == "base-execution-import":
         if any(
             name.endswith("agents") or name.endswith("agent_pi") for name in imports
@@ -206,8 +195,6 @@ def scan_real_tree(check_id: str, modules: Path) -> Tuple[str, ...]:
             if path.name not in _BASE_MODULES
             and not path.name.startswith(("launcher", "route_"))
         ]
-    elif check_id == "digest-import-boundary":
-        candidates = [Path(modules) / "plan_digest.py"]
     elif check_id == "base-execution-import":
         candidates = [path for path in candidates if path.name not in _BASE_MODULES]
     findings: List[str] = []

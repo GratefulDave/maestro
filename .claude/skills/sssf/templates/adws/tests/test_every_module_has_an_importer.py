@@ -24,14 +24,13 @@ imports is a different and much milder problem (dead product code with live test
 it is visible to anyone who greps for it, and folding it in here would make this check fire
 on shapes it was not built to catch and get an allowlist bolted on within a week.
 
-A module loaded by path rather than by an ``import`` statement also counts. Two live
-examples in this copy: ``tests/test_artifact_factory_smoke.py`` reaches
+A module loaded by path rather than by an ``import`` statement also counts. The
+live example in this copy: ``tests/test_artifact_factory_smoke.py`` reaches
 ``adw_modules/tools/artifact_factory_smoke.py`` through
-``importlib.util.spec_from_file_location``, and ``adw_modules/enforcement.py`` reads
-``adw_modules/plan_digest.py`` off disk. So a string literal that is exactly a module's
-filename, or a path ending in it, is an importer. The match is exact on purpose -- prose
-naming ``adw_modules/deliver.py`` inside a docstring must not count, or the check is
-satisfied by anything ever written about a module.
+``importlib.util.spec_from_file_location``. So a string literal that is exactly
+a module's filename, or a path ending in it, is an importer. The match is exact
+on purpose -- prose naming ``adw_modules/deliver.py`` inside a docstring must
+not count, or the check is satisfied by anything ever written about a module.
 
 Imports are resolved statically with ``ast``; nothing is imported, so the check is safe to
 run in any copy, and it makes no path assumption beyond its own location, because it ships

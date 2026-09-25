@@ -14,8 +14,6 @@ safeguards, zero executions.
 whole runtime uses -- was invisible to it, and it returned **zero findings
 against its own planted violation**. A detector that cannot see the violation
 someone wrote down for it detects nothing, and there was no reader to notice.
-`digest-import-boundary` was blind the same way to
-`from adw_modules import plan_model`.
 
 So this file asserts the two-sided verdict the `Obligation` record already
 declares, per obligation:
