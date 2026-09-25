@@ -5,41 +5,33 @@ shipped nine-stage artifact factory in `MAESTRO_architecture.md`. Sections marke
 preserve the pre-factory design; they are not current-facing claims.
 
 ## Shipped contract
+This note described a vault. That design is not the shipped factory.
 
-Sealed private tests are never visible to builders. That is implemented behavior, not a proposal.
+`MAESTRO_architecture.md` §11 is the contract. Accepted tests are visible. The lane graded against them cannot change those bytes. `SEALED_TEST_BUNDLE` was renamed `ACCEPTED_TEST_SUITE`. `TEST_INVALIDATION` is retired. `hidden_vault` and `private_review` are not the live modules.
 
 | Piece | State |
 | --- | --- |
-| Vault object-database isolation (`adw_modules/hidden_vault.py`) | **Shipped.** Private blobs live in a bare repository under `runtime_state_root`, not in the run repository |
-| Private test-author / test-reviewer loop | **Shipped.** `TEST_DRAFT` → `TEST_REVIEW` (`PASS`/`REVISE`) → `SEALED_TEST_BUNDLE` |
-| Builder exclusion | **Shipped.** Builder input is public contract, architecture constraints, allowed paths, prior redacted review, and sealed digest. No private source, fixtures, selectors, expected literals, or vault paths |
-| Code review against sealed tests | **Shipped.** Reviewer runs private tests in harness scratch; public `CODE_REVIEW` is verdict, result summary, and redacted four-key findings |
-| Absence from run repo / builder worktree / fetch | **Shipped.** Isolation proofs are part of seal |
-| Nine-stage lane authority | **Shipped.** `PLANNED` … `WAITING_FOR_USER`; git commits and sealed digests identify artifacts, not stage |
-| Operator verbs | **Shipped.** `run start` / `run resume` / `run amend` / `run status` |
-| External runtime state | **Shipped.** Ledger, vault, locks, receipts, and ephemeral worktrees only under `runtime_state_root` |
+| Vault object-database isolation | **Replaced.** Not the shipped boundary |
+| Private test-author / test-reviewer loop | **Replaced.** `TEST_DRAFT` → `TEST_REVIEW` → `ACCEPTED_TEST_SUITE`, an ordinary candidate |
+| Builder exclusion | **Replaced.** The builder reads the suite and cannot write protected paths |
+| Code review against a hidden suite | **Replaced.** The reviewer hashes accepted blobs, then runs the suite in the candidate checkout |
+| Absence from the run repo | **Replaced.** The suite is in the run repository |
+| Nine-stage lane authority | **Shipped.** `PLANNED` … `WAITING_FOR_USER` |
+| Operator verbs | **Shipped.** `run start` / `run resume` / `run amend` / `run attend` / `run status` |
+| External runtime state | **Shipped.** Ledger, locks, receipts, and ephemeral worktrees under `runtime_state_root`. No suite vault |
 
-The factory does **not** merge tests into the integration branch for the builder to inherit. It does
-**not** require the builder's commit to carry test bytes. It does **not** use `test_visibility` on a
-v5 plan node, composed-tree gate receipts, `RepairDirective` retry prose, or review-budget repair
-chains.
+A tests lane merges its accepted suite into the integration ref. The builder's base carries those files. The builder's commit must not change them. `test_visibility` is not a factory option.
 
 Authoritative transitions:
 
-- `WRITING_TESTS` emits `TEST_DRAFT` (private draft digest/reference plus public behavioral
-  contract).
-- `REVIEWING_TESTS` `PASS` → `TESTS_SEALED`; `REVISE` returns to the test author with actionable
-  findings (no private literals).
-- `TESTS_SEALED` emits `SEALED_TEST_BUNDLE` (vault digest/reference; private bytes absent from run
-  repo and builder input) → `BUILDING`.
-- `REVIEWING_CODE` runs sealed tests against the candidate. `PASS` → `READY_TO_MERGE`. `REVISE` →
-  `BUILDING` with redacted findings.
-- Final integration review, after every lane is `MERGED`, evaluates the integration commit with all
-  sealed tests. Publication is exactly-once and receipt-backed.
+- `WRITING_TESTS` emits `TEST_DRAFT`, an ordinary candidate in the run repository.
+- `REVIEWING_TESTS` `PASS` records `ACCEPTED_TEST_SUITE` and advances to `TESTS_SEALED`. `REVISE` returns the runner output verbatim.
+- The builder reads the suite and cannot write the protected paths.
+- `REVIEWING_CODE` hashes the accepted blobs, then runs the suite in the candidate checkout. `REVISE` carries the failure output verbatim.
+- Final review reads the integration head, which carries every accepted suite.
 
-Test author and test reviewer may read the private draft. The implementation builder may not. The
-code reviewer has controlled vault access for the run and must not put private bytes in the public
-artifact.
+The rest of this file is the retired vault design. It is not the contract.
+
 
 ### Lane-local measured convergence and substantive repetition
 
