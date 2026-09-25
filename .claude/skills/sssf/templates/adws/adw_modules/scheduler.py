@@ -45,14 +45,6 @@ TEMPLATE_MARKERS = (
     "/skills/sssf/templates/adws",
 )
 
-# These are actor/transport failures whose effects belong to the current lane.
-# They are caught only while invoking an actor; ledger and repository failures
-# must remain fatal run-level errors even when they share a base exception.
-ACTOR_TRANSPORT_EXCEPTIONS = (
-    OSError,
-    subprocess.SubprocessError,
-    RuntimeError,
-)
 
 
 class _ActorFaultParked(Exception):
@@ -2201,12 +2193,15 @@ class FactoryScheduler:
     def _call_actor(
         self, ctx: LaneContext, call: Callable[..., Any], /, *args: Any
     ) -> Any:
-        """Invoke one lane actor and turn its transport failure into a wait."""
+        """Dispatch one role and park only its typed launch transport failure."""
         try:
             return call(*args)
-        except (st.KernelError, gitpub.GitPublicationRefused):
-            raise
-        except ACTOR_TRANSPORT_EXCEPTIONS as exc:
+        # `HerdrStageActor._launch` translates an agent-launch refusal to this
+        # boundary type.  It is the entire lane-scoped transport allowlist:
+        # harness, git, preparation, and generic runtime errors remain fatal
+        # even if they arise while a role method is executing.
+        except LaunchFailed as exc:
+            detail = exc.detail + (":pane_retained" if exc.pane_created else "")
             with self._inflight_lock:
                 inflight = self._inflight.get(ctx.lane.lane_id)
             if inflight is not None and inflight[1] is ctx.stage:
@@ -2220,7 +2215,12 @@ class FactoryScheduler:
                 digest,
                 observed=observed,
                 reason=st.WaitReason.LANE_FAULT,
-                fault=st.LaneFault(type(exc).__name__, str(exc)),
+                fault=st.LaneFault(type(exc).__name__, detail),
+            )
+            self._say(
+                ctx.lane.lane_id,
+                "lane fault, blocking for the operator",
+                detail,
             )
             raise _ActorFaultParked from exc
 

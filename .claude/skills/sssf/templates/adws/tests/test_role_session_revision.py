@@ -125,6 +125,24 @@ def _builder_ctx(head: str, lane: LaneProjection) -> LaneContext:
         test_suite_digest="test-suite.v1:" + "33" * 32,
     )
 
+def _code_reviewer_ctx(head: str, lane: LaneProjection) -> LaneContext:
+    return LaneContext(
+        run_id="run-1",
+        lane=lane,
+        plan_revision=1,
+        plan_digest="ef" * 32,
+        plan_artifact_ref="plan:x",
+        input_digest="33" * 32,
+        stage=LaneStage.REVIEWING_CODE,
+        artifacts={},
+        candidate_sha=head,
+        public_contract={
+            "acceptance_criteria": ["a.txt is written"],
+            "declared_outputs": ["a.txt"],
+        },
+        test_suite_digest="test-suite.v1:" + "44" * 32,
+    )
+
 
 class _RoleLauncher:
     """Adopts a live `(lane, role)` agent the way `HerdrLauncher.launch` does."""
@@ -134,9 +152,13 @@ class _RoleLauncher:
         *,
         files: Mapping[str, str] | None = None,
         cancel_error: Exception | None = None,
+        retain_error: Exception | None = None,
+        payload: Mapping[str, Any] | None = None,
     ) -> None:
         self.files = dict(files or {})
         self.cancel_error = cancel_error
+        self.retain_error = retain_error
+        self.payload = dict(payload or {})
         self.launches: list[dict[str, Any]] = []
         self.resubmits: list[object] = []
         self.cancels: list[object] = []
@@ -152,7 +174,7 @@ class _RoleLauncher:
 
     def _reply(self, envelope: Path) -> None:
         envelope.parent.mkdir(parents=True, exist_ok=True)
-        envelope.write_text(json.dumps({}), encoding="utf-8")
+        envelope.write_text(json.dumps(self.payload), encoding="utf-8")
 
     def invoking_repository(self, environment) -> Path | None:
         return None
@@ -245,6 +267,8 @@ class _RoleLauncher:
             raise lch.LaunchRefused(
                 lch.LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
             )
+        if self.retain_error is not None:
+            raise self.retain_error
 
 
 class _Bench:
@@ -470,6 +494,44 @@ class ARefusedCloseIsReportedAndNotFatal(unittest.TestCase):
             self.assertEqual(reported[0][0], "lane-a")
             self.assertIn("tester", reported[0][1])
             self.assertIn("HERDR_QUIESCENCE_UNPROVEN", reported[0][2])
+
+
+class ARetentionFailureKeepsTheDeclaredEnvelope(unittest.TestCase):
+    def test_tester_returns_envelope_files_when_retention_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _RoleLauncher(
+                payload={"test_files": {"tests/test_payload.py": "assert True\n"}},
+                retain_error=lch.HerdrCallError("agent exited", lch.AGENT_NOT_FOUND),
+            )
+            bench = _Bench(tmp, launcher=launcher)
+
+            result = bench.actor.write_tests(_tester_ctx(bench.head, _lane()))
+
+            self.assertEqual(
+                result,
+                {"test_files": {"tests/test_payload.py": "assert True\n"}},
+            )
+            self.assertNotIn(("lane-a", "tester", _SPEC_A), bench.actor._roles)
+
+    def test_code_reviewer_returns_its_verdict_when_retention_is_refused(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _RoleLauncher(
+                payload={"verdict": "PASS", "findings": []},
+                retain_error=lch.HerdrCallError("agent exited", lch.AGENT_NOT_FOUND),
+            )
+            bench = _Bench(tmp, launcher=launcher)
+
+            verdict, findings = bench.actor.review_code(
+                _code_reviewer_ctx(bench.head, _lane())
+            )
+
+            self.assertEqual(verdict, maestro.st.ReviewerVerdict.PASS)
+            self.assertEqual(findings, [])
+            self.assertNotIn(
+                ("lane-a", "code-reviewer", _SPEC_A), bench.actor._roles
+            )
 
 
 if __name__ == "__main__":

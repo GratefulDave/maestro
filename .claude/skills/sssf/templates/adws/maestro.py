@@ -2113,7 +2113,6 @@ class HerdrStageActor:
         checkout: Path | None,
         cwd_used: Path,
     ) -> Path:
-        stored = self._roles[key]
         used = cwd_used.resolve()
         prepared = checkout or attempt / "checkout"
         if prepared.resolve() != used:
@@ -2121,6 +2120,9 @@ class HerdrStageActor:
                 used.relative_to(attempt.resolve())
             except ValueError:
                 self._safe_remove_attempt(attempt, checkout)
+        stored = self._roles.get(key)
+        if stored is None:
+            return used
         stored.cwd = used
         stored.attempt = used.parent if used.name == "checkout" else used
         stored.checkout = used if (used / ".git").exists() else None
@@ -2444,7 +2446,6 @@ class HerdrStageActor:
             extra,
             prepare_cwd=lambda path: self._write_operator_tree(path, request),
         )
-        del cwd_used
         return payload
 
     def publish(

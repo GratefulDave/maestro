@@ -837,7 +837,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
         class StopOnBuild(HandoffActor):
             def build(self, ctx: sch.LaneContext):
                 del ctx
-                raise RuntimeError("stop-before-build")
+                raise sch.LaunchFailed("stop-before-build")
 
         actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = self._start(compiled, actor, "run-stale-bundle")
@@ -896,7 +896,7 @@ class TestsLaneHandoffTests(unittest.TestCase):
         class StopOnBuild(HandoffActor):
             def build(self, ctx: sch.LaneContext):
                 del ctx
-                raise RuntimeError("stop-before-build")
+                raise sch.LaunchFailed("stop-before-build")
 
         actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = self._start(compiled, actor, "run-reseal")

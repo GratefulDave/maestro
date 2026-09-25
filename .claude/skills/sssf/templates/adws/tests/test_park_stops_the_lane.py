@@ -18,13 +18,16 @@ can move, instead of before anything has been tried.
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from adw_modules import git_helper
 from adw_modules import git_publication as gitpub
+from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
@@ -150,10 +153,50 @@ def _fault_plan() -> bytes:
     ).encode("utf-8")
 
 
-class _FaultingActor(_PassingActor):
+class _LaunchFailingActor(_PassingActor):
     def write_tests(self, ctx: sch.LaneContext) -> dict:
         if ctx.lane.lane_id == FAULTED_LANE:
-            raise RuntimeError("agent transport disconnected")
+            raise sch.LaunchFailed(
+                "agent transport disconnected", pane_created=True
+            )
+        return super().write_tests(ctx)
+
+
+class _QuiescenceFailingActor(_PassingActor):
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            raise lch.HarnessQuiescenceError(
+                "HARNESS_CONTEXT_QUIESCENCE_UNPROVEN"
+            )
+        return super().write_tests(ctx)
+
+
+class _AnchorGitFailingActor(_PassingActor):
+    def _lane_child_anchor(self, ctx: sch.LaneContext) -> None:
+        del ctx
+        raise git_helper.GitError("GIT_COMMAND_REFUSED", "anchor unavailable")
+
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            self._lane_child_anchor(ctx)
+        return super().write_tests(ctx)
+
+
+class _PrepareFailingActor(_PassingActor):
+    def _prepare(self, ctx: sch.LaneContext) -> None:
+        del ctx
+        raise subprocess.CalledProcessError(1, ("prepare",))
+
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            self._prepare(ctx)
+        return super().write_tests(ctx)
+
+
+class _RuntimeFailingActor(_PassingActor):
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            raise RuntimeError("not an agent transport failure")
         return super().write_tests(ctx)
 
 
@@ -164,7 +207,7 @@ class _IntegrityFailingActor(_PassingActor):
         return super().write_tests(ctx)
 
 
-class LaneExecutionFaultsDoNotStopTheRun(unittest.TestCase):
+class LaneFaultScopingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -190,14 +233,38 @@ class LaneExecutionFaultsDoNotStopTheRun(unittest.TestCase):
             target=self.target,
         )
 
-    def scheduler(self, actor: cutover.ScriptedActor) -> sch.FactoryScheduler:
+    def scheduler(
+        self, actor: cutover.ScriptedActor, **kwargs: object
+    ) -> sch.FactoryScheduler:
         return sch.FactoryScheduler(
-            self.store, FAULT_RUN_ID, actor, self.runtime, self.target
+            self.store, FAULT_RUN_ID, actor, self.runtime, self.target, **kwargs
         )
 
-    def test_lane_fault_waits_while_an_independent_lane_merges(self) -> None:
+    def _assert_run_level_exception(
+        self, actor: cutover.ScriptedActor, expected: type[BaseException]
+    ) -> None:
+        with self.assertRaises(expected):
+            self.scheduler(actor).run()
+        self.assertEqual(
+            self.store.lane_stage(FAULT_RUN_ID, FAULTED_LANE),
+            st.LaneStage.WRITING_TESTS,
+        )
+        self.assertIsNone(
+            sch._latest(
+                self.store,
+                FAULT_RUN_ID,
+                FAULTED_LANE,
+                st.ArtifactKind.USER_WAIT,
+            )
+        )
+
+    def test_launch_failure_waits_while_an_independent_lane_merges(self) -> None:
+        steps: list[tuple[str, str, str]] = []
         status = self.scheduler(
-            _FaultingActor(self.repo, self.runtime.path / "worktrees")
+            _LaunchFailingActor(self.repo, self.runtime.path / "worktrees"),
+            step=lambda lane, message, detail="": steps.append(
+                (lane, message, detail)
+            ),
         ).run()
 
         self.assertIs(status, st.RunStatus.WAITING)
@@ -216,15 +283,44 @@ class LaneExecutionFaultsDoNotStopTheRun(unittest.TestCase):
             self.store, FAULT_RUN_ID, FAULTED_LANE, st.ArtifactKind.USER_WAIT
         )
         assert wait is not None
+        detail = "agent transport disconnected:pane_retained"
         self.assertEqual(wait.payload["wait_reason"], st.WaitReason.LANE_FAULT.value)
         self.assertEqual(
             wait.payload["fault"],
             {
-                "exception_type": "RuntimeError",
-                "message": "agent transport disconnected",
+                "exception_type": "LaunchFailed",
+                "message": detail,
             },
         )
+        self.assertIn(
+            (FAULTED_LANE, "lane fault, blocking for the operator", detail),
+            steps,
+        )
         self.assertEqual(self.store.ready_lane_ids(FAULT_RUN_ID), ())
+
+    def test_quiescence_error_from_a_role_dispatch_is_run_level(self) -> None:
+        self._assert_run_level_exception(
+            _QuiescenceFailingActor(self.repo, self.runtime.path / "worktrees"),
+            lch.HarnessQuiescenceError,
+        )
+
+    def test_git_error_from_lane_anchor_is_run_level(self) -> None:
+        self._assert_run_level_exception(
+            _AnchorGitFailingActor(self.repo, self.runtime.path / "worktrees"),
+            git_helper.GitError,
+        )
+
+    def test_prepare_subprocess_error_is_run_level(self) -> None:
+        self._assert_run_level_exception(
+            _PrepareFailingActor(self.repo, self.runtime.path / "worktrees"),
+            subprocess.CalledProcessError,
+        )
+
+    def test_generic_runtime_error_is_run_level(self) -> None:
+        self._assert_run_level_exception(
+            _RuntimeFailingActor(self.repo, self.runtime.path / "worktrees"),
+            RuntimeError,
+        )
 
     def test_run_integrity_errors_still_propagate(self) -> None:
         scheduler = self.scheduler(

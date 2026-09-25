@@ -431,7 +431,7 @@ class FactoryCutoverTests(unittest.TestCase):
 
         class StopBeforeBuild(ScriptedActor):
             def build(self, ctx):
-                raise RuntimeError("simulated death")
+                raise sch.LaunchFailed("simulated death")
 
         actor = StopBeforeBuild(self.repo, self.runtime.path / "worktrees")
         scheduler = sch.FactoryScheduler(
@@ -448,7 +448,7 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(wait["wait_reason"], st.WaitReason.LANE_FAULT.value)
         self.assertEqual(
             wait["fault"],
-            {"exception_type": "RuntimeError", "message": "simulated death"},
+            {"exception_type": "LaunchFailed", "message": "simulated death"},
         )
         resumed = sch.FactoryScheduler(
             self.store,
@@ -745,7 +745,7 @@ class FactoryCutoverTests(unittest.TestCase):
                     and ctx.entry_kind is st.BuildingEntryKind.CODE_REVISE
                     and ctx.plan_revision == 1
                 ):
-                    raise RuntimeError("stop before second build")
+                    raise sch.LaunchFailed("stop before second build")
                 return super().build(ctx)
 
         actor = StopAfterRevise(self.repo, self.runtime.path / "worktrees")
@@ -1051,7 +1051,7 @@ class FactoryCutoverTests(unittest.TestCase):
 
             def build(self, ctx: sch.LaneContext) -> dict:
                 if ctx.lane.lane_id == "lane-b" and self.fail_b:
-                    raise RuntimeError("interrupt B before builder output")
+                    raise sch.LaunchFailed("interrupt B before builder output")
                 return super().build(ctx)
 
         first = TwelveStepActor(
