@@ -191,7 +191,7 @@
         <div class="hero-meta">
           <span class="pill">Nine lane stages</span>
           <span class="pill">Immutable artifacts</span>
-          <span class="pill">Hidden sealed tests</span>
+          <span class="pill">Visible immutable suite</span>
           <span class="pill">Receipt-backed publication</span>
           <span class="pill">Stage-restart resume</span>
         </div>
@@ -203,7 +203,7 @@
           <div><h2>Architecture diagrams</h2><p class="section-copy">Current pages are the nine-stage factory, the lane machine, the role topology, and <a href="architecture/00-plan-authoring.html">plan authoring into the factory</a>. Accepted tests are visible and immutable to the lane graded against them. Operator verbs are <code>run start|resume|amend|attend|status</code>. Older gallery pages are historical evidence. Open the <a href="architecture/index.html">architecture gallery</a>.</p></div>
         </div>
         <div class="grid" style="margin-bottom:.85rem">
-          <a class="card" href="architecture/00-artifact-factory.html"><span class="tag">00 · current</span><h3>Nine-stage artifact factory</h3><p>Operator CLI, <code>lane_state.stage</code>, sealed vault, exactly-once integration, and receipt-backed publication.</p></a>
+          <a class="card" href="architecture/00-artifact-factory.html"><span class="tag">00 · current</span><h3>Nine-stage artifact factory</h3><p>Operator CLI, <code>lane_state.stage</code>, visible accepted suite, exactly-once integration, and receipt-backed publication.</p></a>
           <a class="card" href="architecture/00-lane-stage.html"><span class="tag">00 · current</span><h3>Lane stage machine</h3><p>The nine persisted stages, <code>REVISE</code> loops, <code>NO_PROGRESS</code> pause, <code>BASE_INVALIDATION</code>, and <code>WAITING_FOR_USER</code>.</p></a>
           <a class="card" href="architecture/00-role-topology.html"><span class="tag">00 · current</span><h3>Persistent role topology</h3><p>Invoking Space owns UI anchors; role panes execute on target cwd. Resume restores shells before native gates.</p></a>
           <a class="card" href="architecture/00-plan-authoring.html"><span class="tag">00 · current</span><h3>Plan authoring into the factory</h3><p>Planning skills, plan-contract, independent receipt, ingress, tests lane, paired build lane.</p></a>
@@ -225,8 +225,8 @@
           <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · historical</span><h3>Repair chain flowchart (superseded)</h3><p>SEMANTIC repair chain. Not current REVISE→same lane stage.</p></a>
           <a class="card" href="architecture/35-flow-unreviewed.html"><span class="tag">35 · historical</span><h3>Unread candidate flowchart (superseded)</h3><p>Unread candidate repair. Not immutable candidate refs.</p></a>
           <a class="card" href="architecture/40-mind-modules.html"><span class="tag">40 · mind</span><h3>Runtime module tree</h3><p>Module ownership: who may mutate lifecycle, who is transport only.</p></a>
-          <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · historical</span><h3>Verb groups (superseded)</h3><p>Old plan/run/workspace groups. Live verbs are run start|resume|amend|status.</p></a>
-          <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · historical</span><h3>Nine root verbs (superseded)</h3><p>bootstrap, plan, retry, skip, abandon. Not the frozen four-verb CLI.</p></a>
+          <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · historical</span><h3>Verb groups (superseded)</h3><p>Old plan/run/workspace groups. Live verbs are run start|resume|amend|attend|status.</p></a>
+          <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · historical</span><h3>Nine root verbs (superseded)</h3><p>bootstrap, plan, retry, skip, abandon. Not the live five-verb CLI.</p></a>
           <a class="card" href="architecture/04-data-flow-receipts.html"><span class="tag">04 · data</span><h3>Receipt data flow</h3><p>Publication is receipt-backed; <code>main</code> at the same SHA without a receipt is refused.</p></a>
           <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · historical</span><h3>Runtime UML (superseded)</h3><p>Pre-factory Scheduler/store UML. Not live nine-stage types.</p></a>
           <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · historical</span><h3>Attempt sequence (superseded)</h3><p>Attempt identity sequence. Resume is stage restart from artifacts.</p></a>
@@ -254,8 +254,8 @@
         </div>
         <div class="flow" aria-label="Maestro execution flow">
           <div class="flow-step"><code>01</code><b>Start</b><small><code>run start</code> writes the plan revision, DAG projection, and <code>PLANNED</code> lanes, then the integration ref.</small></div>
-          <div class="flow-step"><code>02</code><b>Private tests</b><small>Author → review → seal. Builder never sees private source.</small></div>
-          <div class="flow-step"><code>03</code><b>Build / review</b><small>Builder then code review. <code>REVISE</code> returns redacted findings; <code>PASS</code> advances.</small></div>
+          <div class="flow-step"><code>02</code><b>Accepted suite</b><small>Author, review, accept. The suite is visible. The graded lane cannot edit it.</small></div>
+          <div class="flow-step"><code>03</code><b>Build / review</b><small>Builder then code review. <code>REVISE</code> returns the runner output verbatim; <code>PASS</code> advances.</small></div>
           <div class="flow-step"><code>04</code><b>Merge</b><small>Exactly-once integration merge from the immutable candidate SHA.</small></div>
           <div class="flow-step"><code>05</code><b>Publish</b><small>Final review, then receipt-backed publication to <code>main</code>.</small></div>
         </div>
@@ -274,7 +274,7 @@
               <tr><td>plan_compiler.py</td><td>Objective schema, DAG, dependency, output-ownership, acceptance, and integration-order checks</td><td>Executable plan projection</td></tr>
               <tr><td>lifecycle.py</td><td>One <code>lane_state.stage</code> field, immutable artifacts, audit rows, and atomic transition operations</td><td>Durable workflow state</td></tr>
               <tr><td>scheduler.py</td><td>Ready-set selection, fresh stage dispatch, review loops, and serialized merge/publication decisions</td><td>Run orchestration</td></tr>
-              <tr><td>hidden_vault.py / private_review.py</td><td>Private object storage, sealed test bundles, controlled review materialization, and redaction</td><td>Private-test boundary</td></tr>
+              <tr><td>test_binding.py</td><td>Hashes accepted suite blobs before the runner. Refuses <code>TEST_SUITE_TAMPERED</code>. The graded lane cannot write protected paths.</td><td>Suite immutability</td></tr>
               <tr><td>runtime_state.py</td><td>External state-root descriptor, product-repository identity, permissions, and overlap refusal</td><td>Runtime binding</td></tr>
               <tr><td>git_publication.py</td><td>Immutable candidate/integration/publication refs, compare-and-swap updates, and Git receipts</td><td>Repository mutation</td></tr>
               <tr><td>launcher.py / permissions.py</td><td>Exact persistent role panes, dedicated Claude/OMP profiles, checkout-local role instructions, scratch directories, and role-specific Git worktrees</td><td>Transport and role boundary</td></tr>
@@ -367,7 +367,7 @@
       <section id="guarantees">
         <div class="section-head">
           <span class="section-no">08 / 08</span>
-          <div><h2>Executable guarantees</h2><p class="section-copy">Maestro’s claims are defended by observable factory behavior: sealed private tests, exactly-once merge, receipt-backed publication, and stage-restart resume.</p></div>
+          <div><h2>Executable guarantees</h2><p class="section-copy">Maestro’s claims are defended by observable factory behavior: a visible suite the graded lane cannot change, exactly-once merge, receipt-backed publication, and stage-restart resume.</p></div>
         </div>
         <div class="metric-grid">
           <div class="metric"><b>9</b><span>lane stages</span></div>
@@ -375,7 +375,7 @@
           <div class="metric"><b>2</b><span>dependent lanes in the proven slice</span></div>
           <div class="metric"><b>1</b><span>durable stage field</span></div>
         </div>
-        <div class="callout"><strong>Golden scenarios.</strong> Two dependent lanes prove private-test sealing, builder isolation, exactly-once merge, dependent builder bases, final review, and resume from the last immutable artifact — not from a live agent or dirty worktree.</div>
+        <div class="callout"><strong>Golden scenarios.</strong> Two dependent lanes prove suite immutability, exactly-once merge, dependent builder bases, final review, and resume from the last immutable artifact — not from a live agent or dirty worktree.</div>
       </section>
 
       <footer>Maestro documentation · generated from the shipped implementation · dark interface by design</footer>
