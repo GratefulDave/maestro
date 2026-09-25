@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Plan authoring into the factory",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "output": "00-plan-authoring.html",
+    "viewBox": [1160, 460],
+    "views": [
+      {
+        "id": "authoring-path",
+        "label": "Approved plan",
+        "focus": ["interview", "planf3", "contract", "review", "ingress"],
+        "note": "Requirements become one plan-contract.v1 IR. Only an independent reviewer signs the receipt."
+      },
+      {
+        "id": "paired-lanes",
+        "label": "Tests then producer",
+        "focus": ["contract", "ingress", "tests", "build"],
+        "note": "A prospective file has one tests lane and one build lane that depends on it. The producer starts only after a refreshed receipt."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [64, 56],
+    "cols": 6,
+    "gapX": 28,
+    "gapY": 36,
+    "cellW": 150,
+    "cellH": 76
+  },
+  "components": [
+    {
+      "id": "interview",
+      "type": "external",
+      "label": "deep-interview",
+      "sublabel": "requirements",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "brownfield",
+      "type": "backend",
+      "label": "plan-brownfield",
+      "sublabel": "constraints",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "planf3",
+      "type": "backend",
+      "label": "planf3",
+      "sublabel": "executable lanes",
+      "row": 1,
+      "col": 1
+    },
+    {
+      "id": "contract",
+      "type": "database",
+      "label": "plan-contract",
+      "sublabel": "plan-contract.v1",
+      "tag": "policy",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "review",
+      "type": "security",
+      "label": "arch-review",
+      "sublabel": "signed receipt",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "ingress",
+      "type": "backend",
+      "label": "plan ingress",
+      "sublabel": "maestro-plan v2/v3",
+      "row": 2,
+      "col": 3
+    },
+    {
+      "id": "tests",
+      "type": "backend",
+      "label": "tests lane",
+      "sublabel": "lane_kind tests",
+      "row": 2,
+      "col": 4
+    },
+    {
+      "id": "build",
+      "type": "backend",
+      "label": "build lane",
+      "sublabel": "paired producer",
+      "row": 2,
+      "col": 5
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Authoring",
+      "wraps": ["interview", "brownfield", "planf3", "contract", "review"],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "requirements",
+      "from": "interview",
+      "to": "planf3"
+    },
+    {
+      "id": "constraints",
+      "from": "brownfield",
+      "to": "planf3"
+    },
+    {
+      "id": "ir",
+      "from": "planf3",
+      "to": "contract",
+      "label": "Plan IR",
+      "variant": "emphasis"
+    },
+    {
+      "id": "receipt",
+      "from": "contract",
+      "to": "review",
+      "label": "review"
+    },
+    {
+      "id": "project",
+      "from": "review",
+      "to": "ingress",
+      "label": "signed receipt",
+      "labelDy": 24,
+      "variant": "security"
+    },
+    {
+      "id": "tests-node",
+      "from": "ingress",
+      "to": "tests",
+      "label": "tests node"
+    },
+    {
+      "id": "pair",
+      "from": "tests",
+      "to": "build",
+      "label": "depends_on",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Existing tests",
+      "items": [
+        "Enumerate the pinned tree before writing a selector",
+        "A missing test is not a claim",
+        "Collection never satisfies min_executed"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Prospective file",
+      "items": [
+        "One future whole test file, one tests lane, one build lane",
+        "Seam, decided_by examples, and baseline_absent on that file",
+        "Refresh selectors and obtain a new receipt before the producer"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "What approval means",
+      "items": [
+        "A planning receipt certifies structure, not that tests passed",
+        "Freeze-discipline copies are cataloged and not installed",
+        "declared_cases remains a tests-verifier field the runtime measures"
+      ]
+    }
+  ]
+}

@@ -60,6 +60,7 @@
       <nav>
         <p class="nav-label">Diagrams</p>
         <a href="architecture/00-artifact-factory.html">Current factory</a>
+        <a href="architecture/00-plan-authoring.html">Plan authoring diagram</a>
         <a href="architecture/index.html">Gallery</a>
         <p class="nav-label">Authoring</p>
         <a class="current" href="plan-authoring.html">Plan authoring</a>
@@ -74,7 +75,7 @@
     <main>
       <p class="eyebrow">Contract / plan authoring</p>
       <h1>From a source document to an executable plan</h1>
-      <p class="lede">Planning skills (<code>deep-interview</code>, <code>arch-brownfield</code>, <code>planf3</code>, <code>arch-review</code>) produce one approved executable plan. Maestro does not run <code>plan gate</code>, <code>plan review</code>, <code>plan ship</code>, <code>plan finalize</code>, or <code>bootstrap</code>. Execution is <code>uv run adws/maestro.py run start|resume|amend|status</code>. Durable authority after start is <code>lane_state.stage</code> plus immutable artifacts.</p>
+      <p class="lede">Planning skills (<code>deep-interview</code>, <code>plan-brownfield</code>, <code>planf3</code>, <code>arch-review</code>) produce one approved <code>plan-contract.v1</code> plan. Test selection follows that contract's existing-and-prospective policy. Maestro does not run <code>plan gate</code>, <code>plan review</code>, <code>plan ship</code>, <code>plan finalize</code>, or <code>bootstrap</code>. Execution is <code>uv run adws/maestro.py run start|resume|amend|attend|status</code>. Durable authority after start is <code>lane_state.stage</code> plus immutable artifacts. The authoring path is <a href="architecture/00-plan-authoring.html">Plan authoring into the factory</a>.</p>
       <pre>source documents ──► approved executable plan ──► run start [--repo …] [--main-ref …]
    (audit, interview,     compiler: schema, DAG,         nine-stage factory
     arch)                 ownership, acceptance</pre>
@@ -100,36 +101,36 @@
 
       <h2>Single repository</h2>
       <ol>
-        <li><code>deep-interview</code>, <code>arch-brownfield</code>, <code>planf3</code>, and <code>arch-review</code> — one approved executable plan.</li>
+        <li><code>deep-interview</code>, <code>plan-brownfield</code>, <code>planf3</code>, and <code>arch-review</code> — one approved executable plan.</li>
         <li><code>uv run adws/maestro.py run start &lt;approved-plan&gt; [--repo &lt;target-worktree-root&gt;] [--main-ref &lt;ref&gt;]</code> — creates the run, <code>PLANNED</code> lanes, and integration ref. Omitted routing flags infer the invoking working directory and symbolic <code>HEAD</code>.</li>
         <li><code>uv run adws/maestro.py run resume &lt;run-id&gt;</code> — next incomplete stage from the last immutable artifact.</li>
-        <li><code>uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;</code> — only verb that may apply a <code>PLAN_AMENDMENT</code>.</li>
+        <li><code>uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;</code> — applies a <code>PLAN_AMENDMENT</code>.</li>
+        <li><code>uv run adws/maestro.py run attend --run &lt;run-id&gt;</code> — opted-in. On <code>NO_PROGRESS</code> it authors and applies one amendment. Absent <code>attend.max_amendments_per_lane</code> refuses <code>ATTEND_DISABLED</code>.</li>
         <li><code>uv run adws/maestro.py run status &lt;run-id&gt;</code> — derived from durable rows after fingerprint revalidation.</li>
       </ol>
       <div class="callout"><strong>Deployment copy only.</strong> Invoke <code>adws/maestro.py</code> from the stamped product repository. Template-source run creation refuses <code>RUN_REPOSITORY_MISMATCH</code>. There is no bootstrap or planctl operator path.</div>
-      <pre># frozen operator surface
+      <pre># operator surface
 uv run adws/maestro.py run start &lt;approved-plan&gt; [--repo &lt;target-worktree-root&gt;] [--main-ref &lt;ref&gt;]
 uv run adws/maestro.py run resume &lt;run-id&gt;
 uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;
+uv run adws/maestro.py run attend --run &lt;run-id&gt;
 uv run adws/maestro.py run status &lt;run-id&gt;</pre>
 
-      <h2>Verifier commands</h2>
-      <p>Public acceptance is behavioral. Private tests are authored, reviewed, and sealed before building. Sealed bytes stay in the vault under <code>runtime_state_root</code>; the builder never receives private source.</p>
-      <ul>
-        <li>Pass real argv, never <code>npm test</code> / <code>make test</code>.</li>
-        <li>Exactly one lane owns a path (<code>SINGLE_OUTPUT_OWNER</code>).</li>
-        <li>Playwright and Cypress cannot be public gates today.</li>
-      </ul>
+      <h2>Existing and prospective verification</h2>
+      <p>Existing tests are selected from a pinned-tree enumeration. A selector literal that enumeration does not contain is not written. Collection does not satisfy <code>min_executed</code>.</p>
+      <p>During planning only, a verifier may name one not-yet-created whole test file. That is a future obligation, not coverage. All of these must hold: one <code>lane_kind: tests</code> owner; exactly one build lane that depends on it; both ids and the file path in <code>oracle</code>; an exact <code>observation_seam</code> and <code>decided_by</code> examples, positive and negative; <code>test_strength.coverage</code> and <code>falsifiability.strategy: baseline_absent</code> on the whole-file path until the refresh; a direct pytest or vitest argv at that future file; and an <code>oracle</code> sentence that no tests were executed during planning. After the tests lane writes the file, refresh the selectors, re-render, re-validate, and obtain a new independent receipt before the producer runs. A planning receipt certifies structure, not that tests passed.</p>
+      <p><code>declared_cases</code> remains a supported tests-verifier field. Ingress projects it onto <code>spec.gate.declared_cases</code>, and the runtime measures each named case at the parent. A tests verifier may carry it; a build verifier may not.</p>
+      <div class="callout">Freeze-discipline copies of <code>planf3</code>, <code>arch-review</code>, and <code>plan-brownfield</code> are cataloged and not installed. They are not this path. <code>refusal-triage</code> names a stuck run's owner before a fix; <code>invariant-check</code> is the pre-land gate on that fix. Neither is a factory stage.</div>
 
-      <h2>Private tests are sealed, then hidden</h2>
-      <p>Shipped factory: test author → test review (<code>PASS</code>/<code>REVISE</code>) → <code>SEALED_TEST_BUNDLE</code> in the hidden vault → builder → code review. Private source, fixtures, selectors, and expected literals do not leak to the builder. Code review runs sealed tests and emits a public result summary plus redacted findings. Historical <code>test_visibility</code> / v5 notes live on <a href="hidden-tests-design.html">hidden-tests-design</a>.</p>
+      <h2>Accepted tests are visible</h2>
+      <p>An accepted suite is an ordinary candidate in the run repository. Every actor can read it. The lane graded against it cannot change those bytes: a plan that lets a lane own the suite is refused <code>OUTPUT_OVERLAPS_TEST_SUITE</code>, and a candidate that touches a protected test path is refused <code>CANDIDATE_TEST_PATH_REFUSED</code>. Review sites hash the suite against the accepted blobs before the runner (<code>TEST_SUITE_TAMPERED</code>). The old hidden vault is not the shipped boundary. Historical notes: <a href="hidden-tests-design.html">hidden-tests-design</a>.</p>
 
       <h2>Outputs are write permission</h2>
       <p>Exactly one lane may own a path. Ask: could an agent satisfy this instruction by changing only these files? If not, the lane will fail review. That judgment is a planning-skill / <code>run amend</code> problem, not <code>maestro plan review</code>.</p>
-      <p>Declare the public interface before private tests bind to it. Public acceptance or <code>spec.instruction</code> must name the module/import path, export or callable, argument and return shapes, and observable errors. A module filename is not a function. Test authors must not invent a private binding; test reviewers report undeclared bindings as <code>REVISE</code>. Builders must not recover missing signatures from sealed tests. Public signatures are not fixtures, selectors, expected literals, or assertion text.</p>
+      <p>Declare the public interface before tests bind to it. Public acceptance or <code>spec.instruction</code> must name the module/import path, export or callable, argument and return shapes, and observable errors. A module filename is not a function. Test authors must not invent a private binding; test reviewers report undeclared bindings as <code>REVISE</code>. Builders must not recover a missing signature by editing the suite. Public signatures are not fixtures, selectors, expected literals, or assertion text.</p>
 
       <h2>Review rejection</h2>
-      <p>A reviewer <code>REVISE</code> artifact returns the lane to <code>WRITING_TESTS</code> or <code>BUILDING</code> with actionable redacted findings. There is no repair chain, attempt identity, or <code>run convergence</code> verb. Resume is the next incomplete stage from the last immutable artifact.</p>
+      <p>A reviewer <code>REVISE</code> artifact returns the lane to <code>WRITING_TESTS</code> or <code>BUILDING</code> with actionable findings, including the runner's failure output verbatim. There is no repair chain, attempt identity, or <code>run convergence</code> verb. Resume is the next incomplete stage from the last immutable artifact.</p>
 
       <h2>Several repositories</h2>
       <p>The proven slice is two dependent lanes in one target worktree. Multi-repo workspace manifests are not the factory operator surface.</p>
@@ -140,9 +141,9 @@ uv run adws/maestro.py run status &lt;run-id&gt;</pre>
         <thead><tr><th>Input</th><th>Skill</th><th>Emits</th><th>Runs?</th></tr></thead>
         <tbody>
           <tr><td>requirements and unresolved decisions</td><td>deep-interview</td><td>explicit approved requirements</td><td>no</td></tr>
-          <tr><td>mapped brownfield codebase</td><td>arch-brownfield</td><td>architecture constraints</td><td>no</td></tr>
-          <tr><td>approved architecture + change</td><td>planf3</td><td>executable lane plan</td><td>yes</td></tr>
-          <tr><td>executable plan</td><td>arch-review</td><td>approval or required revisions</td><td>no</td></tr>
+          <tr><td>mapped brownfield codebase</td><td>plan-brownfield</td><td>executable brownfield plan</td><td>yes, after admission</td></tr>
+          <tr><td>approved architecture plus a change</td><td>planf3</td><td>executable lane plan</td><td>yes, after admission</td></tr>
+          <tr><td>executable plan</td><td>arch-review</td><td>independent receipt, or required revisions</td><td>no — receipt only</td></tr>
         </tbody>
       </table></div>
       <footer>Keep plan-authoring.md as the agent contract. This page is the dark HTML view.</footer>
