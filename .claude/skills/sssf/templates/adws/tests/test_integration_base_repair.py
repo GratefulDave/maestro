@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -295,7 +296,7 @@ class TesterCheckoutRefreshTest(unittest.TestCase):
             cold = maestro.HerdrStageActor(
                 cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
             )
-            cold.write_tests(ctx)
+            cold.write_tests(replace(ctx, input_digest="fe" * 32))
             self.assertEqual(len(recorder.launches), 2)
             self.assertEqual(len(recorder.resubmits), 0)
             self.assertEqual(recorder.launches[1]["head"], integration)

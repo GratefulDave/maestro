@@ -42,6 +42,7 @@ the launcher was actually handed.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import subprocess
 import tempfile
 import unittest
@@ -59,6 +60,7 @@ from adw_modules.scheduler_types import (
     LaneArtifact,
     LaneProjection,
     LaneStage,
+    ReviewerVerdict,
     lane_projection_digest,
 )
 
@@ -294,6 +296,194 @@ def _code_ctx(candidate: str) -> LaneContext:
         },
         test_suite_digest="test-suite.v1:" + "55" * 32,
     )
+
+
+class ARestartDispatchReuseTest(unittest.TestCase):
+    """A completed persisted turn is reusable only for its exact dispatch."""
+
+    @staticmethod
+    def _identity_path(bench: _Bench) -> Path:
+        return (
+            bench.state
+            / "worktrees"
+            / "run-1"
+            / "lane-a"
+            / "test-reviewer"
+            / "session"
+            / "identity-1.json"
+        )
+
+    @staticmethod
+    def _envelope_path(bench: _Bench, turn: int) -> Path:
+        return lch.role_result_path(
+            bench.state
+            / "worktrees"
+            / "run-1"
+            / "lane-a"
+            / "test-reviewer"
+            / "checkout",
+            turn,
+        )
+
+    def _first_dispatch(self, bench: _Bench) -> tuple[LaneContext, Path]:
+        draft = _draft(
+            _commit_suite(bench.product, parent=bench.head, body=_ROUND_ONE),
+            "refs/maestro/candidates/run-1/lane-a/one",
+        )
+        context = _review_ctx(draft)
+        verdict, findings = bench.actor.review_tests(context)
+        self.assertIs(verdict, ReviewerVerdict.PASS)
+        self.assertEqual(list(findings), [])
+        identity = self._identity_path(bench)
+        self.assertTrue(identity.is_file())
+        self.assertTrue(self._envelope_path(bench, 1).is_file())
+        return context, identity
+
+    def _assert_second_dispatch(
+        self, bench: _Bench, context: LaneContext
+    ) -> None:
+        verdict, findings = bench.actor.review_tests(context)
+        self.assertIs(verdict, ReviewerVerdict.PASS)
+        self.assertEqual(list(findings), [])
+        self.assertEqual(bench.launcher.launches, 2)
+        self.assertEqual(bench.launcher.resubmits, 0)
+        self.assertTrue(self._envelope_path(bench, 2).is_file())
+
+    def test_matching_identity_returns_the_persisted_payload_without_dispatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, identity = self._first_dispatch(bench)
+            bench.restart()
+
+            verdict, findings = bench.actor.review_tests(context)
+
+            self.assertIs(verdict, ReviewerVerdict.PASS)
+            self.assertEqual(list(findings), [])
+            self.assertEqual(bench.launcher.launches, 1)
+            self.assertEqual(bench.launcher.resubmits, 0)
+            self.assertTrue(identity.is_file())
+
+    def test_different_input_digest_dispatches_turn_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, _identity = self._first_dispatch(bench)
+            bench.restart()
+
+            self._assert_second_dispatch(
+                bench, replace(context, input_digest="34" * 32)
+            )
+
+
+    def test_changed_prompt_context_dispatches_turn_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, _identity = self._first_dispatch(bench)
+            bench.restart()
+
+            self._assert_second_dispatch(
+                bench,
+                replace(
+                    context,
+                    public_contract={
+                        "acceptance_criteria": ["a different requirement"],
+                        "declared_outputs": [_SUITE],
+                    },
+                    rejected_citation="the suite is written",
+                ),
+            )
+
+    def test_missing_identity_keeps_the_legacy_turn_two_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, identity = self._first_dispatch(bench)
+            identity.unlink()
+            bench.restart()
+
+            self._assert_second_dispatch(bench, context)
+
+    def test_invalid_or_missing_envelope_dispatches_turn_two(self) -> None:
+        for invalid_envelope in (True, False):
+            with self.subTest(invalid_envelope=invalid_envelope):
+                with tempfile.TemporaryDirectory() as tmp:
+                    bench = _Bench(tmp)
+                    context, _identity = self._first_dispatch(bench)
+                    envelope = self._envelope_path(bench, 1)
+                    if invalid_envelope:
+                        envelope.write_text(
+                            json.dumps({"verdict": "UNDECIDED"}), encoding="utf-8"
+                        )
+                    else:
+                        envelope.unlink()
+                    bench.restart()
+
+                    self._assert_second_dispatch(bench, context)
+
+
+class ATesterEnvelopeHarvestSurvivesRestart(unittest.TestCase):
+    def test_tester_written_file_is_returned_from_the_harvested_envelope(self) -> None:
+        agent_written = "// written by tester\nit('survives', () => {});\n"
+
+        class _TesterWritingLauncher(_Launcher):
+            def launch(self, spec: lch.LaunchSpec) -> SimpleNamespace:
+                if spec.pane_role == "tester":
+                    suite = Path(spec.worktree) / _SUITE
+                    suite.parent.mkdir(parents=True, exist_ok=True)
+                    suite.write_text(agent_written, encoding="utf-8")
+                    handle = super().launch(spec)
+                    Path(spec.envelope_path).write_text(
+                        json.dumps({"test_files": {_SUITE: agent_written}}),
+                        encoding="utf-8",
+                    )
+                    return handle
+                return super().launch(spec)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            bench.launcher = _TesterWritingLauncher()
+            bench.actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, bench.launcher),
+                bench.state,
+                bench.target,
+                _ROLE_ROUTES,
+            )
+            bench.actor.step = lambda lane, message, detail="": None
+            context = LaneContext(
+                run_id="run-1",
+                lane=_lane(),
+                plan_revision=1,
+                plan_digest="ef" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="11" * 32,
+                stage=LaneStage.WRITING_TESTS,
+                artifacts={},
+                builder_base_sha=bench.head,
+            )
+
+            first = bench.actor.write_tests(context)
+            checkout = (
+                bench.state
+                / "worktrees"
+                / "run-1"
+                / "lane-a"
+                / "tester"
+                / "checkout"
+            )
+            self.assertEqual(first, {"test_files": {_SUITE: agent_written}})
+            self.assertEqual(
+                (checkout / _SUITE).read_text(encoding="utf-8"), agent_written
+            )
+            bench.restart()
+
+            recovered = bench.actor.write_tests(context)
+
+            self.assertEqual(recovered, {"test_files": {_SUITE: agent_written}})
+            self.assertEqual(bench.launcher.launches, 1)
+            self.assertEqual(bench.launcher.resubmits, 0)
+            self.assertEqual(
+                (checkout / _SUITE).read_text(encoding="utf-8"), agent_written
+            )
 
 
 class ATestReviewerCheckoutIsTheDispatchedDraftCandidate(unittest.TestCase):

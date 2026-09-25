@@ -113,8 +113,10 @@ def _launch(launcher: _ExitingRetainer):
         ctx = SimpleNamespace(
             run_id="run-1",
             lane=SimpleNamespace(lane_id="lane-a", lane_kind=None),
-            stage=SimpleNamespace(value="testing"),
+            plan_revision=1,
             input_digest="digest",
+            stage=SimpleNamespace(value="testing"),
+            artifacts={},
         )
         return actor._launch(ctx, "tester", cwd, {}, prepare_cwd=lambda path: None)
 
