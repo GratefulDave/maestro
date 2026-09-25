@@ -1449,19 +1449,31 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
             )
             first.write_tests(ctx)
-            pane = recorder._live[("lane-a", "tester")].pane_id
+            live_tester = recorder._live[("lane-a", "tester")]
+            pane = live_tester.pane_id
+            prompt_path = recorder.specs[0].prompt_path
+            self.assertTrue(prompt_path.is_file())
+            (
+                state
+                / "worktrees"
+                / "run-resume"
+                / "lane-a"
+                / "tester"
+                / "session"
+                / "identity-1.json"
+            ).unlink()
             second = maestro.HerdrStageActor(
                 cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
             )
             second.write_tests(ctx)
             self.assertEqual(len(recorder.launches), 1)
             self.assertEqual(len(recorder.resubmits), 1)
+            self.assertEqual(
+                Path(recorder._live[("lane-a", "tester")].envelope_path).name,
+                "envelope-2.json",
+            )
             self.assertEqual(recorder._live[("lane-a", "tester")].pane_id, pane)
             self.assertEqual(recorder.cancels, [])
-            self.assertEqual(
-                [spec.envelope_path.name for spec in recorder.specs],
-                ["envelope-1.json", "envelope-2.json"],
-            )
 
     def test_tester_tree_survives_revise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

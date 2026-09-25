@@ -1967,16 +1967,93 @@ class HerdrStageActor:
         else:
             attempt = cwd if cwd.name != "checkout" else cwd.parent
             turn = 1
+        session = attempt / "session"
+        session.mkdir(exist_ok=True)
+        try:
+            session_mode = session.lstat().st_mode
+        except OSError as exc:
+            raise FactoryRefused("ROLE_SESSION_UNSAFE") from exc
+        if not stat.S_ISDIR(session_mode):
+            raise FactoryRefused("ROLE_SESSION_UNSAFE")
+        dispatch_identity = {
+            "extra": st.json_ready(dict(extra)),
+            "input_artifact_refs": {
+                str(kind): str(getattr(record, "artifact_ref", ""))
+                for kind, record in sorted(ctx.artifacts.items())
+            },
+            "input_digest": ctx.input_digest,
+            "plan_revision": ctx.plan_revision,
+            "rejected_citation": str(getattr(ctx, "rejected_citation", "") or ""),
+            "role_key": list(key),
+            "run_id": ctx.run_id,
+            "stage": ctx.stage.value,
+        }
+        identity_bytes = st.canonical_bytes(dispatch_identity)
+
+        def identity_path_for(identity_turn: int) -> Path:
+            return session / "identity-{}.json".format(identity_turn)
+
+        def harvested_payload(identity_turn: int) -> Mapping[str, Any] | None:
+            try:
+                persisted_identity = json.loads(
+                    _read_regular_text_under(
+                        session, identity_path_for(identity_turn)
+                    )
+                )
+                payload = json.loads(
+                    _read_regular_text_under(
+                        cwd, lch.role_result_path(cwd, identity_turn)
+                    )
+                )
+            except (FactoryRefused, OSError, UnicodeError, ValueError):
+                return None
+            if persisted_identity != dispatch_identity or not isinstance(payload, dict):
+                return None
+            if not self._payload_ok(role, payload):
+                return None
+            if role == "tester":
+                try:
+                    # `write_tests` parses this with the same conversion after
+                    # a live dispatch. A malformed completed envelope cannot
+                    # be adopted merely because it was left on disk.
+                    dict(
+                        payload.get("test_files")
+                        or payload.get("private_files")
+                        or {}
+                    )
+                except (TypeError, ValueError):
+                    self._say(
+                        ctx.lane.lane_id,
+                        "discarded malformed harvested tester envelope",
+                        "turn {0}: test_files/private_files cannot be converted "
+                        "to a file mapping".format(identity_turn),
+                    )
+                    return None
+            return payload
+
+        highest_existing_turn: int | None = None
         while (
             lch.role_result_path(cwd, turn).exists()
             or lch.role_prompt_path(cwd, turn).exists()
         ):
+            highest_existing_turn = turn
             turn += 1
+        if highest_existing_turn is not None:
+            payload = harvested_payload(highest_existing_turn)
+            if payload is not None:
+                handle = stored.handle if stored is not None else None
+                recovered = stored or _RoleSession(
+                    handle, cwd, attempt, None, ctx.run_id
+                )
+                recovered.turns = highest_existing_turn
+                recovered.run_id = ctx.run_id
+                self._roles[key] = recovered
+                if handle is not None:
+                    self._retain_completed(handle, key)
+                return payload, handle, cwd
         if stored is not None:
             stored.turns = turn
             stored.run_id = ctx.run_id
-        session = attempt / "session"
-        session.mkdir(exist_ok=True)
         # The tree the role reads is materialized from the artifact this
         # dispatch names, on every dispatch, here and nowhere else. This used
         # to be three conditional calls -- one on the resubmit path, one
@@ -2015,6 +2092,37 @@ class HerdrStageActor:
             prompt.write_bytes(
                 st.canonical_bytes(self._prompt(ctx, role, envelope, actual_cwd, extra))
             )
+
+        def write_identity() -> None:
+            identity = identity_path_for(turn)
+            partial = identity.with_name(
+                ".{0}.{1}.part".format(identity.name, uuid.uuid4().hex)
+            )
+            fd = -1
+            try:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                fd = os.open(str(partial), flags, 0o600)
+                with os.fdopen(fd, "wb") as identity_file:
+                    fd = -1
+                    identity_file.write(identity_bytes)
+                    identity_file.flush()
+                    os.fsync(identity_file.fileno())
+                os.replace(partial, identity)
+            except OSError as exc:
+                raise FactoryRefused("ROLE_SESSION_WRITE_REFUSED") from exc
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                try:
+                    partial.unlink()
+                except FileNotFoundError:
+                    pass
 
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
@@ -2064,6 +2172,7 @@ class HerdrStageActor:
             child_anchor=self._lane_child_anchor(ctx, cwd),
             prepare_adopted_cwd=prepare_adopted_cwd,
         )
+        write_identity()
         try:
             handle = self.launcher.launch(spec)
         except lch.LaunchRefused as extra_exc:
@@ -2142,8 +2251,6 @@ class HerdrStageActor:
             cwd = checkout or attempt / "checkout"
         else:
             attempt, checkout, cwd = stored.attempt, stored.checkout, stored.cwd
-        if (cwd / ".git").exists():
-            self._refresh_git_checkout(cwd, sha)
         extra: dict[str, Any] = {
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_acceptance": list(ctx.lane.public_acceptance),
