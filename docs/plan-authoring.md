@@ -18,12 +18,13 @@ source documents ──► plan-contract.v1 Plan IR  ──► approved plan rev
 Because there is exactly one entry format, "support a new kind of input document" never means
 building a new adapter. It means citing that document as a source in a plan.
 
-The shipped operator surface after an approved plan exists is only:
+The shipped operator surface after an approved plan exists is:
 
 ```text
-uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
+uv run adws/maestro.py run start <approved-plan> [--repo <target-worktree-root>] [--main-ref <ref>]
 uv run adws/maestro.py run resume <run-id>
 uv run adws/maestro.py run amend <approved-plan> --run <run-id>
+uv run adws/maestro.py run attend --run <run-id>
 uv run adws/maestro.py run status <run-id>
 ```
 
@@ -69,6 +70,26 @@ anchor a brownfield plan pins, not something that runs.
 
 Repairing a plan means a new approved revision (and, once a run exists, `run amend`), never editing
 an approved IR in place.
+
+## Existing and prospective verification
+
+Planning skills select verifier tests through `plan-contract`'s existing-and-prospective policy. That policy is authoring. It does not add a factory stage. The path is drawn in [`architecture/00-plan-authoring.html`](architecture/00-plan-authoring.html).
+
+Existing tests are selected from an enumeration of the verifier's pinned tree, not the working tree. A node id, `-k`, `--grep`, or `--testNamePattern` literal absent from that enumeration is not written. The enumeration command is stored in `oracle`. Collection does not satisfy `min_executed`. A missing test is not an existing-test claim.
+
+During planning only, a verifier may name one not-yet-created whole test file. That names a future obligation, not coverage and not an executed result. All of the following hold, or the reviewer refuses the obligation even if the compiler accepts it:
+
+- exactly one owning `lane_kind: tests` lane, and exactly one build lane that depends on it; both ids and the repository-relative file are in the verifier's `oracle`
+- every prospective behavior has an exact `observation_seam` and `decided_by` examples, including a negative case
+- the tests-lane verifier uses `test_strength.coverage` and `test_strength.falsifiability.strategy: baseline_absent`; until the refresh, coverage and expected-failure selectors are the owned whole-file path
+- `command` is a direct pytest or vitest argv aimed at that future file
+- `oracle` states that no tests were executed and no behavioral coverage was certified during planning
+- after the tests lane writes the file, enumerate the real cases, replace the provisional selectors, confirm the intended pre-implementation failure, re-render, re-validate, and obtain a fresh independent receipt before the paired producer runs
+
+A planning receipt certifies structure and review acceptance. It does not certify that product behavior exists or that tests passed.
+
+`declared_cases` remains a supported tests-verifier field: `{case, red_at_parent}` per case, projected by ingress onto `spec.gate.declared_cases`. A build verifier that carries it is refused. The runtime measures each named case at the parent.
+
 
 ## Nine-stage lane execution
 
@@ -136,7 +157,7 @@ Run these in the repository the plan will change.
    — verifies the receipt against the IR bytes, projects lanes, runs the same objective compiler
    as `run start`, and writes canonical plan bytes once (`PLAN_EXISTS` on a second call).
    Authoring writes a plan file and starts no run, so it is a tool rather than an operator verb;
-   the operator surface stays frozen at `run start`, `run resume`, `run amend`, `run status`.
+   the operator surface is `run start`, `run resume`, `run amend`, `run attend`, `run status`.
 5. `uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>`
    — creates the run, initial plan revision, complete DAG projection, and `PLANNED` lanes in one
    transaction, then creates the integration ref. Operator execution is only from the stamped
@@ -618,12 +639,13 @@ authority.
 | Input | Skill | Emits | Executable |
 | --- | --- | --- | --- |
 | a mapped codebase, a master spec | `arch-review` | `plan_kind: architecture` | no — anchor only |
-| an approved architecture IR plus a change request | `plan-brownfield` / `arch-brownfield` | `plan_kind: brownfield` | yes, after compiler admission |
+| an approved architecture IR plus a change request | `plan-brownfield` | `plan_kind: brownfield` | yes, after compiler admission |
 | a greenfield request | `planf3` | `plan_kind: implementation` | yes, after compiler admission |
 | interview notes | `deep-interview` | requirements that feed the IR | no — input only |
 
-The shared contract and the `extensions.maestro` shape are documented in the `plan-contract` skill.
-Execution after admission is `MAESTRO_architecture.md`.
+`arch-brownfield` is not a catalog name. Freeze-discipline copies of `planf3`, `arch-review`, and `plan-brownfield` are cataloged and not installed; they are not this path. `refusal-triage` and `invariant-check` name a stuck run's owner and gate the fix. They are not factory stages.
+
+The shared contract and the `extensions.maestro` shape are documented in the `plan-contract` skill. Execution after admission is `MAESTRO_architecture.md`.
 
 ---
 

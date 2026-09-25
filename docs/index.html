@@ -162,6 +162,7 @@
       <nav aria-label="Documentation">
         <p class="nav-label">Diagrams</p>
         <a href="architecture/00-artifact-factory.html">Current factory</a>
+        <a href="architecture/00-plan-authoring.html">Plan authoring diagram</a>
         <a href="architecture/index.html">Gallery</a>
         <p class="nav-label">System</p>
         <a href="#overview">Overview</a>
@@ -199,12 +200,13 @@
       <section id="architecture">
         <div class="section-head">
           <span class="section-no">GALLERY</span>
-          <div><h2>Architecture diagrams</h2><p class="section-copy">Current diagrams describe the shipped nine-stage factory: one <code>lane_state.stage</code> field, immutable artifacts under an external <code>runtime_state_root</code>, private test sealing, exactly-once integration, final review, and receipt-backed publication through <code>uv run adws/maestro.py run start|resume|amend|status</code>. Every other gallery page is <strong>historical / superseded</strong> and retained as evidence, not as the control plane. Open the <a href="architecture/index.html">architecture gallery</a>.</p></div>
+          <div><h2>Architecture diagrams</h2><p class="section-copy">Current pages are the nine-stage factory, the lane machine, the role topology, and <a href="architecture/00-plan-authoring.html">plan authoring into the factory</a>. Accepted tests are visible and immutable to the lane graded against them. Operator verbs are <code>run start|resume|amend|attend|status</code>. Older gallery pages are historical evidence. Open the <a href="architecture/index.html">architecture gallery</a>.</p></div>
         </div>
         <div class="grid" style="margin-bottom:.85rem">
           <a class="card" href="architecture/00-artifact-factory.html"><span class="tag">00 · current</span><h3>Nine-stage artifact factory</h3><p>Operator CLI, <code>lane_state.stage</code>, sealed vault, exactly-once integration, and receipt-backed publication.</p></a>
           <a class="card" href="architecture/00-lane-stage.html"><span class="tag">00 · current</span><h3>Lane stage machine</h3><p>The nine persisted stages, <code>REVISE</code> loops, <code>NO_PROGRESS</code> pause, <code>BASE_INVALIDATION</code>, and <code>WAITING_FOR_USER</code>.</p></a>
           <a class="card" href="architecture/00-role-topology.html"><span class="tag">00 · current</span><h3>Persistent role topology</h3><p>Invoking Space owns UI anchors; role panes execute on target cwd. Resume restores shells before native gates.</p></a>
+          <a class="card" href="architecture/00-plan-authoring.html"><span class="tag">00 · current</span><h3>Plan authoring into the factory</h3><p>Planning skills, plan-contract, independent receipt, ingress, tests lane, paired build lane.</p></a>
         </div>
         <div class="grid-3">
           <a class="card" href="architecture/01-system.html"><span class="tag">01 · historical</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace. Superseded.</p></a>
