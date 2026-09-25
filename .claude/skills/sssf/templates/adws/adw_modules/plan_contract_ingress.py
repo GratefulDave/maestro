@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -139,16 +140,46 @@ def _requirements_by_id(ir: Mapping[str, Any]) -> dict:
 
 REQUIREMENT_HEADING = "Requirement {0}, in the plan's own words:"
 
+# A maximal identifier-shaped token. The lookbehind makes the match whole:
+# `req-a` inside `x-req-a` or `req-a-baseline` is not an occurrence of `req-a`.
+_ID_TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+def _referenced_requirement_ids(text: str, index: Mapping[str, Any]) -> list:
+    """Requirement ids this text names outright, in order of appearance.
+
+    Lexical only: a token counts when it equals a requirement id the plan
+    declares. Prose such as "the release contract" names nothing, and an
+    identifier that is not a plan requirement is not this predicate's business.
+    """
+    found: list = []
+    seen: set = set()
+    for match in _ID_TOKEN.finditer(text):
+        token = match.group(0).rstrip(".,;:!?)]'\"")
+        if token in index and token not in seen:
+            seen.add(token)
+            found.append(token)
+    return found
+
 
 def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
                       lane_id: str) -> str:
-    """The lane's title as a label, then the requirement text that bounds it."""
+    """The lane's title as a label, then the requirement text that bounds it.
+
+    A bound requirement may name another requirement by id, and that passage is
+    unreadable unless the named requirement reaches the same lane. Every lane
+    kind crosses this function, so the closure check lives here and refuses
+    `REQUIREMENT_REFERENCE_OUTSIDE_LANE` before a draft exists. The author
+    clears it by binding the named requirement to the lane or by making the
+    passage self-contained; ingress never widens the lane on its own.
+    """
     title = _require_text(
         lane.get("title"), "UNMAPPABLE_LANES", "{}.title".format(lane_id))
     bound = _require_id_list(
         lane.get("requirement_ids"), "UNMAPPABLE_LANES",
         "{}.requirement_ids".format(lane_id))
     index = _requirements_by_id(ir)
+    bound_ids = {item for item in bound}
     blocks = [title]
     seen = set()
     for requirement_id in bound:
@@ -166,6 +197,11 @@ def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
         if not text:
             raise IngressError(
                 "UNMAPPABLE_REQUIREMENTS:{}.text".format(requirement_id))
+        for referenced in _referenced_requirement_ids(text, index):
+            if referenced not in bound_ids:
+                raise IngressError(
+                    "REQUIREMENT_REFERENCE_OUTSIDE_LANE:{}:{}:{}".format(
+                        lane_id, requirement_id, referenced))
         blocks.append("{0}\n{1}".format(
             REQUIREMENT_HEADING.format(requirement_id), text))
     return "\n\n".join(blocks)
