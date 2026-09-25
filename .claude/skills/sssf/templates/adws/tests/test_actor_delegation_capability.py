@@ -1453,13 +1453,25 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             pane = live_tester.pane_id
             prompt_path = recorder.specs[0].prompt_path
             self.assertTrue(prompt_path.is_file())
-            Path(live_tester.envelope_path).unlink()
+            (
+                state
+                / "worktrees"
+                / "run-resume"
+                / "lane-a"
+                / "tester"
+                / "session"
+                / "identity-1.json"
+            ).unlink()
             second = maestro.HerdrStageActor(
                 cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
             )
             second.write_tests(ctx)
             self.assertEqual(len(recorder.launches), 1)
             self.assertEqual(len(recorder.resubmits), 1)
+            self.assertEqual(
+                Path(recorder._live[("lane-a", "tester")].envelope_path).name,
+                "envelope-2.json",
+            )
             self.assertEqual(recorder._live[("lane-a", "tester")].pane_id, pane)
             self.assertEqual(recorder.cancels, [])
 

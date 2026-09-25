@@ -496,6 +496,49 @@ class ARefusedCloseIsReportedAndNotFatal(unittest.TestCase):
             self.assertIn("HERDR_QUIESCENCE_UNPROVEN", reported[0][2])
 
 
+class AMalformedHarvestedEnvelopeStartsAFreshTurn(unittest.TestCase):
+    def test_restart_discards_the_bad_tester_payload_and_dispatches_turn_two(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _RoleLauncher(
+                payload={"test_files": {"tests/recovered.py": "assert True\n"}}
+            )
+            bench = _Bench(tmp, launcher=launcher)
+            ctx = _tester_ctx(bench.head, _lane())
+            bench.actor.write_tests(ctx)
+            checkout = bench.checkout("lane-a", "tester")
+            lch.role_result_path(checkout, 1).write_text(
+                json.dumps({"test_files": ["tests/a.py"]}), encoding="utf-8"
+            )
+
+            restarted = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, launcher),
+                bench.state,
+                bench.target,
+                _ROLE_ROUTES,
+            )
+            restarted.step = bench.actor.step
+            result = restarted.write_tests(ctx)
+
+            self.assertEqual(
+                result,
+                {"test_files": {"tests/recovered.py": "assert True\n"}},
+            )
+            self.assertEqual(len(launcher.launches), 1)
+            self.assertEqual(len(launcher.resubmits), 1)
+            self.assertTrue(lch.role_result_path(checkout, 2).is_file())
+            self.assertIn(
+                (
+                    "lane-a",
+                    "discarded malformed harvested tester envelope",
+                    "turn 1: test_files/private_files cannot be converted "
+                    "to a file mapping",
+                ),
+                bench.steps,
+            )
+
+
 class ARetentionFailureKeepsTheDeclaredEnvelope(unittest.TestCase):
     def test_tester_returns_envelope_files_when_retention_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

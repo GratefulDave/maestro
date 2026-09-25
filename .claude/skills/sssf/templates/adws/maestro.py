@@ -2009,7 +2009,27 @@ class HerdrStageActor:
                 return None
             if persisted_identity != dispatch_identity or not isinstance(payload, dict):
                 return None
-            return payload if self._payload_ok(role, payload) else None
+            if not self._payload_ok(role, payload):
+                return None
+            if role == "tester":
+                try:
+                    # `write_tests` parses this with the same conversion after
+                    # a live dispatch. A malformed completed envelope cannot
+                    # be adopted merely because it was left on disk.
+                    dict(
+                        payload.get("test_files")
+                        or payload.get("private_files")
+                        or {}
+                    )
+                except (TypeError, ValueError):
+                    self._say(
+                        ctx.lane.lane_id,
+                        "discarded malformed harvested tester envelope",
+                        "turn {0}: test_files/private_files cannot be converted "
+                        "to a file mapping".format(identity_turn),
+                    )
+                    return None
+            return payload
 
         highest_existing_turn: int | None = None
         while (
