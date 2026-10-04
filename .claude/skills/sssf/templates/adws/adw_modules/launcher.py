@@ -379,6 +379,12 @@ SCRATCH_ENV_KEYS: Tuple[str, ...] = (
 #: `--env` at tab/pane create.
 PANE_ENV_KEYS: Tuple[str, ...] = SCRATCH_ENV_KEYS
 
+#: Passed to the role's own `claude` command as `--settings`: its `env` marks that
+#: one claude process (and the hooks it runs) as a launched worker for the-library's
+#: delegation gate. Not a pane `--env`: the pane outlives the agent, and a claude the
+#: operator starts there by hand later must stay a gated main session.
+CLAUDE_WORKER_SETTINGS = Path(__file__).resolve().with_name("claude_worker_settings.json")
+
 ROLE_AGENT_DIR = ".maestro-agent"
 
 
@@ -883,6 +889,8 @@ def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         spec.model,
         "--effort",
         spec.effort,
+        "--settings",
+        str(CLAUDE_WORKER_SETTINGS),
         "--remote-control",
     )
 

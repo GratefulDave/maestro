@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -92,9 +93,14 @@ class HostAgentArgvTest(unittest.TestCase):
                     "opus",
                     "--effort",
                     "high",
+                    "--settings",
+                    str(launcher.CLAUDE_WORKER_SETTINGS),
                     "--remote-control",
                 ),
             )
+            # The worker marker rides on this claude command, not on the pane.
+            settings = json.loads(launcher.CLAUDE_WORKER_SETTINGS.read_text())
+            self.assertEqual(settings, {"env": {"LIBRARY_DELEGATION_ROLE": "worker"}})
 
     def test_pane_env_forwards_only_scratch_and_native_write_paths_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +114,7 @@ class HostAgentArgvTest(unittest.TestCase):
                     key, _, value = flags[index + 1].partition("=")
                     forwarded[key] = value
             self.assertEqual(set(forwarded), set(launcher.SCRATCH_ENV_KEYS))
+            self.assertNotIn("LIBRARY_DELEGATION_ROLE", forwarded)
             self.assertTrue(forwarded["TMPDIR"].startswith(str(root.resolve())))
             sibling = root.parent / "builder" / "checkout"
             sibling.mkdir(parents=True)
