@@ -153,6 +153,26 @@ class DischargeBinding(unittest.TestCase):
         self._run()
         self.assertEqual([p for p in self.tree.rglob("*.xml")], [])
 
+    def test_no_bytecode_is_written_into_the_tree_under_measurement(self) -> None:
+        self._run()
+        self.assertEqual([p for p in self.tree.rglob("__pycache__")], [])
+
+    def test_the_worst_state_wins_whatever_order_a_repeated_id_is_reported_in(self) -> None:
+        def doc(*states: str) -> bytes:
+            cases = "".join(
+                '<testcase classname="a" name="t">{0}</testcase>'.format(s) for s in states
+            )
+            return "<testsuites><testsuite>{0}</testsuite></testsuites>".format(cases).encode()
+
+        error, passed = "<error message='boom'/>", ""
+        for order in ((error, passed), (passed, error)):
+            reduced, _lines = rr.reduce_junit(doc(*order))
+            self.assertEqual(reduced, {"a::t": rr.PROBE_ERROR})
+        reduced, _ = rr.reduce_junit(doc("<failure message='x'/>", "<skipped/>", passed))
+        self.assertEqual(reduced, {"a::t": rr.PROBE_FAILED_STATE})
+        reduced, _ = rr.reduce_junit(doc("<skipped/>", passed))
+        self.assertEqual(reduced, {"a::t": rr.PROBE_SKIPPED})
+
     def test_a_report_directory_inside_the_tree_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             rr.execute_probe(pytest_runner(), self.tree, PROBE, self.tree / "scratch")

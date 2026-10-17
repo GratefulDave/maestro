@@ -2,10 +2,9 @@
 
 A code reviewer that finds a real defect the accepted suite does not cover can
 submit a probe: a test file, written in its own checkout, that cites the
-contract and fails on the candidate. Prose findings are un-executable, so a
-builder satisfied the visible suite and every sentence of prose, and a lane
-plateau-parked while the reviewer named distinct defects each round
-(FDAdb run 9ec5693b, `lane-wp5b-serving-build`).
+contract and fails on the candidate. Prose findings are un-executable, so a builder satisfied the visible suite and
+every sentence of prose, and a lane plateau-parked on a green suite while the
+reviewer named a distinct defect each round.
 
 This module owns the parts that are decisions about bytes, not about
 workflow:
