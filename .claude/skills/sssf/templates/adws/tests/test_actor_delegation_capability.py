@@ -862,7 +862,8 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(prompt["role"], "tester")
             self.assertEqual(prompt["lane_spec"], lane_spec)
             self.assertIn("Do not git commit", prompt["instructions"])
-            self.assertIn("Do not delegate", prompt["instructions"])
+            self.assertNotIn("Do not delegate", prompt["instructions"])
+            self.assertIn("Subagents may be used", prompt["instructions"])
             self.assertIn("Create UTF-8 JSON", prompt["instructions"])
             # The rename is the declaration; writing into the polled path
             # directly is what a reader can catch half-written.
