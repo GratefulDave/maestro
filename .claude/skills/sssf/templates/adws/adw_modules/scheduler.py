@@ -3497,11 +3497,12 @@ class FactoryScheduler:
         settled = artifact.verdict
         if settled is not None and settled is not verdict:
             # The measurement outranked the reviewer, which it can do in one
-            # direction only: a failing runner promoting a PASS. Say so,
-            # because the transition came from the suite and not the vote.
+            # direction only: a failing runner or a failing admitted probe
+            # promoting a PASS. Say so, because the transition came from a
+            # measurement and not the vote.
             self._say(
                 lane_id,
-                "accepted suite is authoritative; verdict recorded as {0}".format(
+                "measured result is authoritative; verdict recorded as {0}".format(
                     settled.value
                 ),
                 "reviewer said {0}".format(verdict.value),
