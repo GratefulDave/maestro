@@ -54,6 +54,19 @@ class SuiteEnvironmentError(ReviewContractError):
     code = "SUITE_ENVIRONMENT_REFUSED"
 
 
+class SuiteTimeoutError(SuiteEnvironmentError):
+    """The suite did not finish inside `suite_timeout_s`.
+
+    A killed run prints no summary line, so its counts read as zero. That is
+    not a measurement of the candidate: the suite is slow, or the budget is
+    short. It parks for the operator and is never billed to the builder, and
+    unlike the other environment refusals it must not be absorbed as "no case
+    outcome" (`code_review._run_suite`) or as "the base fails too".
+    """
+
+    code = "SUITE_TIMEOUT"
+
+
 @dataclass(frozen=True)
 class LaneRequest:
     """Slice identity needed to fill a LaneArtifact."""

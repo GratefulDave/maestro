@@ -84,6 +84,7 @@ def run_integration_gate(
     gate: Mapping[str, object] | object | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
+    suite_timeout_s: float | None = None,
 ) -> Mapping[str, object]:
     """Run one unconsumed lane's accepted suite against the merged integration head.
 
@@ -112,7 +113,7 @@ def run_integration_gate(
     # publication. A gate that measured bytes nobody accepted is a
     # publication decision made on a forgery, so the tree is verified first.
     tb.verify_suite(files, dest)
-    run = tc.run_suite(dest, tuple(files), gate=gate)
+    run = tc.run_suite(dest, tuple(files), gate=gate, timeout_s=suite_timeout_s)
     min_cases = int(run.get("min_cases") or 1)
     counts = run["counts"]
     failed = bool(
@@ -244,6 +245,7 @@ def _run_suite(
     files: Mapping[str, str],
     *,
     gate: Mapping[str, object] | object | None,
+    suite_timeout_s: float | None = None,
 ) -> tuple[Mapping[str, object], rc.ReviewContractError | None]:
     """Run the suite, treating an environment refusal as a measurement.
 
@@ -256,7 +258,14 @@ def _run_suite(
     untouched.
     """
     try:
-        return tc.run_suite(tree, tuple(files), gate=gate), None
+        return (
+            tc.run_suite(tree, tuple(files), gate=gate, timeout_s=suite_timeout_s),
+            None,
+        )
+    except rc.SuiteTimeoutError:
+        # A run that did not finish is not "no case outcome": it must reach the
+        # operator, not the base-collection check that would read it as one.
+        raise
     except rc.ReviewContractError as exc:
         if suite_environment_detail(exc) is None:
             raise
@@ -278,6 +287,7 @@ def _collect_at_base(
     provision_argv: Sequence[str],
     provision_timeout_s: float | None,
     state_root: Path,
+    suite_timeout_s: float | None = None,
 ) -> bool:
     """Whether the same accepted suite reaches a case outcome at the base commit.
 
@@ -299,8 +309,10 @@ def _collect_at_base(
             state_root=state_root,
         )
         tb.verify_suite(files, base_dest)
-        run, refusal = _run_suite(base_dest, files, gate=gate)
-    except (tm.TreeContainmentRefused, tb.TestSuiteTampered):
+        run, refusal = _run_suite(
+            base_dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+        )
+    except (tm.TreeContainmentRefused, tb.TestSuiteTampered, rc.SuiteTimeoutError):
         # Neither is a fact about the base commit, and both must escape the
         # absolution below. Where the tree may be written is one. The other is
         # the suite itself not being the accepted suite -- a
@@ -565,6 +577,7 @@ def measure_candidate(
     gate: Mapping[str, object] | object | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
+    suite_timeout_s: float | None = None,
 ) -> SuiteMeasurement:
     """Run the accepted suite against a candidate and report counts and output.
 
@@ -600,7 +613,9 @@ def measure_candidate(
         state_root=state_root,
     )
     tb.verify_suite(files, dest)
-    run, refusal = _run_suite(dest, files, gate=gate)
+    run, refusal = _run_suite(
+        dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+    )
     collection_broken = False
     if refusal is not None or _collected_no_case(run):
         # "No case outcome" is ambiguous on its own: an undeclared dependency
@@ -620,6 +635,7 @@ def measure_candidate(
             provision_argv=provision_argv,
             provision_timeout_s=provision_timeout_s,
             state_root=state_root,
+            suite_timeout_s=suite_timeout_s,
         ):
             # Not the candidate's doing. Re-raise the runner's own refusal when
             # there was one, so its interpreter detail reaches the operator.
@@ -810,6 +826,7 @@ def review_builder_output(
     gate: Mapping[str, object] | object | None = None,
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
+    suite_timeout_s: float | None = None,
     measurement: SuiteMeasurement | None = None,
     probe_measurement: ProbeMeasurement | None = None,
 ) -> st.LaneArtifact:
@@ -834,6 +851,7 @@ def review_builder_output(
             gate=gate,
             provision_argv=provision_argv,
             provision_timeout_s=provision_timeout_s,
+            suite_timeout_s=suite_timeout_s,
         )
     files = measurement.files
     run = measurement.run

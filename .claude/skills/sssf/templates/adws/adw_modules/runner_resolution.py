@@ -1001,10 +1001,12 @@ def execute_cases(
                 resolved.runner, timeout_s
             ),
             "returncode": -1,
+            "timed_out": True,
         }
     return {
         "output": (result.stdout or "") + "\n" + (result.stderr or ""),
         "returncode": result.returncode,
+        "timed_out": False,
     }
 
 
