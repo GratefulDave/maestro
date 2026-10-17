@@ -19,9 +19,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   removed; no existing check is weakened.
 - Probes need a cross-vendor acceptor. Vendors are declared by the operator as
   an optional `vendor` on each lane role route in that deployment's own
-  `maestro.config.yaml`; the template leaves it unset. FDAdb and every other
-  deployment get probes only after their operator declares vendors for
-  `code-reviewer` and an eligible acceptor role. Until then the reviewer's
+  `maestro.config.yaml`; the template leaves it unset. A deployment gets probes
+  only after its operator declares `role_routes` vendors in its own
+  `maestro.config.yaml` for `code-reviewer` and an eligible acceptor role. Until then the reviewer's
   ordinary verdict is unchanged (`PROBE_ACCEPTOR_NOT_INDEPENDENT`). No
   deployment config is edited by this change.
 - Probe refusals are typed: `PROBE_COUNT_EXCEEDED`, `PROBE_FILE_MISSING`,
