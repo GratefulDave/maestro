@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -2540,6 +2541,42 @@ def _wait_for_available_shell(
         time.sleep(0.1)
 
 
+def tree_venv_activation(cwd: Path) -> Optional[str]:
+    """The shell line that puts the tree's own `.venv` first on the pane's PATH.
+
+    `tree_env.tree_environment` already does this for every subprocess the
+    harness runs, but an agent pane is not one of them: its shell is a login
+    shell forked by the herdr server, and the operator's rc files can
+    re-prepend a directory after any `--env PATH` a split could pass. A bare
+    `pytest` / `python3` then resolved to a stale system interpreter instead of
+    the provisioned `.venv`. Exporting at the prompt, after the rc files ran and
+    before `agent start`, is the one point the agent and every tool shell it
+    spawns inherit. None when the tree was not provisioned with a venv.
+    """
+    venv = Path(cwd) / ".venv"
+    if not (venv / "bin").is_dir():
+        return None
+    return "export VIRTUAL_ENV={0} PATH={1}:\"$PATH\"".format(
+        shlex.quote(str(venv)), shlex.quote(str(venv / "bin"))
+    )
+
+
+def _activate_tree_venv(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    cwd: Path,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Run `tree_venv_activation` in the pane's shell. True when it was sent."""
+    line = tree_venv_activation(cwd)
+    if line is None:
+        return False
+    herdr_call("pane", "send-text", pane_id, line)
+    sleep(PASTE_SETTLE_S)
+    herdr_call("pane", "send-keys", pane_id, "enter")
+    return True
+
+
 #: How long `agent start` keeps re-offering a pane herdr itself calls busy,
 #: and how often. Finite by construction: at the deadline the refusal is
 #: raised exactly as it was before, so the attempt-level retry still gets its
@@ -4884,10 +4921,12 @@ class HerdrLauncher:
             prepare_route_prompt(spec)
             preflight_launch_prompt(spec)
         try:
-            _wait_for_available_shell(
-                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
-                pane_id,
+            shell_call = lambda *args, **kwargs: self._herdr(  # noqa: E731
+                *args, env=environment, **kwargs
             )
+            _wait_for_available_shell(shell_call, pane_id)
+            if _activate_tree_venv(shell_call, pane_id, bound_cwd):
+                _wait_for_available_shell(shell_call, pane_id)
             started = _start_agent_when_free(
                 lambda: self._herdr(
                     "agent",

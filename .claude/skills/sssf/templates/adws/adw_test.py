@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run
 # /// script
-# dependencies = ["pydantic", "python-dotenv", "pyyaml", "rich"]
+# dependencies = ["pydantic", "pytest", "python-dotenv", "pyyaml", "rich"]
 # ///
 """The factory's own test suite — stdlib unittest, no network, no API keys.
 

@@ -561,5 +561,49 @@ class AGitCheckoutIsResetToTheDispatchedSha(unittest.TestCase):
             self.assertEqual(bench.launcher.seen, [_ROUND_ONE, _ROUND_TWO])
 
 
+class ATesterReviseTurnStartsFromItsDraft(unittest.TestCase):
+    """The revise turn's tree was reset to the integration head, so the tester
+    rebuilt its draft from its envelope instead of editing it."""
+
+    def _context(self, bench: _Bench, artifacts: Mapping[str, object]) -> LaneContext:
+        return LaneContext(
+            run_id="run-1",
+            lane=_lane(),
+            plan_revision=1,
+            plan_digest="ef" * 32,
+            plan_artifact_ref="plan:x",
+            input_digest="11" * 32,
+            stage=LaneStage.WRITING_TESTS,
+            artifacts=cast(Mapping[str, LaneArtifact], artifacts),
+            builder_base_sha=bench.head,
+        )
+
+    def test_a_review_revise_turn_sees_the_draft_files_uncommitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            draft_sha = _commit_suite(bench.product, parent=bench.head, body=_ROUND_ONE)
+            review = SimpleNamespace(payload={"findings": [{"summary": "fix it"}]})
+            context = self._context(
+                bench, {"TEST_DRAFT": _draft(draft_sha, "refs/x"), "TEST_REVIEW": review}
+            )
+
+            result = bench.actor.write_tests(context)
+
+            self.assertEqual(bench.launcher.seen, [_ROUND_ONE])
+            self.assertEqual(result, {"test_files": {_SUITE: _ROUND_ONE}})
+            checkout = bench.state / "worktrees" / "run-1" / "lane-a" / "tester" / "checkout"
+            self.assertEqual(_git(checkout, "rev-parse", "HEAD"), bench.head)
+
+    def test_a_first_turn_starts_from_the_integration_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            draft_sha = _commit_suite(bench.product, parent=bench.head, body=_ROUND_ONE)
+            context = self._context(bench, {"TEST_DRAFT": _draft(draft_sha, "refs/x")})
+
+            bench.actor.write_tests(context)
+
+            self.assertEqual(bench.launcher.seen, [None])
+
+
 if __name__ == "__main__":
     unittest.main()
