@@ -6,6 +6,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthens review): post-freeze reviewer probes
+
+- The code reviewer may author probes: test files outside the accepted suite,
+  each cited against a verbatim requirement of the public contract. Each probe
+  is measured by one runner execution (pytest JUnit per case; vitest through
+  JUnit where the real-runner test passes, otherwise the typed
+  `PROBE_RUNNER_UNSUPPORTED`). A probe that fails on an assertion and is
+  accepted by a reviewer of a different declared vendor is admitted, keeps a
+  frozen set of case ids, and blocks as a `PROBE_FAILED` finding until every
+  frozen case passes. Nothing a prose-only `REVISE` could not already do is
+  removed; no existing check is weakened.
+- Probes need a cross-vendor acceptor. Vendors are declared by the operator as
+  an optional `vendor` on each lane role route in that deployment's own
+  `maestro.config.yaml`; the template leaves it unset. FDAdb and every other
+  deployment get probes only after their operator declares vendors for
+  `code-reviewer` and an eligible acceptor role. Until then the reviewer's
+  ordinary verdict is unchanged (`PROBE_ACCEPTOR_NOT_INDEPENDENT`). No
+  deployment config is edited by this change.
+- Probe refusals are typed: `PROBE_COUNT_EXCEEDED`, `PROBE_FILE_MISSING`,
+  `PROBE_FILE_UNSAFE`, `PROBE_TOO_LARGE`, `PROBE_NOT_UTF8`,
+  `PROBE_TOO_MANY_CASES`, `PROBE_INSTRUMENTATION_ERROR`, `PROBE_NOT_ACCEPTED`,
+  `PROBE_ACCEPTOR_UNAVAILABLE`, `PROBE_ACCEPTANCE_MALFORMED`,
+  `PROBE_RUN_INCOMPLETE`.
+- Build-round progress is the pair `(suite_passed, discharged probe ids)`, never
+  a sum. A suite regression, or a probe discharged earlier and open now, stops
+  the lane regardless of new successes. A round with no probes is numerically
+  unchanged.
+- `review.max_probe_rounds` (template default 5, `0` disables probes) bounds
+  probe-introducing rounds per window; exhaustion parks the lane at `BUILDING`
+  as `NO_PROGRESS`, and `run resume` grants a new window.
+- Probe sources are pinned by a commit under
+  `refs/maestro/probes/<run>/<lane>/<probe_commit_sha>`, created once and never
+  moved. Probes are never merged into integration and are protected from the
+  builder like suite paths. The suite paths, the `ACCEPTED_TEST_SUITE` digest
+  and `verify_suite` are unchanged.
+- Docs: `MAESTRO_architecture.md` (build-progress definition, reviewer mandate,
+  test-suite immutability boundary) and `CLAUDE.md` rule 2 no longer say that no
+  reviewer-authored probe runs after the suite is frozen. The `ad186ba`
+  paragraph of `CLAUDE.md` is marked reverted: a `REVISE` over a green suite
+  blocks.
+
 ### Fixed — the code reviewer's findings example was flattened again
 
 - #200 appended the optional `axis` and `severity` keys to the code
