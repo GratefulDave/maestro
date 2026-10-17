@@ -33,23 +33,39 @@ attend:
   # under the plans directory. Absent refuses ATTEND_PLAN_IR_UNRESOLVED
   # rather than handing an agent a projected plan to edit as an IR.
   # plan_ir: /absolute/path/to/plan.ir.json
+# Reviewer-authored probes: how many code reviews per lane (since its last
+# resume) may admit a new probe. 0 turns the feature off. Absent means 5.
+review:
+  max_probe_rounds: 5
+# Each lane role declares the `vendor:` of the provider its route runs on. A
+# probe is accepted by a role whose declared vendor differs from the
+# code-reviewer's; a different profile or model is not independence, and an
+# undeclared vendor is not guessed, so probes stay inactive for a role with
+# none. Values here come from the provider each route resolves to: the omp
+# `grok` profile defaults to xai-oauth/grok-*, `openai-performance` to
+# openai-codex/gpt-*, and the claude route is anthropic.
 role_routes:
   tester:
     route: omp
     profile: grok
+    vendor: xai
   test-reviewer:
     route: omp
     profile: openai-performance
+    vendor: openai
   builder:
     route: claude
     model: opus
     effort: high
+    vendor: anthropic
   code-reviewer:
     route: omp
     profile: openai-performance
+    vendor: openai
   integration-reviewer:
     route: omp
     profile: openai-performance
+    vendor: openai
 executables:
   herdr: herdr
   omp: omp

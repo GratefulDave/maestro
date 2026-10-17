@@ -24,6 +24,7 @@ from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
 from . import plan_model
+from . import probes
 from . import provisioning as prov
 from . import review_contract as rc
 from . import runner_resolution as rr
@@ -300,6 +301,25 @@ def _substantive_blob(repo: Path, path: str, oid: str) -> str:
     return st.digest_bytes(ast.dump(tree, include_attributes=False).encode())
 
 
+#: `probe_submissions` outcomes (the closed set the CODE_REVIEW record carries).
+PROBE_ADMITTED = "ADMITTED"
+PROBE_PASSED_ON_FIRST_RUN = "PASSED_ON_FIRST_RUN"
+PROBE_REJECTED = "REJECTED"
+PROBE_NOT_ADMITTED = "NOT_ADMITTED"
+PROBE_IGNORED_BUDGET = "IGNORED_BUDGET"
+
+
+def _user_wait_marker(store: ArtifactStore, run_id: str, lane_id: str) -> int:
+    """Sequence of the lane's latest USER_WAIT: where an argument's window starts."""
+    for row in store.conn.execute(
+        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
+        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
+    ):
+        return int(row["sequence"])
+    return 0
+
+
 def _review_content_history(
     store: ArtifactStore,
     run_id: str,
@@ -311,13 +331,7 @@ def _review_content_history(
     USER_WAIT and plan revision reset the window. A changed applicable base,
     spec, projection or accepted suite starts a new argument, not a cycle.
     """
-    marker = 0
-    for row in store.conn.execute(
-        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
-        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
-        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
-    ):
-        marker = int(row["sequence"])
+    marker = _user_wait_marker(store, run_id, lane_id)
     producer_kind = (
         st.ArtifactKind.TEST_DRAFT
         if review_kind is st.ArtifactKind.TEST_REVIEW
@@ -393,7 +407,10 @@ def _review_content_history(
             # so higher stays better in both halves.
             outcome = (summary.get("collected"), -len(review.get("findings") or ()))
         else:
-            outcome = summary.get("passed")
+            # One helper, shared with `tools/lane_gates.py`: the plain passed
+            # count for a review that never carried a probe, and the tuple
+            # (passed, discharged, active) for one that did.
+            outcome = cr.review_progress(review)
         history.append((st.digest_canonical(content), outcome))
     return history
 
@@ -402,6 +419,33 @@ def _regressed(latest: Optional[int], prior: Sequence[Optional[int]]) -> bool:
     """One measured quantity below the best an earlier round in this argument reached."""
     best = [value for value in prior if value is not None]
     return latest is not None and bool(best) and latest < max(best)
+
+
+def _build_progress(outcome: Any) -> Optional[tuple[Any, frozenset[str], frozenset[str]]]:
+    """A build round's outcome as (suite passed, discharged ids, active ids).
+
+    A review that never carried a probe is the plain passed count, which
+    normalizes to a tuple with empty sets so old and new rounds compare.
+    """
+    if outcome is None:
+        return None
+    if isinstance(outcome, tuple):
+        passed, discharged, active = outcome
+        return passed, frozenset(discharged), frozenset(active)
+    return outcome, frozenset(), frozenset()
+
+
+def _plateau_key(outcome: Any, review_kind: st.ArtifactKind) -> Any:
+    """What a round must change to count as moving.
+
+    A build round moves either the suite's passed count or the number of
+    probes it discharged. The ids matter for regression, not for plateau: a
+    round that swaps one discharged probe for another has moved nothing.
+    """
+    if review_kind is st.ArtifactKind.TEST_REVIEW:
+        return outcome
+    progress = _build_progress(outcome)
+    return None if progress is None else (progress[0], len(progress[1]))
 
 
 def _stalled(
@@ -413,7 +457,11 @@ def _stalled(
     """REVISE stops on regression, three flat outcomes, or repeated syntax.
 
     A build round is measured by the accepted suite's passed count, and one
-    round below the applicable best is a regression at any setting.
+    round below the applicable best is a regression at any setting. When the
+    lane carries reviewer-authored probes the outcome is a tuple, never a sum:
+    the passed count regresses on its own, a probe discharged earlier in this
+    argument and open again is its own regression, and a plateau is a window
+    flat in (passed, number of probes discharged).
 
     A tests round is measured by both quantities it can move, as the pair
     (collected, -findings). A plateau needs the whole pair flat across the
@@ -439,12 +487,26 @@ def _stalled(
                 findings, [outcome[1] for outcome in prior]
             ):
                 return True
-        elif _regressed(latest, prior):
-            return True
+        else:
+            now = _build_progress(latest)
+            before = [_build_progress(outcome) for outcome in prior]
+            # The suite count is its own axis, unconditional: a probe
+            # discharged this round cannot pay for a case lost this round.
+            if _regressed(now[0], [b[0] for b in before]):
+                return True
+            # And a probe discharged in an earlier round of this argument,
+            # still active, and not discharged now is a regression however
+            # many other probes were discharged beside it.
+            lost = {pid for b in before for pid in b[1]} & now[2]
+            if lost - now[1]:
+                return True
     window = history[-st.NO_PROGRESS_GRACE_ROUNDS:]
     if len(window) < st.NO_PROGRESS_GRACE_ROUNDS:
         return False
-    plateau = latest is not None and all(outcome == latest for _, outcome in window)
+    key = _plateau_key(latest, review_kind)
+    plateau = key is not None and all(
+        _plateau_key(outcome, review_kind) == key for _, outcome in window
+    )
     return plateau or history[-1][0] in [content for content, _ in history[:-1]]
 
 
@@ -1155,6 +1217,19 @@ class LaneContext:
     #: (`TEST_SUITE_TAMPERED`). Other lanes' merged suites are not here: they
     #: are part of the surface this lane legitimately builds on.
     protected_test_paths: tuple[str, ...] = ()
+    #: Set on the second code-review ask: the `Rejection`s of the probes the
+    #: reviewer submitted, so the re-ask names what to repair.
+    rejected_probes: tuple[Any, ...] = ()
+    #: The lane's active probe records, so the reviewer neither resubmits one
+    #: nor writes over its path.
+    existing_probes: tuple[Mapping[str, Any], ...] = ()
+    #: Probe-introducing rounds left in this window.
+    probe_budget_left: int = 0
+    #: Active probe sources keyed by path, read from the pinned probe commit.
+    #: The builder reads them here; it never finds them in its checkout.
+    probe_texts: Mapping[str, str] | None = None
+    #: The challenges handed to the acceptor on a challenge dispatch.
+    challenges: tuple[Any, ...] = ()
 
 
 class StageActor(Protocol):
@@ -1723,6 +1798,8 @@ class FactoryScheduler:
     #: tests build one that way) reads the same value an absent config key
     #: gives: plateau only.
     regression_on_findings: bool = False
+    #: Same reason: `review.max_probe_rounds` absent is 5, `0` is off.
+    max_probe_rounds: int = 5
 
     def __init__(
         self,
@@ -1741,9 +1818,15 @@ class FactoryScheduler:
         provision_argv: Optional[Sequence[str]] = None,
         concurrency: int = 1,
         regression_on_findings: bool = False,
+        max_probe_rounds: int = 5,
     ) -> None:
         if isinstance(concurrency, bool) or int(concurrency) < 1:
             raise ValueError("concurrency is >= 1")
+        if isinstance(max_probe_rounds, bool) or int(max_probe_rounds) < 0:
+            raise ValueError("max_probe_rounds is >= 0")
+        #: Code-review rounds per window (since the latest USER_WAIT) that may
+        #: admit a reviewer-authored probe. `0` turns new submissions off.
+        self.max_probe_rounds = int(max_probe_rounds)
         #: Whether one worse tests round -- more findings than an earlier round
         #: in the same argument -- is itself a stall. `stall.regression_on_
         #: findings` in the deployment's config; absent is False.
@@ -3033,6 +3116,21 @@ class FactoryScheduler:
             entry = st.BuildingEntryKind.CODE_REVISE
         else:
             entry = st.BuildingEntryKind.INITIAL
+        if entry is st.BuildingEntryKind.CODE_REVISE and self._probe_budget_exhausted(
+            lane_id
+        ):
+            # The review that spent the last probe round was completed, and
+            # the pause that should follow it may not have happened (a crash
+            # between the two). Park here instead of dispatching a builder
+            # past the budget, which is the same state the pause reaches.
+            self._park_no_progress(
+                lane_id,
+                st.LaneStage.BUILDING,
+                "probe budget of {0} round(s) spent; resume grants another window".format(
+                    self.max_probe_rounds
+                ),
+            )
+            return
         builder_base = self._builder_base(lane, suite)
         receipts = self._dep_receipts(lane.needs)
         ids = [plan.artifact_id, suite.artifact_id]
@@ -3085,6 +3183,8 @@ class FactoryScheduler:
         }
         if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
             artifacts["CODE_REVIEW"] = revise
+        records, retired, _receipts, probe_commit = self._accumulated_probes(lane_id)
+        active_probes = probes.active_records(records, retired)
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -3102,7 +3202,18 @@ class FactoryScheduler:
                 interface=lane.public_interface,
             ),
             test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
-            protected_test_paths=self._own_test_paths(lane, suite),
+            # A probe is never written into the builder's tree, but a path the
+            # builder creates there would be one the next review cannot place
+            # the probe at. Refuse it at admission, with the suite's paths.
+            protected_test_paths=tuple(
+                sorted(
+                    {
+                        *self._own_test_paths(lane, suite),
+                        *(str(record["path"]) for record in active_probes),
+                    }
+                )
+            ),
+            probe_texts=self._probe_sources(records, retired, probe_commit) or None,
         )
         surface = self._bound_surface(lane, suite)
         if surface is not None:
@@ -3206,6 +3317,16 @@ class FactoryScheduler:
             candidate_sha=builder.payload["candidate_sha"],
             public_contract=product_contract,
             test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
+            # The reviewer is told which paths are the accepted suite, as the
+            # builder is. Without it the reviewer's `test_paths` was empty.
+            protected_test_paths=self._own_test_paths(lane, suite),
+        )
+        records, retired, receipts, prior_commit = self._accumulated_probes(lane_id)
+        solicit = self.max_probe_rounds > 0
+        budget_left = (
+            max(0, self.max_probe_rounds - self._probe_rounds_used(lane_id))
+            if solicit
+            else 0
         )
         ids = [plan.artifact_id, suite.artifact_id, builder.artifact_id]
         suite_artifact = _record_as_lane_artifact(suite, lane)
@@ -3247,10 +3368,25 @@ class FactoryScheduler:
             ),
         )
         ctx = dataclasses.replace(
-            ctx, suite_result_summary=dict(measurement.summary)
+            ctx,
+            suite_result_summary=dict(measurement.summary),
+            existing_probes=probes.active_records(records, retired),
+            probe_budget_left=budget_left,
         )
+        taken: tuple[Any, ...] = ((), (), ())
+
+        def ask(asked: LaneContext) -> Any:
+            """One reviewer turn, keeping the latest probes it submitted."""
+            nonlocal taken
+            answer = self._call_actor(asked, self.actor.review_code, asked)
+            if solicit:
+                got = self._take_probes(asked)
+                if any(got):
+                    taken = got
+            return answer
+
         self._say(lane_id, "asking code reviewer")
-        verdict, findings = self._call_actor(ctx, self.actor.review_code, ctx)
+        verdict, findings = ask(ctx)
         self._say(
             lane_id,
             "code reviewer answered {0}".format(verdict.value),
@@ -3270,10 +3406,8 @@ class FactoryScheduler:
                 if measurement.runner_failed
                 else "REVISE carried no gating finding, asking again",
             )
-            verdict, findings = self._call_actor(
-                ctx,
-                self.actor.review_code,
-                dataclasses.replace(ctx, suite_findings_required=True),
+            verdict, findings = ask(
+                dataclasses.replace(ctx, suite_findings_required=True)
             )
             self._say(
                 lane_id,
@@ -3292,12 +3426,10 @@ class FactoryScheduler:
                 lane_id,
                 "reviewer finding does not cite the contract, asking again",
             )
-            verdict, findings = self._call_actor(
-                ctx,
-                self.actor.review_code,
+            verdict, findings = ask(
                 dataclasses.replace(
                     ctx, rejected_citation=_rejected_citation(first)
-                ),
+                )
             )
             self._say(
                 lane_id,
@@ -3322,6 +3454,22 @@ class FactoryScheduler:
                         citation[:120],
                     )
                 ) from exc
+        probe_measurement = None
+        if records or any(taken):
+            probe_measurement, verdict, findings = self._probe_review(
+                ctx=ctx,
+                measurement=measurement,
+                product_contract=product_contract,
+                records=records,
+                retired=retired,
+                receipts=receipts,
+                prior_commit=prior_commit,
+                taken=taken,
+                solicit=solicit,
+                budget_left=budget_left,
+                verdict=verdict,
+                findings=findings,
+            )
         artifact = cr.review_builder_output(
             request=request,
             state_root=self.runtime.path,
@@ -3339,6 +3487,7 @@ class FactoryScheduler:
             provision_argv=self._provision_argv,
             provision_timeout_s=self._provision_timeout_s,
             measurement=measurement,
+            probe_measurement=probe_measurement,
         )
         _complete(
             self.store,
@@ -3348,11 +3497,12 @@ class FactoryScheduler:
         settled = artifact.verdict
         if settled is not None and settled is not verdict:
             # The measurement outranked the reviewer, which it can do in one
-            # direction only: a failing runner promoting a PASS. Say so,
-            # because the transition came from the suite and not the vote.
+            # direction only: a failing runner or a failing admitted probe
+            # promoting a PASS. Say so, because the transition came from a
+            # measurement and not the vote.
             self._say(
                 lane_id,
-                "accepted suite is authoritative; verdict recorded as {0}".format(
+                "measured result is authoritative; verdict recorded as {0}".format(
                     settled.value
                 ),
                 "reviewer said {0}".format(verdict.value),
@@ -3370,7 +3520,473 @@ class FactoryScheduler:
         # REVISE remains blocking even over a green suite. Repeated candidate
         # content, measured plateau or regression parks only this lane.
         if settled is st.ReviewerVerdict.REVISE:
-            self._block_if_stalled(lane_id)
+            if self._probe_budget_exhausted(lane_id):
+                # The REVISE above is complete and carries its probe, so no
+                # merge-eligible artifact exists with a measured failure
+                # unaddressed. Park at BUILDING; `_building` re-checks on
+                # entry, so a crash before this line reaches the same state.
+                self._park_no_progress(
+                    lane_id,
+                    st.LaneStage.BUILDING,
+                    "probe budget of {0} round(s) spent; resume grants another window".format(
+                        self.max_probe_rounds
+                    ),
+                )
+            else:
+                self._block_if_stalled(lane_id)
+
+    # -- reviewer-authored probes ------------------------------------------
+
+    def _take_probes(self, ctx: LaneContext) -> tuple[Any, ...]:
+        """(submissions, rejections, challenges) the actor kept from its last turn."""
+        take = getattr(self.actor, "take_probes", None)
+        if take is None:
+            return ((), (), ())
+        submissions, rejections, challenges = take(ctx)
+        return tuple(submissions), tuple(rejections), tuple(challenges)
+
+    def _accumulated_probes(
+        self, lane_id: str
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...], str]:
+        """Records, retirements, receipts and pinned commit the lane has so far.
+
+        Read only from the newest CODE_REVIEW of the current plan revision and
+        lane projection, so a revision or projection change drops them, and
+        validated on every read: nothing here trusts a transport stash.
+        """
+        row, lane = self._common(lane_id)
+        prior = _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.CODE_REVIEW,
+            plan_revision=row["plan_revision"],
+            projection_digest=lane.lane_projection_digest,
+        )
+        if prior is None or not prior.payload.get("probe_records"):
+            return (), (), (), ""
+        payload = prior.payload
+        records = tuple(payload["probe_records"])
+        retired = tuple(payload.get("probe_retired") or ())
+        receipts = tuple(payload.get("probe_receipts") or ())
+        try:
+            probes.validate_receipts(records, retired, receipts)
+        except probes.ProbeReceiptError as exc:
+            raise FactoryRefused("PROBE_RECEIPT_INVALID:{0}".format(exc)) from exc
+        return records, retired, receipts, str(payload.get("probe_commit") or "")
+
+    def _probe_sources(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        retired: Sequence[Mapping[str, Any]],
+        commit: str,
+    ) -> dict[str, str]:
+        """Active probe sources by path, read from the pinned commit alone."""
+        active = probes.active_records(records, retired)
+        if not active:
+            return {}
+        if not commit:
+            raise FactoryRefused("PROBE_SOURCES_UNPINNED")
+        pinned = probes.read_pinned_sources(self.target.git(), commit)
+        sources: dict[str, str] = {}
+        for record in active:
+            raw = pinned.get(str(record["path"]))
+            if raw is None or probes.source_digest(raw) != record["source_sha256"]:
+                raise FactoryRefused("PROBE_SOURCE_MISMATCH:{0}".format(record["path"]))
+            sources[str(record["path"])] = raw.decode("utf-8")
+        return sources
+
+    def _probe_rounds_used(self, lane_id: str) -> int:
+        """Code reviews since the latest USER_WAIT that admitted a probe."""
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        used = 0
+        for row in self.store.conn.execute(
+            "SELECT payload_json FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+            "AND artifact_kind=? AND sequence>? AND plan_revision=?",
+            (
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.CODE_REVIEW.value,
+                _user_wait_marker(self.store, self.run_id, lane_id),
+                revision,
+            ),
+        ):
+            submitted = _loads(row["payload_json"]).get("probe_submissions") or ()
+            used += any(item.get("outcome") == PROBE_ADMITTED for item in submitted)
+        return used
+
+    def _probe_budget_exhausted(self, lane_id: str) -> bool:
+        return self.max_probe_rounds > 0 and (
+            self._probe_rounds_used(lane_id) >= self.max_probe_rounds
+        )
+
+    def _acceptor(self, ctx: LaneContext) -> tuple[str, str, str] | probes.Rejection:
+        """(role, author vendor, acceptor vendor), or why there is no acceptor.
+
+        The capability is mandatory once a probe needs deciding: an actor
+        without it yields a typed non-admission, never silent acceptance.
+        """
+        choose = getattr(self.actor, "acceptor_for", None)
+        if choose is None or getattr(self.actor, "accept_probes", None) is None:
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTOR_UNAVAILABLE, "the actor cannot accept probes"
+            )
+        chosen = choose(ctx)
+        if isinstance(chosen, probes.Rejection):
+            return chosen
+        if not (
+            isinstance(chosen, tuple)
+            and len(chosen) == 3
+            and all(isinstance(item, str) and item for item in chosen)
+        ):
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTOR_UNAVAILABLE, "acceptor_for returned no usable acceptor"
+            )
+        return chosen
+
+    def _decide(
+        self, ctx: LaneContext, items: Sequence[Mapping[str, Any]], mode: str
+    ) -> tuple[str, str, str, dict[str, tuple[str, str]]] | probes.Rejection:
+        """One acceptor pass over a batch. Nothing is mutated here."""
+        acceptor = self._acceptor(ctx)
+        if isinstance(acceptor, probes.Rejection):
+            return acceptor
+        role, author, accepting = acceptor
+        raw = self._call_actor(ctx, self.actor.accept_probes, ctx, role, items, mode)
+        try:
+            answers = probes.parse_acceptance(
+                raw, [str(item["probe_id"]) for item in items], mode
+            )
+        except probes.ProbeAcceptanceMalformed as exc:
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTANCE_MALFORMED, str(exc)[:200]
+            )
+        return role, author, accepting, answers
+
+    def _probe_review(
+        self,
+        *,
+        ctx: LaneContext,
+        measurement: cr.SuiteMeasurement,
+        product_contract: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+        retired: Sequence[Mapping[str, Any]],
+        receipts: Sequence[Mapping[str, Any]],
+        prior_commit: str,
+        taken: tuple[Any, ...],
+        solicit: bool,
+        budget_left: int,
+        verdict: st.ReviewerVerdict,
+        findings: Sequence[Mapping[str, Any]],
+    ) -> tuple[cr.ProbeMeasurement, st.ReviewerVerdict, Sequence[Mapping[str, Any]]]:
+        """Admit, challenge, measure and pin the lane's probes for one review.
+
+        Returns the measurement for `review_builder_output` and the reviewer's
+        verdict and findings -- the second ask's when a rejected submission
+        sent the reviewer back once. Every rejection path leaves the reviewer's
+        ordinary verdict alone; only a measured open probe can change it, and
+        that happens in `review_builder_output`.
+        """
+        lane = ctx.lane
+        lane_id = lane.lane_id
+        tree = measurement.tree
+        if tree is None:
+            raise FactoryRefused("probes need the materialized review tree")
+        tree = Path(tree)
+        scratch = self.runtime.path / "worktrees"
+        git = self.target.git()
+        contract_text = _public_contract_text(product_contract)
+        records, retired, receipts = list(records), list(retired), list(receipts)
+        sources = self._probe_sources(records, retired, prior_commit)
+        probes.write_probe_tree(tree, sources)
+        outcomes: dict[str, dict[str, str]] = {}
+
+        def note(key: str, path: str, outcome: str, pid: str = "", reason: str = "") -> None:
+            item = {"path": path, "outcome": outcome}
+            if pid:
+                item["probe_id"] = pid
+            if reason:
+                item["reason"] = reason
+            outcomes[key] = item
+
+        def keep(receipt: Mapping[str, Any]) -> None:
+            if receipt["receipt_id"] not in {r["receipt_id"] for r in receipts}:
+                receipts.append(dict(receipt))
+
+        def discard(path: str) -> None:
+            (tree / path).unlink(missing_ok=True)
+
+        def admit(
+            submissions: Sequence[probes.ProbeSubmission],
+            parse_rejections: Sequence[probes.Rejection],
+        ) -> list[probes.Rejection]:
+            """Screen, run and accept one batch. Returns the reviewer's rejections."""
+            rejected = list(parse_rejections)
+            for item in parse_rejections:
+                note(item.path, item.path, PROBE_REJECTED, reason=item.code)
+            if not submissions:
+                return rejected
+            if budget_left <= 0:
+                for sub in submissions:
+                    note(sub.path, sub.path, PROBE_IGNORED_BUDGET)
+                return rejected
+            # `tc._derive_runner`'s rule, read without its environment error:
+            # a suite that names no single runner gives a probe nothing to run on.
+            named = {r for r in map(tc._file_runner, measurement.files) if r is not None}
+            if len(named) != 1:
+                for sub in submissions:
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=probes.PROBE_RUNNER_UNSUPPORTED)
+                return rejected
+            runner = named.pop()
+            known_paths = {str(r["path"]) for r in records}
+            known_ids = {str(r["probe_id"]) for r in records}
+            survivors: list[probes.ProbeSubmission] = []
+            for sub in submissions:
+                digest = probes.source_digest(sub.source)
+                problems = list(
+                    probes.check_submission(
+                        sub,
+                        contract_text=contract_text,
+                        interface=lane.public_interface,
+                        runner=runner,
+                        tree=tree,
+                    )
+                )
+                if (
+                    sub.path in known_paths
+                    or probes.probe_id(sub.path, digest, sub.requirement) in known_ids
+                    or (tree / sub.path).exists()
+                ):
+                    problems.append(
+                        probes.Rejection(
+                            sub.path, probes.PROBE_PATH_REFUSED, "the path is already occupied"
+                        )
+                    )
+                if not problems:
+                    try:
+                        probes.write_probe_tree(tree, {sub.path: sub.source})
+                    except probes.ProbePathRefused as exc:
+                        problems.append(
+                            probes.Rejection(sub.path, probes.PROBE_PATH_REFUSED, str(exc)[:200])
+                        )
+                if problems:
+                    rejected.extend(problems)
+                    note(sub.path, sub.path, PROBE_REJECTED, reason=problems[0].code)
+                else:
+                    survivors.append(sub)
+            if not survivors:
+                return rejected
+            try:
+                resolved = rr.resolve(
+                    runner, tree, ".", paths=[sub.path for sub in survivors]
+                )
+            except rr.RunnerUnusable as exc:
+                for sub in survivors:
+                    discard(sub.path)
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=probes.PROBE_RUN_INCOMPLETE)
+                return rejected
+            pending: list[dict[str, Any]] = []
+            for sub in survivors:
+                execution = probes.run_probe(resolved, tree, sub.path, scratch)
+                kind = probes.classify_admission(execution)
+                lines = tuple(cr.failure_lines(execution.output))
+                if kind == probes.ADMISSION_FAILING:
+                    pending.append(
+                        {
+                            "sub": sub,
+                            "case_ids": probes.frozen_case_ids(execution),
+                            "lines": lines or ("the probe's cases fail",),
+                        }
+                    )
+                    continue
+                discard(sub.path)
+                if kind == probes.ADMISSION_PASSED_ON_FIRST_RUN:
+                    note(sub.path, sub.path, PROBE_PASSED_ON_FIRST_RUN)
+                elif kind in (probes.PROBE_INSTRUMENTATION_ERROR, probes.PROBE_TOO_MANY_CASES):
+                    rejected.append(
+                        probes.Rejection(sub.path, kind, "; ".join(lines[:3])[:200])
+                    )
+                    note(sub.path, sub.path, PROBE_REJECTED, reason=kind)
+                else:
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=kind)
+            if not pending:
+                return rejected
+            items = [
+                {
+                    "probe_id": probes.probe_id(
+                        p["sub"].path,
+                        probes.source_digest(p["sub"].source),
+                        p["sub"].requirement,
+                    ),
+                    "path": p["sub"].path,
+                    "source": p["sub"].source,
+                    "requirement": p["sub"].requirement,
+                    "intent": p["sub"].intent,
+                    "failing_case_ids": list(p["case_ids"]),
+                    "failure_lines": list(p["lines"]),
+                }
+                for p in pending
+            ]
+            decided = self._decide(ctx, items, probes.MODE_ACCEPT)
+            if isinstance(decided, probes.Rejection):
+                for item, p in zip(items, pending):
+                    discard(p["sub"].path)
+                    note(item["path"], item["path"], PROBE_NOT_ADMITTED, item["probe_id"], decided.code)
+                return rejected
+            role, author, accepting, answers = decided
+            for item, p in zip(items, pending):
+                sub = p["sub"]
+                answer, reason = answers[item["probe_id"]]
+                receipt = probes.make_receipt(
+                    mode=probes.MODE_ACCEPT,
+                    probe_id=item["probe_id"],
+                    source_sha256=probes.source_digest(sub.source),
+                    candidate_sha=ctx.candidate_sha,
+                    input_digest=ctx.input_digest,
+                    requirement_sha256=probes.requirement_digest(sub.requirement),
+                    failure_sha256=probes.failure_digest(p["case_ids"], p["lines"]),
+                    verdict=answer,
+                    acceptor_role=role,
+                    author_vendor=author,
+                    acceptor_vendor=accepting,
+                    reason=reason,
+                )
+                keep(receipt)
+                if answer == "PASS":
+                    records.append(
+                        probes.make_record(
+                            path=sub.path,
+                            source=sub.source,
+                            blob_oid=git.hash_object(sub.source.encode("utf-8")),
+                            requirement=sub.requirement,
+                            intent=sub.intent,
+                            case_ids=p["case_ids"],
+                            admitted_in=ctx.input_digest,
+                            acceptance_receipt_id=receipt["receipt_id"],
+                        )
+                    )
+                    sources[sub.path] = sub.source
+                    note(sub.path, sub.path, PROBE_ADMITTED, item["probe_id"])
+                else:
+                    discard(sub.path)
+                    rejected.append(
+                        probes.Rejection(sub.path, probes.PROBE_NOT_ACCEPTED, reason[:200])
+                    )
+                    note(sub.path, sub.path, PROBE_REJECTED, item["probe_id"], probes.PROBE_NOT_ACCEPTED)
+            return rejected
+
+        submissions, rejections, challenges = taken
+        existing = {str(r["probe_id"]) for r in probes.active_records(records, retired)}
+        rejected = admit(submissions, rejections)
+        if rejected and solicit and budget_left > 0:
+            self._say(lane_id, "probe submission rejected, asking the reviewer once more")
+            again = dataclasses.replace(
+                ctx,
+                rejected_probes=tuple(rejected),
+                existing_probes=probes.active_records(records, retired),
+            )
+            verdict2, findings2 = self._call_actor(again, self.actor.review_code, again)
+            submissions2, rejections2, challenges2 = self._take_probes(again)
+            try:
+                findings2 = _bind_reviewer_findings(findings2, contract_text=contract_text)
+            except st.CanonicalIdentityError:
+                pass  # an unbound second answer does not replace a bound first one
+            else:
+                verdict, findings = verdict2, findings2
+            held = {str(r["path"]) for r in records}
+            admit([s for s in submissions2 if s.path not in held], rejections2)
+            challenges = challenges2 or challenges
+        by_id = {str(r["probe_id"]): r for r in records}
+        if challenges and existing:
+            first = cr.measure_probes(
+                tree=tree,
+                records=records,
+                retired=retired,
+                receipts=receipts,
+                scratch_root=scratch,
+            )
+            items = []
+            for challenge in challenges:
+                record = by_id.get(challenge.probe_id)
+                if (
+                    record is None
+                    or challenge.probe_id not in existing
+                    or first.status.get(challenge.probe_id) != probes.STATUS_OPEN
+                    or any(item["probe_id"] == challenge.probe_id for item in items)
+                ):
+                    note(
+                        "challenge:" + challenge.probe_id, "", PROBE_REJECTED,
+                        challenge.probe_id, "PROBE_CHALLENGE_NOT_APPLICABLE",
+                    )
+                    continue
+                items.append(
+                    {
+                        "probe_id": challenge.probe_id,
+                        "path": record["path"],
+                        "source": sources[str(record["path"])],
+                        "requirement": record["requirement"],
+                        "intent": record["intent"],
+                        "failing_case_ids": list(record["case_ids"]),
+                        "failure_lines": list(first.evidence.get(challenge.probe_id, ())),
+                        "reason": challenge.reason,
+                    }
+                )
+            if items:
+                decided = self._decide(
+                    dataclasses.replace(ctx, challenges=tuple(challenges)),
+                    items,
+                    probes.MODE_CHALLENGE,
+                )
+                for item in items:
+                    record = by_id[item["probe_id"]]
+                    if isinstance(decided, probes.Rejection):
+                        note(item["path"], item["path"], PROBE_NOT_ADMITTED, item["probe_id"], decided.code)
+                        continue
+                    role, author, accepting, answers = decided
+                    answer, reason = answers[item["probe_id"]]
+                    receipt = probes.make_receipt(
+                        mode=probes.MODE_CHALLENGE,
+                        probe_id=item["probe_id"],
+                        source_sha256=str(record["source_sha256"]),
+                        candidate_sha=ctx.candidate_sha,
+                        input_digest=ctx.input_digest,
+                        requirement_sha256=probes.requirement_digest(str(record["requirement"])),
+                        failure_sha256=probes.failure_digest(
+                            item["failing_case_ids"], item["failure_lines"]
+                        ),
+                        verdict=answer,
+                        acceptor_role=role,
+                        author_vendor=author,
+                        acceptor_vendor=accepting,
+                        reason=reason,
+                    )
+                    keep(receipt)
+                    if answer == "REVISE":
+                        retired.append(
+                            {
+                                "probe_id": item["probe_id"],
+                                "retired_in": ctx.input_digest,
+                                "challenge_receipt_id": receipt["receipt_id"],
+                            }
+                        )
+        active = probes.active_records(records, retired)
+        measured = cr.measure_probes(
+            tree=tree,
+            records=records,
+            retired=retired,
+            receipts=receipts,
+            submissions=tuple(outcomes[key] for key in sorted(outcomes)),
+            scratch_root=scratch,
+        )
+        if active:
+            commit, ref = probes.pin_sources(
+                git,
+                self.run_id,
+                lane_id,
+                {str(r["path"]): sources[str(r["path"])] for r in active},
+            )
+            measured = dataclasses.replace(measured, commit=commit, ref=ref)
+        return measured, verdict, findings
 
     def _block_if_stalled(self, lane_id: str) -> None:
         """Pause a lane on measured stagnation or substantive repetition.
@@ -3402,6 +4018,19 @@ class FactoryScheduler:
             regression_on_findings=self.regression_on_findings,
         ):
             return
+        self._park_no_progress(
+            lane_id,
+            stage,
+            "reviewed outcomes or substantive content stalled after {0} round(s); resume grants another {1}".format(
+                len(history),
+                st.NO_PROGRESS_GRACE_ROUNDS,
+            ),
+        )
+
+    def _park_no_progress(
+        self, lane_id: str, stage: st.LaneStage, detail: str
+    ) -> None:
+        """Pause a lane at `stage` with reason NO_PROGRESS."""
         if stage not in st.PAUSEABLE_STAGES:
             return
         digest, observed = self._pause_input(lane_id, stage)
@@ -3413,14 +4042,7 @@ class FactoryScheduler:
             observed=observed,
             reason=st.WaitReason.NO_PROGRESS,
         )
-        self._say(
-            lane_id,
-            "no progress, blocking for the operator",
-            "reviewed outcomes or substantive content stalled after {0} round(s); resume grants another {1}".format(
-                len(history),
-                st.NO_PROGRESS_GRACE_ROUNDS,
-            ),
-        )
+        self._say(lane_id, "no progress, blocking for the operator", detail)
 
     def _ready_to_merge(self, lane_id: str) -> None:
         """Merge the lane's accepted candidate into the integration ref.

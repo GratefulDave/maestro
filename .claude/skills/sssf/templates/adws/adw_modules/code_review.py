@@ -16,6 +16,7 @@ import dataclasses
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from . import probes
 from . import provisioning as prov
 from . import review_contract as rc
 from . import runner_resolution as rr
@@ -441,6 +442,18 @@ def _summary_is_red(summary: Mapping[str, object]) -> bool:
     return False
 
 
+#: Prepended to the findings the builder is handed when any of them was
+#: synthesized from a probe the harness executed. Unlike the suite framing it
+#: does not depend on the suite being red: a probe fails on a green suite.
+_PROBE_FRAMING = (
+    "Findings coded PROBE_FAILED come from a probe file the harness executed "
+    "against your last candidate. The lines in failure_output that begin "
+    "[probe <path>] are the runner's own output and are ground truth. The probe "
+    "source is in probes; it is read-only and you may not edit, move or delete "
+    "it. Make its cases pass by changing the product outputs."
+)
+
+
 def builder_view(
     *,
     public_contract: Mapping[str, object],
@@ -448,6 +461,7 @@ def builder_view(
     test_suite_digest: str,
     test_paths: Sequence[str] = (),
     prior_code_review: st.LaneArtifact | None = None,
+    probe_texts: Mapping[str, str] | None = None,
 ) -> dict:
     contract = rc.public_contract(
         acceptance_criteria=rc.as_str_tuple(
@@ -469,6 +483,11 @@ def builder_view(
             )
         summary = dict(prior_code_review.payload["public_result_summary"])
         findings = list(prior_code_review.payload["findings"])
+        if any(
+            isinstance(item, Mapping) and item.get("code") == st.PROBE_FAILED
+            for item in findings
+        ):
+            findings.insert(0, _PROBE_FRAMING)
         if _summary_is_red(summary):
             findings.insert(0, _FINDINGS_FRAMING)
         prior = {
@@ -492,6 +511,23 @@ def builder_view(
     }
     if not view["architecture_constraints"]:
         raise rc.ReviewContractError("builder view requires architecture_constraints")
+    if prior_code_review is not None and prior_code_review.payload.get("probe_records"):
+        payload = prior_code_review.payload
+        status = payload.get("probe_status") or {}
+        texts = probe_texts or {}
+        view["probes"] = [
+            {
+                "intent": record["intent"],
+                "path": record["path"],
+                "probe_id": record["probe_id"],
+                "requirement": record["requirement"],
+                "source": texts.get(record["path"], ""),
+                "status": status.get(record["probe_id"], probes.STATUS_OPEN),
+            }
+            for record in probes.active_records(
+                payload["probe_records"], payload.get("probe_retired") or ()
+            )
+        ]
     return view
 
 
@@ -511,6 +547,9 @@ class SuiteMeasurement:
     min_cases: int
     run: Mapping[str, object]
     files: Mapping[str, str]
+    #: The materialized, provisioned review tree the suite ran in. Probes are
+    #: written into and run from this same tree.
+    tree: Path | None = None
 
 
 def measure_candidate(
@@ -552,7 +591,7 @@ def measure_candidate(
     dest = Path(scratch_root) / "review-{0}-{1}".format(
         request.lane_id, request.input_digest[:12]
     )
-    _review_tree(
+    tree = _review_tree(
         candidate_repo,
         candidate_sha,
         dest,
@@ -618,7 +657,140 @@ def measure_candidate(
         min_cases=min_cases,
         run=run,
         files=files,
+        tree=tree,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbeMeasurement:
+    """The probes of one review: the cumulative record and this review's reading.
+
+    `records`, `retired` and `receipts` are cumulative and immutable -- every
+    CODE_REVIEW carries the full lists so far. `status` and `evidence` are what
+    THIS review measured for each ACTIVE probe (records minus retired).
+    `submissions` is this review's per-submission outcome list.
+    """
+
+    records: tuple[Mapping[str, object], ...] = ()
+    retired: tuple[Mapping[str, object], ...] = ()
+    receipts: tuple[Mapping[str, object], ...] = ()
+    submissions: tuple[Mapping[str, object], ...] = ()
+    status: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    evidence: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    commit: str = ""
+    ref: str = ""
+
+    def is_empty(self) -> bool:
+        return not (self.records or self.retired or self.receipts or self.submissions)
+
+
+_DRIFT_IDS = 3
+
+
+def _drift_line(frozen: Sequence[str], seen: Mapping[str, str]) -> str:
+    missing = sorted(set(frozen) - set(seen))[:_DRIFT_IDS]
+    extra = sorted(set(seen) - set(frozen))[:_DRIFT_IDS]
+    return "probe cases changed: missing {0}, extra {1}".format(missing, extra)
+
+
+def measure_probes(
+    *,
+    tree: Path,
+    records: Sequence[Mapping[str, object]],
+    retired: Sequence[Mapping[str, object]] = (),
+    receipts: Sequence[Mapping[str, object]] = (),
+    submissions: Sequence[Mapping[str, object]] = (),
+    scratch_root: Path,
+    commit: str = "",
+    ref: str = "",
+    timeout_s: float = rr.EXECUTE_TIMEOUT_S,
+) -> ProbeMeasurement:
+    """Execute every ACTIVE probe once against the review tree.
+
+    The probe files must already be in `tree` (`probes.write_probe_tree`). A
+    probe is DISCHARGED only by `probes.discharge` over its single execution
+    against its frozen case ids; anything else -- a failing case, a runner
+    failure, a missing or partial report, collection drift, an unusable
+    runner -- is OPEN with the evidence that says why. Candidate-dependent
+    case growth earns nothing: the frozen set is fixed at admission.
+    """
+    probes.validate_receipts(records, retired, receipts)
+    status: dict[str, str] = {}
+    evidence: dict[str, tuple[str, ...]] = {}
+    resolved: dict[str, rr.ResolvedRunner | str] = {}
+    active = probes.active_records(records, retired)
+    for record in active:
+        pid = str(record["probe_id"])
+        path = str(record["path"])
+        runner = tc._file_runner(path)
+        if runner is None:
+            status[pid], evidence[pid] = probes.STATUS_OPEN, ("probe names no runner",)
+            continue
+        if runner not in resolved:
+            peers = [str(r["path"]) for r in active if tc._file_runner(str(r["path"])) == runner]
+            try:
+                resolved[runner] = rr.resolve(runner, Path(tree), ".", paths=peers)
+            except rr.RunnerUnusable as extra:
+                resolved[runner] = "runner unusable: {0}".format(
+                    getattr(extra, "detail", "") or extra
+                )[:300]
+        runner_or_reason = resolved[runner]
+        if isinstance(runner_or_reason, str):
+            status[pid], evidence[pid] = probes.STATUS_OPEN, (runner_or_reason,)
+            continue
+        execution = probes.run_probe(
+            runner_or_reason, Path(tree), path, Path(scratch_root), timeout_s
+        )
+        frozen = [str(item) for item in record["case_ids"]]
+        if probes.discharge(execution, frozen):
+            status[pid], evidence[pid] = probes.STATUS_DISCHARGED, ()
+            continue
+        lines = list(failure_lines(execution.output))
+        if execution.report_error:
+            lines.append(
+                "probe run incomplete: {0} (exit {1})".format(
+                    execution.report_error, execution.returncode
+                )
+            )
+        elif set(execution.cases) != set(frozen):
+            lines.append(_drift_line(frozen, execution.cases))
+        elif execution.returncode != 0 and not lines:
+            lines.append("probe run exited {0}".format(execution.returncode))
+        status[pid] = probes.STATUS_OPEN
+        evidence[pid] = tuple(lines) or ("probe cases did not all pass",)
+    return ProbeMeasurement(
+        records=tuple(records),
+        retired=tuple(retired),
+        receipts=tuple(receipts),
+        submissions=tuple(submissions),
+        status=status,
+        evidence=evidence,
+        commit=commit,
+        ref=ref,
+    )
+
+
+def review_progress(payload: Mapping[str, object]) -> object:
+    """What a build round moved, for the stall rules and for the gate tool.
+
+    A tuple, never a sum: `(suite_passed, discharged ids, active ids)`. A
+    discharged probe cannot compensate for a suite regression, and a probe
+    that was discharged and is open again is its own regression -- both are
+    read off the tuple's parts. A review that never carried a probe returns
+    the plain `passed` integer, so every existing history is unchanged.
+    """
+    summary = payload.get("public_result_summary") or {}
+    passed = summary.get("passed")
+    records = payload.get("probe_records")
+    if not records:
+        return passed
+    retired = {entry.get("probe_id") for entry in payload.get("probe_retired") or ()}
+    active = sorted(
+        str(r["probe_id"]) for r in records if r.get("probe_id") not in retired
+    )
+    status = payload.get("probe_status") or {}
+    discharged = [pid for pid in active if status.get(pid) == probes.STATUS_DISCHARGED]
+    return (passed, tuple(discharged), tuple(active))
 
 
 def review_builder_output(
@@ -639,6 +811,7 @@ def review_builder_output(
     provision_argv: Sequence[str] = (),
     provision_timeout_s: float | None = None,
     measurement: SuiteMeasurement | None = None,
+    probe_measurement: ProbeMeasurement | None = None,
 ) -> st.LaneArtifact:
     """Bind a reviewer verdict to the measurement of one candidate.
 
@@ -670,9 +843,40 @@ def review_builder_output(
     # it is recorded in `advisory_findings`, and it is not in the set that
     # decides whether this lane goes back to BUILDING. Nothing below ranks one
     # axis against the other -- they simply never meet again.
+    for submitted in findings:
+        if any(key in submitted for key in st.HARNESS_FINDING_KEYS):
+            raise rc.ReviewContractError(
+                "REVIEW_FINDINGS_MALFORMED: a reviewer finding may not carry a code"
+            )
     findings, standards = st.partition_findings_by_axis(findings)
+    probe_findings: tuple[Mapping[str, str], ...] = ()
+    probe_lines: list[str] = []
+    probed = probe_measurement is not None and not probe_measurement.is_empty()
+    if probed:
+        probes.validate_receipts(
+            probe_measurement.records, probe_measurement.retired, probe_measurement.receipts
+        )
+        for record in probes.active_records(
+            probe_measurement.records, probe_measurement.retired
+        ):
+            pid = str(record["probe_id"])
+            if probe_measurement.status.get(pid) == probes.STATUS_DISCHARGED:
+                continue
+            lines = probe_measurement.evidence.get(pid) or ()
+            probe_findings += (probes.probe_failed_finding(record, lines),)
+            probe_lines.extend(
+                "[probe {0}] {1}".format(record["path"], line) for line in lines
+            )
     if measurement.runner_failed and verdict is st.ReviewerVerdict.PASS:
         verdict = st.ReviewerVerdict.REVISE
+    if probe_findings and verdict is st.ReviewerVerdict.PASS:
+        # One direction only, like the runner promotion above: a measured
+        # failing probe is a REVISE whatever the reviewer's vote, and whatever
+        # the probe budget says. It is never rewritten the other way.
+        verdict = st.ReviewerVerdict.REVISE
+    # Appended BEFORE the empty-findings check so `_UNGATED_REVISE` can never
+    # stand in for a located, measured failure.
+    findings = tuple(findings) + probe_findings
     if verdict is st.ReviewerVerdict.REVISE and not findings:
         # A REVISE with nothing locatable left: a red suite the reviewer did
         # not locate, or a REVISE whose findings were all standards. Say what
@@ -685,23 +889,27 @@ def review_builder_output(
             )
         else:
             findings = (_UNGATED_REVISE,)
-    results_digest = st.digest_bytes(
-        st.canonical_bytes(
-            {
-                "counts": run["counts"],
-                "executed": run["executed"],
-                "output": run["output"],
-                "returncode": run["returncode"],
-            }
-        )
-    )
+    digest_body: dict[str, object] = {
+        "counts": run["counts"],
+        "executed": run["executed"],
+        "output": run["output"],
+        "returncode": run["returncode"],
+    }
+    if probed:
+        digest_body["probes"] = {
+            "evidence": {k: list(v) for k, v in probe_measurement.evidence.items()},
+            "records": [r["probe_id"] for r in probe_measurement.records],
+            "retired": [r["probe_id"] for r in probe_measurement.retired],
+            "status": dict(probe_measurement.status),
+        }
+    results_digest = st.digest_bytes(st.canonical_bytes(digest_body))
     findings_out = rc.actionable_findings(verdict, findings)
     test_suite_digest = str(accepted_suite.payload["test_suite_digest"])
     payload = {
         "builder_base_sha": builder_base_sha,
         "candidate_ref": candidate_ref,
         "candidate_sha": candidate_sha,
-        "failure_output": list(failure_lines(str(run["output"]))),
+        "failure_output": list(failure_lines(str(run["output"]))) + probe_lines,
         "findings": [dict(item) for item in findings_out],
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
@@ -724,6 +932,35 @@ def review_builder_output(
             }
             for item in standards
         ]
+    if probed:
+        active_ids = [
+            r["probe_id"]
+            for r in probes.active_records(
+                probe_measurement.records, probe_measurement.retired
+            )
+        ]
+        payload["probe_records"] = [dict(r) for r in probe_measurement.records]
+        payload["probe_retired"] = [dict(r) for r in probe_measurement.retired]
+        payload["probe_receipts"] = [dict(r) for r in probe_measurement.receipts]
+        payload["probe_submissions"] = [dict(r) for r in probe_measurement.submissions]
+        payload["probe_status"] = dict(probe_measurement.status)
+        payload["probe_summary"] = {
+            "active": len(active_ids),
+            "discharged": sum(
+                1
+                for pid in active_ids
+                if probe_measurement.status.get(pid) == probes.STATUS_DISCHARGED
+            ),
+            "open": sum(
+                1
+                for pid in active_ids
+                if probe_measurement.status.get(pid) != probes.STATUS_DISCHARGED
+            ),
+        }
+        if probe_measurement.commit:
+            payload["probe_commit"] = probe_measurement.commit
+        if probe_measurement.ref:
+            payload["probe_ref"] = probe_measurement.ref
     if payload["test_suite_digest"] != test_suite_digest:
         raise rc.ReviewContractError("measured suite is not the accepted suite")
     # The ref is keyed on the digest of the runner's own result bytes, not on

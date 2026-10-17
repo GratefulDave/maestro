@@ -48,9 +48,18 @@ now, and the rule is about immutability.
    `ACCEPTED_TEST_SUITE` digest binds the builder, the code review and the run
    gate to the same bytes. The builder and reviewer prompts say the reviewer
    grades against the acceptance criteria, not the suite; that is an
-   instruction, not a check -- there is no blocking finding kind for an
-   implementation shaped to the assertions, and no reviewer-authored probe
-   runs after the suite is frozen.
+   instruction, not a check. The one measured answer to an implementation
+   shaped to the assertions is the reviewer probe: the code reviewer may author
+   a test file outside the suite, cited against the public contract, and an
+   admitted probe that fails blocks as a `PROBE_FAILED` finding. Admission
+   needs a failing assertion and acceptance by a reviewer of a different
+   declared vendor (`vendor` on a lane role route in the deployment's own
+   `maestro.config.yaml`; undeclared means no probes). Probes are pinned under
+   `refs/maestro/probes/<run>/<lane>/<probe_commit_sha>`, never merged to
+   integration, protected from the builder, and bounded by
+   `review.max_probe_rounds` (default 5, `0` off). They are a second set: the
+   suite paths, the `ACCEPTED_TEST_SUITE` digest and `verify_suite` are
+   unchanged.
 3. **A weakened check is a contract change, never a fix** — a diff that deletes
    or weakens a verdict, a check, or an error path is never the fix for a
    blocked run. It lands on its own, labeled as such, separately from the bug
@@ -67,6 +76,13 @@ causes a transition. The scheduler logs it plainly — `"suite is
 authoritative; verdict recorded as PASS"` beside `"reviewer said REVISE"`
 (`adw_modules/scheduler.py`). Bundled with six other changes, nobody saw it.
 Alone, it would have read as what it is: a decision that a reviewer cannot block.
+That override has since been reverted and is history, not current behavior:
+`review_builder_output` now keeps a reviewer's `REVISE` over a green suite and
+the lane returns to `BUILDING` (`adw_modules/code_review.py`). The
+runner still outranks the reviewer in one direction only, a `PASS` over a
+failing suite or a failing admitted probe becoming `REVISE`; the scheduler's
+`"measured result is authoritative; verdict recorded as ..."` log
+(`adw_modules/scheduler.py`) fires only for that promotion.
 
 `c2cece7` (#205, 2026-09-04) added `FactoryScheduler._drop_unobservable_findings`.
 The integration reviewer kept reporting that sealed test paths were absent from
