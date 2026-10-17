@@ -177,8 +177,13 @@ def _config_concurrency(value: object, label: str) -> int:
     return int(value)
 
 
-def _config_timeout(value: object, label: str) -> float:
-    """Seconds allowed for one provisioning run. Absent keeps the default.
+def _config_timeout(
+    value: object, label: str, default: float | None = lch.PROVISION_TIMEOUT_S
+) -> float | None:
+    """Seconds allowed for one provisioning (or suite) run. Absent keeps the default.
+
+    `suite_timeout_s` passes `default=None`: the suite default lives in
+    `tests_chain.SUITE_TIMEOUT_S` and an absent key defers to it.
 
     A deployment whose `provision_argv` installs several manifests on a cold
     cache legitimately needs longer than the default, and a timeout there is
@@ -186,7 +191,7 @@ def _config_timeout(value: object, label: str) -> float:
     rather than a slow one.
     """
     if value is None:
-        return lch.PROVISION_TIMEOUT_S
+        return default
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _MaestroConfigurationError(label + " must be a positive number")
     seconds = float(value)
@@ -455,6 +460,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     )
     loaded["provision_timeout_s"] = _config_timeout(
         loaded.get("provision_timeout_s"), "provision_timeout_s"
+    )
+    loaded["suite_timeout_s"] = _config_timeout(
+        loaded.get("suite_timeout_s"), "suite_timeout_s", None
     )
     loaded["dashboard"] = _canonical_dashboard(loaded.get("dashboard"))
     loaded["attend"] = _canonical_attend(loaded.get("attend"))
@@ -3088,6 +3096,7 @@ def _actor_for(
         provision_argv=layout.get("provision_argv") or (),
         provision_timeout_s=layout.get("provision_timeout_s")
         or lch.PROVISION_TIMEOUT_S,
+        suite_timeout_s=layout.get("suite_timeout_s"),
         workspace_label=lch.workspace_label_for(_project_identity(target), run_id),
         parent_workspace_id=_INVOCATION_WORKSPACE.get(),
     )

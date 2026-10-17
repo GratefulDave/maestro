@@ -2723,6 +2723,7 @@ class HerdrLauncher:
         admitted_routes: AdmittedRouteSet,
         provision_argv: Sequence[str] = (),
         provision_timeout_s: float = PROVISION_TIMEOUT_S,
+        suite_timeout_s: float | None = None,
         workspace_label: str = "",
         parent_workspace_id: str = "",
     ) -> None:
@@ -2738,6 +2739,10 @@ class HerdrLauncher:
         #: cold cache outruns the default, so a deployment can raise it; a
         #: timeout must read as a slow install, not a broken command.
         self.provision_timeout_s = float(provision_timeout_s)
+        #: Bound on one accepted-suite run; None defers to
+        #: `tests_chain.SUITE_TIMEOUT_S` (3600s). A run that hits it parks as
+        #: SUITE_TIMEOUT instead of reading as zero cases.
+        self.suite_timeout_s = None if suite_timeout_s is None else float(suite_timeout_s)
         #: Label for a parent Space Maestro creates when none is open on the
         #: repository (the operator's own Space, when open, is the parent and
         #: keeps its label). Empty keeps the non-run path: panes split from

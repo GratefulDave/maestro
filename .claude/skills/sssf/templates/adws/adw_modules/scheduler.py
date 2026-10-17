@@ -1791,6 +1791,17 @@ def _resolved_provision_timeout(actor: object) -> float | None:
     return None if seconds is None else float(seconds)
 
 
+def _resolved_suite_timeout(actor: object) -> float | None:
+    """Seconds one accepted-suite run may take, or None for `tc.SUITE_TIMEOUT_S`.
+
+    Same launcher binding as the provisioning timeout: both are bounds a
+    deployment sets once in `maestro.config.yaml`.
+    """
+    launcher = getattr(actor, "launcher", None)
+    seconds = getattr(launcher, "suite_timeout_s", None)
+    return None if seconds is None else float(seconds)
+
+
 class FactoryScheduler:
     """Advance every ready lane one frozen stage at a time."""
 
@@ -1800,6 +1811,8 @@ class FactoryScheduler:
     regression_on_findings: bool = False
     #: Same reason: `review.max_probe_rounds` absent is 5, `0` is off.
     max_probe_rounds: int = 5
+    #: Same reason: absent means `tc.SUITE_TIMEOUT_S`.
+    _suite_timeout_s: float | None = None
 
     def __init__(
         self,
@@ -1842,6 +1855,7 @@ class FactoryScheduler:
         self.target = target
         self._provision_argv = _resolved_provision_argv(actor, provision_argv)
         self._provision_timeout_s = _resolved_provision_timeout(actor)
+        self._suite_timeout_s = _resolved_suite_timeout(actor)
         self.stage_started = stage_started
         self.stage_completed = stage_completed
         self.step = step
@@ -3353,6 +3367,7 @@ class FactoryScheduler:
             gate=self._suite_gate(lane),
             provision_argv=self._provision_argv,
             provision_timeout_s=self._provision_timeout_s,
+            suite_timeout_s=self._suite_timeout_s,
         )
         counts = measurement.summary
         self._say(
@@ -3486,6 +3501,7 @@ class FactoryScheduler:
             gate=self._suite_gate(lane),
             provision_argv=self._provision_argv,
             provision_timeout_s=self._provision_timeout_s,
+            suite_timeout_s=self._suite_timeout_s,
             measurement=measurement,
             probe_measurement=probe_measurement,
         )
@@ -4246,6 +4262,7 @@ class FactoryScheduler:
                 gate=self._suite_gate(lane),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
+                suite_timeout_s=self._suite_timeout_s,
             )
             if result["failed"]:
                 failures.append(lane.lane_id)

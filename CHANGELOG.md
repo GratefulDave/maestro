@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed — a suite that outruns its budget parks as `SUITE_TIMEOUT`
+
+- `run_suite` killed the accepted suite at a hard-coded 120s. A killed run
+  prints no summary line, its counts parsed as zero, and the candidate read as
+  one that collects nothing: the builder was billed revise rounds until the
+  lane parked `NO_PROGRESS`.
+- `execute_cases` now reports `timed_out`, and `run_suite` raises the typed
+  `SuiteTimeoutError` (`SUITE_TIMEOUT`, a `SuiteEnvironmentError`). It is not
+  absorbed as "no case outcome" in `code_review._run_suite`, nor as "the base
+  fails too" in `_collect_at_base`.
+- The bound is `suite_timeout_s` in the deployment's `maestro.config.yaml`,
+  validated like `provision_timeout_s`; absent defers to
+  `tests_chain.SUITE_TIMEOUT_S` (3600s). It reaches every suite run: candidate
+  measurement, base collection, review binding and the integration gate.
+
 ### Fixed — restore the reviewed test draft on correction
 
 - When a test review requests changes, refresh the tester's checkout to the current integration head and restore the reviewed draft files as uncommitted changes before resubmitting the tester.

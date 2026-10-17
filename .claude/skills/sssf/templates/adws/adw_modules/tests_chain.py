@@ -653,13 +653,21 @@ def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
     return counts
 
 
+#: Default bound on one accepted-suite run. A run stops only when the suite is
+#: done, not when a short budget ran out: a deployment lowers it, never the
+#: reverse. `maestro.config.yaml`'s `suite_timeout_s` overrides it.
+SUITE_TIMEOUT_S = 3600.0
+
+
 def run_suite(
     tree: Path,
     paths: Sequence[str],
     *,
     gate: Any = None,
-    timeout_s: float = 120.0,
+    timeout_s: float | None = None,
 ) -> dict:
+    if timeout_s is None:
+        timeout_s = SUITE_TIMEOUT_S
     files = tuple(paths)
     bound = _suite_gate(gate, files)
     # The tree runs with what provisioning installed in it and nothing else.
@@ -703,6 +711,15 @@ def run_suite(
     )
     output = str(raw.get("output") or "")
     returncode = int(raw.get("returncode") or 0)
+    if raw.get("timed_out"):
+        # A killed run prints no summary line, so parsing it would report zero
+        # cases and read as a candidate that collects nothing. It measured
+        # nothing; the operator raises `suite_timeout_s` and resumes.
+        raise rc.SuiteTimeoutError(
+            f"SUITE_TIMEOUT:{bound.runner}: the suite did not finish within "
+            f"{timeout_s:g}s, so no case outcome was measured. "
+            "Raise `suite_timeout_s`."
+        )
     counts = _parse_suite_counts(bound.runner, output)
     executed = (
         counts["passed"] + counts["failed"] + counts["errored"] + counts["skipped"]
