@@ -1255,12 +1255,36 @@ def _assert_ingress_projection_is_total(
                 raise IngressProjectionIncomplete(
                     "lane {0}: build bindings carry {1}".format(lane_id, key))
     try:
-        st._reject_private_keys(projected["spec"])
+        _reject_projected_private_keys(projected["spec"])
     except st.CanonicalIdentityError as exc:
         raise IngressProjectionIncomplete(
             "lane {0}: projected spec carries a private key ({1}); the "
             "projection controls every key it emits, so this is a "
             "projection defect".format(lane_id, exc)) from None
+
+
+# IR fields whose values the projection copies verbatim from the signed IR.
+# Their inner keys are the plan's own payload (a worked example's `input` may
+# legitimately hold `{"fixture": false}`), not keys the projection emits, so the
+# private-key self-check names the field and does not descend into its value.
+_VERBATIM_IR_VALUES = frozenset(
+    {"decided_by", "witness", "preconditions", "producer_metadata"})
+
+
+def _reject_projected_private_keys(value: Any, path: str = "") -> None:
+    """`st._reject_private_keys` over the keys the projection itself emits."""
+    if isinstance(value, Mapping):
+        for key, inner in value.items():
+            joined = "{0}.{1}".format(path, key) if path else str(key)
+            if key in st.FORBIDDEN_PRIVATE_KEYS:
+                raise st.CanonicalIdentityError(
+                    "private field refused:{}".format(joined))
+            if key not in _VERBATIM_IR_VALUES:
+                _reject_projected_private_keys(inner, joined)
+    elif isinstance(value, (list, tuple)):
+        for index, inner in enumerate(value):
+            _reject_projected_private_keys(
+                inner, "{0}[{1}]".format(path, index))
 
 
 def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
