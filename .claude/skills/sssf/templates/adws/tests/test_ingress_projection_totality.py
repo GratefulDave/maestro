@@ -70,6 +70,47 @@ class IngressTotalityTests(unittest.TestCase):
                 self.ingress.project_draft(self.ir, self.repo)
         self.assertIn("private key", str(caught.exception))
 
+    def test_private_key_names_inside_verbatim_ir_values_are_carried(self) -> None:
+        # The signed IR's own payload may use these names as data: a worked
+        # example for a model-index API holds `"fixture": false`. The projection
+        # copies those values verbatim, so the self-check must not refuse them.
+        ir = copy.deepcopy(self.ir)
+        claims = {c["claim_id"]: c for c in ir["claims"]}
+        example = {
+            "input": {"call": {"name": "m", "fixture": False}},
+            "expect": {"entry": {"fixture": False, "selectors": []}},
+        }
+        claims["claim-t"]["decided_by"] = [example]
+        claims["claim-t"]["witness"] = {"fixture": "f"}
+        claims["claim-t"]["preconditions"] = [{"selector": "s"}]
+        ir["fixtures"][0]["producer_metadata"] = {"fixtures": ["x"]}
+
+        draft = self.ingress.project_draft(ir, self.repo)
+
+        tests_lane = next(
+            lane for lane in draft["lanes"] if "obligations" in lane["spec"])
+        obligations = tests_lane["spec"]["obligations"]
+        claim = obligations["claims"][0]
+        self.assertEqual(claim["decided_by"], [example])
+        self.assertEqual(claim["witness"], {"fixture": "f"})
+        self.assertEqual(claim["preconditions"], [{"selector": "s"}])
+        self.assertEqual(
+            obligations["observed_baseline"][0]["producer_metadata"],
+            {"fixtures": ["x"]})
+
+    def test_private_key_beside_verbatim_value_is_still_named(self) -> None:
+        real = self.ingress._obligations
+
+        def leak(*args, **kwargs):
+            data = real(*args, **kwargs)
+            data["claims"] = [dict(data["claims"][0], fixture="leaked")]
+            return data
+
+        with mock.patch.object(self.ingress, "_obligations", leak):
+            with self.assertRaises(self.ingress.IngressProjectionIncomplete) as caught:
+                self.ingress.project_draft(self.ir, self.repo)
+        self.assertIn("obligations.claims[0].fixture", str(caught.exception))
+
     def test_dropped_decided_by_examples_are_named(self) -> None:
         real = self.ingress._acceptance
 

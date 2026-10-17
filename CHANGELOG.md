@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (narrows a check): projection private-key self-check skips verbatim IR values
+
+- The ingress self-check over each projected lane spec refused any key in
+  `FORBIDDEN_PRIVATE_KEYS` at any depth, including inside values the
+  projection copies verbatim from the signed IR. A plan whose worked example
+  holds `{"fixture": false}` as API data could not be projected at all.
+- The check still refuses a forbidden key anywhere the projection emits one,
+  and still refuses one named as a verbatim field's own key; it no longer
+  descends into the values of `decided_by`, `witness`, `preconditions` and
+  `producer_metadata`, which are the plan author's payload. Lane artifact
+  payloads keep the unchanged recursive check.
+
 ### Fixed — a suite that outruns its budget parks as `SUITE_TIMEOUT`
 
 - `run_suite` killed the accepted suite at a hard-coded 120s. A killed run
