@@ -51,6 +51,9 @@ class LayoutToActorTest(unittest.TestCase):
     def _layout(self, root: Path, vendors: Mapping[str, str] | None) -> dict[str, Any]:
         text = Path(maestro.__file__).with_name("maestro.config.yaml").read_text(encoding="utf-8")
         config = yaml.safe_load(text)
+        if vendors is not None:
+            for binding in config["role_routes"].values():
+                binding.pop("vendor", None)
         for role, vendor in (vendors or {}).items():
             config["role_routes"][role]["vendor"] = vendor
         config["runtime_state_root"] = str(root / "state")
@@ -83,7 +86,9 @@ class LayoutToActorTest(unittest.TestCase):
         self.assertEqual(actor.role_vendors["code-reviewer"], "openai")
         self.assertEqual(actor.role_vendors["test-reviewer"], "anthropic")
         self.assertIsNone(actor.role_vendors["tester"])
-        self.assertEqual(actor.acceptor_for(mock.Mock()), "test-reviewer")
+        self.assertEqual(
+            actor.acceptor_for(mock.Mock()), ("test-reviewer", "openai", "anthropic")
+        )
 
     def test_vendors_never_ride_inside_the_route_mapping(self) -> None:
         actor = self._actor({"code-reviewer": "openai", "test-reviewer": "anthropic"})
@@ -93,23 +98,23 @@ class LayoutToActorTest(unittest.TestCase):
     def test_an_actor_built_without_vendors_is_not_independent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bench = pb.Bench(tmp, _acceptor())
-            self.assertIsNone(bench.actor.acceptor_for(mock.Mock()))
-            self.assertIsInstance(
-                probes.select_acceptor(bench.actor.role_vendors), probes.Rejection
-            )
-            self.assertEqual(
-                probes.select_acceptor(bench.actor.role_vendors).code,
-                probes.PROBE_ACCEPTOR_NOT_INDEPENDENT,
-            )
+            rejected = bench.actor.acceptor_for(mock.Mock())
+            self.assertIsInstance(rejected, probes.Rejection)
+            self.assertEqual(rejected.code, probes.PROBE_ACCEPTOR_NOT_INDEPENDENT)
 
-    def test_template_vendors_unset_means_no_acceptor(self) -> None:
-        self.assertIsNone(self._actor(None).acceptor_for(mock.Mock()))
+    def test_template_vendors_resolve_an_acceptor(self) -> None:
+        self.assertEqual(
+            self._actor(None).acceptor_for(mock.Mock()), ("tester", "openai", "xai")
+        )
 
 
 class AcceptorSelectionTest(unittest.TestCase):
     def _for(self, vendors: Mapping[str, str | None] | None) -> str | None:
         with tempfile.TemporaryDirectory() as tmp:
-            return pb.Bench(tmp, _acceptor(), role_vendors=vendors).actor.acceptor_for(mock.Mock())
+            found = pb.Bench(tmp, _acceptor(), role_vendors=vendors).actor.acceptor_for(
+                mock.Mock()
+            )
+        return None if isinstance(found, probes.Rejection) else found[0]
 
     def test_different_vendors_select_the_test_reviewer(self) -> None:
         self.assertEqual(self._for(pb.DIFFERENT_VENDORS), "test-reviewer")

@@ -218,7 +218,7 @@ def _without_vendor(binding: object) -> object:
 
     `vendor` is read by `_canonical_role_vendors` into its own mapping. Route
     admission and receipts bind the route mapping, so the declared vendor must
-    never ride inside it: a deployment that adds `vendor:` keeps byte-identical
+    never ride inside it: a config that adds `vendor:` keeps byte-identical
     canonical routes.
     """
     if isinstance(binding, Mapping) and "vendor" in binding:
@@ -2681,15 +2681,16 @@ class HerdrStageActor:
             found = self._probe_stash.pop((ctx.lane.lane_id, ctx.input_digest), None)
         return found if found is not None else ((), (), ())
 
-    def acceptor_for(self, ctx: LaneContext) -> str | None:
-        """The role that may accept this lane's probes, or None.
+    def acceptor_for(
+        self, ctx: LaneContext
+    ) -> tuple[str, str, str] | probes.Rejection:
+        """`probes.select_acceptor` over the declared vendors, verbatim.
 
-        None is `PROBE_ACCEPTOR_NOT_INDEPENDENT`: the code reviewer's declared
-        vendor and the acceptor's are both declared and differ, or no one
-        accepts. Both vendors are on `self.role_vendors` for the receipt.
+        The `(role, author_vendor, acceptor_vendor)` triple, or the
+        `PROBE_ACCEPTOR_NOT_INDEPENDENT` rejection when the code reviewer's
+        vendor and an acceptor's are not both declared and different.
         """
-        selected = probes.select_acceptor(self.role_vendors)
-        return None if isinstance(selected, probes.Rejection) else selected[0]
+        return probes.select_acceptor(self.role_vendors)
 
     def accept_probes(
         self,

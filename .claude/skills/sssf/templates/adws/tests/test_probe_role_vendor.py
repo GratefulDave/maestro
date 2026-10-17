@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 import maestro
+from adw_modules import probes
 
 
 def _template() -> dict[str, Any]:
@@ -39,12 +40,23 @@ def _routes(loaded: dict[str, Any]) -> str:
 
 
 class RoleVendorTest(unittest.TestCase):
-    def test_template_declares_no_vendor(self) -> None:
+    def test_template_declares_each_roles_provider(self) -> None:
         loaded = _load()
         self.assertEqual(
-            set(loaded["role_vendors"].values()), {None}
+            dict(loaded["role_vendors"]),
+            {
+                "tester": "xai",
+                "test-reviewer": "openai",
+                "builder": "anthropic",
+                "code-reviewer": "openai",
+                "integration-reviewer": "openai",
+            },
         )
-        self.assertEqual(set(loaded["role_vendors"]), set(maestro.lch.LANE_PANE_ROLES))
+
+    def test_template_resolves_an_independent_acceptor(self) -> None:
+        selected = probes.select_acceptor(_load()["role_vendors"])
+        self.assertNotIsInstance(selected, probes.Rejection)
+        self.assertEqual(selected, ("tester", "openai", "xai"))
 
     def test_vendor_is_accepted_on_each_lane_role_and_normalized(self) -> None:
         for role in maestro.lch.LANE_PANE_ROLES:
@@ -55,12 +67,10 @@ class RoleVendorTest(unittest.TestCase):
                 self.assertEqual(_load(declare)["role_vendors"][role], "openai")
 
     def test_absent_vendor_is_none(self) -> None:
-        def declare(config: dict[str, Any]) -> None:
-            config["role_routes"]["tester"]["vendor"] = "xai"
+        def drop(config: dict[str, Any]) -> None:
+            del config["role_routes"]["code-reviewer"]["vendor"]
 
-        vendors = _load(declare)["role_vendors"]
-        self.assertEqual(vendors["tester"], "xai")
-        self.assertIsNone(vendors["code-reviewer"])
+        self.assertIsNone(_load(drop)["role_vendors"]["code-reviewer"])
 
     def test_non_string_and_blank_vendors_are_refused(self) -> None:
         for bad in (1, True, ["openai"], "", "   "):
