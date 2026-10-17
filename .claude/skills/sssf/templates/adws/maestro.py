@@ -1595,6 +1595,26 @@ class HerdrStageActor:
         candidate = self._git(checkout, "rev-parse", "HEAD")
         return candidate, True
 
+    def _restore_draft(
+        self, checkout: Path, draft_sha: str, files: Sequence[str]
+    ) -> None:
+        """Write `files` as they are at `draft_sha` into the working tree only.
+
+        The index stays at the refreshed head, so the restored files read as
+        the role's uncommitted output exactly as if it had just written them.
+        """
+        present = tuple(
+            line
+            for line in self._git(
+                checkout, "ls-tree", "-r", "--name-only", draft_sha, "--", *files
+            ).splitlines()
+            if line
+        )
+        if not present:
+            return
+        self._git(checkout, "checkout", draft_sha, "--", *present)
+        self._git(checkout, "reset", "-q", "--", *present)
+
     def _clean_checkout(self, checkout: Path) -> None:
         self._git(checkout, "clean", "-fdx", "-e", lch.ROLE_AGENT_DIR)
 
@@ -2242,9 +2262,14 @@ class HerdrStageActor:
         key = self._role_key(ctx, "tester")
         stored = self._roles.get(key)
 
+        # Filled in below once the turn is known to be a review revise.
+        revise_draft: list[tuple[str, tuple[str, ...]]] = []
+
         def prepare(path: Path) -> None:
             if (path / ".git").exists():
                 self._refresh_git_checkout(path, sha)
+                for draft_sha, draft_files in revise_draft:
+                    self._restore_draft(path, draft_sha, draft_files)
 
         if stored is None:
             attempt, checkout = self._prepare(ctx, "tester", sha=sha)
@@ -2263,6 +2288,17 @@ class HerdrStageActor:
             review_findings = self._revise_findings(ctx, "TEST_REVIEW")
             if review_findings is not None:
                 findings = review_findings
+                # The refresh above resets the tree to the integration head,
+                # which does not hold the draft under review, so the tester
+                # would find its own files gone on the revise turn and rebuild
+                # them from its envelope. Lay the draft's files back down,
+                # uncommitted, so the revise edits the draft it was asked to.
+                draft = ctx.artifacts.get("TEST_DRAFT")
+                draft_payload = getattr(draft, "payload", None) or {}
+                draft_sha = str(draft_payload.get("candidate_sha") or "")
+                draft_files = tuple(sorted(dict(draft_payload.get("files") or {})))
+                if draft_sha and draft_files:
+                    revise_draft.append((draft_sha, draft_files))
         if findings:
             extra["revise_findings"] = findings
         invalidation = ctx.artifacts.get("TEST_INVALIDATION")
