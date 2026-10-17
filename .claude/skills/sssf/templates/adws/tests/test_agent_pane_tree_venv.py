@@ -66,5 +66,53 @@ class TreeVenvActivationTests(unittest.TestCase):
         self.assertEqual(out[1], str(self.tree / ".venv"))
 
 
+class LaunchActivatesTheTreeVenvBeforeAgentStart(unittest.TestCase):
+    """The real `HerdrLauncher.launch`, against the Herdr fake."""
+
+    def _launch_calls(self, *, with_venv: bool) -> tuple[list, Path]:
+        from tests.herdr_fake import FakeHerdr
+        from tests.test_herdr_workspace_topology import (
+            PROJECT,
+            RUN_HASH,
+            _checkout,
+            _launch,
+            _launcher,
+            _spec,
+        )
+
+        herdr = FakeHerdr()
+        launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
+        launcher._herdr = herdr  # type: ignore[method-assign]
+        root = Path(tempfile.mkdtemp(prefix="launch venv "))
+        self.addCleanup(shutil.rmtree, root, True)
+        herdr.add_workspace(PROJECT, root)
+        checkout = _checkout(root, "tester")
+        if with_venv:
+            (checkout / ".venv" / "bin").mkdir(parents=True)
+        _launch(launcher, herdr, _spec(checkout, lane="lane-x", role="tester"))
+        return list(herdr.calls), checkout
+
+    def test_export_is_submitted_in_the_pane_before_agent_start(self) -> None:
+        calls, checkout = self._launch_calls(with_venv=True)
+        verbs = [call[:2] for call in calls]
+        start = verbs.index(("agent", "start"))
+        line = lch.tree_venv_activation(checkout.resolve())
+        sent = [
+            index
+            for index, call in enumerate(calls)
+            if call[:2] == ("pane", "send-text") and line in call
+        ]
+        self.assertEqual(len(sent), 1)
+        self.assertLess(sent[0], start)
+        self.assertEqual(calls[sent[0] + 1][:2], ("pane", "send-keys"))
+
+    def test_an_unprovisioned_tree_gets_no_export(self) -> None:
+        calls, _ = self._launch_calls(with_venv=False)
+        start = [call[:2] for call in calls].index(("agent", "start"))
+        self.assertFalse(
+            any(call[:2] == ("pane", "send-text") for call in calls[:start])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
