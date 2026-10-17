@@ -344,6 +344,12 @@ def _drive_reviewing_code(actor):
     with mock.patch.object(sch, "_latest", return_value=artifact), mock.patch.object(
         sch, "_record_as_lane_artifact", return_value=None
     ), mock.patch.object(
+        # The stub above yields no suite artifact to read paths off.
+        scheduler, "_own_test_paths", return_value=()
+    ), mock.patch.object(
+        # No probe was ever admitted on this fake ledger.
+        scheduler, "_probe_rounds_used", return_value=0
+    ), mock.patch.object(
         sch, "_with_input_artifact_ids", side_effect=lambda art, ids: art
     ), mock.patch.object(
         sch, "_complete", side_effect=lambda store, ctx, art: completed.append(art)

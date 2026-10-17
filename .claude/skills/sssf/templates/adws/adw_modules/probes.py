@@ -131,6 +131,10 @@ class ProbeReceiptError(rc.ReviewContractError):
     """A record, retirement or receipt does not bind to what it claims."""
 
 
+class ProbePathRefused(rc.ReviewContractError):
+    """A probe cannot be written at its path in the review tree."""
+
+
 class ProbeAcceptanceMalformed(rc.ReviewContractError):
     """The acceptor's answer is not a valid response to what was asked."""
 
@@ -547,12 +551,12 @@ def write_probe_tree(tree: Path, sources: Mapping[str, str | bytes]) -> tuple[st
         for part in _components(relative)[:-1]:
             probe = probe / part
             if probe.is_symlink():
-                raise rc.ReviewContractError("PROBE_PATH_UNSAFE:{0}".format(relative))
+                raise ProbePathRefused("PROBE_PATH_UNSAFE:{0}".format(relative))
         if target.is_symlink():
-            raise rc.ReviewContractError("PROBE_PATH_UNSAFE:{0}".format(relative))
+            raise ProbePathRefused("PROBE_PATH_UNSAFE:{0}".format(relative))
         if target.exists():
             if not target.is_file() or target.read_bytes() != data:
-                raise rc.ReviewContractError("PROBE_PATH_OCCUPIED:{0}".format(relative))
+                raise ProbePathRefused("PROBE_PATH_OCCUPIED:{0}".format(relative))
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)

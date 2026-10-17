@@ -3571,7 +3571,7 @@ class FactoryScheduler:
         receipts = tuple(payload.get("probe_receipts") or ())
         try:
             probes.validate_receipts(records, retired, receipts)
-        except rc.ReviewContractError as exc:
+        except probes.ProbeReceiptError as exc:
             raise FactoryRefused("PROBE_RECEIPT_INVALID:{0}".format(exc)) from exc
         return records, retired, receipts, str(payload.get("probe_commit") or "")
 
@@ -3730,12 +3730,14 @@ class FactoryScheduler:
                 for sub in submissions:
                     note(sub.path, sub.path, PROBE_IGNORED_BUDGET)
                 return rejected
-            try:
-                runner = tc._derive_runner(tuple(measurement.files))
-            except rc.ReviewContractError:
+            # `tc._derive_runner`'s rule, read without its environment error:
+            # a suite that names no single runner gives a probe nothing to run on.
+            named = {r for r in map(tc._file_runner, measurement.files) if r is not None}
+            if len(named) != 1:
                 for sub in submissions:
                     note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=probes.PROBE_RUNNER_UNSUPPORTED)
                 return rejected
+            runner = named.pop()
             known_paths = {str(r["path"]) for r in records}
             known_ids = {str(r["probe_id"]) for r in records}
             survivors: list[probes.ProbeSubmission] = []
@@ -3763,7 +3765,7 @@ class FactoryScheduler:
                 if not problems:
                     try:
                         probes.write_probe_tree(tree, {sub.path: sub.source})
-                    except rc.ReviewContractError as exc:
+                    except probes.ProbePathRefused as exc:
                         problems.append(
                             probes.Rejection(sub.path, probes.PROBE_PATH_REFUSED, str(exc)[:200])
                         )
