@@ -13,6 +13,7 @@ Python implementation of the Agentic Development Workflow: planning, scheduling,
 | `adw_test.py` | ADW test/support entrypoint |
 | `adw_modules/coordinator.py` | Dependency-DAG coordination |
 | `adw_modules/scheduler.py` | Runnable-node scheduling |
+| `adw_modules/probes.py` | Reviewer-authored probes: admission, execution, discharge |
 | `adw_modules/launcher.py` | Agent/process launch contract |
 | `adw_modules/workspace_runtime.py` | Workspace execution runtime |
 
