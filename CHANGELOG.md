@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed — restore the reviewed test draft on correction
+
+- When a test review requests changes, refresh the tester's checkout to the current integration head and restore the reviewed draft files as uncommitted changes before resubmitting the tester.
+- Before starting an agent in a provisioned tree with `.venv`, activate that environment in the agent pane so its commands use the tree's interpreter.
+- Builder instructions direct Python test commands through `uv run pytest`.
+
 ### Changed — contract change (strengthens review): post-freeze reviewer probes
 
 - The code reviewer may author probes: test files outside the accepted suite,

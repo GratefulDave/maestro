@@ -95,7 +95,7 @@
     <div class="figure">
     <svg viewBox="0 0 1360 880" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-mech-title 00-mech-desc">
       <title id="00-mech-title">Nine-stage lane machine, with the artifact or verdict that causes every transition and the suite-immutability boundary</title>
-      <desc id="00-mech-desc">PLANNED emits LANE_PLAN. WRITING_TESTS emits TEST_DRAFT, an ordinary candidate in the run repository. TEST_REVIEW PASS records ACCEPTED_TEST_SUITE and advances to TESTS_SEALED; REVISE returns to WRITING_TESTS with the runner output verbatim. The accepted suite stays in the candidate and, after merge, on the integration ref. The lane graded against it cannot write those paths: OUTPUT_OVERLAPS_TEST_SUITE, CANDIDATE_TEST_PATH_REFUSED, TEST_SUITE_TAMPERED. BUILDING emits BUILDER_OUTPUT. CODE_REVIEW PASS advances to READY_TO_MERGE. There is no private vault and no TEST_INVALIDATION reset.</desc>
+      <desc id="00-mech-desc">PLANNED emits LANE_PLAN. WRITING_TESTS emits TEST_DRAFT, an ordinary candidate in the run repository. TEST_REVIEW PASS records ACCEPTED_TEST_SUITE and advances to TESTS_SEALED; REVISE returns to WRITING_TESTS with the prior draft files restored before the tester resumes. Agent panes activate a role tree's .venv before starting the agent when present. The accepted suite stays in the candidate and, after merge, on the integration ref. The lane graded against it cannot write those paths: OUTPUT_OVERLAPS_TEST_SUITE, CANDIDATE_TEST_PATH_REFUSED, TEST_SUITE_TAMPERED. BUILDING emits BUILDER_OUTPUT; code review may add independently accepted probes, and build progress tracks suite passes and discharged probe ids separately. CODE_REVIEW PASS advances to READY_TO_MERGE. There is no private vault and no TEST_INVALIDATION reset.</desc>
       <defs>
         <marker id="m-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
         <marker id="m-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
@@ -116,7 +116,7 @@
       <text x="832" y="216" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_REVIEW</text>
       <text x="832" y="228" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PASS</text>
       <path d="M 704,124 V 76 H 448 V 116" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
-      <text x="576" y="66" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_REVIEW · REVISE — actionable findings to the same tester session</text>
+      <text x="576" y="66" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_REVIEW · REVISE — restore prior TEST_DRAFT files before tester resumes</text>
 
       <!-- A protected-path touch is refused. It does not reset the lane. TEST_INVALIDATION is retired. -->
       <text x="412" y="248" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">CANDIDATE_TEST_PATH_REFUSED · not a stage reset</text>
@@ -136,6 +136,7 @@
       <text x="412" y="332" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">code reviewer, integration</text>
       <text x="412" y="344" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">failure output verbatim</text>
       <text x="412" y="356" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">suite digest on the artifact</text>
+      <text x="412" y="368" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">agent launch activates tree .venv</text>
       <text x="604" y="306" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">REFUSED</text>
       <text x="604" y="320" fill="#929292" font-size="8" font-family="'Geist', sans-serif">owning the suite</text>
       <text x="604" y="332" fill="#929292" font-size="8" font-family="'Geist', sans-serif">writing a protected path</text>
@@ -197,7 +198,7 @@
       <text x="388" y="141" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
       <rect x="522" y="134" width="6" height="6" rx="1" fill="#ff6b35"/>
       <text x="448" y="168" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">WRITING_TESTS</text>
-      <text x="448" y="184" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">tester writes the draft</text>
+      <text x="448" y="184" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">tester writes draft · revise resumes prior files</text>
 
       <!-- REVIEWING_TESTS -->
       <rect x="616" y="124" width="176" height="76" rx="8" fill="#000000"/>
@@ -224,7 +225,7 @@
       <text x="388" y="417" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
       <rect x="522" y="410" width="6" height="6" rx="1" fill="#ff6b35"/>
       <text x="448" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BUILDING</text>
-      <text x="448" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">reads the suite, cannot edit it</text>
+      <text x="448" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">reads suite · probe + suite progress</text>
 
       <!-- REVIEWING_CODE -->
       <rect x="616" y="400" width="176" height="76" rx="8" fill="#000000"/>
