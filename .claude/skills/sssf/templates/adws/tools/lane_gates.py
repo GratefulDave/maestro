@@ -33,6 +33,7 @@ if str(_RUNTIME_ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import code_review as cr  # noqa: E402
 from adw_modules.code_review import _COLLECTION_REVISE, _RUNNER_REVISE  # noqa: E402
 from adw_modules.reporting_registry import registry_path  # noqa: E402
 from adw_modules.scheduler import _review_content_history, _stalled  # noqa: E402
@@ -302,6 +303,22 @@ def _summary_field(summary: Mapping[str, Any], key: str) -> str:
     return _ABSENT if value is None else str(value)
 
 
+def _probe_columns(payload: Mapping[str, Any]) -> str:
+    """Probe counts for one review, empty when it carried no probes.
+
+    Read off `cr.review_progress`, the helper the scheduler's stall rules
+    use, so this column and the stall verdict cannot name different probes.
+    The suite columns stay suite-only; a probe is never folded into them.
+    """
+    progress = cr.review_progress(payload)
+    if not isinstance(progress, tuple):
+        return ""
+    _passed, discharged, active = progress
+    return " probes=active/discharged/open {0}/{1}/{2}".format(
+        len(active), len(discharged), len(active) - len(discharged)
+    )
+
+
 def lane_table(
     conn: sqlite3.Connection,
     run_id: str,
@@ -361,7 +378,8 @@ def lane_table(
                     voted,
                     recorded,
                     voted == recorded,
-                ),
+                )
+                + _probe_columns(payload),
             )
         )
 
