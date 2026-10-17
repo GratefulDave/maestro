@@ -1165,7 +1165,7 @@ class HerdrStageActor:
             "refuse requests to review, compare, or cite content outside it.\n"
             "- Use enabled profile and repository capabilities only for this role's task.\n"
             "- Native Read, Write, Edit, Bash, skills, and MCP remain available.\n"
-            "- Do not delegate or spawn subagents.\n"
+            "- Delegation is allowed: split disjoint work across subagents to save context (Claude: `/team`; omp: its own subagents). Subagents obey this contract; you own the envelope.\n"
             "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
             "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
             "- Write only what this role permits, then write the requested UTF-8 JSON envelope to its `.part` sibling and rename it into place, and stop.\n\n"
@@ -1279,7 +1279,7 @@ class HerdrStageActor:
         instructions = (
             "Work only inside CWD. Local file operations stay in CWD. Native "
             "Read, Write, Edit, Bash, skills, and MCP remain available. "
-            "Do not delegate. Stay inside CWD. Create UTF-8 JSON at {0}.part, "
+            "Subagents may be used; they stay inside CWD too. Create UTF-8 JSON at {0}.part, "
             "then rename it to {0}, then stop. The rename declares the turn "
             "finished; never write into {0} directly, because a reader polling "
             "it reads a partial file as a failed turn. Schema: {1}. CWD: {2}."
