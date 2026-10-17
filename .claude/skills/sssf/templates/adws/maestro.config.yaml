@@ -33,6 +33,20 @@ attend:
   # under the plans directory. Absent refuses ATTEND_PLAN_IR_UNRESOLVED
   # rather than handing an agent a projected plan to edit as an IR.
   # plan_ir: /absolute/path/to/plan.ir.json
+# Reviewer-authored probes: how many code reviews per lane (since its last
+# resume) may admit a new probe. 0 turns the feature off. Absent means 5.
+review:
+  max_probe_rounds: 5
+# Each lane role may declare an optional `vendor:` string beside its route.
+# A probe is accepted by a role whose declared vendor differs from the
+# code-reviewer's; a different profile or model is not independence, and an
+# undeclared vendor is not guessed. Probes stay inactive until the
+# code-reviewer and an eligible acceptor (test-reviewer, then tester) both
+# declare differing vendors. Left unset in this template, for example:
+#   code-reviewer:
+#     route: omp
+#     profile: openai-performance
+#     vendor: openai
 role_routes:
   tester:
     route: omp

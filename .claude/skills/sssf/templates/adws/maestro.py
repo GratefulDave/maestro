@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextvars import ContextVar
@@ -37,6 +38,7 @@ from adw_modules import launcher as lch
 from adw_modules import plan_approval
 from adw_modules import plan_compiler
 from adw_modules import plan_contract_ingress as ingress
+from adw_modules import probes
 from adw_modules import route_admission as admission
 from adw_modules import review_contract as rc
 from adw_modules import provisioning
@@ -206,9 +208,48 @@ def _canonical_role_routes(
     canonical: dict[str, Mapping[str, str]] = {}
     for role in lch.LANE_PANE_ROLES:
         canonical[role] = _canonical_role_route(
-            value[role], "role_routes.{}".format(role)
+            _without_vendor(value[role]), "role_routes.{}".format(role)
         )
     return MappingProxyType(canonical)
+
+
+def _without_vendor(binding: object) -> object:
+    """The route binding with its operator-declared `vendor` removed.
+
+    `vendor` is read by `_canonical_role_vendors` into its own mapping. Route
+    admission and receipts bind the route mapping, so the declared vendor must
+    never ride inside it: a deployment that adds `vendor:` keeps byte-identical
+    canonical routes.
+    """
+    if isinstance(binding, Mapping) and "vendor" in binding:
+        return {key: item for key, item in binding.items() if key != "vendor"}
+    return binding
+
+
+def _canonical_role_vendors(value: object) -> Mapping[str, str | None]:
+    """Operator-declared vendor per lane role. Absent is None.
+
+    Declared only on the five lane roles, never on `attend.route`. Normalized
+    (strip, casefold) because `probes.select_acceptor` compares them; a probe
+    acceptor is independent of the code reviewer only when both vendors are
+    declared and differ, so a route, profile or model difference is not read
+    as one.
+    """
+    if not isinstance(value, Mapping):
+        raise _MaestroConfigurationError("role_routes must be a mapping")
+    vendors: dict[str, str | None] = {}
+    for role in lch.LANE_PANE_ROLES:
+        binding = value.get(role)
+        declared = binding.get("vendor") if isinstance(binding, Mapping) else None
+        if declared is None:
+            vendors[role] = None
+            continue
+        label = "role_routes.{}.vendor".format(role)
+        text = _optional_config_string(declared, label).casefold()
+        if not text:
+            raise _MaestroConfigurationError(label + " must not be blank")
+        vendors[role] = text
+    return MappingProxyType(vendors)
 
 
 def _canonical_role_route(value: object, label: str) -> Mapping[str, str]:
@@ -405,6 +446,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
         loaded["keys_dir"] = keys_dir
     else:
         loaded["keys_dir"] = root / "keys"
+    # Vendors first: they are read off the raw bindings, and the canonical
+    # routes that replace them carry no `vendor`.
+    loaded["role_vendors"] = _canonical_role_vendors(loaded.get("role_routes"))
     loaded["role_routes"] = _canonical_role_routes(loaded.get("role_routes"))
     loaded["provision_argv"] = _config_argv(
         loaded.get("provision_argv"), "provision_argv"
@@ -423,6 +467,10 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
         loaded["stall_regression_on_findings"] = st.stall_regression_on_findings(
             loaded
         )
+    except ValueError as exc:
+        raise _MaestroConfigurationError(str(exc)) from exc
+    try:
+        loaded["review_max_probe_rounds"] = st.review_max_probe_rounds(loaded)
     except ValueError as exc:
         raise _MaestroConfigurationError(str(exc)) from exc
     loaded["repo"] = repo.resolve()
@@ -698,6 +746,9 @@ TEST_DOUBLE_BOUNDARY = (
 )
 
 
+_PROBE_VIEW_KEYS = ("probe_id", "path", "requirement", "intent")
+
+
 class HerdrStageActor:
     """Persistent role panes. Envelope bytes are payload, not stage."""
 
@@ -709,6 +760,7 @@ class HerdrStageActor:
         role_routes: Mapping[str, Mapping[str, str]],
         lane_specs: Mapping[str, Mapping[str, Any]] | None = None,
         operator_route: Mapping[str, str] | None = None,
+        role_vendors: Mapping[str, str | None] | None = None,
     ) -> None:
         self.launcher = launcher
         self.state_root = Path(state_root)
@@ -723,6 +775,12 @@ class HerdrStageActor:
         if operator_route:
             routes["operator"] = MappingProxyType(dict(operator_route))
         self.role_routes = MappingProxyType(routes)
+        # Beside the routes, never inside them: `routes` is what route
+        # admission binds, and the declared vendor only decides whether a
+        # probe acceptor is independent of the code reviewer.
+        self.role_vendors = MappingProxyType(dict(role_vendors or {}))
+        self._probe_stash: dict[tuple[str, str], tuple[Any, ...]] = {}
+        self._probe_stash_lock = threading.Lock()
         self.lane_specs = MappingProxyType(
             {
                 str(lane_id): MappingProxyType(dict(spec))
@@ -878,7 +936,9 @@ class HerdrStageActor:
             )
         shutil.rmtree(resolved, ignore_errors=True)
 
-    def _schema(self, role: str) -> dict[str, Any]:
+    def _schema(
+        self, role: str, *, with_probes: bool = False, mode: str | None = None
+    ) -> dict[str, Any]:
         # One object inside a list, with each key carrying a placeholder --
         # never the bare key names. `list(REVISE_FINDING_KEYS)` renders as
         # `["implementation_area", "observed_behavior", ...]`, which reads as
@@ -891,6 +951,18 @@ class HerdrStageActor:
         # the scheduler and ended the run, taking four healthy in-flight lanes
         # with it. The reviewer had done the work; only the shape was wrong.
         findings = [{key: "<{0}>".format(key) for key in st.REVISE_FINDING_KEYS}]
+        if mode in (probes.MODE_ACCEPT, probes.MODE_CHALLENGE):
+            # One object inside a list, for the same reason as `findings`.
+            return {
+                "verdict": "PASS|REVISE",
+                "probe_verdicts": [
+                    {
+                        "probe_id": "<probe_id, exactly as given>",
+                        "verdict": "PASS|REVISE",
+                        "reason": "<why>",
+                    }
+                ],
+            }
         if role == "tester":
             return {"test_files": {"<path>": "<utf-8 contents>"}}
         if role == "builder":
@@ -903,7 +975,25 @@ class HerdrStageActor:
             example["severity"] = "<optional: {0}>".format(
                 "|".join(st.FINDING_SEVERITIES)
             )
-            return {"verdict": "PASS|REVISE", "findings": [example]}
+            envelope: dict[str, Any] = {
+                "verdict": "PASS|REVISE",
+                "findings": [example],
+            }
+            if with_probes:
+                envelope["probes"] = [
+                    {
+                        "path": "<optional: path of a probe file you wrote>",
+                        "requirement": "<verbatim public_contract quote>",
+                        "intent": "<what the probe asserts>",
+                    }
+                ]
+                envelope["challenges"] = [
+                    {
+                        "probe_id": "<optional: id of an existing probe>",
+                        "reason": "<why that probe is invalid>",
+                    }
+                ]
+            return envelope
         if role == "test-reviewer":
             return {"verdict": "PASS|REVISE", "findings": findings}
         if role == "operator":
@@ -1260,6 +1350,86 @@ class HerdrStageActor:
         )
         return text
 
+    def _probes_offered(self, ctx: LaneContext) -> bool:
+        """Whether this code review is asked to author probes.
+
+        Needs budget left (`max_probe_rounds` 0, or exhausted, is zero) and an
+        acceptor whose declared vendor differs from the code-reviewer's. With
+        either missing the reviewer's ordinary verdict is all that is asked
+        for, so nothing it writes could be admitted and the mandate is omitted.
+        """
+        if int(getattr(ctx, "probe_budget_left", 0) or 0) <= 0:
+            return False
+        return not isinstance(
+            probes.select_acceptor(self.role_vendors), probes.Rejection
+        )
+
+    @staticmethod
+    def _probe_instruction(extra: Mapping[str, Any]) -> str:
+        text = (
+            " Probes. In addition to your verdict you may author up to "
+            "{0} probes: small tests, written as files in THIS checkout, that "
+            "fail on this candidate because it breaks the public contract. A "
+            "probe is how a defect you can name becomes something the builder "
+            "can run. Rules: (1) requirement is a verbatim quote of "
+            "public_contract, at least 12 characters, and the probe's "
+            "expectation must follow from that quote and from nothing you "
+            "learned by reading the candidate; (2) import only the modules and "
+            "names the public contract's interface declares, so the probe "
+            "binds what the plan promises and not the candidate's internals; "
+            "(3) write each probe file at a new path that is not a declared "
+            "output, not one of test_paths and not an existing probe, and "
+            "list it in `probes` with its requirement and intent; (4) use the "
+            "same runner as the accepted suite, with at most {1} cases per "
+            "probe; (5) do not edit any tracked file. The harness runs each "
+            "probe against this candidate. A probe that passes, errors, or "
+            "does not follow from its quote is dropped and never reaches the "
+            "builder; a failing one is judged by a reviewer from another "
+            "vendor before it binds the builder. To retire an existing probe "
+            "you believe is wrong, list it in `challenges` with the reason; "
+            "you cannot retire one yourself. Your PASS/REVISE verdict is not "
+            "changed by any of this."
+        ).format(probes.MAX_PROBES_PER_ROUND, probes.MAX_PROBE_CASES)
+        existing = extra.get("existing_probes")
+        if existing:
+            text += (
+                " existing_probes lists probes already binding the builder; "
+                "do not resubmit them."
+            )
+        rejected = extra.get("rejected_probes")
+        if rejected:
+            text += (
+                " rejected_probes lists submissions from your previous answer "
+                "that were refused, each with its code. Fix or drop them and "
+                "answer again; accepted ones are kept."
+            )
+        return text
+
+    @staticmethod
+    def _acceptance_instruction(mode: str) -> str:
+        decision = (
+            "A PASS means the probe is valid and stands; a REVISE means it is "
+            "invalid and is not admitted."
+            if mode == probes.MODE_ACCEPT
+            else "A PASS means the probe is valid and stays binding; a REVISE "
+            "means it is invalid and is retired."
+        )
+        return (
+            " This turn is a probe acceptance, not an authoring turn: write "
+            "nothing in this checkout, create no files, and run no git "
+            "command that changes it. This checkout is the candidate. For "
+            "each entry in probes, read its source, its requirement and the "
+            "failure the harness measured, and answer one question: does the "
+            "assertion follow from the cited requirement in public_contract, "
+            "with its expected value derived from the contract and not from "
+            "reading the candidate, and is the measured failure an assertion "
+            "failure of the candidate rather than a fault in the probe? "
+            + decision
+            + " Return exactly one probe_verdicts entry per probe_id given, "
+            "no other ids and no duplicates, and a top-level verdict that is "
+            "PASS only if every entry is PASS."
+        )
+
     def _prompt_lane_spec(self, ctx: LaneContext, role: str) -> dict[str, Any]:
         spec = dict(self.lane_specs[ctx.lane.lane_id])
         if role in ("builder", "code-reviewer") and ctx.lane.lane_kind == st.LANE_KIND_BUILD:
@@ -1275,7 +1445,15 @@ class HerdrStageActor:
         extra: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         envelope_path = str(envelope.resolve())
-        schema = self._schema(role)
+        mode = extra.get("mode")
+        acceptance = (
+            role in probes.ACCEPTOR_ROLES
+            and mode in (probes.MODE_ACCEPT, probes.MODE_CHALLENGE)
+        )
+        mandate = role == "code-reviewer" and self._probes_offered(ctx)
+        schema = self._schema(
+            role, with_probes=mandate, mode=mode if acceptance else None
+        )
         instructions = (
             "Work only inside CWD. Local file operations stay in CWD. Native "
             "Read, Write, Edit, Bash, skills, and MCP remain available. "
@@ -1285,7 +1463,9 @@ class HerdrStageActor:
             "it reads a partial file as a failed turn. Schema: {1}. CWD: {2}."
         ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
 
-        if role == "tester":
+        if acceptance:
+            instructions += self._acceptance_instruction(str(mode))
+        elif role == "tester":
             if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
                 instructions += (
                     " Author acceptance files exactly at "
@@ -1404,9 +1584,14 @@ class HerdrStageActor:
                 "may call. "
                 + att.TWO_IMPLEMENTATIONS_QUESTION
             )
-        if role in ("tester", "test-reviewer", "builder"):
+        if mandate:
+            instructions += self._probe_instruction(extra)
+        if role in ("tester", "test-reviewer", "builder") and not acceptance:
             instructions += " " + self._PUBLIC_INTERFACE_RULE
-        if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
+        if (
+            role in ("test-reviewer", "code-reviewer", "integration-reviewer")
+            and not acceptance
+        ):
             instructions += " PASS requires findings=[]. REVISE requires at least one actionable finding."
             rejected = getattr(ctx, "rejected_citation", "")
             if rejected:
@@ -2413,6 +2598,21 @@ class HerdrStageActor:
             extra["suite_result_summary"] = dict(ctx.suite_result_summary)
         if ctx.suite_findings_required:
             extra["suite_findings_required"] = True
+        # Each key only when there is something to say, so a lane that has
+        # never carried a probe dispatches byte-identical extra.
+        existing = [
+            {key: record.get(key) for key in _PROBE_VIEW_KEYS}
+            for record in getattr(ctx, "existing_probes", ()) or ()
+            if isinstance(record, Mapping)
+        ]
+        if existing:
+            extra["existing_probes"] = existing
+        rejected = [
+            {"path": item.path, "code": item.code, "detail": item.detail}
+            for item in getattr(ctx, "rejected_probes", ()) or ()
+        ]
+        if rejected:
+            extra["rejected_probes"] = rejected
         sha = self._base_sha(ctx, "code-reviewer")
         key = self._role_key(ctx, "code-reviewer")
         stored = self._roles.get(key)
@@ -2431,7 +2631,109 @@ class HerdrStageActor:
             prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
-        return self._review_payload(payload)
+        result = self._review_payload(payload)
+        self._stash_probes(ctx, payload, cwd_used, existing)
+        return result
+
+    def _stash_probes(
+        self,
+        ctx: LaneContext,
+        payload: Mapping[str, Any],
+        root: Path,
+        existing: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Parse and read what the code reviewer authored, keyed to this review.
+
+        The envelope is validated before any file is read, then each listed
+        file is read bounded and without following links from the reviewer's
+        own checkout. Nothing here decides anything: the scheduler takes the
+        result with `take_probes` and the `review_code` return is unchanged.
+        """
+        reserved = [
+            *ctx.lane.declared_outputs,
+            *ctx.protected_test_paths,
+            *(str(record.get("path") or "") for record in existing),
+        ]
+        entries, rejections, challenges = probes.parse_envelope(
+            payload, reserved=[item for item in reserved if item]
+        )
+        submissions, unread = probes.read_submissions(Path(root), entries)
+        with self._probe_stash_lock:
+            self._probe_stash[(ctx.lane.lane_id, ctx.input_digest)] = (
+                submissions,
+                rejections + unread,
+                challenges,
+            )
+
+    def take_probes(
+        self, ctx: LaneContext
+    ) -> tuple[
+        tuple[probes.ProbeSubmission, ...],
+        tuple[probes.Rejection, ...],
+        tuple[probes.Challenge, ...],
+    ]:
+        """What the last `review_code` for this lane and input authored.
+
+        Removed on read: a completed stage is never reauthored from here, it is
+        read from its artifact.
+        """
+        with self._probe_stash_lock:
+            found = self._probe_stash.pop((ctx.lane.lane_id, ctx.input_digest), None)
+        return found if found is not None else ((), (), ())
+
+    def acceptor_for(self, ctx: LaneContext) -> str | None:
+        """The role that may accept this lane's probes, or None.
+
+        None is `PROBE_ACCEPTOR_NOT_INDEPENDENT`: the code reviewer's declared
+        vendor and the acceptor's are both declared and differ, or no one
+        accepts. Both vendors are on `self.role_vendors` for the receipt.
+        """
+        selected = probes.select_acceptor(self.role_vendors)
+        return None if isinstance(selected, probes.Rejection) else selected[0]
+
+    def accept_probes(
+        self,
+        ctx: LaneContext,
+        role: str,
+        items: Sequence[Mapping[str, Any]],
+        mode: str,
+    ) -> Mapping[str, Any]:
+        """One read-only acceptance pass over `items` by `role`; the raw envelope.
+
+        Dispatched at the candidate checkout like `review_tests`. The session
+        is this lane's own (`_role_key` carries the lane id), so it cannot be a
+        tests lane's tester or test-reviewer. Parsing is the caller's:
+        `probes.parse_acceptance` is the gate, not this envelope.
+        """
+        if role not in probes.ACCEPTOR_ROLES:
+            raise FactoryRefused("PROBE_ACCEPTOR_ROLE_INVALID:{0}".format(role))
+        if mode not in (probes.MODE_ACCEPT, probes.MODE_CHALLENGE):
+            raise FactoryRefused("PROBE_ACCEPTANCE_MODE_INVALID:{0}".format(mode))
+        sha = ctx.candidate_sha
+        if not sha:
+            raise FactoryRefused("PROBE_ACCEPTANCE_CANDIDATE_MISSING")
+        key = self._role_key(ctx, role)
+        stored = self._roles.get(key)
+        if stored is None:
+            attempt, checkout = self._prepare(ctx, role, sha=sha)
+            cwd = checkout or attempt / "checkout"
+        else:
+            attempt, checkout, cwd = stored.attempt, stored.checkout, stored.cwd
+        extra = {
+            "mode": mode,
+            "probes": [dict(item) for item in items],
+            "candidate_sha": sha,
+            "public_contract": ctx.public_contract,
+        }
+        payload, _handle, cwd_used = self._launch(
+            ctx,
+            role,
+            cwd,
+            extra,
+            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
+        )
+        self._bind_checkout(key, attempt, checkout, cwd_used)
+        return payload
 
     def review_integration(
         self,
@@ -2692,7 +2994,22 @@ class HerdrStageActor:
                         ", ".join(st.REVISE_FINDING_KEYS),
                     )
                 )
+            # `code` is harness-synthesized from a measured probe run. A
+            # reviewer that writes one would let prose pose as a measurement.
+            if any(key in finding for key in st.HARNESS_FINDING_KEYS):
+                raise FactoryRefused(
+                    "REVIEW_FINDINGS_MALFORMED:findings[{0}] carries {1}, "
+                    "which only the harness sets".format(
+                        index, ", ".join(st.HARNESS_FINDING_KEYS)
+                    )
+                )
         return st.ReviewerVerdict(payload["verdict"]), findings
+
+
+def _max_probe_rounds(layout: Mapping[str, Any]) -> int:
+    """`review.max_probe_rounds` as the loader read it. Absent means the default."""
+    value = layout.get("review_max_probe_rounds")
+    return st.DEFAULT_MAX_PROBE_ROUNDS if value is None else int(value)
 
 
 def _actor_for(
@@ -2748,6 +3065,7 @@ def _actor_for(
         role_routes,
         lane_specs=lane_specs,
         operator_route=attend_route or None,
+        role_vendors=layout.get("role_vendors"),
     )
 
 
@@ -3070,6 +3388,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 regression_on_findings=bool(
                     layout.get("stall_regression_on_findings")
                 ),
+                max_probe_rounds=_max_probe_rounds(layout),
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -3263,6 +3582,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                 regression_on_findings=bool(
                     layout.get("stall_regression_on_findings")
                 ),
+                max_probe_rounds=_max_probe_rounds(layout),
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -3332,6 +3652,7 @@ def _run_amend(args: argparse.Namespace) -> int:
                 regression_on_findings=bool(
                     layout.get("stall_regression_on_findings")
                 ),
+                max_probe_rounds=_max_probe_rounds(layout),
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -3752,6 +4073,7 @@ def _run_attend(args: argparse.Namespace) -> int:
             compiled=plan,
             concurrency=layout.get("concurrency") or 1,
             regression_on_findings=bool(layout.get("stall_regression_on_findings")),
+            max_probe_rounds=_max_probe_rounds(layout),
         )
         return actor, scheduler
 
@@ -3941,6 +4263,7 @@ def _run_status(args: argparse.Namespace) -> int:
                 runtime,
                 target,
                 compiled=compiled,
+                max_probe_rounds=_max_probe_rounds(layout),
             )
             status = scheduler.status()
             stages = {
