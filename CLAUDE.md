@@ -78,11 +78,11 @@ authoritative; verdict recorded as PASS"` beside `"reviewer said REVISE"`
 Alone, it would have read as what it is: a decision that a reviewer cannot block.
 That override has since been reverted and is history, not current behavior:
 `review_builder_output` now keeps a reviewer's `REVISE` over a green suite and
-the lane returns to `BUILDING` (`adw_modules/code_review.py:676-682`). The
+the lane returns to `BUILDING` (`adw_modules/code_review.py`). The
 runner still outranks the reviewer in one direction only, a `PASS` over a
 failing suite becoming `REVISE`; the scheduler's `"accepted suite is
-authoritative; verdict recorded as ..."` log (`adw_modules/scheduler.py`
-near 3355) fires only for that promotion.
+authoritative; verdict recorded as ..."` log (`adw_modules/scheduler.py`)
+fires only for that promotion.
 
 `c2cece7` (#205, 2026-09-04) added `FactoryScheduler._drop_unobservable_findings`.
 The integration reviewer kept reporting that sealed test paths were absent from
