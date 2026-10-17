@@ -73,6 +73,20 @@ STANDARDS_MAX_SEVERITY = SEVERITY_WARNING
 # finding submitted without them comes back with exactly REVISE_FINDING_KEYS.
 FINDING_OPTIONAL_KEYS = ("axis", "severity")
 
+# A finding may carry one typed `code`, and the set is closed. `PROBE_FAILED`
+# is synthesized by the harness from a probe it executed; no reviewer envelope
+# may submit one (`maestro._review_payload` refuses it), so a transition that
+# keys on the code keys on a measurement, never on reviewer prose.
+PROBE_FAILED = "PROBE_FAILED"
+FINDING_CODES = (PROBE_FAILED,)
+
+# Not in FINDING_OPTIONAL_KEYS on purpose: that tuple is what a reviewer's
+# envelope example advertises, and a reviewer must never be invited to submit
+# a code. `require_revise_findings` accepts the key so a stored artifact
+# round-trips; `code_review.review_builder_output` refuses it on any
+# reviewer-submitted finding.
+HARNESS_FINDING_KEYS = ("code",)
+
 
 class LaneStage(str, Enum):
     PLANNED = "PLANNED"
@@ -179,6 +193,32 @@ def stall_regression_on_findings(config: Any) -> bool:
     value = stall.get("regression_on_findings", False)
     if not isinstance(value, bool):
         raise ValueError("stall.regression_on_findings must be a boolean")
+    return value
+
+
+DEFAULT_MAX_PROBE_ROUNDS = 5
+
+
+def review_max_probe_rounds(config: Any) -> int:
+    """`review.max_probe_rounds` off a loaded config. Absent means 5.
+
+    A probe round is a code review that admitted a reviewer-authored probe.
+    `0` turns the feature off: no probe prompt, and the envelope key is
+    ignored. Read beside `stall_regression_on_findings` so every reader agrees
+    where the key lives and what absent means.
+    """
+    if config is None:
+        return DEFAULT_MAX_PROBE_ROUNDS
+    if not isinstance(config, Mapping):
+        raise ValueError("config root must be a mapping")
+    review = config.get("review")
+    if review is None:
+        return DEFAULT_MAX_PROBE_ROUNDS
+    if not isinstance(review, Mapping):
+        raise ValueError("review must be a mapping")
+    value = review.get("max_probe_rounds", DEFAULT_MAX_PROBE_ROUNDS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("review.max_probe_rounds must be a non-negative integer")
     return value
 
 
@@ -398,7 +438,7 @@ def require_revise_findings(
         keys = set(finding)
         if not set(REVISE_FINDING_KEYS) <= keys:
             raise CanonicalIdentityError("REVISE finding keys are not actionable")
-        if keys - set(REVISE_FINDING_KEYS) - set(FINDING_OPTIONAL_KEYS):
+        if keys - set(REVISE_FINDING_KEYS) - set(FINDING_OPTIONAL_KEYS) - set(HARNESS_FINDING_KEYS):
             raise CanonicalIdentityError("REVISE finding keys are not actionable")
         for key in REVISE_FINDING_KEYS:
             text = finding[key]
@@ -415,6 +455,11 @@ def require_revise_findings(
                     "finding severity is not a known severity"
                 )
             row["severity"] = severity
+        if "code" in keys:
+            code = finding["code"]
+            if not isinstance(code, str) or code not in FINDING_CODES:
+                raise CanonicalIdentityError("finding code is not a known code")
+            row["code"] = code
         normalized.append(row)
     return tuple(normalized)
 
@@ -430,6 +475,18 @@ def _normalize_requirement_quote(value: str) -> str:
     while text and text[-1] in _REQUIREMENT_QUOTE_MARKS:
         text = text[:-1].rstrip()
     return " ".join(text.split()).casefold()
+
+
+def normalize_requirement_quote(value: str) -> str:
+    """The comparison form every contract citation is checked in.
+
+    Public so a probe's cited requirement is held to exactly the normalization
+    a reviewer finding is, not a second copy of it.
+    """
+    return _normalize_requirement_quote(value)
+
+
+MIN_CONTRACT_QUOTE = _MIN_CONTRACT_QUOTE
 
 
 def bind_findings_to_contract(

@@ -86,10 +86,12 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from xml.etree import ElementTree
 
 from . import tree_env as te
 
@@ -1115,3 +1117,163 @@ def execute_case_outcomes(
         )
     return outcomes
 
+
+
+# -- probe execution ---------------------------------------------------------
+#
+# A reviewer-authored probe is measured by ONE process run that yields the exit
+# code, the complete per-case report and the failure evidence together. The
+# per-case report is the runner's own JUnit XML, written to a path this module
+# allocates outside the tree under test, so the measurement never mutates its
+# subject and two runs never share a report.
+
+PROBE_PASSED = "PASSED"
+PROBE_FAILED_STATE = "FAILED"
+PROBE_ERROR = "ERROR"
+PROBE_SKIPPED = "SKIPPED"
+
+#: Worst first. A case reported twice (pytest's setup/call/teardown, a repeated
+#: id) reduces to the worst state seen, so a split can never turn a failure
+#: into a pass and nothing is overwritten.
+_PROBE_SEVERITY = (PROBE_ERROR, PROBE_FAILED_STATE, PROBE_SKIPPED, PROBE_PASSED)
+
+#: `ProbeExecution.report_error` values. Empty means the report parsed whole.
+PROBE_REPORT_MISSING = "MISSING"
+PROBE_REPORT_UNPARSEABLE = "UNPARSEABLE"
+PROBE_REPORT_EMPTY = "EMPTY"
+PROBE_REPORT_UNSUPPORTED = "UNSUPPORTED"
+
+_PROBE_REPORT_BYTES = 8 * 1024 * 1024
+_PROBE_MESSAGE_CHARS = 300
+_PROBE_MESSAGE_LINES = 20
+
+#: Per-case JUnit reporting for one probe file. `{report}` is the allocated
+#: path. The mode (`run` for vitest) stays `execute_argv`'s to supply.
+_PROBE_ARGS: Dict[str, Tuple[str, ...]] = {
+    "pytest": (
+        "-o", "addopts=", "-o", "junit_family=xunit2", "-p", "no:cacheprovider",
+        "--tb=line", "--junitxml={report}",
+    ),
+    "vitest": ("--reporter=junit", "--outputFile={report}"),
+}
+
+
+@dataclass(frozen=True)
+class ProbeExecution:
+    """One probe run: exit code, merged output, reduced per-case states.
+
+    `cases` maps `classname::name` to the worst state seen across phases.
+    `report_error` is non-empty when no complete report exists, in which case
+    `cases` is empty and nothing may be concluded from it.
+    """
+
+    returncode: int
+    output: str
+    cases: Mapping[str, str]
+    report_error: str = ""
+
+
+def _junit_state(element: ElementTree.Element) -> Tuple[str, str]:
+    for child in element:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "error":
+            return PROBE_ERROR, _junit_message(child)
+        if tag in ("failure", "flakyFailure", "rerunFailure"):
+            return PROBE_FAILED_STATE, _junit_message(child)
+    for child in element:
+        if child.tag.rsplit("}", 1)[-1] == "skipped":
+            return PROBE_SKIPPED, ""
+    return PROBE_PASSED, ""
+
+
+def _junit_message(element: ElementTree.Element) -> str:
+    text = (element.get("message") or element.text or "").strip()
+    return " ".join(text.split())[:_PROBE_MESSAGE_CHARS]
+
+
+def reduce_junit(raw: bytes) -> Tuple[Dict[str, str], List[str]]:
+    """Reduce a JUnit document to `({id: worst state}, [failure lines])`.
+
+    Raises `ValueError` for a document that is not well formed or holds no
+    `<testcase>`: a truncated or empty report is never a pass.
+    """
+    if len(raw) > _PROBE_REPORT_BYTES:
+        raise ValueError(PROBE_REPORT_UNPARSEABLE)
+    try:
+        root = ElementTree.fromstring(raw)
+    except ElementTree.ParseError as extra:
+        raise ValueError(PROBE_REPORT_UNPARSEABLE) from extra
+    states: Dict[str, str] = {}
+    lines: List[str] = []
+    for case in root.iter():
+        if case.tag.rsplit("}", 1)[-1] != "testcase":
+            continue
+        name = case.get("name")
+        if not name:
+            raise ValueError(PROBE_REPORT_UNPARSEABLE)
+        ident = "{0}::{1}".format(case.get("classname") or "", name)
+        state, message = _junit_state(case)
+        prior = states.get(ident)
+        if prior is None or _PROBE_SEVERITY.index(state) < _PROBE_SEVERITY.index(prior):
+            states[ident] = state
+        if message and len(lines) < _PROBE_MESSAGE_LINES:
+            lines.append("FAILED {0} - {1}".format(ident, message))
+    if not states:
+        raise ValueError(PROBE_REPORT_EMPTY)
+    return states, lines
+
+
+def execute_probe(
+    resolved: ResolvedRunner,
+    tree: Path,
+    probe_path: str,
+    scratch_root: Path,
+    timeout_s: float = EXECUTE_TIMEOUT_S,
+    *,
+    cwd: str = ".",
+) -> ProbeExecution:
+    """Run one probe file once and read back its own complete report.
+
+    The report lives in a directory allocated here with `tempfile.mkdtemp`
+    under `scratch_root/probe-reports`, so two calls with identical run, lane,
+    input and probe ids share no path and a stale report from an earlier run
+    can never be read. A report that is absent after the process exits is
+    `MISSING`, never a fallback to another file. Only this call's own
+    directory is removed.
+    """
+    if resolved.runner not in _PROBE_ARGS:
+        return ProbeExecution(-1, "", {}, PROBE_REPORT_UNSUPPORTED)
+    tree = Path(tree).resolve()
+    base = Path(scratch_root).resolve() / "probe-reports"
+    if base == tree or tree in base.parents:
+        raise ValueError("probe reports must be written outside the tree under test")
+    base.mkdir(parents=True, exist_ok=True)
+    report_dir = Path(tempfile.mkdtemp(prefix="probe-", dir=str(base)))
+    try:
+        report = report_dir / "report.xml"
+        flags = tuple(arg.format(report=str(report)) for arg in _PROBE_ARGS[resolved.runner])
+        gate = _OutcomeGate(argv=flags + (probe_path,), cwd=cwd)
+        # No bytecode: a probe rewritten inside one mtime second at the same
+        # size would otherwise be run from the previous run's cached module,
+        # and the measurement would also write into the tree it measures.
+        raw = execute_cases(
+            resolved, gate, tree, timeout_s=timeout_s,
+            env={"PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        output = str(raw.get("output") or "")
+        returncode = int(raw.get("returncode") if raw.get("returncode") is not None else -1)
+        try:
+            data = report.read_bytes()
+        except OSError:
+            return ProbeExecution(returncode, output, {}, PROBE_REPORT_MISSING)
+        try:
+            cases, lines = reduce_junit(data)
+        except ValueError as extra:
+            return ProbeExecution(returncode, output, {}, str(extra))
+        if resolved.runner == "vitest" and lines:
+            # vitest's junit carries the failure text; its stdout under the
+            # junit reporter does not.
+            output = output + "\n" + "\n".join(lines)
+        return ProbeExecution(returncode, output, cases, "")
+    finally:
+        shutil.rmtree(report_dir, ignore_errors=True)
