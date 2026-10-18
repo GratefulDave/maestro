@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -24,6 +25,7 @@ sys.path.insert(0, str(ADWS))
 
 import maestro
 from adw_modules import git_publication as gitpub
+from adw_modules import handoff_budget as hb
 from adw_modules import launcher as lch
 from adw_modules import review_contract as rcv
 from adw_modules import tests_chain as tchain
@@ -137,6 +139,26 @@ def _assert_prompt_under_agent_dir(
     resolved.relative_to((Path(cwd).resolve() / lch.ROLE_AGENT_DIR))
     test.assertEqual(resolved.name, name)
     test.assertTrue(resolved.is_file())
+
+
+def _context_section(
+    test: unittest.TestCase, launch: Mapping[str, Any], *keys: str
+) -> Any:
+    """Read a plan-scaled prompt section back from the file it was moved to.
+
+    The reference must name a file inside the role's own agent directory, and
+    the file's bytes must be the ones the reference's sha256 names.
+    """
+    value: Any = launch["prompt"]
+    for key in keys:
+        value = value[key]
+    test.assertEqual({"bytes", "context_file", "sha256"}, set(value))
+    path = Path(value["context_file"]).resolve()
+    path.relative_to(Path(launch["worktree"]).resolve() / lch.ROLE_AGENT_DIR)
+    data = path.read_bytes()
+    test.assertEqual(value["bytes"], len(data))
+    test.assertEqual(value["sha256"], hashlib.sha256(data).hexdigest())
+    return json.loads(data)
 
 
 class CliHasNoDelegationPolicyFlagsTest(unittest.TestCase):
@@ -1769,20 +1791,165 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     test_suite_digest="test-suite.v1:" + "44" * 32,
                 )
             )
-            prompts = {
-                launch["prompt"]["role"]: launch["prompt"]
-                for launch in recorder.launches
+            launches = {
+                launch["prompt"]["role"]: launch for launch in recorder.launches
             }
             self.assertEqual(
                 {"tester", "test-reviewer", "builder", "code-reviewer"},
-                set(prompts),
+                set(launches),
             )
-            for role, prompt in prompts.items():
+            for role, launch in launches.items():
                 with self.subTest(role=role):
                     self.assertEqual(
                         [interface_entry],
-                        prompt["public_contract"]["interface"],
+                        _context_section(
+                            self, launch, "public_contract", "interface"
+                        ),
                     )
+
+
+def _filler(prefix: str, size: int) -> str:
+    return (prefix + " ") * max(1, size // (len(prefix) + 1))
+
+
+def _records(count: int, total: int, tag: str) -> list[dict[str, Any]]:
+    return [
+        {"id": "{0}-{1}".format(tag, index), "text": _filler(tag, total // count)}
+        for index in range(count)
+    ]
+
+
+class PlanScaledPromptSectionsTest(unittest.TestCase):
+    """A tests lane's test-reviewer prompt, at the sizes a live plan produced.
+
+    The sections are synthesized at the byte sizes measured on a refused
+    dispatch: one paired build lane's obligations at 547 KB, the lane's own
+    claims at 137 KB, acceptance criteria at 143 KB and a 36 KB interface.
+    Inline, that prompt was 863 KB, ~287k tokens against a 262144-token omp
+    window, and the launch refused it PROMPT_TOO_LARGE.
+    """
+
+    def _dispatch(self, root: Path) -> tuple[RecordingLauncher, dict[str, Any], Any]:
+        product = root / "product"
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        _init_repo(product)
+        target = gitpub.bind_target_worktree(product, "refs/heads/main")
+        lane = _lane(lane_kind="tests", outputs=("tests/test_contract.py",))
+        interface = _records(26, 36_000, "interface")
+        obligations = {
+            "claims": _records(7, 137_000, "claim"),
+            "for_build_lanes": [
+                {
+                    "lane_id": "lane-a-build",
+                    "acceptance": _records(8, 250_000, "acceptance"),
+                    "claims": _records(7, 244_000, "claim"),
+                    "interface": interface,
+                    "observed_baseline": _records(11, 10_700, "baseline"),
+                    "seams": ["seam"],
+                    "verifier": {"oracle": _filler("oracle", 3_800)},
+                }
+            ],
+            "observed_baseline": _records(3, 3_400, "baseline"),
+            "rendered_bindings": _records(9, 9_000, "binding"),
+            "seams": ["seam"],
+            "verifier": {"oracle": _filler("oracle", 3_400)},
+        }
+        lane_spec = {
+            "goal": "contract tests",
+            "instruction": "write the contract tests",
+            "obligations": obligations,
+        }
+        contract = {
+            "acceptance_criteria": [
+                item["text"] for item in _records(40, 143_000, "criterion")
+            ],
+            "declared_outputs": ["tests/test_contract.py"],
+            "interface": interface,
+        }
+        draft = tchain.write_test_draft(
+            request=rcv.LaneRequest(
+                run_id="run-size",
+                lane_id=lane.lane_id,
+                plan_revision=1,
+                spec_digest=lane.spec_digest,
+                lane_projection_digest=lane.lane_projection_digest,
+                input_digest="44" * 32,
+            ),
+            binding=target,
+            integration_head=_git(product, "rev-parse", "refs/heads/main"),
+            files={"tests/test_contract.py": "assert True\n"},
+            public_contract=contract,
+            declared_outputs=["tests/test_contract.py"],
+        )
+        reviewer = RecordingLauncher(envelope={"verdict": "PASS", "findings": []})
+        actor = maestro.HerdrStageActor(
+            cast(lch.LauncherAdapter, reviewer),
+            state,
+            target,
+            _ROLE_ROUTES,
+            lane_specs={lane.lane_id: lane_spec},
+        )
+        actor.review_tests(
+            LaneContext(
+                run_id="run-size",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="55" * 32,
+                stage=LaneStage.REVIEWING_TESTS,
+                artifacts={"TEST_DRAFT": draft},  # type: ignore[dict-item]
+                candidate_sha=str(draft.payload["candidate_sha"]),
+                public_contract=contract,
+            )
+        )
+        return reviewer, {"lane_spec": lane_spec, "public_contract": contract}, actor
+
+    def test_the_test_reviewer_prompt_fits_its_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reviewer, sections, _actor = self._dispatch(Path(tmp))
+            spec = reviewer.specs[0]
+            self.assertEqual("omp", spec.route)
+            estimate = lch.preflight_launch_prompt(spec)
+            budget = hb.handoff_budget(spec.context_window_tokens)
+            assert estimate is not None
+            self.assertLessEqual(estimate, budget)
+            self.assertLess(spec.prompt_path.stat().st_size, 20_000)
+            launch = reviewer.launches[0]
+            for keys in (
+                ("lane_spec", "obligations"),
+                ("public_contract", "acceptance_criteria"),
+                ("public_contract", "interface"),
+            ):
+                with self.subTest(section=".".join(keys)):
+                    expected: Any = sections
+                    for key in keys:
+                        expected = expected[key]
+                    self.assertEqual(
+                        json.loads(json.dumps(expected)),
+                        _context_section(self, launch, *keys),
+                    )
+            self.assertIn("context_file", launch["prompt"]["instructions"])
+
+    def test_the_same_sections_inline_are_refused(self) -> None:
+        """The gate still measures what enters the prompt.
+
+        Put every moved section back inline and the same launch spec is
+        refused PROMPT_TOO_LARGE: the size check was not loosened, the
+        prompt got smaller.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            reviewer, sections, _actor = self._dispatch(Path(tmp))
+            spec = reviewer.specs[0]
+            inline = dict(reviewer.launches[0]["prompt"])
+            inline["lane_spec"] = dict(inline["lane_spec"])
+            inline["lane_spec"]["obligations"] = sections["lane_spec"]["obligations"]
+            inline["public_contract"] = sections["public_contract"]
+            spec.prompt_path.write_text(json.dumps(inline), encoding="utf-8")
+            with self.assertRaises(lch.LaunchRefused) as refused:
+                lch.preflight_launch_prompt(spec)
+            self.assertIs(lch.LaunchRefusal.PROMPT_TOO_LARGE, refused.exception.refusal)
 
 
 class RoleRouteBindingTest(unittest.TestCase):
