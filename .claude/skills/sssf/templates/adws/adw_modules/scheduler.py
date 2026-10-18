@@ -2034,8 +2034,15 @@ class FactoryScheduler:
         finally:
             self.locks.release()
 
-    def resume_waiting(self) -> None:
+    def resume_waiting(self, held: Sequence[str] = ()) -> None:
+        """Resume every resumable park except the lanes in `held`.
+
+        `held` is `run attend`'s: a `LANE_FAULT` its author declared a runtime
+        defect stays parked for the rest of that session.
+        """
         for lane in self.store.active_projection(self.run_id):
+            if lane.lane_id in held:
+                continue
             if (
                 self.store.lane_stage(self.run_id, lane.lane_id)
                 is not st.LaneStage.WAITING_FOR_USER

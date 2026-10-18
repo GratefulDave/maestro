@@ -1125,6 +1125,12 @@ class HerdrStageActor:
                 "rationales": [
                     {key: "<{0}>".format(key) for key in att.RATIONALE_KEYS}
                 ],
+                "runtime_defects": [
+                    {
+                        "lane": "<optional: a parked LANE_FAULT lane id>",
+                        "detail": "<why no plan edit can fix this fault>",
+                    }
+                ],
             }
         if role == _ATTEND_REVIEWER_ROLE:
             return {
@@ -1338,6 +1344,16 @@ class HerdrStageActor:
                 "normally one seam contract on the lane's own carrier. An "
                 "`AMENDMENT_REQUIRED` lane's spec must change, or the "
                 "amendment is refused.\n"
+                "A `LANE_FAULT` lane parked because harness code raised while "
+                "running it; the exception is `fault` in that lane's "
+                "`reviews.json`. If the plan caused it -- an oversized or "
+                "mis-specified lane -- answer it with the same kind of edit "
+                "and a rationale. If no plan edit can fix it, it is a runtime "
+                "defect: list it under `runtime_defects` with a `detail` "
+                "naming the defect, give it no rationale, and leave its "
+                "contract alone. That lane stays parked and an issue is "
+                "filed; when every parked lane is a runtime defect, write no "
+                "revision.\n"
                 "Each lane's accepted acceptance suite is in this checkout "
                 "under `suite/<lane_id>/`; the builder and every reviewer read "
                 "the same files in their own checkouts. Stating an expectation "
@@ -1737,7 +1753,8 @@ class HerdrStageActor:
                 "table, reviews and final review under lanes/<lane_id>/. "
                 "Write one revised IR answering every parked lane at "
                 "revision_out_path and return that exact path plus one "
-                "rationale per parked lane. Change only lanes in "
+                "rationale per parked lane, except a LANE_FAULT lane you "
+                "list under runtime_defects instead. Change only lanes in "
                 "allowed_lane_ids. Run no maestro verb, no git command, and "
                 "no planctl. A tests lane stalled on an undeclared binding is "
                 "repaired by declaring extensions.maestro.interfaces entries "
@@ -2138,8 +2155,12 @@ class HerdrStageActor:
         if role == "operator":
             # Asked again here rather than refused later: an envelope with no
             # revision_path is a turn the agent has not finished, and the
-            # attend loop's refusal would end the whole verb over it.
-            return bool(str(payload.get("revision_path") or "").strip())
+            # attend loop's refusal would end the whole verb over it. A turn
+            # that declared only runtime defects owes no revision.
+            return bool(
+                str(payload.get("revision_path") or "").strip()
+                or payload.get("runtime_defects")
+            )
         return True
 
     #: Set by FactoryScheduler when an operator console is attached. Reporting
@@ -3028,6 +3049,7 @@ class HerdrStageActor:
                         "round": lane.round_number,
                         "stage": lane.stage,
                         "wait_reason": lane.wait_reason,
+                        "fault": st.json_ready(lane.fault),
                     },
                     indent=2,
                     sort_keys=True,
@@ -3682,41 +3704,50 @@ def _run_start(args: argparse.Namespace) -> int:
                 repository=repo,
                 state=runtime.path,
             )
-            maybe_autoload_dashboard(
-                layout,
-                repository=repo,
-                ledger=runtime.ledger_path(),
-            )
-            console = step_log.RunReporter(run_id, runtime.path)
-            console.opened(
-                "start",
-                run_id,
-                target.target_repository_root,
-                target.target_main_ref,
-                (lane.lane_id for lane in compiled.lanes),
-            )
-            scheduler = FactoryScheduler(
-                store,
-                run_id,
-                _actor_for(runtime, layout, target, run_id, compiled),
-                runtime,
-                target,
-                stage_started=console.stage_started,
-                stage_completed=console.stage_completed,
-                step=console.step,
-                compiled=compiled,
-                concurrency=layout.get("concurrency") or 1,
-                regression_on_findings=bool(
-                    layout.get("stall_regression_on_findings")
-                ),
-                max_probe_rounds=_max_probe_rounds(layout),
-            )
-            status = scheduler.run()
-            console.finished(run_id, status)
+            # The run exists and is pinned. With attend enabled, `run attend`
+            # binds it like any other and runs the scheduler itself, once
+            # this verb's store and runtime are closed.
+            attend = _attend_policy(layout).enabled
+            if not attend:
+                maybe_autoload_dashboard(
+                    layout,
+                    repository=repo,
+                    ledger=runtime.ledger_path(),
+                )
+                console = step_log.RunReporter(run_id, runtime.path)
+                console.opened(
+                    "start",
+                    run_id,
+                    target.target_repository_root,
+                    target.target_main_ref,
+                    (lane.lane_id for lane in compiled.lanes),
+                )
+                scheduler = FactoryScheduler(
+                    store,
+                    run_id,
+                    _actor_for(runtime, layout, target, run_id, compiled),
+                    runtime,
+                    target,
+                    stage_started=console.stage_started,
+                    stage_completed=console.stage_completed,
+                    step=console.step,
+                    compiled=compiled,
+                    concurrency=layout.get("concurrency") or 1,
+                    regression_on_findings=bool(
+                        layout.get("stall_regression_on_findings")
+                    ),
+                    max_probe_rounds=_max_probe_rounds(layout),
+                )
+                status = scheduler.run()
+                console.finished(run_id, status)
         finally:
             store.close()
     finally:
         runtime.close()
+    if attend:
+        return _run_attend(
+            argparse.Namespace(run_id=run_id, local=False), verb="start"
+        )
     print(
         json.dumps(
             {"outcome": "STARTED", "run_id": run_id, "status": status.value},
@@ -3872,6 +3903,12 @@ def _bind_existing_run(
 def _run_resume(args: argparse.Namespace) -> int:
     run_id = args.run_id
     layout, runtime, store, row, target, compiled = _bind_existing_run(run_id)
+    if _attend_policy(layout).enabled:
+        # A deployment that opted into attend never stops at a park an
+        # amendment can answer; `run attend` rebinds the run itself.
+        store.close()
+        runtime.close()
+        return _run_attend(args, verb="resume")
     maybe_autoload_dashboard(
         layout,
         repository=Path(row["target_repository_root"]),
@@ -4266,6 +4303,7 @@ def _attend_lane_evidence(
         ),
         suite_files=_attend_suite_files(store, repo, run_id, lane),
         final_review=_attend_final_review(store, run_id, wait),
+        fault=dict((wait or {}).get("fault") or {}),
     )
 
 
@@ -4569,17 +4607,20 @@ def _attend_project(
     return compiled, plan_out
 
 
-def _run_attend(args: argparse.Namespace) -> int:
+def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     """Run the factory and author the amendment its attendable parks need.
 
     Everything about a lane's lifecycle is unchanged. This verb runs the same
     scheduler `run resume` runs, and when that scheduler settles with lanes
-    parked `NO_PROGRESS` or `AMENDMENT_REQUIRED` it does what the operator
-    would have done by hand instead of returning to a prompt: dispatches one
-    agent to author one plan revision for all of them, has a second agent of
-    a different declared vendor review it, validates and projects it exactly
-    as `run amend` requires, and applies it through `apply_factory_amendment`.
-    `PAUSE`, `LANE_FAULT`, and any lane past its bound park as they do today.
+    parked `NO_PROGRESS`, `AMENDMENT_REQUIRED` or `LANE_FAULT` it does what
+    the operator would have done by hand instead of returning to a prompt:
+    dispatches one agent to author one plan revision for all of them, has a
+    second agent of a different declared vendor review it, validates and
+    projects it exactly as `run amend` requires, and applies it through
+    `apply_factory_amendment`. A `LANE_FAULT` the author declares a runtime
+    defect files an issue and stays parked. `PAUSE`, and any lane past its
+    bound, park as they do today. `run start` and `run resume` end here
+    whenever the deployment enabled attend; `verb` is which one ran.
     """
     run_id = args.run_id
     layout, runtime, store, row, target, compiled = _bind_existing_run(run_id)
@@ -4626,11 +4667,13 @@ def _run_attend(args: argparse.Namespace) -> int:
         )
         return actor, scheduler
 
-    def run_scheduler(plan: st.CompiledPlan) -> st.RunStatus:
+    def run_scheduler(
+        plan: st.CompiledPlan, held: Sequence[str] = ()
+    ) -> st.RunStatus:
         actor, scheduler = build_scheduler(plan)
         state["actor"] = actor
         actor.restore_layout(run_id, store.active_projection(run_id))
-        scheduler.resume_waiting()
+        scheduler.resume_waiting(held)
         status = scheduler.run()
         state["passes"] = state["passes"] + 1
         return status
@@ -4762,10 +4805,12 @@ def _run_attend(args: argparse.Namespace) -> int:
     # `UnboundLocalError: applied`.
     applied: tuple[att.AppliedAmendment, ...] = ()
     status = st.RunStatus.WAITING
+    parks: tuple[tuple[str, str], ...] = ()
+    escalated: tuple[att.RuntimeDefect, ...] = ()
     try:
         try:
             console.opened(
-                "attend",
+                verb,
                 run_id,
                 row["target_repository_root"],
                 row["target_main_ref"],
@@ -4794,6 +4839,8 @@ def _run_attend(args: argparse.Namespace) -> int:
                 status = outcome.status
                 stop_reason = outcome.stop_reason
                 applied = outcome.applied
+                parks = outcome.parks
+                escalated = outcome.escalated
             except att.AttendRefused as refused:
                 stop_reason = refused.code
                 raise
@@ -4844,6 +4891,20 @@ def _run_attend(args: argparse.Namespace) -> int:
                 "revisions_applied": len(
                     {item.amendment_artifact_id for item in applied}
                 ),
+                # Every lane the run is still waiting on, and why: what the
+                # operator has to answer, since nothing here will.
+                "parks": [
+                    {"lane_id": lane_id, "wait_reason": reason}
+                    for lane_id, reason in parks
+                ],
+                "runtime_defects": [
+                    {
+                        "lane_id": item.lane_id,
+                        "fault": dict(item.fault),
+                        "issue": dict(item.issue),
+                    }
+                    for item in escalated
+                ],
             },
             sort_keys=True,
         )

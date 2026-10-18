@@ -613,7 +613,9 @@ agent on a different declared vendor (`attend.reviewer_route`, `attend.reviewer_
 the plan-review question for that revision and returns `PASS` or a located `REVISE`, which goes
 back to the author, up to `attend.max_review_rounds`. On `PASS`, Maestro approves the revision
 with `planctl` signed as that reviewer, projects it, and applies it exactly as `run amend` would.
-`PAUSE` and `LANE_FAULT` are never attended.
+`PAUSE` is never attended. A `LANE_FAULT` is: the author either revises the plan to answer it,
+or declares it a runtime defect, which files an issue and leaves only that lane parked. With
+attend enabled, `run start` and `run resume` attend on their own.
 
 Four authoring consequences.
 

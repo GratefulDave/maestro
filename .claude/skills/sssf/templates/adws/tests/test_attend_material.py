@@ -345,7 +345,7 @@ class AttendLeavesIssueAndDeviations(unittest.TestCase):
         findings.parent.mkdir(parents=True, exist_ok=True)
         passes = []
 
-        def run_scheduler(plan):
+        def run_scheduler(plan, held=()):
             passes.append(plan.plan_revision)
             return st.RunStatus.WAITING if store.parked else st.RunStatus.COMPLETE
 

@@ -25,6 +25,14 @@ The operator agent reads the accepted suite, as the builder and every
 reviewer do in their own checkouts; the operator agent is a plan author, and
 what it writes is a contract clause stating an expectation the suite asserts,
 never a test edit.
+
+A `LANE_FAULT` park is attended too. The author reads the fault beside the
+lane's evidence and either answers it with the same kind of revision, or
+declares it a runtime defect: a fault in harness code no plan edit can fix.
+A declared defect files one deduplicated issue and leaves that lane parked
+for the rest of the session -- the scheduler never resumes it again -- while
+every other lane keeps running and every other park is still attended. The
+declaration moves no lane; it only withholds a resume.
 """
 
 from __future__ import annotations
@@ -70,6 +78,9 @@ KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
 #: The Plan IR the live revision was projected from could not be located.
 PLAN_IR_UNRESOLVED = "ATTEND_PLAN_IR_UNRESOLVED"
 
+#: The operator agent's runtime-defect declaration was not the typed shape.
+DEFECT_INVALID = "ATTEND_RUNTIME_DEFECT_INVALID"
+
 #: Why an attend session stopped. Recorded on the STOP `ATTEND_SESSION`.
 STOP_RUN_SETTLED = "RUN_SETTLED"
 STOP_WAIT_NOT_ATTENDABLE = "WAIT_NOT_ATTENDABLE"
@@ -77,11 +88,13 @@ STOP_LANE_CAP = "LANE_CAP_REACHED"
 STOP_RUN_CAP = "RUN_CAP_REACHED"
 STOP_REVIEW_UNRESOLVED = "REVIEW_UNRESOLVED"
 
-#: The wait reasons a plan amendment can answer. `PAUSE` is a human decision
-#: and `LANE_FAULT` a runtime exception in harness code; neither is attended.
+#: The wait reasons the loop attends. `PAUSE` is a human decision and is
+#: never attended. A `LANE_FAULT` is attended: the author either amends the
+#: plan (an oversized or mis-specified lane) or declares a runtime defect.
 ATTENDABLE_REASONS: Tuple[str, ...] = (
     st.WaitReason.NO_PROGRESS.value,
     st.WaitReason.AMENDMENT_REQUIRED.value,
+    st.WaitReason.LANE_FAULT.value,
 )
 
 #: Issue filing outcomes, as `file_issue` reports them.
@@ -137,6 +150,9 @@ class LaneEvidence:
     lane_gates: str
     suite_files: Mapping[str, str]
     final_review: Mapping[str, Any] = field(default_factory=dict)
+    #: The `USER_WAIT` fault (`exception_type`, `message`) of a `LANE_FAULT`
+    #: park, empty for every other reason.
+    fault: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -228,11 +244,25 @@ class AppliedAmendment:
 
 
 @dataclass(frozen=True)
+class RuntimeDefect:
+    """A `LANE_FAULT` the author declared a harness defect, and its issue."""
+
+    lane_id: str
+    fault: Mapping[str, Any]
+    detail: str
+    issue: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class AttendOutcome:
     status: st.RunStatus
     stop_reason: str
     applied: Tuple[AppliedAmendment, ...]
     compiled: st.CompiledPlan
+    #: `(lane_id, wait_reason)` for every lane still `WAITING_FOR_USER` when
+    #: the loop stopped, attendable or not.
+    parks: Tuple[Tuple[str, str], ...] = ()
+    escalated: Tuple[RuntimeDefect, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,14 +274,13 @@ class MaterialChange:
     obligations_touched: Tuple[str, ...]
 
 
-def parked_lane_ids(store: Any, run_id: str) -> Tuple[Tuple[str, str], ...]:
-    """`(lane_id, wait_reason)` for every attendable park, in projection order.
+def waiting_lanes(store: Any, run_id: str) -> Tuple[Tuple[str, str], ...]:
+    """`(lane_id, wait_reason)` for every `WAITING_FOR_USER` lane.
 
     Reads `lane_state.stage` and the lane's own latest `USER_WAIT`, which is
-    the pair §5 makes authoritative. A lane waiting on `PAUSE` or `LANE_FAULT`
-    is not attendable and is deliberately left for the operator.
+    the pair §5 makes authoritative.
     """
-    parked = []
+    waiting = []
     for lane in store.active_projection(run_id):
         if store.lane_stage(run_id, lane.lane_id) is not st.LaneStage.WAITING_FOR_USER:
             continue
@@ -260,11 +289,24 @@ def parked_lane_ids(store: Any, run_id: str) -> Tuple[Tuple[str, str], ...]:
         )
         if wait is None:
             continue
-        reason = wait.get("wait_reason")
-        if reason not in ATTENDABLE_REASONS:
-            continue
-        parked.append((lane.lane_id, str(reason)))
-    return tuple(parked)
+        waiting.append((lane.lane_id, str(wait.get("wait_reason"))))
+    return tuple(waiting)
+
+
+def parked_lane_ids(
+    store: Any, run_id: str, held: Sequence[str] = ()
+) -> Tuple[Tuple[str, str], ...]:
+    """`(lane_id, wait_reason)` for every attendable park, in projection order.
+
+    A lane waiting on `PAUSE` is not attendable and is deliberately left for
+    the operator, and so is a lane in `held`: one this session already
+    escalated as a runtime defect.
+    """
+    return tuple(
+        (lane_id, reason)
+        for lane_id, reason in waiting_lanes(store, run_id)
+        if reason in ATTENDABLE_REASONS and lane_id not in held
+    )
 
 
 def paired_lane_ids(
@@ -410,6 +452,57 @@ def require_rationales(
             NO_REVISION, "rationale for a lane not parked: " + ", ".join(extra)
         )
     return tuple(by_lane[lane] for lane in lane_ids)
+
+
+def require_runtime_defects(
+    payload: Any, parked: Sequence[Tuple[str, str]]
+) -> Tuple[Tuple[str, str], ...]:
+    """`(lane_id, detail)` for each runtime defect the operator declared.
+
+    Absent means none. Only a parked `LANE_FAULT` lane can be declared one:
+    a `NO_PROGRESS` or `AMENDMENT_REQUIRED` park is a contract gap by
+    definition, and letting the author call it a harness defect would be a
+    way to stop answering it.
+    """
+    if payload is None:
+        return ()
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
+        raise AttendRefused(DEFECT_INVALID, "runtime_defects is not a list")
+    faulted = {
+        lane_id
+        for lane_id, reason in parked
+        if reason == st.WaitReason.LANE_FAULT.value
+    }
+    declared: dict = {}
+    for index, item in enumerate(payload):
+        if not isinstance(item, Mapping):
+            raise AttendRefused(
+                DEFECT_INVALID, "runtime_defects[{0}] is not an object".format(index)
+            )
+        lane = item.get("lane")
+        detail = item.get("detail")
+        if not (isinstance(lane, str) and lane.strip()):
+            raise AttendRefused(
+                DEFECT_INVALID, "runtime_defects[{0}] names no lane".format(index)
+            )
+        if not (isinstance(detail, str) and detail.strip()):
+            raise AttendRefused(
+                DEFECT_INVALID, "runtime_defects[{0}] has a blank detail".format(index)
+            )
+        lane = lane.strip()
+        if lane not in faulted:
+            raise AttendRefused(
+                DEFECT_INVALID,
+                "{0} is not a parked LANE_FAULT lane".format(lane),
+            )
+        if lane in declared:
+            raise AttendRefused(DEFECT_INVALID, "two runtime defects for " + lane)
+        declared[lane] = detail.strip()
+    return tuple(
+        (lane_id, declared[lane_id])
+        for lane_id, _reason in parked
+        if lane_id in declared
+    )
 
 
 def require_review_verdict(
@@ -651,6 +744,31 @@ def issue_title(run_id: str, plan_revision: int) -> str:
     )
 
 
+def defect_issue_title(run_id: str, lane_id: str, fault: Mapping[str, Any]) -> str:
+    return "Runtime defect on run {0}: {1} {2}".format(
+        run_id, lane_id, fault.get("exception_type") or "LANE_FAULT"
+    )
+
+
+def defect_issue_body(
+    *, run_id: str, lane_id: str, fault: Mapping[str, Any], detail: str
+) -> str:
+    return "\n".join(
+        [
+            "Run `{0}` parked `{1}` with `LANE_FAULT`, and the attend operator "
+            "declared it a runtime defect rather than a plan gap. The lane stays "
+            "parked; every other lane keeps running.".format(run_id, lane_id),
+            "",
+            "## Fault",
+            "- exception_type: `{0}`".format(fault.get("exception_type", "")),
+            "- message: {0}".format(fault.get("message", "")),
+            "",
+            "## Operator's diagnosis",
+            detail,
+        ]
+    ) + "\n"
+
+
 def issue_body(
     *,
     run_id: str,
@@ -818,7 +936,7 @@ def attend_run(
     policy: AttendPolicy,
     compiled: st.CompiledPlan,
     session_id: str,
-    run_scheduler: Callable[[st.CompiledPlan], st.RunStatus],
+    run_scheduler: Callable[[st.CompiledPlan, Tuple[str, ...]], st.RunStatus],
     request_for: Callable[..., OperatorRequest],
     dispatch: Callable[[OperatorRequest], Mapping[str, Any]],
     review_request_for: Callable[..., ReviewRequest],
@@ -832,11 +950,18 @@ def attend_run(
     """Run the factory, and amend every attendable park instead of stopping.
 
     The scheduler runs until nothing else is runnable. Every attendable park
-    it left -- `NO_PROGRESS` and `AMENDMENT_REQUIRED` -- goes into one batch:
+    it left -- `NO_PROGRESS`, `AMENDMENT_REQUIRED` and `LANE_FAULT` -- goes
+    into one batch:
     one author dispatch, up to `max_review_rounds` independent reviews, one
     signed revision, one `apply_amendment`, and the scheduler runs again. The
     parked set, the projection and the evidence are all re-derived from the
     ledger after each batch rather than carried across.
+
+    A `LANE_FAULT` lane the author declares a runtime defect leaves the
+    batch: its issue is filed, and `run_scheduler(compiled, held)` is told
+    never to resume it again this session. A batch that was only such lanes
+    applies nothing and does not re-run the scheduler, which already ran
+    every other lane as far as it could.
 
     `request_for(parked, compiled, review_round, reviewer_findings,
     previous_revision)` and `review_request_for(request, revision,
@@ -847,25 +972,41 @@ def attend_run(
     if not policy.enabled:
         raise AttendRefused(DISABLED, "attend.max_amendments_per_lane is not set")
     applied: list[AppliedAmendment] = []
+    escalated: list[RuntimeDefect] = []
     per_lane: dict[str, int] = {}
     batches = 0
+    status = st.RunStatus.WAITING
+    rerun = True
+
+    def held() -> Tuple[str, ...]:
+        return tuple(item.lane_id for item in escalated)
+
+    def done(reason: str) -> AttendOutcome:
+        return AttendOutcome(
+            status,
+            reason,
+            tuple(applied),
+            compiled,
+            waiting_lanes(store, run_id),
+            tuple(escalated),
+        )
+
     while True:
-        status = run_scheduler(compiled)
+        if rerun:
+            status = run_scheduler(compiled, held())
+        rerun = True
         if status is not st.RunStatus.WAITING:
-            return AttendOutcome(status, STOP_RUN_SETTLED, tuple(applied), compiled)
-        parked = parked_lane_ids(store, run_id)
+            return done(STOP_RUN_SETTLED)
+        parked = parked_lane_ids(store, run_id, held())
         if not parked:
-            return AttendOutcome(
-                status, STOP_WAIT_NOT_ATTENDABLE, tuple(applied), compiled
-            )
+            return done(STOP_WAIT_NOT_ATTENDABLE)
         if batches >= policy.max_amendments_per_run:
-            return AttendOutcome(status, STOP_RUN_CAP, tuple(applied), compiled)
+            return done(STOP_RUN_CAP)
         if any(
             per_lane.get(lane_id, 0) >= policy.max_amendments_per_lane
             for lane_id, _reason in parked
         ):
-            return AttendOutcome(status, STOP_LANE_CAP, tuple(applied), compiled)
-        lane_ids = tuple(lane_id for lane_id, _reason in parked)
+            return done(STOP_LANE_CAP)
         for lane_id, reason in parked:
             say(lane_id, "attending a {0} park".format(reason))
         # Rendered whatever the batch's outcome: a review that never passed,
@@ -887,19 +1028,64 @@ def attend_run(
                 file_issue=file_issue,
                 deviations_path=deviations_path,
                 applied=applied,
+                escalated=escalated,
                 say=say,
             )
         finally:
             _write_deviations(store, run_id, deviations_path)
         if revised is None:
-            return AttendOutcome(
-                status, STOP_REVIEW_UNRESOLVED, tuple(applied), compiled
-            )
+            return done(STOP_REVIEW_UNRESOLVED)
+        if revised is compiled:
+            rerun = False
+            continue
+        lane_ids = tuple(
+            lane_id for lane_id, _reason in parked if lane_id not in held()
+        )
         for lane_id in lane_ids:
             per_lane[lane_id] = per_lane.get(lane_id, 0) + 1
         batches += 1
         compiled = revised
         say(lane_ids[0], "amended to revision {0}".format(revised.plan_revision))
+
+
+def _escalate(
+    store: Any,
+    run_id: str,
+    defects: Sequence[Tuple[str, str]],
+    file_issue: Optional[Callable[[str, str], Mapping[str, str]]],
+    escalated: Optional[list],
+    say: Callable[[str, str], None],
+) -> None:
+    """File one deduplicated issue per declared defect; hold each lane."""
+    for lane_id, detail in defects:
+        wait = store.latest_lane_artifact_payload(
+            run_id, lane_id, st.ArtifactKind.USER_WAIT
+        ) or {}
+        fault = dict(wait.get("fault") or {})
+        issue: Mapping[str, str] = {}
+        if file_issue is not None:
+            try:
+                issue = dict(
+                    file_issue(
+                        defect_issue_title(run_id, lane_id, fault),
+                        defect_issue_body(
+                            run_id=run_id, lane_id=lane_id, fault=fault, detail=detail
+                        ),
+                    )
+                )
+            except Exception as exc:  # an unfiled issue still holds the lane
+                issue = {
+                    "status": ISSUE_FAILED,
+                    "detail": "{0}: {1}".format(type(exc).__name__, exc),
+                }
+        if escalated is not None:
+            escalated.append(RuntimeDefect(lane_id, fault, detail, issue))
+        say(
+            lane_id,
+            "runtime defect, lane stays parked: {0}".format(
+                issue.get("url") or issue.get("detail") or "no issue filed"
+            ),
+        )
 
 
 def _attend_batch(
@@ -920,11 +1106,14 @@ def _attend_batch(
     deviations_path: Optional[Path],
     applied: list,
     say: Callable[[str, str], None],
+    escalated: Optional[list] = None,
 ) -> Optional[st.CompiledPlan]:
     """One batch: author, review rounds, sign, apply. None when unresolved.
 
     Each round's revision has its own path, and the reviewer judges the
     bytes whose sha256 the round records; only those bytes are projected.
+    `compiled` itself is returned when every lane in the batch was declared
+    a runtime defect, so nothing was revised.
     """
     lane_ids = tuple(lane_id for lane_id, _reason in parked)
     allowed = batch_scope(compiled.lanes, parked)
@@ -943,6 +1132,17 @@ def _attend_batch(
             raise AttendRefused(
                 OPERATOR_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
             ) from exc
+        if not isinstance(envelope, Mapping):
+            raise AttendRefused(NO_REVISION, "envelope is not an object")
+        defects = require_runtime_defects(envelope.get("runtime_defects"), parked)
+        if defects:
+            _escalate(store, run_id, defects, file_issue, escalated, say)
+            declared = {lane_id for lane_id, _detail in defects}
+            parked = tuple(item for item in parked if item[0] not in declared)
+            if not parked:
+                return compiled
+            lane_ids = tuple(lane_id for lane_id, _reason in parked)
+            allowed = batch_scope(compiled.lanes, parked)
         written = revision_path(envelope, Path(request.revision_out_path))
         rationales = require_rationales(envelope.get("rationales"), lane_ids)
         digest = sha256_hex(written.read_bytes())

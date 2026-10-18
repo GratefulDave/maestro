@@ -9,7 +9,9 @@ without the human, and -- more importantly -- pin what it still refuses to do:
 - a deployment that never opted in gets `ATTEND_DISABLED`, not an agent;
 - `NO_PROGRESS` and `AMENDMENT_REQUIRED` parks are answered together, by one
   author dispatch, one independent review, and one `PLAN_AMENDMENT`;
-- `PAUSE` and `LANE_FAULT` park exactly as they do today;
+- `PAUSE` parks exactly as it does today, and a `LANE_FAULT` is attended:
+  amended like any park, or declared a runtime defect that files an issue
+  and stays parked while every other lane keeps going;
 - a reviewer REVISE goes back to the author with its located findings, and a
   revision still unresolved at the bound is never applied;
 - a lane past its bound parks, and so does a run past its own;
@@ -70,6 +72,7 @@ OTHER_LANE = _lane("lane-b-build", kind=st.LANE_KIND_BUILD)
 PLAN = _plan((TESTS_LANE, BUILD_LANE, OTHER_LANE), 1)
 
 NO_PROGRESS = st.WaitReason.NO_PROGRESS.value
+LANE_FAULT = st.WaitReason.LANE_FAULT.value
 AMENDMENT_REQUIRED = st.WaitReason.AMENDMENT_REQUIRED.value
 
 
@@ -169,7 +172,8 @@ class _Harness:
                  stays_parked: bool = False,
                  file_issue: Any = None,
                  tamper_after_review: bool = False,
-                 project_refusal: BaseException | None = None) -> None:
+                 project_refusal: BaseException | None = None,
+                 defects: Mapping[str, str] = {}) -> None:
         self.tmp = tmp
         self.store = _Store(parked)
         self.policy = policy
@@ -187,9 +191,14 @@ class _Harness:
         self.reviewed: list[att.ReviewRequest] = []
         self.projected: list[tuple[int, list]] = []
         self.applied: list[st.CompiledPlan] = []
+        self.held: list[tuple[str, ...]] = []
+        self.defects = dict(defects)
 
-    def run_scheduler(self, plan: st.CompiledPlan) -> st.RunStatus:
+    def run_scheduler(
+        self, plan: st.CompiledPlan, held: Sequence[str] = ()
+    ) -> st.RunStatus:
         self.passes += 1
+        self.held.append(tuple(held))
         if self.store.parked:
             return st.RunStatus.WAITING
         return st.RunStatus.COMPLETE
@@ -230,12 +239,22 @@ class _Harness:
         self.dispatched.append(request)
         if self.crash is not None:
             raise self.crash
+        declared = [
+            {"lane": lane.lane_id, "detail": self.defects[lane.lane_id]}
+            for lane in request.lanes
+            if lane.lane_id in self.defects
+        ]
+        owed = [lane for lane in request.lanes if lane.lane_id not in self.defects]
+        envelope: dict[str, Any] = {"runtime_defects": declared} if declared else {}
+        if not owed:
+            return envelope
         Path(request.revision_out_path).write_text(
             json.dumps({"round": request.review_round}), encoding="utf-8"
         )
         return {
+            **envelope,
             "revision_path": request.revision_out_path,
-            "rationales": [_rationale(lane.lane_id) for lane in request.lanes],
+            "rationales": [_rationale(lane.lane_id) for lane in owed],
         }
 
     def review_request_for(self, request, revision, rationales, review_round, digest):
@@ -296,7 +315,13 @@ class _Harness:
             {"artifact_id": artifact_id, "payload": {"resets": []}}
         )
         if not self.stays_parked:
-            self.store.parked = {}
+            # Only the lanes the amendment reached leave their park; a lane
+            # held as a runtime defect is not one of them.
+            self.store.parked = {
+                lane_id: reason
+                for lane_id, reason in self.store.parked.items()
+                if lane_id in self.defects
+            }
         return _Record(artifact_id)
 
     def attend(self, **extra: Any) -> att.AttendOutcome:
@@ -409,18 +434,94 @@ class AttendLoop(unittest.TestCase):
         )
         self.assertEqual(outcome.applied[0].rationale_artifact_id, "rationale-1")
 
-    def test_a_pause_or_lane_fault_wait_parks_exactly_as_it_does_today(self) -> None:
-        """A2."""
-        for reason in (st.WaitReason.PAUSE.value, st.WaitReason.LANE_FAULT.value):
-            with self.subTest(reason=reason):
-                harness = _Harness(
-                    self.tmp, parked={"lane-a-build": reason}, policy=_policy()
-                )
-                outcome = harness.attend()
-                self.assertIs(outcome.status, st.RunStatus.WAITING)
-                self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
-                self.assertEqual(harness.dispatched, [])
-                self.assertEqual(harness.reviewed, [])
+    def test_a_pause_wait_parks_exactly_as_it_does_today(self) -> None:
+        """A2: an operator's explicit pause is never attended."""
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": st.WaitReason.PAUSE.value},
+            policy=_policy(),
+        )
+        outcome = harness.attend()
+        self.assertIs(outcome.status, st.RunStatus.WAITING)
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(harness.dispatched, [])
+        self.assertEqual(harness.reviewed, [])
+        self.assertEqual(outcome.parks, (("lane-a-build", st.WaitReason.PAUSE.value),))
+
+    def test_a_lane_fault_park_is_amended_and_the_run_continues(self) -> None:
+        """A1: a fault the plan caused is answered like any other park."""
+        harness = _Harness(
+            self.tmp, parked={"lane-a-build": LANE_FAULT}, policy=_policy()
+        )
+        outcome = harness.attend()
+        self.assertIs(outcome.status, st.RunStatus.COMPLETE)
+        self.assertEqual(outcome.stop_reason, att.STOP_RUN_SETTLED)
+        self.assertEqual([item.lane_id for item in outcome.applied], ["lane-a-build"])
+        self.assertEqual(outcome.escalated, ())
+        self.assertEqual(harness.passes, 2)
+
+    def test_a_runtime_defect_files_an_issue_and_only_that_lane_stays_parked(
+        self,
+    ) -> None:
+        """A1: the defect is escalated, its sibling's park is still amended."""
+        filed: list[tuple[str, str]] = []
+
+        def file_issue(title: str, body: str) -> Mapping[str, str]:
+            filed.append((title, body))
+            return {"status": att.ISSUE_CREATED, "url": "https://example.test/1"}
+
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS, "lane-b-build": LANE_FAULT},
+            policy=_policy(),
+            defects={"lane-b-build": "the launcher refuses every pane"},
+            file_issue=file_issue,
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.dispatched), 1)
+        self.assertEqual(len(filed), 1)
+        self.assertEqual(
+            filed[0][0], "Runtime defect on run run-1: lane-b-build LANE_FAULT"
+        )
+        self.assertIn("the launcher refuses every pane", filed[0][1])
+        # Only the sibling was amended, and the revision's scope was its own.
+        self.assertEqual([item.lane_id for item in outcome.applied], ["lane-a-build"])
+        self.assertEqual(
+            harness.reviewed[0].rationales[0]["lane"], "lane-a-build"
+        )
+        # The scheduler ran again for the amended lane, holding the defect.
+        self.assertEqual(harness.held, [(), ("lane-b-build",)])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(outcome.parks, (("lane-b-build", LANE_FAULT),))
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-b-build"])
+        self.assertEqual(outcome.escalated[0].issue["url"], "https://example.test/1")
+
+    def test_a_batch_of_only_runtime_defects_applies_nothing(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-b-build": LANE_FAULT},
+            policy=_policy(),
+            defects={"lane-b-build": "harness bug"},
+        )
+        outcome = harness.attend()
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(harness.reviewed, [])
+        self.assertEqual(harness.applied, [])
+        # Nothing changed, so the scheduler is not run a second time.
+        self.assertEqual(harness.passes, 1)
+        self.assertEqual(outcome.parks, (("lane-b-build", LANE_FAULT),))
+
+    def test_only_a_lane_fault_can_be_declared_a_runtime_defect(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            defects={"lane-a-build": "not my problem"},
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            harness.attend()
+        self.assertEqual(caught.exception.code, att.DEFECT_INVALID)
+        self.assertEqual(harness.applied, [])
 
     def test_a_reviewer_revise_returns_its_findings_to_the_author(self) -> None:
         harness = _Harness(
@@ -737,27 +838,33 @@ class PairedLanes(unittest.TestCase):
 
 
 class ParkedLanes(unittest.TestCase):
-    def test_no_progress_and_amendment_required_are_attendable(self) -> None:
+    def test_no_progress_amendment_required_and_lane_fault_are_attendable(
+        self,
+    ) -> None:
         store = _Store(
             {
                 "lane-a-build": NO_PROGRESS,
-                "lane-a-tests": st.WaitReason.LANE_FAULT.value,
+                "lane-a-tests": LANE_FAULT,
                 "lane-b-build": AMENDMENT_REQUIRED,
             }
         )
         self.assertEqual(
             att.parked_lane_ids(store, "run-1"),
-            (("lane-a-build", NO_PROGRESS), ("lane-b-build", AMENDMENT_REQUIRED)),
+            (
+                ("lane-a-tests", LANE_FAULT),
+                ("lane-a-build", NO_PROGRESS),
+                ("lane-b-build", AMENDMENT_REQUIRED),
+            ),
         )
 
-    def test_pause_and_lane_fault_are_not(self) -> None:
+    def test_pause_and_a_held_lane_are_not(self) -> None:
         store = _Store(
             {
                 "lane-a-build": st.WaitReason.PAUSE.value,
-                "lane-b-build": st.WaitReason.LANE_FAULT.value,
+                "lane-b-build": LANE_FAULT,
             }
         )
-        self.assertEqual(att.parked_lane_ids(store, "run-1"), ())
+        self.assertEqual(att.parked_lane_ids(store, "run-1", ("lane-b-build",)), ())
 
 
 if __name__ == "__main__":  # pragma: no cover
