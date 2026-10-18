@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added — `run attend --local`; attend's planctl review runs its mutation pass on EC2 by default
+
+- planctl now runs the mutation pass on an EC2 spot instance by default.
+  `run attend --local` forwards `--local` to `planctl review`, the only attend
+  call that runs mutate; without it attend inherits the EC2 default.
+- A `review.remote_runner` failure keeps planctl's message and adds a hint
+  naming `maestro run attend --local`. There is no automatic local retry.
+
 ### Changed — contract change (strengthening): `run attend` covers every amendable park, reviewed by an independent agent
 
 - **D1.** `run attend` now attends `AMENDMENT_REQUIRED` (lanes named by a

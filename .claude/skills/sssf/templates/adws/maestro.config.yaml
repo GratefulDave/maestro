@@ -13,7 +13,9 @@ stall:
   regression_on_findings: false
 # `run attend` lets the scheduler settle, then answers every NO_PROGRESS and
 # AMENDMENT_REQUIRED park with one plan amendment instead of stopping for a
-# human. PAUSE and LANE_FAULT still stop it. Opt-in: 0 (and absent) refuses
+# human. PAUSE and LANE_FAULT still stop it. The planctl review behind it
+# runs its mutation pass on EC2 by default; `run attend --local` opts out.
+# Opt-in: 0 (and absent) refuses
 # the verb with ATTEND_DISABLED, so an upgraded deployment keeps parking for
 # its operator until someone sets this key in *this* file. The operator agent
 # it dispatches reads the accepted suite, as builders and reviewers do in

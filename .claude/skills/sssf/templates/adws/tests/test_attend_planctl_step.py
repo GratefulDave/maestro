@@ -21,6 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +45,15 @@ def _configured_planctl() -> Path | None:
         return None
     candidate = Path(raw)
     return candidate if candidate.is_file() else None
+
+
+def _forbid_aws(case: unittest.TestCase, runner: str = "/nonexistent") -> None:
+    """Point planctl's default mutation runner somewhere that cannot reach AWS."""
+    from unittest import mock
+
+    patcher = mock.patch.dict(os.environ, {"PLANCTL_DEFAULT_RUNNER": runner})
+    patcher.start()
+    case.addCleanup(patcher.stop)
 
 
 class _Runtime:
@@ -425,6 +436,7 @@ class RealValidatorInvocation(unittest.TestCase):
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         self.tmp = Path(holder.name)
+        _forbid_aws(self)
 
     def test_a_refusing_validator_becomes_a_typed_refusal_with_its_own_words(
         self,
@@ -523,6 +535,7 @@ class RealReviewerSigning(unittest.TestCase):
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         self.tmp = Path(holder.name)
+        _forbid_aws(self)
 
     def test_the_receipt_is_signed_as_the_reviewer_agent_and_verifies(self) -> None:
         from adw_modules import plan_approval
@@ -546,7 +559,8 @@ class RealReviewerSigning(unittest.TestCase):
         plans = repo / "plans"
         with self.assertRaises(att.AttendRefused) as caught:
             maestro._attend_project(
-                policy, {"keys_dir": keys}, repo, plans, "run-1", authored.read_bytes(), 2, []
+                policy, {"keys_dir": keys}, repo, plans, "run-1", authored.read_bytes(), 2, [],
+                local=True,
             )
         # Past render, review and validate: refused only by ingress.
         self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
@@ -562,6 +576,178 @@ class RealReviewerSigning(unittest.TestCase):
             None,
             plan_approval.key_bytes(key),
         )
+
+
+class ReviewMutationPassLocation(unittest.TestCase):
+    """`--local` is forwarded to `planctl review`; EC2 stays the default."""
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+        self.revision = self.tmp / "r2.ir.json"
+        self.revision.write_text("{}", encoding="utf-8")
+
+    def _argvs(self, **kwargs) -> list:
+        from unittest import mock
+
+        calls = []
+
+        def run_planctl(binary, argv, **_):
+            calls.append(list(argv))
+            if argv[0] == "question-surface":
+                return json.dumps({"plan_id": "p-1", "question_surface_sha256": "a" * 64})
+            return ""
+
+        with (
+            mock.patch.object(maestro, "_planctl_binary", return_value=Path("planctl")),
+            mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
+            mock.patch.object(maestro, "_run_planctl", side_effect=run_planctl),
+            mock.patch.object(
+                ingress, "author_from_plan_contract", side_effect=RuntimeError("stop")
+            ),
+        ):
+            with self.assertRaises(att.AttendRefused):
+                maestro._attend_project(
+                    _REVIEWER, {"keys_dir": self.tmp / "keys"}, self.tmp,
+                    self.tmp / "plans", "run", self.revision.read_bytes(), 2, [],
+                    **kwargs,
+                )
+        return calls
+
+    def test_the_default_review_argv_has_no_local_flag(self) -> None:
+        (review,) = [a for a in self._argvs() if a[0] == "review"]
+        self.assertNotIn("--local", review)
+
+    def test_local_is_forwarded_to_review_only(self) -> None:
+        calls = self._argvs(local=True)
+        (review,) = [a for a in calls if a[0] == "review"]
+        self.assertIn("--local", review)
+        self.assertEqual(
+            [a[0] for a in calls if "--local" in a], ["review"]
+        )
+
+    def test_the_parser_exposes_local_on_attend_only(self) -> None:
+        parser = maestro.build_parser()
+        self.assertFalse(parser.parse_args(["run", "attend", "--run", "r"]).local)
+        self.assertTrue(parser.parse_args(["run", "attend", "--run", "r", "--local"]).local)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run", "amend", "plan.json", "--run", "r", "--local"])
+
+    def test_a_remote_runner_failure_surfaces_planctl_words_and_the_hint(self) -> None:
+        from unittest import mock
+
+        done = mock.Mock(
+            returncode=2,
+            stdout="",
+            stderr="review.remote_runner: boom; rerun with --local to run the "
+            "mutation pass on this machine",
+        )
+        with mock.patch.object(maestro.subprocess, "run", return_value=done):
+            with self.assertRaises(att.AttendRefused) as caught:
+                maestro._run_planctl(Path("planctl.py"), ["review", "ir.json"])
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertIn("rerun with --local", caught.exception.detail)
+        self.assertIn("maestro run attend --local", caught.exception.detail)
+
+    def test_other_failures_carry_no_hint(self) -> None:
+        from unittest import mock
+
+        done = mock.Mock(returncode=2, stdout="", stderr="receipt.key_missing")
+        with mock.patch.object(maestro.subprocess, "run", return_value=done):
+            with self.assertRaises(att.AttendRefused) as caught:
+                maestro._run_planctl(Path("planctl.py"), ["review", "ir.json"])
+        self.assertNotIn("--local", caught.exception.detail)
+
+
+_FAKE_RUNNER = """#!{python}
+import os, subprocess, sys
+
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+with open(os.environ["FAKE_RUNNER_DUMP"], "w") as handle:
+    handle.write("invoked")
+rest = [a for a in argv if a != "--out" and a != out]
+with open(out, "w") as handle:
+    subprocess.run(
+        [sys.executable, {planctl!r}, "mutate", "--local", *rest[1:], "--workers", "4", "--json"],
+        stdout=handle,
+        check=False,
+    )
+"""
+
+
+class RealReviewThroughAttendProject(unittest.TestCase):
+    """`_attend_project` (not the whole verb, which needs a live run) against the
+    mutate-remote planctl and a fake EC2 runner."""
+
+    def setUp(self) -> None:
+        raw = os.environ.get("MAESTRO_TEST_PLANCTL_REMOTE", "") or os.environ.get(
+            _PLANCTL_ENV, ""
+        )
+        self.binary = Path(raw) if raw and Path(raw).is_file() else None
+        if self.binary is None or "--local" not in self.binary.read_text(encoding="utf-8"):
+            self.skipTest("set MAESTRO_TEST_PLANCTL to a planctl with the EC2 default")
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+        self.dump = self.tmp / "runner-dump"
+        runner = self.tmp / "fake-runner.py"
+        runner.write_text(
+            _FAKE_RUNNER.format(python=sys.executable, planctl=str(self.binary)),
+            encoding="utf-8",
+        )
+        runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+        from unittest import mock
+
+        patcher = mock.patch.dict(
+            os.environ,
+            {"PLANCTL_DEFAULT_RUNNER": str(runner), "FAKE_RUNNER_DUMP": str(self.dump)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _project(self, **kwargs) -> att.AttendRefused:
+        tmp = self.tmp / "work"
+        tmp.mkdir()
+        repo, authored = _planctl_fixture(self.binary, tmp, "run-1", 2)
+        keys = tmp / "keys"
+        keys.mkdir()
+        (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text("ab" * 32)
+        route = {"route": "omp", "profile": "profile-b", "model": "", "effort": ""}
+        policy = att.AttendPolicy(
+            max_amendments_per_lane=1,
+            planctl=self.binary,
+            reviewer_id=maestro._attend_reviewer_id(route),
+            reviewer_vendor="vendor-b",
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._attend_project(
+                policy, {"keys_dir": keys}, repo, repo / "plans", "run-1",
+                authored.read_bytes(), 2, [], **kwargs,
+            )
+        return caught.exception
+
+    def test_without_local_the_runner_is_invoked(self) -> None:
+        refused = self._project()
+        self.assertTrue(self.dump.exists())
+        # Past review: only ingress refuses the planctl fixture.
+        self.assertIn("MAESTRO_EXTENSION_MISSING", refused.detail)
+
+    def test_with_local_the_runner_is_not_invoked(self) -> None:
+        refused = self._project(local=True)
+        self.assertFalse(self.dump.exists())
+        self.assertIn("MAESTRO_EXTENSION_MISSING", refused.detail)
+
+    def test_an_unrunnable_runner_names_local_and_never_falls_back(self) -> None:
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"PLANCTL_DEFAULT_RUNNER": "/nonexistent"}):
+            refused = self._project()
+        self.assertFalse(self.dump.exists())
+        self.assertIn("review.remote_runner", refused.detail)
+        self.assertIn("--local", refused.detail)
+        self.assertIn("maestro run attend --local", refused.detail)
 
 
 if __name__ == "__main__":  # pragma: no cover

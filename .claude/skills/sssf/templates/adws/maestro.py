@@ -4046,12 +4046,17 @@ def _run_planctl(
     if result.returncode == 0:
         return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
-    raise att.AttendRefused(
-        att.REVISION_REFUSED,
-        "planctl {0} exited {1}: {2}".format(
-            argv[0], result.returncode, detail.strip()[:2000]
-        ),
+    message = "planctl {0} exited {1}: {2}".format(
+        argv[0], result.returncode, detail.strip()[:2000]
     )
+    if "review.remote_runner" in detail:
+        # planctl runs its mutation pass on EC2 by default. Maestro never
+        # falls back to a local run on its own; the operator opts in.
+        message += (
+            "\nhint: EC2 could not run the mutation pass; rerun with "
+            "`maestro run attend --local` to run it on this machine"
+        )
+    raise att.AttendRefused(att.REVISION_REFUSED, message)
 
 
 def _attend_lane_gates(
@@ -4398,6 +4403,7 @@ def _attend_project(
     revision_bytes: bytes,
     revision: int,
     review_findings: Sequence[Any],
+    local: bool = False,
 ) -> tuple[st.CompiledPlan, Path]:
     """Validate, approve, project and compile one reviewed revision.
 
@@ -4469,6 +4475,7 @@ def _attend_project(
             "--findings",
             str(findings),
             *root,
+            *(["--local"] if local else []),
         ],
         key=key,
     )
@@ -4664,7 +4671,7 @@ def _run_attend(args: argparse.Namespace) -> int:
     ) -> st.CompiledPlan:
         plan, plan_out = _attend_project(
             policy, layout, repo, plans_dir, run_id, revision_bytes, revision,
-            review_findings,
+            review_findings, local=bool(getattr(args, "local", False)),
         )
         state["plan_path"] = plan_out
         return plan
@@ -4862,6 +4869,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     attend = run_sub.add_parser("attend")
     attend.add_argument("--run", dest="run_id", required=True)
+    attend.add_argument(
+        "--local",
+        action="store_true",
+        help="run planctl's mutation pass on this machine instead of EC2",
+    )
     attend.set_defaults(handler=_run_attend)
 
     status = run_sub.add_parser("status")
