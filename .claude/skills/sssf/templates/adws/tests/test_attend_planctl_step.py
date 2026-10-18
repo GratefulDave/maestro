@@ -82,6 +82,69 @@ class ValidatorResolution(unittest.TestCase):
         self.assertIn("planctl.py", caught.exception.detail)
 
 
+class PlanctlExitStatus(unittest.TestCase):
+    """Whose failure a planctl exit is, decided by its exit status alone.
+
+    planctl exits 1 for a verdict about the revision and 3 when its own
+    harness (the remote mutation runner, an uncaught crash) failed. A real
+    interpreter runs a stand-in script, because the decision is about what a
+    process exit looks like, not about any one planctl rule.
+    """
+
+    def setUp(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+
+    def _binary(self, body: str) -> Path:
+        path = self.tmp / "planctl.py"
+        path.write_text("import os, signal, sys\n" + body + "\n", encoding="utf-8")
+        return path
+
+    def _code(self, binary: Path) -> str:
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._run_planctl(binary, ["review", "x.ir.json"])
+        return caught.exception.code
+
+    def test_a_verdict_about_the_revision_is_still_a_revision_refusal(self) -> None:
+        binary = self._binary('print("schema.version: wrong"); sys.exit(1)')
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._run_planctl(binary, ["validate", "x.ir.json"])
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertIn("schema.version: wrong", caught.exception.detail)
+
+    def test_a_harness_exit_is_a_planctl_failure_not_a_refusal(self) -> None:
+        binary = self._binary('print("review.remote_runner: spot capacity"); sys.exit(3)')
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._run_planctl(binary, ["review", "x.ir.json"])
+        self.assertEqual(caught.exception.code, att.PLANCTL_FAILED)
+        self.assertIn("spot capacity", caught.exception.detail)
+
+    def test_a_planctl_killed_by_a_signal_is_a_planctl_failure(self) -> None:
+        binary = self._binary("os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertEqual(self._code(binary), att.PLANCTL_FAILED)
+
+    def test_a_planctl_that_vanished_is_a_planctl_failure(self) -> None:
+        # The interpreter exits 2 when it cannot open the script.
+        self.assertEqual(self._code(self.tmp / "gone.py"), att.PLANCTL_FAILED)
+
+    def test_a_question_surface_that_is_not_json_is_a_planctl_failure(self) -> None:
+        binary = self._binary('print("not json")')
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._write_review_findings(
+                binary, self.tmp / "x.ir.json", self.tmp / "f.json",
+                att.AttendPolicy(max_amendments_per_lane=1), [],
+            )
+        self.assertEqual(caught.exception.code, att.PLANCTL_FAILED)
+
+    def test_an_interpreter_that_cannot_start_is_a_planctl_failure(self) -> None:
+        from unittest import mock
+
+        binary = self._binary("sys.exit(0)")
+        with mock.patch.object(maestro.sys, "executable", str(self.tmp / "no-python")):
+            self.assertEqual(self._code(binary), att.PLANCTL_FAILED)
+
+
 class ReviewerKeyResolution(unittest.TestCase):
     """One resolver: `keys_dir` from the deployment config, else the state root's `keys/`."""
 
@@ -637,8 +700,10 @@ class ReviewMutationPassLocation(unittest.TestCase):
     def test_a_remote_runner_failure_surfaces_planctl_words_and_the_hint(self) -> None:
         from unittest import mock
 
+        # planctl exits 3 for its own harness: the runner said nothing about
+        # the revision, so this is attend's failure, not a refusal.
         done = mock.Mock(
-            returncode=2,
+            returncode=3,
             stdout="",
             stderr="review.remote_runner: boom; rerun with --local to run the "
             "mutation pass on this machine",
@@ -646,14 +711,14 @@ class ReviewMutationPassLocation(unittest.TestCase):
         with mock.patch.object(maestro.subprocess, "run", return_value=done):
             with self.assertRaises(att.AttendRefused) as caught:
                 maestro._run_planctl(Path("planctl.py"), ["review", "ir.json"])
-        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertEqual(caught.exception.code, att.PLANCTL_FAILED)
         self.assertIn("rerun with --local", caught.exception.detail)
         self.assertIn("maestro run attend --local", caught.exception.detail)
 
     def test_other_failures_carry_no_hint(self) -> None:
         from unittest import mock
 
-        done = mock.Mock(returncode=2, stdout="", stderr="receipt.key_missing")
+        done = mock.Mock(returncode=1, stdout="", stderr="receipt.key_missing")
         with mock.patch.object(maestro.subprocess, "run", return_value=done):
             with self.assertRaises(att.AttendRefused) as caught:
                 maestro._run_planctl(Path("planctl.py"), ["review", "ir.json"])

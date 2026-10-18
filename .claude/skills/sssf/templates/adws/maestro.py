@@ -4692,6 +4692,11 @@ def _planctl_binary(policy: att.AttendPolicy) -> Path:
     return policy.planctl
 
 
+#: planctl's exit status for a verdict about the plan. Every other non-zero
+#: status is planctl failing to give one.
+_PLANCTL_VERDICT_EXIT = 1
+
+
 def _run_planctl(
     binary: Path, argv: Sequence[str], *, key: Optional[str] = None
 ) -> str:
@@ -4700,18 +4705,31 @@ def _run_planctl(
     The refusal carries planctl's own output because a receipt or validation
     refusal names the IR field that is wrong, and that sentence is the whole
     value of running it. It is never parsed: the decision is the exit code.
+    Exit 1 is planctl's verdict about the revision (`ATTEND_REVISION_REFUSED`).
+    Any other failure -- an interpreter that cannot start, a signal, the
+    interpreter's own exit 2 for a script it cannot open, planctl's exit 3
+    for its own harness (remote runner, uncaught crash) -- said nothing about
+    the revision and is `ATTEND_PLANCTL_FAILED`, which attend contains.
     """
     environment = dict(os.environ)
     environment.pop(admission.REVIEWER_HMAC_KEY_ENV, None)
     if key is not None:
         environment[admission.REVIEWER_HMAC_KEY_ENV] = key
-    result = subprocess.run(
-        [sys.executable, str(binary), *argv],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(binary), *argv],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        raise att.AttendRefused(
+            att.PLANCTL_FAILED,
+            "planctl {0} could not start: {1}: {2}".format(
+                argv[0], type(exc).__name__, exc
+            ),
+        ) from exc
     if result.returncode == 0:
         return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
@@ -4725,6 +4743,8 @@ def _run_planctl(
             "\nhint: EC2 could not run the mutation pass; rerun with "
             "`maestro run attend --local` to run it on this machine"
         )
+    if result.returncode != _PLANCTL_VERDICT_EXIT:
+        raise att.AttendRefused(att.PLANCTL_FAILED, message)
     raise att.AttendRefused(att.REVISION_REFUSED, message)
 
 
@@ -5045,8 +5065,10 @@ def _write_review_findings(
             _run_planctl(binary, ["question-surface", str(ir), "--json"])
         )
     except ValueError as exc:
+        # planctl exited 0 and printed something that is not its JSON: that
+        # is planctl failing, not a verdict about the revision.
         raise att.AttendRefused(
-            att.REVISION_REFUSED, "question surface: {0}".format(exc)
+            att.PLANCTL_FAILED, "question surface: {0}".format(exc)
         ) from exc
     out.write_text(
         json.dumps(
