@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sys
+import dataclasses
 import tempfile
 import threading
 import unittest
@@ -605,6 +606,48 @@ class LazyParentChildTest(unittest.TestCase):
         self.assertEqual(
             launcher._tabs[TESTS_LANE].parent_workspace_id,
             layout.parent_workspace_id,
+        )
+
+
+class PaneGridTest(unittest.TestCase):
+    def test_grid_for_fills_2x2_then_3x3(self) -> None:
+        shapes = {n: lch.grid_for(n) for n in range(1, 11)}
+        self.assertEqual(
+            shapes,
+            {1: (1, 1), 2: (1, 2), 3: (2, 2), 4: (2, 2), 5: (2, 3), 6: (2, 3),
+             7: (3, 3), 8: (3, 3), 9: (3, 3), 10: (3, 3)},
+        )
+
+    def test_tenth_pane_opens_next_tab_and_replaces_its_root(self) -> None:
+        herdr = FakeHerdr()
+        launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
+        launcher._herdr = herdr  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
+            root = Path(tmp)
+            placed = []
+            for n in range(10):
+                role = "role-{}".format(n)
+                spec = _spec(_checkout(root, role), lane=TESTS_LANE, role=role)
+                spec = dataclasses.replace(spec, pane_group_size=10)
+                placed.append(_place(launcher, herdr, spec)[0])
+        splits = [call for call in herdr.calls if call[:2] == ("pane", "split")]
+        tabs = [call for call in herdr.calls if call[:2] == ("tab", "create")]
+        self.assertEqual(len(tabs), 1)
+        # splits[0] replaces the seeded root pane; 1..8 build the 3x3 grid.
+        directions = [_flag(call, "--direction") for call in splits]
+        self.assertEqual(
+            directions, ["right", "right", "right", "down", "down", "down",
+                         "down", "down", "down", "right"],
+        )
+        # Panes 3..8 split the pane one row up (index - 3), staying in tab 1.
+        for k in range(3, 9):
+            self.assertEqual(splits[k][2], placed[k - 3].pane_id)
+        # The tenth pane splits the new tab's root pane, which is then closed.
+        self.assertIn(splits[9][2], herdr.closed_panes)
+        self.assertNotEqual(
+            herdr.panes[placed[9].pane_id]["tab_id"],
+            herdr.panes[placed[0].pane_id]["tab_id"],
         )
 
 

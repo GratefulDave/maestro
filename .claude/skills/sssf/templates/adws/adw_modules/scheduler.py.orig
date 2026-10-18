@@ -1,0 +1,4599 @@
+"""Nine-stage artifact-factory reducer. Only the orchestrator writes the store."""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as _wait_futures
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Optional, Protocol
+
+from . import bound_surface as bsf
+from . import code_review as cr
+from . import git_publication as gitpub
+from . import plan_model
+from . import probes
+from . import provisioning as prov
+from . import review_contract as rc
+from . import runner_resolution as rr
+from . import scheduler_types as st
+from . import tests_chain as tc
+from . import tree_materialize as tm
+from .lifecycle import (
+    AmendmentRefused,
+    ArtifactRecord,
+    ArtifactStore,
+    RunAlreadyExists,
+    StageCasConflict,
+)
+from .runtime_state import RuntimeStateRoot
+
+
+TEMPLATE_MARKERS = (
+    "/.claude/skills/sssf/templates/adws",
+    "/skills/sssf/templates/adws",
+)
+
+
+
+class _ActorFaultParked(Exception):
+    """An actor fault has already been durably parked on its lane."""
+
+
+class RunRepositoryMismatch(st.KernelError):
+    code = "RUN_REPOSITORY_MISMATCH"
+
+
+class PublicationWorktreeLockRefused(st.KernelError):
+    code = "PUBLICATION_WORKTREE_LOCK_REFUSED"
+
+
+class FactoryRefused(st.KernelError):
+    code = "FACTORY_REFUSED"
+
+
+class RunnerPreflightRefused(FactoryRefused):
+    """A runner the plan names cannot run here. No agent is dispatched.
+
+    This is the harness's environment failing, never a lane's work, so it
+    refuses the run rather than sending a finding to an actor that cannot act
+    on it.
+    """
+
+    code = "RUNNER_PREFLIGHT_REFUSED"
+
+
+class ReviewFindingUncited(FactoryRefused):
+    """A reviewer that twice could not quote the contract it REVISEd against.
+
+    The run refuses rather than guessing. The operator reads the citation
+    to decide whether the contract or the reviewer is wrong.
+    """
+
+    code = "REVIEW_FINDING_UNCITED"
+
+
+class DraftCollectionRefused(FactoryRefused):
+    """The lane's gate cannot be measured. Never a verdict about a draft.
+
+    Raised by `_lane_gate` for a gate the plan declared wrong -- a missing
+    `min_cases`, an unsupported runner, `required_cases` longer than the floor.
+    Nothing a tester writes can answer that, so it refuses the run.
+
+    `_collect_draft` also raises it, and there it *is* about a draft:
+    that call site is inside `_measure_draft_gate`, which catches it and turns
+    it into a REVISE the tester is asked to answer. It reaches no further.
+    Before 2026-09-05 it did: on FDAdb run a2ea7355 one tests lane submitted a
+    module that deadlocked vitest at load, this exception left the scheduler,
+    and four sibling lanes -- two MERGED, two READY_TO_MERGE -- lost their run
+    with it.
+    """
+
+    code = "DRAFT_COLLECTION_REFUSED"
+
+
+class ParentOutcomesRefused(DraftCollectionRefused):
+    """The draft collected, and then could not be adjudicated case by case.
+
+    Its own type because the two say different things to a tester. "Your draft
+    could not be listed" is about import time; this is about a suite that
+    listed cleanly and then produced no per-case verdict at the parent, which
+    is what `gate.declared_cases` is compared against. A subclass of
+    `DraftCollectionRefused` so every existing caller that already contains a
+    draft-shaped refusal keeps containing this one.
+    """
+
+    code = "PARENT_OUTCOMES_REFUSED"
+
+
+class TypedTestOutputsRefused(FactoryRefused):
+    code = "TYPED_TEST_OUTPUTS"
+
+
+class TestFileOnDeclaredOutput(FactoryRefused):
+    """An untyped lane's tester wrote a test at one of the lane's own outputs."""
+
+    code = "TEST_FILE_ON_DECLARED_OUTPUT"
+
+
+def classify_executing_runtime(maestro_file: Path) -> str:
+    resolved = maestro_file.resolve()
+    text = str(resolved)
+    if any(marker in text for marker in TEMPLATE_MARKERS):
+        return "template"
+    if resolved.name == "maestro.py" and resolved.parent.name == "adws":
+        return "deployment"
+    return "template"
+
+
+def git_common_dir(path: Path) -> Path:
+    raw = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(path),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        text=True,
+    ).strip()
+    return Path(raw).resolve()
+
+
+def require_deployment(maestro_file: Path, target_root: Path) -> None:
+    if classify_executing_runtime(maestro_file) != "deployment":
+        raise RunRepositoryMismatch("template source cannot create a run")
+    executing_root = maestro_file.resolve().parent.parent
+    if git_common_dir(executing_root) != git_common_dir(target_root):
+        raise RunRepositoryMismatch(
+            "deployment is bound to a different Git common directory"
+        )
+
+
+def _loads(text: str) -> Any:
+    return json.loads(text)
+
+
+def _latest(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    kind: st.ArtifactKind,
+    *,
+    verdict: st.ReviewerVerdict | None = None,
+    plan_revision: int | None = None,
+    projection_digest: str | None = None,
+) -> Optional[ArtifactRecord]:
+    sql = (
+        "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+        "AND artifact_kind=? ORDER BY sequence DESC"
+    )
+    for row in store.conn.execute(sql, (run_id, lane_id, kind.value)):
+        if plan_revision is not None and row["plan_revision"] != plan_revision:
+            continue
+        if (
+            projection_digest is not None
+            and row["lane_projection_digest"] != projection_digest
+        ):
+            continue
+        payload = _loads(row["payload_json"])
+        if verdict is None or payload.get("verdict") == verdict.value:
+            return ArtifactRecord(
+                artifact_id=row["artifact_id"],
+                run_id=run_id,
+                lane_id=lane_id,
+                sequence=row["sequence"],
+                kind=kind,
+                plan_revision=row["plan_revision"],
+                input_digest=row["input_digest"],
+                output_digest=row["output_digest"],
+                artifact_ref=row["artifact_ref"],
+                payload=payload,
+            )
+    return None
+
+
+
+def _lane_artifact_by_id(
+    store: ArtifactStore, run_id: str, lane_id: str, artifact_id: str
+) -> Optional[ArtifactRecord]:
+    """One lane artifact by the id another artifact names.
+
+    `_latest` answers "the newest of this kind under these filters", which is a
+    different question and the wrong one whenever a record already names the
+    artifact it was derived from. A BASE_INVALIDATION carries
+    `stale_builder_output_artifact_id` and `stale_code_review_artifact_id`;
+    re-deriving those by a newest-under-this-plan-revision query gave a
+    different answer across an amendment, because the candidate it invalidated
+    belongs to the revision before the one now current.
+    """
+    row = store.conn.execute(
+        "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? AND artifact_id=?",
+        (run_id, lane_id, artifact_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return ArtifactRecord(
+        artifact_id=row["artifact_id"],
+        run_id=run_id,
+        lane_id=lane_id,
+        sequence=row["sequence"],
+        kind=st.stored_artifact_kind(row["artifact_kind"], run_id=run_id),
+        plan_revision=row["plan_revision"],
+        input_digest=row["input_digest"],
+        output_digest=row["output_digest"],
+        artifact_ref=row["artifact_ref"],
+        payload=_loads(row["payload_json"]),
+    )
+
+
+def _base_invalidation_priors(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    invalidation: Optional[ArtifactRecord],
+) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord]]:
+    """The builder output and passing review a BASE_INVALIDATION invalidated.
+
+    Read off the invalidation record itself, never re-queried. The candidate a
+    base invalidation is about was accepted before the invalidation existed,
+    and after an amendment it sits under the previous plan revision, so a
+    revision-scoped `_latest` finds nothing and the lane refuses
+    BASE_INVALIDATION missing artifacts. That refusal was unreachable while a
+    merged build lane re-entered BUILDING as INITIAL; it became reachable the
+    moment such a lane began re-entering through READY_TO_MERGE instead.
+    """
+    if invalidation is None:
+        return None, None
+    payload = invalidation.payload
+    builder_id = payload.get("stale_builder_output_artifact_id")
+    review_id = payload.get("stale_code_review_artifact_id")
+    if not isinstance(builder_id, str) or not isinstance(review_id, str):
+        return None, None
+    return (
+        _lane_artifact_by_id(store, run_id, lane_id, builder_id),
+        _lane_artifact_by_id(store, run_id, lane_id, review_id),
+    )
+
+
+def _substantive_blob(repo: Path, path: str, oid: str) -> str:
+    """Conservative syntax equality; unknown or invalid files stay exact."""
+    suffix = Path(path).suffix
+    if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"} or oid == "NO_BLOB":
+        return oid
+    raw = tm.cat_blob(repo, oid)
+    if suffix != ".py":
+        try:
+            tokens = bsf._tokenize_javascript(raw.decode("utf-8"), comparison=True)
+            # The surface scanner is not a JSX parser and its slash heuristic
+            # cannot distinguish every regex from division. Stay exact rather
+            # than erase executable JSX whitespace or regex-body spaces.
+            if suffix in {".jsx", ".tsx"} or any(
+                token.kind == "punct" and token.value in {"/", "/="}
+                for token in tokens
+            ):
+                return oid
+        except UnicodeError:
+            return oid
+        return st.digest_canonical(tokens)
+    try:
+        tree = ast.parse(raw)
+    except (SyntaxError, ValueError, UnicodeError):
+        return oid
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                del body[0]
+    return st.digest_bytes(ast.dump(tree, include_attributes=False).encode())
+
+
+#: `probe_submissions` outcomes (the closed set the CODE_REVIEW record carries).
+PROBE_ADMITTED = "ADMITTED"
+PROBE_PASSED_ON_FIRST_RUN = "PASSED_ON_FIRST_RUN"
+PROBE_REJECTED = "REJECTED"
+PROBE_NOT_ADMITTED = "NOT_ADMITTED"
+PROBE_IGNORED_BUDGET = "IGNORED_BUDGET"
+
+
+def _user_wait_marker(store: ArtifactStore, run_id: str, lane_id: str) -> int:
+    """Sequence of the lane's latest USER_WAIT: where an argument's window starts."""
+    for row in store.conn.execute(
+        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
+        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
+    ):
+        return int(row["sequence"])
+    return 0
+
+
+def _review_content_history(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    review_kind: st.ArtifactKind,
+) -> list[tuple[str, int | None]]:
+    """Content of the exact reviewed artifacts in the current argument.
+
+    USER_WAIT and plan revision reset the window. A changed applicable base,
+    spec, projection or accepted suite starts a new argument, not a cycle.
+    """
+    marker = _user_wait_marker(store, run_id, lane_id)
+    producer_kind = (
+        st.ArtifactKind.TEST_DRAFT
+        if review_kind is st.ArtifactKind.TEST_REVIEW
+        else st.ArtifactKind.BUILDER_OUTPUT
+    )
+    history: list[tuple[str, int | None]] = []
+    applicability = None
+    repo: Path | None = None
+    for row in store.conn.execute(
+        "SELECT payload_json, spec_digest, lane_projection_digest "
+        "FROM lane_artifacts WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+        "AND sequence>? "
+        "AND plan_revision=(SELECT plan_revision FROM runs WHERE run_id=?) "
+        "ORDER BY sequence ASC",
+        (run_id, lane_id, review_kind.value, marker, run_id),
+    ):
+        review = _loads(row["payload_json"])
+        producers = [
+            artifact
+            for artifact_id in review.get("input_artifact_ids", ())
+            if (artifact := _lane_artifact_by_id(
+                store, run_id, lane_id, artifact_id
+            )) is not None and artifact.kind is producer_kind
+        ]
+        if len(producers) != 1:
+            raise FactoryRefused("review must name exactly one reviewed artifact")
+        payload = producers[0].payload
+        if repo is None:
+            # The blobs a draft or a candidate names live in the run
+            # repository's object database, whichever kind is being read.
+            repo = Path(store.conn.execute(
+                "SELECT target_repository_root FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()["target_repository_root"])
+        if producer_kind is st.ArtifactKind.TEST_DRAFT:
+            content = sorted(
+                (path, _substantive_blob(repo, path, oid))
+                for path, oid in dict(payload["files"]).items()
+            )
+            current = (
+                row["spec_digest"],
+                row["lane_projection_digest"],
+                payload["builder_base_sha"],
+                st.digest_canonical(payload["public_contract"]),
+            )
+        else:
+            current = (
+                payload["spec_digest"],
+                payload["projection_digest"],
+                payload["builder_base_sha"],
+                payload["test_suite_digest"],
+            )
+            # The admitted fixed-base delta names old/new paths, modes and
+            # blobs. Commit metadata and attempt ids are deliberately absent.
+            content = []
+            for entry in payload["tree_delta"]:
+                item = dict(entry)
+                for side in ("old", "new"):
+                    item[side + "_oid"] = _substantive_blob(
+                        repo, item[side + "_path"], item[side + "_oid"]
+                    )
+                content.append(item)
+            content.sort(key=st.canonical_bytes)
+        if current != applicability:
+            history.clear()
+            applicability = current
+        summary = review.get("public_result_summary") or {}
+        outcome: Any
+        if producer_kind is st.ArtifactKind.TEST_DRAFT:
+            # Both quantities a tests round can move, together. Cases alone
+            # read a tester rewriting assertions inside the same twelve as a
+            # plateau; findings alone read a draft climbing toward min_cases
+            # under one substituted refusal the same way. Findings are negated
+            # so higher stays better in both halves.
+            outcome = (summary.get("collected"), -len(review.get("findings") or ()))
+        else:
+            # One helper, shared with `tools/lane_gates.py`: the plain passed
+            # count for a review that never carried a probe, and the tuple
+            # (passed, discharged, active) for one that did.
+            outcome = cr.review_progress(review)
+        history.append((st.digest_canonical(content), outcome))
+    return history
+
+
+def _regressed(latest: Optional[int], prior: Sequence[Optional[int]]) -> bool:
+    """One measured quantity below the best an earlier round in this argument reached."""
+    best = [value for value in prior if value is not None]
+    return latest is not None and bool(best) and latest < max(best)
+
+
+def _build_progress(outcome: Any) -> Optional[tuple[Any, frozenset[str], frozenset[str]]]:
+    """A build round's outcome as (suite passed, discharged ids, active ids).
+
+    A review that never carried a probe is the plain passed count, which
+    normalizes to a tuple with empty sets so old and new rounds compare.
+    """
+    if outcome is None:
+        return None
+    if isinstance(outcome, tuple):
+        passed, discharged, active = outcome
+        return passed, frozenset(discharged), frozenset(active)
+    return outcome, frozenset(), frozenset()
+
+
+def _plateau_key(outcome: Any, review_kind: st.ArtifactKind) -> Any:
+    """What a round must change to count as moving.
+
+    A build round moves either the suite's passed count or the number of
+    probes it discharged. The ids matter for regression, not for plateau: a
+    round that swaps one discharged probe for another has moved nothing.
+    """
+    if review_kind is st.ArtifactKind.TEST_REVIEW:
+        return outcome
+    progress = _build_progress(outcome)
+    return None if progress is None else (progress[0], len(progress[1]))
+
+
+def _stalled(
+    history: Sequence[tuple[str, Any]],
+    review_kind: st.ArtifactKind,
+    *,
+    regression_on_findings: bool = False,
+) -> bool:
+    """REVISE stops on regression, three flat outcomes, or repeated syntax.
+
+    A build round is measured by the accepted suite's passed count, and one
+    round below the applicable best is a regression at any setting. When the
+    lane carries reviewer-authored probes the outcome is a tuple, never a sum:
+    the passed count regresses on its own, a probe discharged earlier in this
+    argument and open again is its own regression, and a plateau is a window
+    flat in (passed, number of probes discharged).
+
+    A tests round is measured by both quantities it can move, as the pair
+    (collected, -findings). A plateau needs the whole pair flat across the
+    grace window, so a draft adding cases under a repeated harness refusal
+    keeps going, and so does a suite that rewrites assertions inside the same
+    cases while its reviewer's list shrinks. Collected falling below the
+    applicable best is a regression at any setting -- that measurement has
+    always stopped a lane. Findings rising is a regression only where the
+    deployment's `stall.regression_on_findings` says so, because a reviewer
+    naming one more thing after the tester fixed three is describing the same
+    work getting better.
+    """
+    if not history:
+        return False
+    latest = history[-1][1]
+    prior = [outcome for _, outcome in history[:-1] if outcome is not None]
+    if latest is not None and prior:
+        if review_kind is st.ArtifactKind.TEST_REVIEW:
+            collected, findings = latest
+            if _regressed(collected, [outcome[0] for outcome in prior]):
+                return True
+            if regression_on_findings and _regressed(
+                findings, [outcome[1] for outcome in prior]
+            ):
+                return True
+        else:
+            now = _build_progress(latest)
+            before = [_build_progress(outcome) for outcome in prior]
+            # The suite count is its own axis, unconditional: a probe
+            # discharged this round cannot pay for a case lost this round.
+            if _regressed(now[0], [b[0] for b in before]):
+                return True
+            # And a probe discharged in an earlier round of this argument,
+            # still active, and not discharged now is a regression however
+            # many other probes were discharged beside it.
+            lost = {pid for b in before for pid in b[1]} & now[2]
+            if lost - now[1]:
+                return True
+    window = history[-st.NO_PROGRESS_GRACE_ROUNDS:]
+    if len(window) < st.NO_PROGRESS_GRACE_ROUNDS:
+        return False
+    key = _plateau_key(latest, review_kind)
+    plateau = key is not None and all(
+        _plateau_key(outcome, review_kind) == key for _, outcome in window
+    )
+    return plateau or history[-1][0] in [content for content, _ in history[:-1]]
+
+
+def _writing_tests_predecessors(
+    store: ArtifactStore, run_id: str, lane_id: str
+) -> tuple[Optional[ArtifactRecord], str]:
+    review = _latest(
+        store,
+        run_id,
+        lane_id,
+        st.ArtifactKind.TEST_REVIEW,
+        verdict=st.ReviewerVerdict.REVISE,
+    )
+    review_id = review.artifact_id if review is not None else st.NO_TEST_REVIEW
+    return review, review_id
+
+
+
+def run_row(store: ArtifactStore, run_id: str) -> Mapping[str, Any]:
+    row = store.conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    if row is None:
+        raise FactoryRefused(f"unknown run {run_id}")
+    return {key: row[key] for key in row.keys()}
+
+
+def runs_for_target(
+    store: ArtifactStore, *, repository_fingerprint: str, main_ref: str
+) -> tuple[Mapping[str, Any], ...]:
+    """Every run bound to one target repository identity and main ref.
+
+    The durable half of deterministic run selection: the caller narrows these
+    rows further by plan artifact ref / compiled digest and by derived status.
+    Ordered by creation so a refusal names the same ids in the same order.
+    """
+    rows = store.conn.execute(
+        "SELECT * FROM runs WHERE target_repository_fingerprint=? "
+        "AND target_main_ref=? ORDER BY created_at, run_id",
+        (repository_fingerprint, main_ref),
+    ).fetchall()
+    return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+
+def binding_from_run(row: Mapping[str, Any]) -> st.RunBinding:
+    return st.RunBinding(
+        runtime_state_root=row["runtime_state_root"],
+        runtime_state_fingerprint=row["runtime_state_fingerprint"],
+        integration_ref=row["integration_ref"],
+        integration_initial_sha=row["integration_initial_sha"],
+        target_repository_root=row["target_repository_root"],
+        target_git_common_dir=row["target_git_common_dir"],
+        target_worktree_git_dir=row["target_worktree_git_dir"],
+        target_object_format=row["target_object_format"],
+        target_repository_fingerprint=row["target_repository_fingerprint"],
+        target_sync_journal_fingerprint=row["target_sync_journal_fingerprint"],
+        target_initial_main_sha=row["target_initial_main_sha"],
+        target_main_ref=row["target_main_ref"],
+    )
+
+
+def target_from_binding(binding: st.RunBinding) -> gitpub.TargetBinding:
+    return gitpub.restore_target_initial_main_sha(
+        gitpub.restore_integration_sha(
+            gitpub.bind_target_worktree(
+                binding.target_repository_root, binding.target_main_ref
+            ),
+            binding.integration_initial_sha,
+        ),
+        binding.target_initial_main_sha,
+    )
+
+
+def integration_merge_payloads(
+    store: ArtifactStore, run_id: str
+) -> tuple[Mapping[str, Any], ...]:
+    return store.integration_merge_payloads(run_id)
+
+
+def durable_integration_tip(store: ArtifactStore, run_id: str) -> str:
+    row = run_row(store, run_id)
+    return gitpub.durable_integration_tip(
+        row["integration_initial_sha"], integration_merge_payloads(store, run_id)
+    )
+
+
+def merge_epoch_seconds(created_at: str) -> int:
+    stamp = datetime.fromisoformat(created_at)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return int(stamp.astimezone(timezone.utc).timestamp())
+
+
+def ensure_run_integration_ref(
+    target: gitpub.TargetBinding, store: ArtifactStore, run_id: str
+) -> str:
+    tip = durable_integration_tip(store, run_id)
+    gitpub.ensure_integration_ref(target, run_id, expected_tip=tip)
+    return tip
+
+
+UNSAFE_LEGACY_REBASE_KINDS = frozenset(
+    {
+        st.ArtifactKind.BUILDER_OUTPUT,
+        st.ArtifactKind.CODE_REVIEW,
+        st.ArtifactKind.INTEGRATION_MERGE,
+        st.ArtifactKind.BASE_INVALIDATION,
+        st.ArtifactKind.FINAL_INTEGRATION_REVIEW,
+        st.ArtifactKind.MAIN_PUBLICATION,
+    }
+)
+
+
+def refuse_historical_artifacts(store: ArtifactStore, run_id: str) -> None:
+    """Refuse a run whose ledger still holds a pre-v5 suite artifact.
+
+    Checked once where a run is bound, before any verb reads its artifacts,
+    so `run resume`, `run status`, `run amend` and `run attend` all answer
+    `LIVE_RUN_CUTOVER_REQUIRED` rather than whichever reader reaches the row
+    first.
+    """
+    placeholders = ",".join("?" for _ in st.HISTORICAL_LANE_ARTIFACT_KINDS)
+    row = store.conn.execute(
+        "SELECT artifact_kind FROM lane_artifacts WHERE run_id=? "
+        "AND artifact_kind IN ({0}) ORDER BY sequence LIMIT 1".format(placeholders),
+        (run_id, *st.HISTORICAL_LANE_ARTIFACT_KINDS),
+    ).fetchone()
+    if row is not None:
+        raise st.LiveRunCutoverRequired(run_id, str(row[0]))
+
+
+def recorded_artifact_kinds(
+    store: ArtifactStore, run_id: str
+) -> tuple[st.ArtifactKind, ...]:
+    kinds: list[st.ArtifactKind] = []
+    for row in store.conn.execute(
+        "SELECT artifact_kind FROM lane_artifacts WHERE run_id=?",
+        (run_id,),
+    ):
+        kinds.append(st.stored_artifact_kind(row[0], run_id=run_id))
+    for row in store.conn.execute(
+        "SELECT artifact_kind FROM run_artifacts WHERE run_id=?",
+        (run_id,),
+    ):
+        kinds.append(st.stored_artifact_kind(row[0], run_id=run_id))
+    return tuple(kinds)
+
+
+def legacy_integration_correction_decision(
+    *,
+    stored_sha: str,
+    declared_sha: str,
+    lane_stages: Sequence[st.LaneStage],
+    artifact_kinds: Sequence[st.ArtifactKind],
+) -> str:
+    stored = st.require_git_sha(stored_sha, name="stored_sha")
+    declared = st.require_git_sha(declared_sha, name="declared_sha")
+    if stored == declared:
+        return "noop"
+    if st.LaneStage.REVIEWING_TESTS in lane_stages:
+        return "defer"
+    if any(kind in UNSAFE_LEGACY_REBASE_KINDS for kind in artifact_kinds):
+        return "refuse"
+    return "migrate"
+
+
+def legacy_retarget_journal_path(runtime_state_root: str | Path, run_id: str) -> Path:
+    return (
+        Path(runtime_state_root)
+        / "locks"
+        / f"legacy_integration_retarget.{run_id}.json"
+    )
+
+
+def _legacy_retarget_journal_payload(
+    run_id: str, from_sha: str, to_sha: str
+) -> dict[str, str]:
+    return {
+        "from_sha": st.require_git_sha(from_sha, name="from_sha"),
+        "run_id": run_id,
+        "to_sha": st.require_git_sha(to_sha, name="to_sha"),
+    }
+
+
+def _write_legacy_retarget_journal(
+    row: Mapping[str, Any], from_sha: str, to_sha: str
+) -> Path:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_bytes(
+        st.canonical_bytes(
+            _legacy_retarget_journal_payload(row["run_id"], from_sha, to_sha)
+        )
+    )
+    os.replace(tmp, path)
+    return path
+
+
+def _read_legacy_retarget_journal(row: Mapping[str, Any]) -> Mapping[str, str] | None:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_bytes())
+    if not isinstance(payload, Mapping):
+        raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_INVALID")
+    return _legacy_retarget_journal_payload(
+        str(payload.get("run_id") or ""),
+        str(payload.get("from_sha") or ""),
+        str(payload.get("to_sha") or ""),
+    )
+
+
+def _clear_legacy_retarget_journal(row: Mapping[str, Any]) -> None:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    if path.is_file():
+        path.unlink()
+
+
+def _finish_legacy_integration_retarget(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    from_sha: str,
+    to_sha: str,
+) -> gitpub.TargetBinding:
+    source = st.require_git_sha(from_sha, name="from_sha")
+    dest = st.require_git_sha(to_sha, name="to_sha")
+    current = target.git().read_ref(st.integration_ref(run_id))
+    if current is not None and current not in (source, dest):
+        raise gitpub.GitPublicationRefused(
+            "INTEGRATION_REF_COLLISION", f"{current}!={source}"
+        )
+    if current != dest:
+        gitpub.retarget_integration_ref(target, run_id, source, dest)
+    db_sha = str(run_row(store, run_id)["integration_initial_sha"])
+    if db_sha not in (source, dest):
+        raise FactoryRefused(f"{run_id}:integration_initial_sha")
+    if db_sha != dest:
+        store.retarget_integration_initial_sha(run_id, source, dest)
+    return gitpub.restore_integration_sha(target, dest)
+
+
+def recover_legacy_retarget_journal(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+) -> gitpub.TargetBinding:
+    row = run_row(store, run_id)
+    journal = _read_legacy_retarget_journal(row)
+    if journal is None:
+        return target
+    if journal["run_id"] != run_id:
+        raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_MISMATCH")
+    updated = _finish_legacy_integration_retarget(
+        store=store,
+        target=target,
+        run_id=run_id,
+        from_sha=journal["from_sha"],
+        to_sha=journal["to_sha"],
+    )
+    _clear_legacy_retarget_journal(row)
+    return updated
+
+
+def correct_legacy_integration_base(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    declared_sha: str,
+) -> gitpub.TargetBinding:
+    row = run_row(store, run_id)
+    stored = str(row["integration_initial_sha"])
+    declared = st.require_git_sha(declared_sha, name="declared_sha")
+    stages = tuple(
+        store.lane_stage(run_id, lane.lane_id)
+        for lane in store.active_projection(run_id)
+    )
+    kinds = recorded_artifact_kinds(store, run_id)
+    journal = _read_legacy_retarget_journal(row)
+    if journal is not None:
+        if journal["run_id"] != run_id or journal["to_sha"] != declared:
+            raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_MISMATCH")
+        return recover_legacy_retarget_journal(
+            store=store, target=target, run_id=run_id
+        )
+    if _completed_publication_matches(store, target, run_id, declared):
+        return target
+    action = legacy_integration_correction_decision(
+        stored_sha=stored,
+        declared_sha=declared,
+        lane_stages=stages,
+        artifact_kinds=kinds,
+    )
+    if action == "refuse":
+        raise FactoryRefused("LEGACY_INTEGRATION_REBASE_UNSAFE")
+    if action in ("noop", "defer"):
+        return target
+    _write_legacy_retarget_journal(row, stored, declared)
+    updated = _finish_legacy_integration_retarget(
+        store=store,
+        target=target,
+        run_id=run_id,
+        from_sha=stored,
+        to_sha=declared,
+    )
+    _clear_legacy_retarget_journal(row)
+    return updated
+
+
+
+
+def pin_target_from_plan(
+    target: gitpub.TargetBinding, compiled: st.CompiledPlan
+) -> gitpub.TargetBinding:
+    ref = gitpub.declared_integration_ref(gitpub.lane_specs_from_plan(compiled))
+    return gitpub.pin_integration_sha(target, ref)
+
+
+def plan_artifact_ref_for(store: ArtifactStore, run_id: str, plan_revision: int) -> str:
+    found = store.conn.execute(
+        "SELECT plan_artifact_ref FROM plan_revisions "
+        "WHERE run_id=? AND plan_revision=?",
+        (run_id, plan_revision),
+    ).fetchone()
+    return found[0]
+
+
+def _merge_producers(
+    store: ArtifactStore, run_id: str, lane: st.LaneProjection
+) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord]]:
+    """The candidate and the passing review a READY_TO_MERGE lane merges.
+
+    A build lane merges its BUILDER_OUTPUT under its CODE_REVIEW PASS. A tests
+    lane merges its ACCEPTED_TEST_SUITE -- the candidate its test reviewer
+    accepted -- under that TEST_REVIEW PASS. Same edge, same payload keys
+    (`builder_base_sha`, `candidate_ref`, `candidate_sha`), one producer pair
+    per lane kind. `ArtifactStore._merge_producers` is the same rule read off
+    the ledger's own tables.
+    """
+    if lane.lane_kind == st.LANE_KIND_TESTS:
+        revision = run_row(store, run_id)["plan_revision"]
+        return (
+            _latest(
+                store,
+                run_id,
+                lane.lane_id,
+                st.ArtifactKind.ACCEPTED_TEST_SUITE,
+                plan_revision=revision,
+            ),
+            _latest(
+                store,
+                run_id,
+                lane.lane_id,
+                st.ArtifactKind.TEST_REVIEW,
+                verdict=st.ReviewerVerdict.PASS,
+            ),
+        )
+    return (
+        _latest(store, run_id, lane.lane_id, st.ArtifactKind.BUILDER_OUTPUT),
+        _latest(
+            store,
+            run_id,
+            lane.lane_id,
+            st.ArtifactKind.CODE_REVIEW,
+            verdict=st.ReviewerVerdict.PASS,
+        ),
+    )
+
+
+def _merge_artifacts(
+    lane: st.LaneProjection, producer: ArtifactRecord, review: ArtifactRecord
+) -> dict[str, ArtifactRecord]:
+    if lane.lane_kind == st.LANE_KIND_TESTS:
+        return {"ACCEPTED_TEST_SUITE": producer, "TEST_REVIEW": review}
+    return {"BUILDER_OUTPUT": producer, "CODE_REVIEW": review}
+
+
+def _base_head(
+    target: gitpub.TargetBinding, lane: st.LaneProjection, builder_base_sha: str
+) -> str:
+    """The integration head a lane's builder base was cut from.
+
+    A typed lane builds on the integration head itself: a build lane's base
+    already carries its predecessor tests lane's merged suite, and a tests
+    lane's draft is committed straight on the head. An untyped lane builds
+    on the head plus its own accepted suite (`_untyped_builder_base`), one
+    commit above the head, so the head is that commit's first parent. This
+    is what `decide_merge_action` measures staleness against.
+    """
+    if lane.lane_kind is not None:
+        return builder_base_sha
+    parents = target.git().commit_parents(builder_base_sha)
+    if not parents:
+        raise FactoryRefused("untyped builder base has no parent")
+    return parents[0]
+
+
+ACCEPTED_TESTS_COMMIT_MESSAGE = b"maestro accepted tests\n"
+
+
+def _untyped_builder_base(
+    target: gitpub.TargetBinding,
+    head: str,
+    accepted: st.LaneArtifact,
+) -> str:
+    """The commit an untyped lane builds on: the integration head plus its suite.
+
+    A typed build lane finds its suite in the head because the tests lane
+    merged it there. An untyped lane authors and builds in one lane, and its
+    tests are its own, so they are put on top of the current head as one
+    content-addressed commit -- the same bytes the reviewer accepted, at the
+    same paths, on whatever head the lane builds against now. The candidate's
+    delta is measured from this commit, so its tests are in its base and
+    `CANDIDATE_TEST_PATH_REFUSED` protects them exactly as it protects a typed
+    lane's; `verify_suite` proves they are still the accepted blobs before
+    the suite runs. Nothing is overlaid into any tree at any later point.
+    """
+    repo = Path(target.target_repository_root)
+    files = {
+        path: tm.cat_blob(repo, blob)
+        for path, blob in tc.suite_files(accepted).items()
+    }
+    return gitpub.commit_files_on_base(
+        target,
+        base_sha=head,
+        files=files,
+        message=ACCEPTED_TESTS_COMMIT_MESSAGE,
+    )
+
+
+def _explain_ahead_merge(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    lane_id: str,
+    ledger_tip: str,
+    current: str,
+    row: Mapping[str, Any],
+    state_root: Path,
+) -> Optional[tuple[LaneContext, Mapping[str, Any]]]:
+    del state_root
+    lane = next(
+        item for item in store.active_projection(run_id) if item.lane_id == lane_id
+    )
+    builder, review = _merge_producers(store, run_id, lane)
+    if builder is None or review is None:
+        return None
+    try:
+        decision = gitpub.decide_merge_action(
+            changed=bool(builder.payload.get("changed", True)),
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_sha=builder.payload["candidate_sha"],
+            integration_head=ledger_tip,
+            base_head=_base_head(target, lane, builder.payload["builder_base_sha"]),
+        )
+    except (gitpub.GitPublicationRefused, FactoryRefused):
+        return None
+    if decision.action != "MERGE":
+        return None
+    digest = st.ready_to_merge_input_digest(
+        run_id=run_id,
+        lane_id=lane_id,
+        plan_revision=row["plan_revision"],
+        plan_digest=row["plan_digest"],
+        spec_digest=lane.spec_digest,
+        projection_digest=lane.lane_projection_digest,
+        builder_output_id=builder.artifact_id,
+        code_review_id=review.artifact_id,
+        builder_base_sha=builder.payload["builder_base_sha"],
+        candidate_ref=builder.payload["candidate_ref"],
+        candidate_sha=builder.payload["candidate_sha"],
+        integration_head=ledger_tip,
+    )
+    ctx = LaneContext(
+        run_id=run_id,
+        lane=lane,
+        plan_revision=row["plan_revision"],
+        plan_digest=row["plan_digest"],
+        plan_artifact_ref=plan_artifact_ref_for(store, run_id, row["plan_revision"]),
+        input_digest=digest,
+        stage=st.LaneStage.READY_TO_MERGE,
+        artifacts=_merge_artifacts(lane, builder, review),
+        builder_base_sha=builder.payload["builder_base_sha"],
+        candidate_ref=builder.payload["candidate_ref"],
+        candidate_sha=builder.payload["candidate_sha"],
+        integration_head=ledger_tip,
+    )
+    try:
+        payload = gitpub.merge_or_reconcile(
+            target,
+            run_id=run_id,
+            lane_id=lane_id,
+            stage_input_digest=digest,
+            builder_artifact_id=builder.artifact_id,
+            code_review_artifact_id=review.artifact_id,
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            candidate_sha=builder.payload["candidate_sha"],
+            before_sha=ledger_tip,
+            epoch_seconds=merge_epoch_seconds(row["created_at"]),
+            input_digest=digest,
+        )
+    except gitpub.GitPublicationRefused:
+        return None
+    if payload.get("after_sha") != current or payload.get("before_sha") != ledger_tip:
+        return None
+    payload = dict(payload)
+    payload["integration_head"] = ledger_tip
+    payload["input_digest"] = digest
+    return ctx, payload
+
+
+def reconcile_orphaned_integration_merge_locked(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    state_root: Path,
+) -> None:
+    """Caller already holds OrderedLocks 1-2 or 1-3. Does not acquire or release."""
+    row = run_row(store, run_id)
+    ledger_tip = durable_integration_tip(store, run_id)
+    current = target.git().read_ref(st.integration_ref(run_id))
+    if current is None or current == ledger_tip:
+        return
+    parents = target.git().commit_parents(current)
+    if not parents or parents[0] != ledger_tip:
+        raise FactoryRefused("integration ref is not one commit ahead of ledger")
+    matches: list[tuple[LaneContext, Mapping[str, Any]]] = []
+    for lane in store.active_projection(run_id):
+        if store.lane_stage(run_id, lane.lane_id) is not st.LaneStage.READY_TO_MERGE:
+            continue
+        explained = _explain_ahead_merge(
+            store, target, run_id, lane.lane_id, ledger_tip, current, row, state_root
+        )
+        if explained is not None:
+            matches.append(explained)
+    if len(matches) != 1:
+        raise FactoryRefused("orphaned integration merge is not uniquely attributable")
+    ctx, payload = matches[0]
+    artifact = rc.make_lane_artifact(
+        kind=st.ArtifactKind.INTEGRATION_MERGE,
+        request=_request(ctx),
+        payload=payload,
+        artifact_ref=st.integration_ref(run_id),
+    )
+    _complete(store, ctx, artifact)
+
+
+def _record_publication(
+    store: ArtifactStore,
+    run_id: str,
+    fingerprint: str,
+    payload: Mapping[str, Any],
+) -> ArtifactRecord:
+    row = run_row(store, run_id)
+    artifact = st.RunArtifact(
+        kind=st.ArtifactKind.MAIN_PUBLICATION,
+        plan_revision=row["plan_revision"],
+        input_digest=fingerprint,
+        output_digest=st.digest_canonical(payload),
+        artifact_ref=str(payload["receipt_ref"]),
+        payload=payload,
+    )
+    return store.complete_publication(
+        run_id,
+        fingerprint,
+        str(payload["receipt_ref"]),
+        str(payload["receipt_object"]),
+        str(payload["expected_before_sha"]),
+        str(payload["published_sha"]),
+        artifact,
+    )
+
+
+def _latest_run_artifact(
+    store: ArtifactStore, run_id: str, kind: st.ArtifactKind
+) -> Optional[ArtifactRecord]:
+    row = store.conn.execute(
+        "SELECT * FROM run_artifacts WHERE run_id=? AND artifact_kind=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (run_id, kind.value),
+    ).fetchone()
+    if row is None:
+        return None
+    return ArtifactRecord(
+        artifact_id=row["artifact_id"],
+        run_id=run_id,
+        lane_id=None,
+        sequence=row["sequence"],
+        kind=kind,
+        plan_revision=row["plan_revision"],
+        input_digest=row["input_digest"],
+        output_digest=row["output_digest"],
+        artifact_ref=row["artifact_ref"],
+        payload=_loads(row["payload_json"]),
+    )
+
+
+def _has_publication(store: ArtifactStore, run_id: str) -> bool:
+    return (
+        store.conn.execute(
+            "SELECT 1 FROM run_artifacts WHERE run_id=? AND artifact_kind=?",
+            (run_id, st.ArtifactKind.MAIN_PUBLICATION.value),
+        ).fetchone()
+        is not None
+    )
+
+
+def _completed_publication_matches(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    declared_sha: str,
+) -> bool:
+    """A committed publication needs cleanup, not a new integration baseline."""
+    publication = _latest_run_artifact(store, run_id, st.ArtifactKind.MAIN_PUBLICATION)
+    if publication is None:
+        return False
+    tip = durable_integration_tip(store, run_id)
+    fingerprint = store.active_final_review_fingerprint(run_id, tip)
+    review = _latest_run_artifact(
+        store, run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW
+    )
+    if review is None or review.input_digest != fingerprint:
+        raise FactoryRefused("PUBLICATION_RECEIPT_MISMATCH")
+    gitpub.revalidate_binding(target)
+    ref = gitpub.publication_ref_name(run_id, fingerprint)
+    git = target.git()
+    receipt = git.read_ref(ref)
+    expected_before = str(publication.payload["expected_before_sha"])
+    expected = gitpub.publication_receipt_payload(
+        run_id=run_id,
+        target_repository_fingerprint=target.target_repository_fingerprint,
+        target_main_ref=target.target_main_ref,
+        review_input_fingerprint=fingerprint,
+        final_review_artifact_id=review.artifact_id,
+        expected_before_sha=expected_before,
+        reviewed_integration_sha=tip,
+    )
+    if (
+        declared_sha != tip
+        or git.rev_parse(target.target_main_ref) != tip
+        or receipt is None
+        or publication.payload != gitpub.main_publication_payload(
+            review_input_fingerprint=fingerprint,
+            receipt_ref=ref,
+            receipt_object=receipt,
+            expected_before_sha=expected_before,
+            published_sha=tip,
+        )
+        or git.cat_file("blob", receipt) != st.canonical_bytes(expected)
+    ):
+        raise FactoryRefused("PUBLICATION_RECEIPT_MISMATCH")
+    return True
+
+
+@dataclass(frozen=True)
+class LaneContext:
+    run_id: str
+    lane: st.LaneProjection
+    plan_revision: int
+    plan_digest: str
+    plan_artifact_ref: str
+    input_digest: str
+    stage: st.LaneStage
+    artifacts: Mapping[str, ArtifactRecord]
+    builder_base_sha: str = ""
+    candidate_ref: str = ""
+    candidate_sha: str = ""
+    integration_head: str = ""
+    entry_kind: st.BuildingEntryKind = st.BuildingEntryKind.INITIAL
+    public_contract: Mapping[str, Any] | None = None
+    #: `test_binding.suite_digest` of the accepted suite this lane is graded
+    #: against: for a build lane its tests-lane predecessor's, for an untyped
+    #: lane its own.
+    test_suite_digest: str = ""
+    draft_correction: Sequence[Mapping[str, str]] | None = None
+    #: Counts from the accepted suite, measured before the code reviewer
+    #: votes. The same five integers ship to the builder as
+    #: `public_result_summary`; showing them to the reviewer is the difference
+    #: between a located finding and a canned sentence.
+    suite_result_summary: Mapping[str, int] | None = None
+    #: Set on the second ask, when the suite is red and the reviewer's first
+    #: answer carried no finding the builder could act on.
+    suite_findings_required: bool = False
+    #: Set on the second ask, when the reviewer's first `violated_requirement`
+    #: was not a verbatim quote of the public contract. Without it the re-ask
+    #: is byte-identical and a paraphrase repeats: FDAdb run be064e58
+    #: `lane-wp3-reader-tests` refused REVIEW_FINDING_UNCITED on a finding the
+    #: contract does state, reworded both times.
+    rejected_citation: str = ""
+    #: The names the accepted suite binds to: module specifiers, the symbols
+    #: imported from each, and the result-object keys the assertions read.
+    #: An index into a suite the builder can also read in full; it was the
+    #: only thing the builder was told while the suite was hidden, and it
+    #: still saves a builder from guessing a symbol nineteen times before
+    #: opening the file. Derived from the accepted files by `bound_surface`.
+    bound_surface: Mapping[str, Any] | None = None
+    #: The paths of THIS lane's own accepted suite -- for a build lane, its
+    #: tests-lane predecessor's; for an untyped lane, its own. They are in
+    #: the builder's checkout, and the builder may read them. It may not
+    #: create, edit, delete, rename or copy them: `admit_candidate` refuses a
+    #: candidate whose delta names one (`CANDIDATE_TEST_PATH_REFUSED`) before
+    #: any reviewer reads it, and `verify_suite` refuses to measure a tree
+    #: whose bytes at these paths are not the accepted blobs
+    #: (`TEST_SUITE_TAMPERED`). Other lanes' merged suites are not here: they
+    #: are part of the surface this lane legitimately builds on.
+    protected_test_paths: tuple[str, ...] = ()
+    #: Set on the second code-review ask: the `Rejection`s of the probes the
+    #: reviewer submitted, so the re-ask names what to repair.
+    rejected_probes: tuple[Any, ...] = ()
+    #: The lane's active probe records, so the reviewer neither resubmits one
+    #: nor writes over its path.
+    existing_probes: tuple[Mapping[str, Any], ...] = ()
+    #: Probe-introducing rounds left in this window.
+    probe_budget_left: int = 0
+    #: Active probe sources keyed by path, read from the pinned probe commit.
+    #: The builder reads them here; it never finds them in its checkout.
+    probe_texts: Mapping[str, str] | None = None
+    #: The challenges handed to the acceptor on a challenge dispatch.
+    challenges: tuple[Any, ...] = ()
+
+
+class StageActor(Protocol):
+    def write_tests(self, ctx: LaneContext) -> Mapping[str, Any]: ...
+    def review_tests(
+        self, ctx: LaneContext
+    ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]: ...
+    def build(self, ctx: LaneContext) -> Mapping[str, Any]: ...
+    def review_code(
+        self, ctx: LaneContext
+    ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]: ...
+    def review_integration(
+        self, ctx: LaneContext, lanes: Sequence[st.LaneProjection], integration_sha: str
+    ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]], Sequence[str]]: ...
+    def publish(
+        self,
+        ctx: LaneContext,
+        *,
+        fingerprint: str,
+        expected_before: str,
+        published_sha: str,
+    ) -> Mapping[str, Any]: ...
+    def complete_run_spaces(self, run_id: str) -> None: ...
+
+
+
+class OrderedLocks:
+    """Lock order: (1) run mutation, (2) integration-ref, (3) target worktree."""
+
+    def __init__(self, runtime: RuntimeStateRoot, worktree_git_dir: str) -> None:
+        runtime.ensure_layout()
+        self._run_path = runtime.path / "locks" / "run.lock"
+        self._integration_path = runtime.path / "locks" / "integration.lock"
+        self._worktree_git_dir = worktree_git_dir
+        self._worktree_lock_path = os.path.join(
+            worktree_git_dir, "maestro-publication.lock"
+        )
+        # What is held is per thread. Lanes advance on worker threads while
+        # merges stay on the main thread, and `acquire` begins by releasing
+        # whatever the *caller* holds so a re-entry re-takes in order; held
+        # state on the instance would make one thread release another's.
+        self._held = threading.local()
+
+    @property
+    def _locals(self) -> list[threading.RLock]:
+        held = self._held
+        if not hasattr(held, "locals"):
+            held.locals = []
+        return held.locals
+
+    @property
+    def _fds(self) -> list[int]:
+        held = self._held
+        if not hasattr(held, "fds"):
+            held.fds = []
+        return held.fds
+
+    @property
+    def _worktree_cm(self) -> Any:
+        return getattr(self._held, "worktree_cm", None)
+
+    @_worktree_cm.setter
+    def _worktree_cm(self, value: Any) -> None:
+        self._held.worktree_cm = value
+
+    def acquire(self, levels: int) -> None:
+        self.release()
+        file_paths = [self._run_path, self._integration_path][:levels]
+        local_paths = [str(path) for path in file_paths]
+        if levels >= 3:
+            local_paths.append(self._worktree_lock_path)
+        try:
+            for path in local_paths:
+                lock = _process_lock(path)
+                lock.acquire()
+                self._locals.append(lock)
+            for path in file_paths:
+                path.touch(exist_ok=True)
+                fd = os.open(path, os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._fds.append(fd)
+        except Exception:
+            self.release()
+            raise
+        if levels >= 3:
+            try:
+                cm = gitpub.target_worktree_lock(self._worktree_git_dir)
+                cm.__enter__()
+                self._worktree_cm = cm
+            except Exception as exc:
+                self.release()
+                raise PublicationWorktreeLockRefused(str(exc)) from exc
+
+    def release(self) -> None:
+        try:
+            cm = self._worktree_cm
+            if cm is not None:
+                try:
+                    cm.__exit__(None, None, None)
+                finally:
+                    self._worktree_cm = None
+        finally:
+            try:
+                while self._fds:
+                    os.close(self._fds.pop())
+            finally:
+                while self._locals:
+                    self._locals.pop().release()
+
+
+def _process_lock(path: str) -> threading.RLock:
+    key = os.path.realpath(path)
+    with _PROCESS_LOCK_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
+
+
+_PROCESS_LOCK_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _request(ctx: LaneContext) -> rc.LaneRequest:
+    return rc.LaneRequest(
+        run_id=ctx.run_id,
+        lane_id=ctx.lane.lane_id,
+        plan_revision=ctx.plan_revision,
+        spec_digest=ctx.lane.spec_digest,
+        lane_projection_digest=ctx.lane.lane_projection_digest,
+        input_digest=ctx.input_digest,
+    )
+
+
+def _complete(
+    store: ArtifactStore,
+    ctx: LaneContext,
+    artifact: st.LaneArtifact,
+) -> ArtifactRecord:
+    next_stage = st.next_stage_for(
+        ctx.stage, artifact.kind, artifact.verdict, lane_kind=ctx.lane.lane_kind
+    )
+    return store.complete_stage(
+        ctx.run_id,
+        ctx.lane.lane_id,
+        ctx.stage,
+        ctx.input_digest,
+        artifact,
+        next_stage,
+    )
+
+
+def _with_input_artifact_ids(
+    artifact: st.LaneArtifact, ids: Sequence[str]
+) -> st.LaneArtifact:
+    payload = dict(artifact.payload)
+    payload["input_artifact_ids"] = list(ids)
+    return st.LaneArtifact(
+        kind=artifact.kind,
+        plan_revision=artifact.plan_revision,
+        spec_digest=artifact.spec_digest,
+        lane_projection_digest=artifact.lane_projection_digest,
+        input_digest=artifact.input_digest,
+        output_digest=st.digest_canonical(payload),
+        artifact_ref=artifact.artifact_ref,
+        payload=payload,
+        verdict=artifact.verdict,
+    )
+
+
+def _record_as_lane_artifact(
+    record: ArtifactRecord, lane: st.LaneProjection
+) -> st.LaneArtifact:
+    verdict = None
+    if record.kind in (st.ArtifactKind.TEST_REVIEW, st.ArtifactKind.CODE_REVIEW):
+        verdict = st.ReviewerVerdict(str(record.payload["verdict"]))
+    return st.LaneArtifact(
+        kind=record.kind,
+        plan_revision=record.plan_revision,
+        spec_digest=lane.spec_digest,
+        lane_projection_digest=lane.lane_projection_digest,
+        input_digest=record.input_digest,
+        output_digest=record.output_digest,
+        artifact_ref=record.artifact_ref,
+        payload=dict(record.payload),
+        verdict=verdict,
+    )
+
+
+def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
+    specs = getattr(actor, "lane_specs", None)
+    if not isinstance(specs, Mapping):
+        return None
+    spec = specs.get(lane_id)
+    if not isinstance(spec, Mapping) or "gate" not in spec:
+        return None
+    gate = spec["gate"]
+    if not isinstance(gate, Mapping):
+        raise DraftCollectionRefused("lane gate is not a mapping")
+    runner = gate.get("runner")
+    if runner not in rr.COLLECT_ARGS:
+        raise DraftCollectionRefused("unsupported runner")
+    min_cases = gate.get("min_cases")
+    if isinstance(min_cases, bool) or not isinstance(min_cases, int) or min_cases < 1:
+        raise DraftCollectionRefused("min_cases")
+    argv = gate.get("argv") or ()
+    if not isinstance(argv, (list, tuple)):
+        raise DraftCollectionRefused("argv")
+    cwd = gate.get("cwd") or "."
+    if not isinstance(cwd, str) or not cwd:
+        raise DraftCollectionRefused("cwd")
+    # A count cannot tell eleven happy-path cases from a contract that also
+    # needs refusals. `required_cases` names the cases that must exist, so an
+    # obligation is measured rather than hoped for. Optional: a lane that
+    # declares none is checked on `min_cases` alone, as before.
+    required = gate.get("required_cases") or ()
+    if not isinstance(required, (list, tuple)):
+        raise DraftCollectionRefused("required_cases")
+    required = tuple(str(item) for item in required if str(item).strip())
+    if len(required) > int(min_cases):
+        raise DraftCollectionRefused("required_cases exceeds min_cases")
+    # Which cases the plan says must be RED at the parent, and which must
+    # already hold there. `plan_validate.CASE_FALSIFICATION_UNDECLARED` judged
+    # the shape before the run started; this only reads it. Absent is the
+    # shipped-plan case and means the parent is not measured per case.
+    declared = gate.get("declared_cases")
+    if declared is None:
+        declared_cases = ()
+    elif not isinstance(declared, (list, tuple)):
+        raise DraftCollectionRefused("declared_cases")
+    else:
+        rows = []
+        for item in declared:
+            if not isinstance(item, Mapping):
+                raise DraftCollectionRefused("declared_cases")
+            name = str(item.get("case") or "").strip()
+            red = item.get("red_at_parent")
+            if not name or not isinstance(red, bool):
+                raise DraftCollectionRefused("declared_cases")
+            rows.append((name, red))
+        declared_cases = tuple(rows)
+    return SimpleNamespace(
+        runner=str(runner),
+        argv=tuple(str(item) for item in argv),
+        cwd=cwd,
+        min_cases=int(min_cases),
+        required_cases=required,
+        declared_cases=declared_cases,
+    )
+
+
+def _collect_gate(
+    gate: SimpleNamespace, files: Mapping[str, str], tree: Path
+) -> SimpleNamespace:
+    argv, _selectors = rc.substituted_gate_argv(gate.argv, files, tree)
+    return SimpleNamespace(
+        runner=gate.runner,
+        argv=argv,
+        cwd=gate.cwd,
+        min_cases=gate.min_cases,
+        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
+        declared_cases=tuple(getattr(gate, "declared_cases", ()) or ()),
+    )
+
+
+def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
+    """The collection refusal, as a finding its own author can act on.
+
+    The detail is whatever the refusal carries, verbatim; the tester authored
+    the files it describes.
+
+    What it does *not* say is "fix what the refusal names", which is what it
+    used to say. A collect that never returns names a stopwatch --
+    `vitest did not finish collecting in 120.0s` -- and a tester handed that
+    sentence has been told the harness gave up, not what its module did. The
+    required behaviour below states the obligation the draft actually broke:
+    listing cases is an import, and an import that blocks, awaits, connects,
+    reads, or loops never reaches the listing. That is actionable against a
+    stopwatch, against a syntax error, and against a runner that printed a
+    stack trace, without the finding having to know which one it got.
+    """
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "the lane's gate could not list the draft's cases. The "
+                    "runner reported: {0}".format(detail)
+                ),
+                "required_behavior": (
+                    "every declared test file must import cleanly and register "
+                    "its cases at import time, so the gate's collect command "
+                    "lists them. Listing runs no case body: nothing at module "
+                    "scope may block, await, sleep, open a connection, read a "
+                    "fixture, or loop -- move it inside a case or a fixture. "
+                    "Correct what the runner reported above and resubmit the "
+                    "full draft"
+                ),
+                "violated_requirement": "gate collection",
+            },
+        )
+    )
+
+
+def _missing_required_cases(
+    collected: Sequence[str], required: Sequence[str]
+) -> tuple[str, ...]:
+    """Required case names with no collected identifier naming them.
+
+    Matched as a substring of the collected identifier, because a runner prints
+    `path::name` (pytest) or `path > title` (vitest) and the plan names the case,
+    not the file it landed in.
+    """
+    return tuple(
+        name for name in required if not any(name in cid for cid in collected)
+    )
+
+
+def _draft_required_cases_findings(
+    missing: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "native collect listed no case named: {0}".format(
+                        ", ".join(missing)
+                    )
+                ),
+                "required_behavior": (
+                    "the suite must contain a case for each name the gate "
+                    "requires, discharging the obligation it names"
+                ),
+                "violated_requirement": "gate.required_cases",
+            },
+        )
+    )
+
+
+def _red_at_parent_divergences(
+    declared: Sequence[tuple[str, bool]], outcomes: Mapping[str, bool]
+) -> tuple[str, ...]:
+    """Where the parent measurement disagrees with what the plan declared.
+
+    Matched as a substring of the runner's own case identifier, the same
+    convention `_missing_required_cases` uses and for the same reason: a runner
+    prints `path::name` (pytest) or `path > title` (vitest) and the plan names
+    the case, not the file it landed in.
+
+    Three divergences, and only three, because these are the ones a case
+    identifier can carry without reading failure prose:
+
+      * a declared case no case at the parent names -- the plan and the suite
+        disagree about what exists;
+      * declared red, observed green -- the case does not depend on the lane's
+        outputs, so it will pass no matter what the builder writes;
+      * declared green, observed red -- the case is red for a reason the plan
+        did not claim. This is the FDAdb be064e58 shape, and it is the whole
+        point: a case red at the parent for a reason other than the behaviour
+        it claims to test has not been falsified, and sealing it seals a suite
+        that can never go green.
+
+    Deliberately NOT compared: the failure's text, its traceback, or the module
+    it names. Matching a declared reason against a runner's failure prose is
+    fuzzy in both directions, and a false refusal on a good suite costs more
+    rounds than the gap it closes. Which CASES are red is the strongest
+    comparison that stays mechanical.
+    """
+    problems: list[str] = []
+    for name, want_red in declared:
+        matched = [cid for cid in outcomes if name in cid]
+        if not matched:
+            problems.append(
+                "{0!r}: declared, but the parent ran no case naming it".format(name)
+            )
+            continue
+        got_red = any(outcomes[cid] for cid in matched)
+        if want_red and not got_red:
+            problems.append(
+                "{0!r}: declared red at the parent, observed green -- it does "
+                "not depend on this lane's declared outputs".format(name)
+            )
+        elif got_red and not want_red:
+            problems.append(
+                "{0!r}: declared green at the parent, observed red -- it is "
+                "red for a reason this plan does not claim".format(name)
+            )
+    return tuple(problems)
+
+
+def _red_at_parent_findings(
+    problems: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "run against the parent commit, the draft's cases did not "
+                    "match the outcomes this lane's plan declares: {0}".format(
+                        "; ".join(problems)
+                    )
+                ),
+                "required_behavior": (
+                    "a case the plan declares red at the parent must fail "
+                    "there because the lane's declared outputs do not exist "
+                    "yet, and a case the plan declares green must already "
+                    "hold. Rewrite the named cases so each one's outcome at "
+                    "the parent is the one the plan states, asserting only on "
+                    "the seam this lane owns"
+                ),
+                "violated_requirement": "gate.declared_cases",
+            },
+        )
+    )
+
+
+def _red_at_parent_unreadable_findings(detail: str) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "the draft could not be measured case by case against the "
+                    "parent commit. The runner reported: {0}".format(detail)
+                ),
+                "required_behavior": (
+                    "every case must run to a per-case verdict at the parent "
+                    "commit, so the plan's declared red and green outcomes can "
+                    "be compared against it. A suite whose cases cannot be "
+                    "individually adjudicated cannot be accepted"
+                ),
+                "violated_requirement": "gate.declared_cases",
+            },
+        )
+    )
+
+
+def _draft_min_cases_findings(
+    collected: int, min_cases: int
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": "native collect listed {0} cases".format(
+                    collected
+                ),
+                "required_behavior": "native collect must list at least {0} cases".format(
+                    min_cases
+                ),
+                "violated_requirement": "gate.min_cases",
+            },
+        )
+    )
+
+
+HARNESS_VIOLATED_REQUIREMENTS = frozenset(
+    {
+        "gate collection",
+        "gate.required_cases",
+        "gate.min_cases",
+        "gate.declared_cases",
+        cr._RUNNER_REVISE["violated_requirement"],
+        cr._COLLECTION_REVISE["violated_requirement"],
+        cr._UNGATED_REVISE["violated_requirement"],
+        cr._INTEGRATION_GATE_REVISE["violated_requirement"],
+    }
+)
+
+
+def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
+    """The public contract the reviewer was handed, as searchable text.
+
+    Same mapping `pr.public_contract` / `tests_chain.write_test_draft` /
+    `code_review.builder_view` project -- acceptance_criteria plus
+    declared_outputs plus the declared interface entries -- not a second
+    projection.
+    """
+    if not isinstance(contract, Mapping):
+        return ""
+    criteria = contract.get("acceptance_criteria") or ()
+    outputs = contract.get("declared_outputs") or ()
+    interface = contract.get("interface") or ()
+    return " ".join(
+        [str(item) for item in criteria]
+        + [str(item) for item in outputs]
+        + [
+            json.dumps(entry, sort_keys=True, ensure_ascii=False)
+            for entry in interface
+        ]
+    )
+
+
+def _rejected_citation(exc: BaseException) -> str:
+    citation = getattr(exc, "offending_requirement", "")
+    return citation if isinstance(citation, str) else ""
+
+
+def _bind_reviewer_findings(
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    contract_text: str,
+) -> tuple[Mapping[str, Any], ...]:
+    return st.bind_findings_to_contract(
+        findings,
+        contract_text=contract_text,
+        harness_keys=HARNESS_VIOLATED_REQUIREMENTS,
+    )
+
+
+def _remove_collect_tree(dest: Path) -> None:
+    tm.remove_tree(dest)
+
+
+def _write_test_files(extra: Mapping[str, Any]) -> dict[str, str]:
+    files = (
+        extra.get("test_files") or extra.get("files") or extra.get("private_files") or {}
+    )
+    if not files:
+        raise FactoryRefused("write_tests produced no test files")
+    return dict(files)
+
+
+
+def _resolved_provision_argv(
+    actor: object, override: Optional[Sequence[str]]
+) -> tuple[str, ...]:
+    """The command that installs a tree's declared dependencies.
+
+    The deployment's `provision_argv` already reaches the launcher, which
+    provisions agent worktrees. A *review* tree is materialized by the scheduler
+    instead, so it has to be provisioned from here or its accepted suite runs
+    against a tree with nothing installed -- collecting zero cases, which
+    `code_review` then reports as the builder's tests failing.
+
+    Read off the actor's launcher rather than re-reading the config: that is the
+    binding this run was actually admitted with. An actor with no launcher (a
+    test double, `FakeLauncher`) resolves to no provisioning, which is the
+    behaviour every existing caller already has.
+    """
+    if override is None:
+        launcher = getattr(actor, "launcher", None)
+        override = getattr(launcher, "provision_argv", ()) or ()
+    return tuple(str(item) for item in override)
+
+
+def _resolved_provision_timeout(actor: object) -> float | None:
+    """Seconds allowed for one review-tree provisioning run, or None for default.
+
+    Rides the same launcher binding as the argv, because the two are one
+    setting: a deployment that declares a multi-manifest install is the same
+    deployment that needs longer than the default to run it.
+    """
+    launcher = getattr(actor, "launcher", None)
+    seconds = getattr(launcher, "provision_timeout_s", None)
+    return None if seconds is None else float(seconds)
+
+
+def _resolved_suite_timeout(actor: object) -> float | None:
+    """Seconds one accepted-suite run may take, or None for `tc.SUITE_TIMEOUT_S`.
+
+    Same launcher binding as the provisioning timeout: both are bounds a
+    deployment sets once in `maestro.config.yaml`.
+    """
+    launcher = getattr(actor, "launcher", None)
+    seconds = getattr(launcher, "suite_timeout_s", None)
+    return None if seconds is None else float(seconds)
+
+
+class FactoryScheduler:
+    """Advance every ready lane one frozen stage at a time."""
+
+    #: Class default so a scheduler assembled without `__init__` (several
+    #: tests build one that way) reads the same value an absent config key
+    #: gives: plateau only.
+    regression_on_findings: bool = False
+    #: Same reason: `review.max_probe_rounds` absent is 5, `0` is off.
+    max_probe_rounds: int = 5
+    #: Same reason: absent means `tc.SUITE_TIMEOUT_S`.
+    _suite_timeout_s: float | None = None
+
+    def __init__(
+        self,
+        store: ArtifactStore,
+        run_id: str,
+        actor: StageActor,
+        runtime: RuntimeStateRoot,
+        target: gitpub.TargetBinding,
+        *,
+        stage_started: Optional[Callable[[str, st.LaneStage], None]] = None,
+        stage_completed: Optional[
+            Callable[[str, st.LaneStage, st.LaneStage], None]
+        ] = None,
+        step: Optional[Callable[..., None]] = None,
+        compiled: Optional[st.CompiledPlan] = None,
+        provision_argv: Optional[Sequence[str]] = None,
+        concurrency: int = 1,
+        regression_on_findings: bool = False,
+        max_probe_rounds: int = 5,
+    ) -> None:
+        if isinstance(concurrency, bool) or int(concurrency) < 1:
+            raise ValueError("concurrency is >= 1")
+        if isinstance(max_probe_rounds, bool) or int(max_probe_rounds) < 0:
+            raise ValueError("max_probe_rounds is >= 0")
+        #: Code-review rounds per window (since the latest USER_WAIT) that may
+        #: admit a reviewer-authored probe. `0` turns new submissions off.
+        self.max_probe_rounds = int(max_probe_rounds)
+        #: Whether one worse tests round -- more findings than an earlier round
+        #: in the same argument -- is itself a stall. `stall.regression_on_
+        #: findings` in the deployment's config; absent is False.
+        self.regression_on_findings = bool(regression_on_findings)
+        #: Independent ready lanes advance author/review/build stages on this
+        #: many worker threads; merges stay on the calling thread and are
+        #: serialized. 1 keeps every stage inline on the calling thread.
+        self.concurrency = int(concurrency)
+        self.store = store
+        self.run_id = run_id
+        self.actor = actor
+        self.runtime = runtime
+        self.target = target
+        self._provision_argv = _resolved_provision_argv(actor, provision_argv)
+        self._provision_timeout_s = _resolved_provision_timeout(actor)
+        self._suite_timeout_s = _resolved_suite_timeout(actor)
+        self.stage_started = stage_started
+        self.stage_completed = stage_completed
+        self.step = step
+        # An actor that can report its own dispatch and wait gets the same
+        # channel; a fake in the tests simply has no attribute to set.
+        try:
+            actor.step = step  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        self._compiled = compiled
+        self._compiled_kinds = {
+            lane.lane_id: lane.lane_kind for lane in compiled.lanes
+        } if compiled is not None else {}
+        row = run_row(store, run_id)
+        runtime.revalidate(row["runtime_state_fingerprint"])
+        gitpub.revalidate_binding(target)
+        self.locks = OrderedLocks(runtime, row["target_worktree_git_dir"])
+        #: lane_id -> (lane_id, stage, input digest, observed) for every lane
+        #: whose stage is executing right now, on any thread.
+        self._inflight: dict[str, tuple[str, st.LaneStage, str, Mapping[str, Any]]] = {}
+        self._inflight_lock = threading.Lock()
+        self._pool: Optional[ThreadPoolExecutor] = None
+
+    def run(self) -> st.RunStatus:
+        previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle_sigint)
+        try:
+            self._assert_runners_usable()
+            self._recover_legacy_retarget_journal()
+            self._resume_orphaned_integration_merge()
+            self._maybe_correct_legacy_integration_base()
+            ensure_run_integration_ref(self.target, self.store, self.run_id)
+            while True:
+                status = self.status()
+                if status is st.RunStatus.COMPLETE:
+                    self._complete_run_spaces()
+                    return status
+                if status is st.RunStatus.PUBLISHABLE:
+                    self._publish()
+                    if self.status() is st.RunStatus.COMPLETE:
+                        self._complete_run_spaces()
+                        return st.RunStatus.COMPLETE
+                    continue
+                if status is st.RunStatus.INTEGRATION_REVIEW_PENDING:
+                    self._final_review()
+                    continue
+                progressed = False
+                advancing = self._advanceable_lane_ids()
+                if advancing:
+                    self._advance_ready(advancing)
+                    progressed = True
+                merge_ready = [
+                    lane_id
+                    for lane_id in self.store.ready_lane_ids(self.run_id)
+                    if self.store.lane_stage(self.run_id, lane_id)
+                    is st.LaneStage.READY_TO_MERGE
+                ]
+                if merge_ready:
+                    self._advance(merge_ready[0])
+                    progressed = True
+                if not progressed:
+                    return self.status()
+        except KeyboardInterrupt:
+            self._pause_on_interrupt()
+            return st.RunStatus.WAITING
+        finally:
+            pool, self._pool = self._pool, None
+            if pool is not None:
+                # Nothing is running here except after an interrupt, where a
+                # worker still inside an agent turn finishes on its own and
+                # its late completion is refused by the ledger (the lane is
+                # already WAITING_FOR_USER). Waiting on it would hold the
+                # operator's Ctrl-C until that turn ends.
+                pool.shutdown(wait=False, cancel_futures=True)
+            signal.signal(signal.SIGINT, previous)
+
+    def _advanceable_lane_ids(self) -> list[str]:
+        """Ready lanes whose current stage may advance on a worker right now.
+
+        A lane that is already executing still reads as ready here -- its
+        stage does not change until it completes -- so the caller filters
+        what it has already dispatched.
+        """
+        advancing: list[str] = []
+        for lane_id in self.store.ready_lane_ids(self.run_id):
+            stage = self.store.lane_stage(self.run_id, lane_id)
+            if stage is st.LaneStage.READY_TO_MERGE:
+                continue
+            if (
+                stage is st.LaneStage.WRITING_TESTS
+                and self._legacy_correction_action() == "defer"
+            ):
+                continue
+            advancing.append(lane_id)
+        return advancing
+
+    def _advance_ready(self, lane_ids: Sequence[str]) -> None:
+        """Advance every ready non-merge lane one stage.
+
+        With `concurrency` 1 each lane advances inline on this thread, in
+        order, exactly as before. Above 1 the lanes go to a pool of that many
+        workers, and a worker that frees up is refilled from a freshly
+        computed ready set instead of idling until the slowest lane of the
+        batch returns. Waiting for the whole batch is what let three
+        admissible lanes sit behind one builder turn with two workers free.
+
+        A lane execution fault parks that lane through the same USER_WAIT path
+        as an operator pause; `ready_lane_ids` then skips it and anything
+        downstream while every independent lane keeps advancing. Integrity
+        failures still leave this method and drain the concurrent batch.
+        Merges never come through here, so this returns with the pool empty
+        and the outer loop still sees the run between stages, as before.
+        """
+        if self.concurrency == 1:
+            for lane_id in lane_ids:
+                self._advance(lane_id)
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self.concurrency, thread_name_prefix="maestro-lane"
+            )
+        queued: list[str] = list(lane_ids)
+        running: dict[Future, str] = {}
+        submitted: list[Future] = []
+        draining = False
+        while queued or running:
+            while queued and not draining and len(running) < self.concurrency:
+                lane_id = queued.pop(0)
+                future = self._pool.submit(self._advance, lane_id)
+                running[future] = lane_id
+                submitted.append(future)
+            if not running:
+                break
+            done, _pending = _wait_futures(
+                list(running), return_when=FIRST_COMPLETED
+            )
+            for future in done:
+                running.pop(future, None)
+                if future.exception() is not None:
+                    draining = True
+            if draining:
+                queued.clear()
+                continue
+            busy = set(running.values()) | set(queued)
+            queued.extend(
+                lane_id
+                for lane_id in self._advanceable_lane_ids()
+                if lane_id not in busy
+            )
+        for future in submitted:
+            exc = future.exception()
+            if exc is not None:
+                raise exc
+
+    def status(self) -> st.RunStatus:
+        self._resume_orphaned_integration_merge()
+        head = self._integration_head()
+        return self.store.derive_run_status(self.run_id, head)
+
+
+    def _recover_legacy_retarget_journal(self) -> None:
+        self.locks.acquire(2)
+        try:
+            self.target = recover_legacy_retarget_journal(
+                store=self.store, target=self.target, run_id=self.run_id
+            )
+        finally:
+            self.locks.release()
+
+    def _resume_orphaned_integration_merge(self) -> None:
+        self.locks.acquire(2)
+        try:
+            reconcile_orphaned_integration_merge_locked(
+                self.store, self.target, self.run_id, self.runtime.path
+            )
+        finally:
+            self.locks.release()
+
+    def resume_waiting(self) -> None:
+        for lane in self.store.active_projection(self.run_id):
+            if (
+                self.store.lane_stage(self.run_id, lane.lane_id)
+                is not st.LaneStage.WAITING_FOR_USER
+            ):
+                continue
+            wait = _latest(
+                self.store, self.run_id, lane.lane_id, st.ArtifactKind.USER_WAIT
+            )
+            if wait is None:
+                continue
+            reasons = {r.value for r in st.RESUMABLE_WAIT_REASONS}
+            if wait.payload.get("wait_reason") not in reasons:
+                continue
+            self.store.resume_lane(self.run_id, lane.lane_id)
+
+    def _integration_head(self) -> str:
+        return ensure_run_integration_ref(self.target, self.store, self.run_id)
+
+    def _handle_sigint(self, _signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    def _pause_on_interrupt(self) -> None:
+        with self._inflight_lock:
+            targets = list(self._inflight.values())
+        if not targets:
+            for lane in self.store.active_projection(self.run_id):
+                stage = self.store.lane_stage(self.run_id, lane.lane_id)
+                if stage not in st.PAUSEABLE_STAGES:
+                    continue
+                digest, observed = self._pause_input(lane.lane_id, stage)
+                targets.append((lane.lane_id, stage, digest, observed))
+        for lane_id, stage, digest, observed in targets:
+            try:
+                self.store.pause_lane(
+                    self.run_id, lane_id, stage, digest, observed=observed
+                )
+            except StageCasConflict:
+                # A worker completed this stage between the interrupt and
+                # the pause: the lane is at its next stage and no longer in
+                # flight, so there is nothing of it to pause. Its siblings
+                # still are.
+                continue
+
+    def _pause_input(
+        self, lane_id: str, stage: st.LaneStage
+    ) -> tuple[str, Mapping[str, Any]]:
+        row, lane = self._common(lane_id)
+        plan_ref = self._plan_artifact_ref(row)
+        common = dict(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+        )
+        if stage is st.LaneStage.PLANNED:
+            return (
+                st.planned_input_digest(
+                    **common,
+                    plan_artifact_ref=plan_ref,
+                    needs=lane.needs,
+                    declared_outputs=lane.declared_outputs,
+                ),
+                {},
+            )
+        if stage is st.LaneStage.WRITING_TESTS:
+            plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+            if plan is None:
+                raise FactoryRefused("missing LANE_PLAN")
+            _review, review_id = _writing_tests_predecessors(
+                self.store, self.run_id, lane_id
+            )
+            return (
+                st.writing_tests_input_digest(
+                    **common,
+                    lane_plan_id=plan.artifact_id,
+                    test_review_id=review_id,
+                    integration_head=self._integration_head(),
+                ),
+                {},
+            )
+
+        if stage is st.LaneStage.REVIEWING_TESTS:
+            plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+            draft = _latest(
+                self.store, self.run_id, lane_id, st.ArtifactKind.TEST_DRAFT
+            )
+            if plan is None or draft is None:
+                raise FactoryRefused("missing TEST_DRAFT")
+            return (
+                st.reviewing_tests_input_digest(
+                    **common,
+                    lane_plan_id=plan.artifact_id,
+                    test_draft_id=draft.artifact_id,
+                ),
+                {},
+            )
+        if stage is st.LaneStage.TESTS_SEALED:
+            plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+            draft = _latest(
+                self.store, self.run_id, lane_id, st.ArtifactKind.TEST_DRAFT
+            )
+            review = _latest(
+                self.store,
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.TEST_REVIEW,
+                verdict=st.ReviewerVerdict.PASS,
+            )
+            if plan is None or draft is None or review is None:
+                raise FactoryRefused("missing accepted-suite inputs")
+            return (
+                st.tests_sealed_input_digest(
+                    **common,
+                    lane_plan_id=plan.artifact_id,
+                    test_draft_id=draft.artifact_id,
+                    test_review_id=review.artifact_id,
+                ),
+                {},
+            )
+        if stage is st.LaneStage.BUILDING:
+            plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+            suite = self._accepted_suite_for(lane)
+            if plan is None:
+                raise FactoryRefused("missing BUILDING inputs")
+            revision = row["plan_revision"]
+            revise = _latest(
+                self.store,
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.CODE_REVIEW,
+                verdict=st.ReviewerVerdict.REVISE,
+                plan_revision=revision,
+            )
+            invalidation = _latest(
+                self.store,
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.BASE_INVALIDATION,
+                plan_revision=revision,
+            )
+            if invalidation is not None and (
+                revise is None or invalidation.sequence > revise.sequence
+            ):
+                entry = st.BuildingEntryKind.BASE_INVALIDATION
+            elif revise is not None:
+                entry = st.BuildingEntryKind.CODE_REVISE
+            else:
+                entry = st.BuildingEntryKind.INITIAL
+            builder_base = self._builder_base(lane, suite)
+            receipts = self._dep_receipts(lane.needs)
+            ids = [plan.artifact_id, suite.artifact_id]
+            ids.extend(
+                item.artifact_id for item in receipts if item.artifact_id not in ids
+            )
+            prior_builder = st.NO_PRIOR_BUILDER
+            code_review = st.NO_CODE_REVIEW
+            base_invalidation = st.NO_BASE_INVALIDATION
+            if entry is st.BuildingEntryKind.CODE_REVISE:
+                prior = _latest(
+                    self.store,
+                    self.run_id,
+                    lane_id,
+                    st.ArtifactKind.BUILDER_OUTPUT,
+                    plan_revision=revision,
+                )
+                if prior is None or revise is None:
+                    raise FactoryRefused("CODE_REVISE missing prior artifacts")
+                prior_builder = prior.artifact_id
+                code_review = revise.artifact_id
+                ids.extend([prior_builder, code_review])
+            elif entry is st.BuildingEntryKind.BASE_INVALIDATION:
+                prior, passing = _base_invalidation_priors(
+                    self.store, self.run_id, lane_id, invalidation
+                )
+                if prior is None or passing is None or invalidation is None:
+                    raise FactoryRefused("BASE_INVALIDATION missing artifacts")
+                prior_builder = prior.artifact_id
+                code_review = passing.artifact_id
+                base_invalidation = invalidation.artifact_id
+                ids.extend([prior_builder, code_review, base_invalidation])
+            digest = st.building_input_digest(
+                **common,
+                input_artifact_ids=ids,
+                entry_kind=entry,
+                builder_base_sha=builder_base,
+                prior_builder=prior_builder,
+                code_review=code_review,
+                base_invalidation=base_invalidation,
+            )
+            return digest, {
+                "builder_base_sha": builder_base,
+                "entry_kind": entry.value,
+            }
+        if stage is st.LaneStage.REVIEWING_CODE:
+            plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+            suite = self._accepted_suite_for(lane)
+            builder = _latest(
+                self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
+            )
+            if plan is None or suite is None or builder is None:
+                raise FactoryRefused("missing REVIEWING_CODE inputs")
+            return (
+                st.reviewing_code_input_digest(
+                    **common,
+                    lane_plan_id=plan.artifact_id,
+                    accepted_suite_id=suite.artifact_id,
+                    builder_output_id=builder.artifact_id,
+                    builder_base_sha=builder.payload["builder_base_sha"],
+                    candidate_ref=builder.payload["candidate_ref"],
+                    candidate_sha=builder.payload["candidate_sha"],
+                ),
+                {},
+            )
+        if stage is st.LaneStage.READY_TO_MERGE:
+            builder, review = _merge_producers(self.store, self.run_id, lane)
+            if builder is None or review is None:
+                raise FactoryRefused("missing READY_TO_MERGE inputs")
+            head = self._integration_head()
+            digest = st.ready_to_merge_input_digest(
+                **common,
+                builder_output_id=builder.artifact_id,
+                code_review_id=review.artifact_id,
+                builder_base_sha=builder.payload["builder_base_sha"],
+                candidate_ref=builder.payload["candidate_ref"],
+                candidate_sha=builder.payload["candidate_sha"],
+                integration_head=head,
+            )
+            return digest, {"integration_head": head}
+        raise FactoryRefused(f"not pauseable {stage.value}")
+
+    def _say(self, lane_id: str, message: str, detail: str = "") -> None:
+        """Report one step inside a stage. Never workflow state.
+
+        Deliberately swallowing: an observer that raises must not be able to
+        fail a lane. Nothing downstream reads these, and no transition keys on
+        one -- they exist so an operator can tell provisioning from a hung
+        agent from a dead scheduler while a stage is still running.
+        """
+        # getattr, not self.step: a scheduler built with __new__ for a targeted
+        # test has no attribute, and reporting must never be the thing that
+        # raises.
+        step = getattr(self, "step", None)
+        if step is None:
+            return
+        try:
+            step(lane_id, message, detail)
+        except Exception:
+            pass
+
+    def _call_actor(
+        self, ctx: LaneContext, call: Callable[..., Any], /, *args: Any
+    ) -> Any:
+        """Dispatch one role and park only its typed launch transport failure."""
+        try:
+            return call(*args)
+        # `HerdrStageActor._launch` translates an agent-launch refusal to this
+        # boundary type.  It is the entire lane-scoped transport allowlist:
+        # harness, git, preparation, and generic runtime errors remain fatal
+        # even if they arise while a role method is executing.
+        except LaunchFailed as exc:
+            detail = exc.detail + (":pane_retained" if exc.pane_created else "")
+            with self._inflight_lock:
+                inflight = self._inflight.get(ctx.lane.lane_id)
+            if inflight is not None and inflight[1] is ctx.stage:
+                _, _, digest, observed = inflight
+            else:
+                digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
+            self.store.pause_lane(
+                self.run_id,
+                ctx.lane.lane_id,
+                ctx.stage,
+                digest,
+                observed=observed,
+                reason=st.WaitReason.LANE_FAULT,
+                fault=st.LaneFault(type(exc).__name__, detail),
+            )
+            self._say(
+                ctx.lane.lane_id,
+                "lane fault, blocking for the operator",
+                detail,
+            )
+            raise _ActorFaultParked from exc
+
+
+    def _advance(self, lane_id: str) -> None:
+        stage = self.store.lane_stage(self.run_id, lane_id)
+        if stage is st.LaneStage.WRITING_TESTS:
+            self._maybe_correct_legacy_integration_base()
+        digest, observed = self._pause_input(lane_id, stage)
+        with self._inflight_lock:
+            self._inflight[lane_id] = (lane_id, stage, digest, observed)
+        if self.stage_started is not None:
+            self.stage_started(lane_id, stage)
+        try:
+            if stage is st.LaneStage.READY_TO_MERGE:
+                self.locks.acquire(2)
+                try:
+                    self._ready_to_merge(lane_id)
+                finally:
+                    self.locks.release()
+            elif stage is st.LaneStage.BUILDING:
+                self.locks.acquire(2)
+                try:
+                    self._building(lane_id)
+                finally:
+                    self.locks.release()
+            else:
+                dispatch = {
+                    st.LaneStage.PLANNED: self._planned,
+                    st.LaneStage.WRITING_TESTS: self._writing_tests,
+                    st.LaneStage.REVIEWING_TESTS: self._reviewing_tests,
+                    st.LaneStage.TESTS_SEALED: self._tests_sealed,
+                    st.LaneStage.REVIEWING_CODE: self._reviewing_code,
+                }
+                dispatch[stage](lane_id)
+            if self.stage_completed is not None:
+                self.stage_completed(
+                    lane_id, stage, self.store.lane_stage(self.run_id, lane_id)
+                )
+        except _ActorFaultParked:
+            return
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(lane_id, None)
+
+    def _common(self, lane_id: str) -> tuple[Mapping[str, Any], st.LaneProjection]:
+        row = run_row(self.store, self.run_id)
+        if self._compiled is not None:
+            projection = next(
+                lane for lane in self._compiled.lanes if lane.lane_id == lane_id
+            )
+        else:
+            projection = next(
+                lane
+                for lane in self.store.active_projection(self.run_id)
+                if lane.lane_id == lane_id
+            )
+        return row, projection
+
+    def _lane_kind(self, lane_id: str) -> str | None:
+        if lane_id in self._compiled_kinds:
+            return self._compiled_kinds[lane_id]
+        return self.store._lane_kind(self.run_id, lane_id)
+
+    def _suite_gate(self, lane: st.LaneProjection) -> SimpleNamespace | None:
+        if lane.lane_kind == st.LANE_KIND_BUILD:
+            for dep in lane.needs:
+                if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                    return _lane_gate(self.actor, dep)
+            return None
+        return _lane_gate(self.actor, lane.lane_id)
+
+
+
+    def _current_accepted_suite(self, lane_id: str) -> ArtifactRecord | None:
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        return _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.ACCEPTED_TEST_SUITE,
+            plan_revision=revision,
+        )
+
+    def _accepted_suite_for(self, lane: st.LaneProjection) -> ArtifactRecord:
+        """The accepted suite this lane is graded against.
+
+        A build lane's is its tests-lane predecessor's; an untyped lane's is
+        its own. Named by the plan, never guessed from a path shape.
+        """
+        if lane.lane_kind == st.LANE_KIND_BUILD:
+            for dep in lane.needs:
+                if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                    suite = self._current_accepted_suite(dep)
+                    if suite is None:
+                        raise FactoryRefused(f"missing dependency accepted tests {dep}")
+                    return suite
+            raise FactoryRefused("missing tests-lane accepted suite")
+        suite = self._current_accepted_suite(lane.lane_id)
+        if suite is None:
+            raise FactoryRefused("missing BUILDING inputs")
+        return suite
+
+    def _builder_base(self, lane: st.LaneProjection, suite: ArtifactRecord) -> str:
+        """The commit this lane's builder starts from.
+
+        The integration head for a typed build lane, which carries the merged
+        suite; the head plus the lane's own accepted suite for an untyped lane
+        (`_untyped_builder_base`). Content-addressed in both cases, so the
+        pause/resume digest that reads this off a paused lane recomputes the
+        same sha.
+        """
+        head = self._integration_head()
+        if lane.lane_kind is not None:
+            return head
+        return _untyped_builder_base(
+            self.target, head, _record_as_lane_artifact(suite, lane)
+        )
+
+    def _dep_receipts(self, needs: Sequence[str]) -> list[ArtifactRecord]:
+        receipts = []
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        for dep in needs:
+            if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                suite = self._current_accepted_suite(dep)
+                if suite is None:
+                    raise FactoryRefused(f"missing dependency accepted tests {dep}")
+                receipts.append(suite)
+                continue
+            merge = _latest(
+                self.store,
+                self.run_id,
+                dep,
+                st.ArtifactKind.INTEGRATION_MERGE,
+                plan_revision=revision,
+            )
+            if merge is None:
+                raise FactoryRefused(f"missing dependency merge {dep}")
+            receipts.append(merge)
+        return receipts
+
+
+
+
+    def _plan_artifact_ref(self, row: Mapping[str, Any]) -> str:
+        return plan_artifact_ref_for(self.store, self.run_id, row["plan_revision"])
+
+    def _planned(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        digest = st.planned_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            needs=lane.needs,
+            declared_outputs=lane.declared_outputs,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.PLANNED,
+            artifacts={},
+        )
+        payload = {
+            "declared_outputs": list(lane.declared_outputs),
+            "input_artifact_ids": [],
+            "input_digest": digest,
+            "needs": list(lane.needs),
+            "plan_artifact_ref": ctx.plan_artifact_ref,
+        }
+        if lane.lane_kind is not None:
+            payload["lane_kind"] = lane.lane_kind
+        artifact = rc.make_lane_artifact(
+            kind=st.ArtifactKind.LANE_PLAN,
+            request=_request(ctx),
+            payload=payload,
+            artifact_ref=f"lane-plan:{self.run_id}:{lane_id}:{digest}",
+        )
+        _complete(self.store, ctx, artifact)
+
+    def _legacy_correction_action(self) -> str:
+        specs = getattr(self.actor, "lane_specs", None)
+        if not specs:
+            return "noop"
+        ref = gitpub.declared_integration_ref(specs)
+        declared = self.target.git().rev_parse(ref)
+        if _completed_publication_matches(
+            self.store, self.target, self.run_id, declared
+        ):
+            return "noop"
+        row = run_row(self.store, self.run_id)
+        stages = tuple(
+            self.store.lane_stage(self.run_id, lane.lane_id)
+            for lane in self.store.active_projection(self.run_id)
+        )
+        return legacy_integration_correction_decision(
+            stored_sha=str(row["integration_initial_sha"]),
+            declared_sha=declared,
+            lane_stages=stages,
+            artifact_kinds=recorded_artifact_kinds(self.store, self.run_id),
+        )
+
+    def _maybe_correct_legacy_integration_base(self) -> None:
+        specs = getattr(self.actor, "lane_specs", None)
+        if not specs:
+            return
+        ref = gitpub.declared_integration_ref(specs)
+        declared = self.target.git().rev_parse(ref)
+        self.locks.acquire(2)
+        try:
+            self.target = correct_legacy_integration_base(
+                store=self.store,
+                target=self.target,
+                run_id=self.run_id,
+                declared_sha=declared,
+            )
+        finally:
+            self.locks.release()
+
+    def _writing_tests(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+        if plan is None:
+            raise FactoryRefused("missing LANE_PLAN")
+        review, review_id = _writing_tests_predecessors(
+            self.store, self.run_id, lane_id
+        )
+        tip = self._integration_head()
+        digest = st.writing_tests_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            lane_plan_id=plan.artifact_id,
+            test_review_id=review_id,
+            integration_head=tip,
+        )
+        artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
+        if review is not None:
+            artifacts["TEST_REVIEW"] = review
+        contract = rc.public_contract(
+            acceptance_criteria=lane.public_acceptance,
+            declared_outputs=lane.declared_outputs,
+            interface=lane.public_interface,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.WRITING_TESTS,
+            artifacts=artifacts,
+            integration_head=tip,
+            public_contract=contract,
+        )
+        self._say(lane_id, "asking tester for a test draft")
+        extra = dict(self._call_actor(ctx, self.actor.write_tests, ctx))
+        self._say(lane_id, "tester returned a draft")
+        # The draft is recorded first and measured at REVIEWING_TESTS, where a
+        # verdict about it can be recorded beside it. Measuring here and
+        # refusing meant a refused draft was never written anywhere: the
+        # scratch tree that held it was removed in the `finally` of
+        # `_collect_draft`, and the only reason FDAdb run a2ea7355 could be
+        # diagnosed at all is that the agent happened to leave copies in its
+        # own scratch directory. An artifact a verdict is about has to outlive
+        # the verdict. The draft is a candidate now -- committed on the head
+        # and pinned at a candidate ref -- so it outlives everything.
+        files = _write_test_files(extra)
+        self._require_typed_test_outputs(lane, files)
+        self._refuse_test_files_on_outputs(lane, files)
+        artifact = tc.write_test_draft(
+            request=_request(ctx),
+            binding=self.target,
+            integration_head=tip,
+            files=files,
+            public_contract=contract,
+            declared_outputs=(
+                lane.declared_outputs
+                if lane.lane_kind == st.LANE_KIND_TESTS
+                else None
+            ),
+        )
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(artifact, [plan.artifact_id, review_id]),
+        )
+
+    def _require_typed_test_outputs(
+        self, lane: st.LaneProjection, files: Mapping[str, str]
+    ) -> None:
+        if lane.lane_kind != st.LANE_KIND_TESTS:
+            return
+        returned = {rc.normalize_repo_path(path) for path in files}
+        declared = set(lane.declared_outputs)
+        if returned != declared:
+            undeclared = sorted(returned - declared)
+            missing = sorted(declared - returned)
+            detail = "test files must equal declared outputs"
+            if undeclared:
+                detail += "; undeclared: " + ", ".join(undeclared)
+            if missing:
+                detail += "; missing: " + ", ".join(missing)
+            raise TypedTestOutputsRefused(detail)
+
+    def _refuse_test_files_on_outputs(
+        self, lane: st.LaneProjection, files: Mapping[str, str]
+    ) -> None:
+        """An untyped lane's tests may not sit at its own product outputs.
+
+        Its tests are committed into the base its builder starts from and
+        protected there (`CANDIDATE_TEST_PATH_REFUSED`), so a test written at
+        a declared output would make that output unwritable by the builder.
+        A typed tests lane's outputs ARE its tests, and its build lane's
+        outputs are kept off them by the plan (`OUTPUT_OVERLAPS_TEST_SUITE`).
+        """
+        if lane.lane_kind is not None:
+            return
+        # Ancestry, not equality: a test file `pkg` and an output `pkg/mod.py`
+        # cannot both exist in one tree, in either direction.
+        collisions = sorted(
+            path
+            for path in {rc.normalize_repo_path(path) for path in files}
+            if any(
+                plan_model.outputs_conflict(path, output)
+                for output in lane.declared_outputs
+            )
+        )
+        if collisions:
+            raise TestFileOnDeclaredOutput(", ".join(collisions))
+
+
+    def _draft_files(self, draft: st.LaneArtifact) -> dict[str, str]:
+        """The draft's own bytes, read back off its pinned candidate.
+
+        `write_test_draft` admitted the draft as a candidate before this stage
+        was reached, so the measurement below reads the artifact's blobs out
+        of the run repository rather than a scratch tree that no longer exists.
+        """
+        files = tc.read_suite(
+            Path(self.target.target_repository_root), tc.suite_files(draft)
+        )
+        if not files:
+            raise FactoryRefused("draft carries no test files")
+        return files
+
+    def _measure_draft_gate(
+        self, ctx: LaneContext, draft: st.LaneArtifact
+    ) -> tuple[tuple[Mapping[str, str], ...] | None, int | None]:
+        """Return gate findings and its native count (None when unmeasured).
+
+        No findings means the draft satisfies the gate and the test reviewer is the
+        next reader. Findings mean it does not, and they are recorded as this
+        round's REVISE without a reviewer being asked -- there is nothing for a
+        reviewer to judge in a suite whose cases cannot be listed, and a
+        reviewer that passed one anyway would seal it.
+
+        Every answer here is REVISE-shaped on purpose. "Your draft collected 6
+        cases against a floor of 16" and "your draft could not be collected"
+        are judgements about work the tester authored and can fix, which is the
+        same class of event as a test reviewer's REVISE, and a REVISE has never
+        been fatal. Raising them out of the scheduler instead cost FDAdb run
+        a2ea7355 four lanes that had nothing to do with the draft.
+
+        A gate the *plan* declared wrong is a different thing and still
+        refuses: `_lane_gate` raises outside the try below.
+        """
+        gate = _lane_gate(self.actor, ctx.lane.lane_id)
+        if gate is None:
+            return None, None
+        files = self._draft_files(draft)
+        try:
+            collected, outcomes = self._collect_draft(ctx, gate, files)
+        except ParentOutcomesRefused as refused:
+            return _red_at_parent_unreadable_findings(str(refused)), None
+        except DraftCollectionRefused as refused:
+            return _draft_collection_findings(str(refused)), None
+        # Names before count: a suite missing a required case is wrong in a way
+        # the tester can act on, and saying "write 4 more cases" instead of
+        # naming them is what let run a33d5e9b re-emit the same eleven.
+        missing = _missing_required_cases(
+            collected, tuple(getattr(gate, "required_cases", ()) or ())
+        )
+        if missing:
+            return _draft_required_cases_findings(missing), len(collected)
+        if len(collected) < gate.min_cases:
+            return _draft_min_cases_findings(len(collected), gate.min_cases), len(collected)
+        # Last, because it is the only check that ran the cases: a draft that
+        # does not collect, or is short of its floor, has nothing to adjudicate
+        # against the parent and would be told two things at once.
+        divergent = _red_at_parent_divergences(
+            tuple(getattr(gate, "declared_cases", ()) or ()), outcomes
+        )
+        if divergent:
+            return _red_at_parent_findings(divergent), len(collected)
+        return None, len(collected)
+
+    def _assert_runners_usable(self) -> None:
+        """Every runner the plan names must run, before any agent is dispatched.
+
+        A lane's runner was first exercised at draft collection -- after a
+        tester had been dispatched, had spent its turn, and had written a
+        correct draft. On 2026-09-03 `lane-wp7-gw-dpa-tests` spent nine
+        minutes producing a valid suite and was refused seven seconds later
+        with `no usable pytest was found for .`; a correction turn then asked
+        the tester to fix an environment it does not own, and it spent four
+        more minutes. Nothing the tester could write was the thing that was
+        wrong, and the run had no way to say so.
+
+        One tree per distinct `(runner, cwd)` the plan names, provisioned the
+        way collection provisions, and resolved. The tree is discarded; only
+        the verdict is kept. This is the whole plan's environment answered
+        once, at the chokepoint both run verbs cross, instead of per lane at
+        the point where it is too late to be cheap.
+        """
+        wanted: dict[tuple[str, str], None] = {}
+        for lane in self.store.active_projection(self.run_id):
+            gate = _lane_gate(self.actor, lane.lane_id)
+            if gate is None:
+                continue
+            wanted.setdefault((gate.runner, gate.cwd), None)
+        if not wanted:
+            return
+        run_repo = Path(self.target.target_repository_root)
+        base = self._integration_head()
+        unusable: list[str] = []
+        for runner, cwd in wanted:
+            dest = tm.scratch_tree_path(
+                self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
+            )
+            tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
+            keep = False
+            try:
+                self._say("", "checking {0} is usable in {1}".format(runner, cwd))
+                # The one provisioner every actor and measurement tree crosses,
+                # with nothing bridged in afterwards: this probe speaks for the
+                # tester, reviewer and builder trees only if it runs in exactly
+                # what `provision_argv` installs.
+                prov.provision_tree(
+                    dest, self._provision_argv, self._provision_timeout_s
+                )
+                rr.resolve(
+                    runner,
+                    dest,
+                    cwd,
+                    # Empty on purpose, and now stated rather than defaulted:
+                    # this preflight runs before any candidate exists, so the
+                    # whole tree genuinely is its question.
+                    (),
+                )
+            except (rr.RunnerUnusable, prov.ReviewProvisioningError) as extra:
+                # Provisioning belongs to this refusal, not above it. The
+                # preflight's own sentence is "the environment every lane will
+                # run in is usable", and a `provision_argv` that fails is that
+                # sentence coming out false -- one whose answer is the
+                # deployment's command, which no agent can act on either. It
+                # escaped here as an untyped crash, so the one run verb both
+                # paths cross reported a stack trace for the case it exists to
+                # name.
+                #
+                # The tree stays. A refusal about an environment is answered by
+                # opening that environment, and this one used to be deleted on
+                # the way out -- so the cheapest possible diagnosis, running the
+                # probe by hand where it failed, cost a full rebuild of the
+                # environment from the deployment's own `provision_argv` before
+                # it could start. `scratch_worktree_path` randomizes the name,
+                # so a kept tree can never be one a later call is refused for
+                # adopting.
+                keep = True
+                detail = getattr(extra, "detail", None) or str(extra)
+                unusable.append(
+                    "{0} in {1}: {2}; measured in {3}, which is kept".format(
+                        runner, cwd, detail, dest
+                    )
+                )
+            finally:
+                if not keep:
+                    _remove_collect_tree(dest)
+        if unusable:
+            raise RunnerPreflightRefused("; ".join(unusable))
+
+    def _collect_draft(
+        self,
+        ctx: LaneContext,
+        gate: SimpleNamespace,
+        files: Mapping[str, str],
+    ) -> tuple[tuple[str, ...], Mapping[str, bool]]:
+        run_repo = Path(self.target.target_repository_root)
+        base = self._integration_head()
+        dest = tm.scratch_tree_path(
+            self.runtime.path / "worktrees",
+            "draft-collect-{0}".format(ctx.lane.lane_id),
+        )
+        tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
+        keep = False
+        try:
+            # Provision before probing, with nothing bridged in from the
+            # product checkout, so a dependency the deployment's
+            # `provision_argv` does not install is missing here exactly as it
+            # is missing in the tester's tree.
+            prov.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
+            # Resolve BEFORE the draft is written, because `resolve`'s probe is
+            # a whole-tree `--collect-only` and would otherwise be measuring the
+            # draft it is supposed to be measuring the environment for. FDAdb
+            # run 2489c772 paid for that ordering: `lane-wp4-release-tests`
+            # drafted `services/device-substrates/tests/release/
+            # test_release_artifact.py`, the repository already carried
+            # `services/label-batch/tests/observations/test_release_artifact.py`
+            # from a merged lane, neither directory has an `__init__.py`, so
+            # pytest derived the same module name twice and interrupted
+            # collection with `import file mismatch` at exit 2. That is a name
+            # the tester chose and can change in one line -- and it was
+            # reported as `RUNNER_PREFLIGHT_REFUSED`, which ends the whole run,
+            # because a probe run after `write_files` cannot tell an unusable
+            # interpreter from a draft that will not collect.
+            resolved = rr.resolve(
+                gate.runner,
+                dest,
+                gate.cwd,
+                # Empty on purpose. This probe deliberately runs BEFORE
+                # `write_files`, so the draft's paths do not exist yet and
+                # naming them makes pytest exit 4, `file or directory not
+                # found` -- an unusable-interpreter refusal for a draft that
+                # was never written. The question here is only whether the
+                # environment is usable.
+                (),
+            )
+            rc.write_files(dest, files)
+            measured = _collect_gate(gate, files, Path(dest))
+            ids = rr.collect_cases(resolved, measured, dest)
+            # The tree this collected in IS the parent commit -- `base` is the
+            # integration head with only the draft's files written on top --
+            # so the red-at-parent measurement belongs here and nowhere else. A second tree would provision twice and, worse, would let
+            # the two measurements disagree about which commit they were made
+            # against.
+            outcomes: Mapping[str, bool] = {}
+            if getattr(gate, "declared_cases", ()):
+                outcomes = rr.execute_case_outcomes(resolved, measured, dest)
+            return tuple(ids), outcomes
+        except (
+            rr.CollectFailed,
+            rr.RunnerUnusable,
+            rr.CaseOutcomesUnreadable,
+        ) as extra:
+            detail = str(getattr(extra, "detail", None) or extra.__class__.__name__)
+            if isinstance(extra, rr.RunnerUnusable):
+                # The runner itself cannot run here. That is the harness's
+                # environment, never the draft, so it must not become a
+                # finding: a tester cannot install a runner, and sending it
+                # one spends three of its rounds and then parks its lane for
+                # an operator with a verdict about somebody else's work.
+                # `_assert_runners_usable` asks this question at run start for
+                # every (runner, cwd) the plan names; reaching it here means
+                # the answer changed mid-run, which is the same fault
+                # discovered later.
+                #
+                # And the same fault keeps the same evidence: this refusal ends
+                # the run and is read by an operator, so the tree it was
+                # measured in stays, named beside the detail.
+                keep = True
+                raise RunnerPreflightRefused(
+                    "{0}; measured in {1}, which is kept".format(detail, dest)
+                ) from extra
+            if isinstance(extra, rr.CaseOutcomesUnreadable):
+                raise ParentOutcomesRefused(detail) from extra
+            raise DraftCollectionRefused(detail) from extra
+        finally:
+            if not keep:
+                _remove_collect_tree(dest)
+
+
+
+    def _reviewing_tests(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+        draft = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.TEST_DRAFT)
+        if plan is None or draft is None:
+            raise FactoryRefused("missing TEST_DRAFT")
+        digest = st.reviewing_tests_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            lane_plan_id=plan.artifact_id,
+            test_draft_id=draft.artifact_id,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.REVIEWING_TESTS,
+            artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft},
+            candidate_ref=str(draft.payload["candidate_ref"]),
+            candidate_sha=str(draft.payload["candidate_sha"]),
+            public_contract=draft.payload.get("public_contract"),
+        )
+        draft_artifact = _record_as_lane_artifact(draft, lane)
+        measured, collected = self._measure_draft_gate(ctx, draft_artifact)
+        if measured is not None:
+            verdict: st.ReviewerVerdict = st.ReviewerVerdict.REVISE
+            findings: Sequence[Mapping[str, str]] = measured
+            self._say(
+                lane_id,
+                "gate measurement answered REVISE",
+                "{0} finding(s); test reviewer not asked".format(len(findings)),
+            )
+        else:
+            self._say(lane_id, "asking test reviewer")
+            verdict, findings = self._call_actor(
+                ctx, self.actor.review_tests, ctx
+            )
+            self._say(
+                lane_id,
+                "test reviewer answered {0}".format(verdict.value),
+                "{0} finding(s)".format(len(findings)),
+            )
+            try:
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(ctx.public_contract),
+                )
+            except st.CanonicalIdentityError as first:
+                self._say(
+                    lane_id,
+                    "reviewer finding does not cite the contract, asking again",
+                )
+                verdict, findings = self._call_actor(
+                    ctx,
+                    self.actor.review_tests,
+                    dataclasses.replace(
+                        ctx, rejected_citation=_rejected_citation(first)
+                    ),
+                )
+                self._say(
+                    lane_id,
+                    "test reviewer answered {0} on the second ask".format(
+                        verdict.value
+                    ),
+                    "{0} finding(s)".format(len(findings)),
+                )
+                try:
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=_public_contract_text(ctx.public_contract),
+                    )
+                except st.CanonicalIdentityError as exc:
+                    citation = getattr(exc, "offending_requirement", "")
+                    if not isinstance(citation, str):
+                        citation = ""
+                    raise ReviewFindingUncited(
+                        "{0}:{1}:{2}".format(
+                            lane_id,
+                            "test-reviewer",
+                            citation[:120],
+                        )
+                    ) from exc
+        artifact = tc.review_test_draft(
+            request=_request(ctx),
+            verdict=verdict,
+            findings=findings,
+            test_draft=draft_artifact,
+        )
+        if collected is not None:
+            payload = dict(artifact.payload, public_result_summary={"collected": collected})
+            artifact = dataclasses.replace(
+                artifact, payload=payload, output_digest=st.digest_canonical(payload)
+            )
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(artifact, [plan.artifact_id, draft.artifact_id]),
+        )
+        # The lane is back at WRITING_TESTS and will redraft. A tests lane that
+        # keeps redrafting without measured or substantive progress gets the same
+        # answer a build lane does: park for the operator rather than opening
+        # another tester turn. Only this lane stops; the run keeps advancing
+        # every lane that does not need it.
+        if verdict is st.ReviewerVerdict.REVISE:
+            self._block_if_stalled(lane_id)
+
+    def _tests_sealed(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+        draft = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.TEST_DRAFT)
+        review = _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.TEST_REVIEW,
+            verdict=st.ReviewerVerdict.PASS,
+        )
+        if plan is None or draft is None or review is None:
+            raise FactoryRefused("missing accepted-suite inputs")
+        digest = st.tests_sealed_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            lane_plan_id=plan.artifact_id,
+            test_draft_id=draft.artifact_id,
+            test_review_id=review.artifact_id,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.TESTS_SEALED,
+            artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft, "TEST_REVIEW": review},
+            public_contract=draft.payload.get("public_contract"),
+        )
+        test_draft = _record_as_lane_artifact(draft, lane)
+        artifact = tc.accept_tests(
+            request=_request(ctx),
+            test_draft=test_draft,
+            test_review=_record_as_lane_artifact(review, lane),
+        )
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(
+                artifact, [plan.artifact_id, draft.artifact_id, review.artifact_id]
+            ),
+        )
+
+    def _own_test_paths(
+        self, lane: st.LaneProjection, suite: ArtifactRecord
+    ) -> tuple[str, ...]:
+        """Where this lane's own accepted suite lives in a tree.
+
+        `suite` is what `_accepted_suite_for` resolved: for a build lane its
+        tests-lane predecessor's, for an untyped lane its own. Names only --
+        the keys of the path-to-blob map. These are the paths
+        `admit_candidate` refuses a candidate for touching.
+        """
+        return tuple(sorted(tc.suite_files(_record_as_lane_artifact(suite, lane))))
+
+    def _bound_surface(
+        self, lane: st.LaneProjection, suite: ArtifactRecord
+    ) -> Mapping[str, Any] | None:
+        """The names the accepted suite binds to, an index for the builder.
+
+        `derive_bound_surface` returns module specifiers, the symbols imported
+        from each, and the keys read off result objects. The builder can read
+        the suite itself; this is the summary that tells it which names to
+        look for first.
+
+        Read off the run repository exactly the way `_reviewing_code` and
+        `code_review.measure_candidate` read it: the artifact's path-to-blob
+        map, the blobs out of the object database.
+        """
+        files = tc.read_suite(
+            Path(self.target.target_repository_root),
+            tc.suite_files(_record_as_lane_artifact(suite, lane)),
+        )
+        surface = bsf.derive_bound_surface(files)
+        if not surface.get("modules") and not surface.get("object_keys"):
+            # Nothing extracted is not an empty contract, it is no contract.
+            # Rendering it would tell the builder the suite binds to nothing.
+            return None
+        return surface
+
+    def _building(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+        suite = self._accepted_suite_for(lane)
+        if plan is None:
+            raise FactoryRefused("missing BUILDING inputs")
+        revision = row["plan_revision"]
+        revise = _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.CODE_REVIEW,
+            verdict=st.ReviewerVerdict.REVISE,
+            plan_revision=revision,
+        )
+        invalidation = _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.BASE_INVALIDATION,
+            plan_revision=revision,
+        )
+        if invalidation is not None and (
+            revise is None or invalidation.sequence > revise.sequence
+        ):
+            entry = st.BuildingEntryKind.BASE_INVALIDATION
+        elif revise is not None:
+            entry = st.BuildingEntryKind.CODE_REVISE
+        else:
+            entry = st.BuildingEntryKind.INITIAL
+        if entry is st.BuildingEntryKind.CODE_REVISE and self._probe_budget_exhausted(
+            lane_id
+        ):
+            # The review that spent the last probe round was completed, and
+            # the pause that should follow it may not have happened (a crash
+            # between the two). Park here instead of dispatching a builder
+            # past the budget, which is the same state the pause reaches.
+            self._park_no_progress(
+                lane_id,
+                st.LaneStage.BUILDING,
+                "probe budget of {0} round(s) spent; resume grants another window".format(
+                    self.max_probe_rounds
+                ),
+            )
+            return
+        builder_base = self._builder_base(lane, suite)
+        receipts = self._dep_receipts(lane.needs)
+        ids = [plan.artifact_id, suite.artifact_id]
+        ids.extend(
+            item.artifact_id for item in receipts if item.artifact_id not in ids
+        )
+        prior_builder = st.NO_PRIOR_BUILDER
+        code_review = st.NO_CODE_REVIEW
+        base_invalidation = st.NO_BASE_INVALIDATION
+        if entry is st.BuildingEntryKind.CODE_REVISE:
+            prior = _latest(
+                self.store,
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.BUILDER_OUTPUT,
+                plan_revision=revision,
+            )
+            if prior is None or revise is None:
+                raise FactoryRefused("CODE_REVISE missing prior artifacts")
+            prior_builder = prior.artifact_id
+            code_review = revise.artifact_id
+            ids.extend([prior_builder, code_review])
+        elif entry is st.BuildingEntryKind.BASE_INVALIDATION:
+            prior, passing = _base_invalidation_priors(
+                self.store, self.run_id, lane_id, invalidation
+            )
+            if prior is None or passing is None or invalidation is None:
+                raise FactoryRefused("BASE_INVALIDATION missing artifacts")
+            prior_builder = prior.artifact_id
+            code_review = passing.artifact_id
+            base_invalidation = invalidation.artifact_id
+            ids.extend([prior_builder, code_review, base_invalidation])
+        digest = st.building_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            input_artifact_ids=ids,
+            entry_kind=entry,
+            builder_base_sha=builder_base,
+            prior_builder=prior_builder,
+            code_review=code_review,
+            base_invalidation=base_invalidation,
+        )
+        artifacts: dict[str, ArtifactRecord] = {
+            "LANE_PLAN": plan,
+            "ACCEPTED_TEST_SUITE": suite,
+        }
+        if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
+            artifacts["CODE_REVIEW"] = revise
+        records, retired, _receipts, probe_commit = self._accumulated_probes(lane_id)
+        active_probes = probes.active_records(records, retired)
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.BUILDING,
+            artifacts=artifacts,
+            builder_base_sha=builder_base,
+            entry_kind=entry,
+            public_contract=rc.public_contract(
+                acceptance_criteria=lane.public_acceptance,
+                declared_outputs=lane.declared_outputs,
+                interface=lane.public_interface,
+            ),
+            test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
+            # A probe is never written into the builder's tree, but a path the
+            # builder creates there would be one the next review cannot place
+            # the probe at. Refuse it at admission, with the suite's paths.
+            protected_test_paths=tuple(
+                sorted(
+                    {
+                        *self._own_test_paths(lane, suite),
+                        *(str(record["path"]) for record in active_probes),
+                    }
+                )
+            ),
+            probe_texts=self._probe_sources(records, retired, probe_commit) or None,
+        )
+        surface = self._bound_surface(lane, suite)
+        if surface is not None:
+            ctx = dataclasses.replace(ctx, bound_surface=surface)
+            self._say(
+                lane_id,
+                "derived the bound surface from the accepted suite",
+                "{0} module(s), {1} result key(s)".format(
+                    len(surface.get("modules") or ()),
+                    len(surface.get("object_keys") or ()),
+                ),
+            )
+        self._say(lane_id, "asking builder for a candidate")
+        extra = dict(self._call_actor(ctx, self.actor.build, ctx))
+        self._say(lane_id, "builder returned a candidate")
+        candidate_sha = extra["candidate_sha"]
+        changed = bool(extra.get("changed", True))
+        admitted = gitpub.admit_candidate(
+            self.target,
+            run_id=self.run_id,
+            lane_id=lane_id,
+            input_digest=digest,
+            builder_base_sha=builder_base,
+            candidate_sha=candidate_sha,
+            changed=changed,
+            declared_outputs=lane.declared_outputs,
+            # The suite this lane is graded against, named by the plan. It is
+            # in the builder's base -- merged there by the tests lane, or put
+            # there by `_untyped_builder_base` -- and this refuses a candidate
+            # whose delta names any of it, before any reviewer reads it. Every
+            # lane kind: an untyped lane's tests are in its base too now, so
+            # a candidate landing on one is the same violation, not the
+            # collision the retired `TEST_INVALIDATION` reset used to answer.
+            protected_paths=ctx.protected_test_paths,
+        )
+        builder_payload = {
+            "builder_base_sha": admitted["builder_base_sha"],
+            "candidate_ref": admitted["candidate_ref"],
+            "candidate_sha": admitted["candidate_sha"],
+            "changed": admitted["changed"],
+            "entry_kind": entry.value,
+            "input_artifact_ids": ids,
+            "input_digest": digest,
+            "plan_revision": row["plan_revision"],
+            "spec_digest": lane.spec_digest,
+            "projection_digest": lane.lane_projection_digest,
+            "test_suite_digest": ctx.test_suite_digest,
+            "tree_delta": admitted.get("tree_delta") or [],
+        }
+        artifact = rc.make_lane_artifact(
+            kind=st.ArtifactKind.BUILDER_OUTPUT,
+            request=_request(ctx),
+            payload=builder_payload,
+            artifact_ref=admitted["candidate_ref"],
+        )
+        _complete(self.store, ctx, artifact)
+
+    def _reviewing_code(self, lane_id: str) -> None:
+        row, lane = self._common(lane_id)
+        plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
+        suite = self._accepted_suite_for(lane)
+        builder = _latest(
+            self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
+        )
+        if plan is None or suite is None or builder is None:
+            raise FactoryRefused("missing REVIEWING_CODE inputs")
+        digest = st.reviewing_code_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            lane_plan_id=plan.artifact_id,
+            accepted_suite_id=suite.artifact_id,
+            builder_output_id=builder.artifact_id,
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            candidate_sha=builder.payload["candidate_sha"],
+        )
+        product_contract = rc.public_contract(
+            acceptance_criteria=lane.public_acceptance,
+            declared_outputs=lane.declared_outputs,
+            interface=lane.public_interface,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.REVIEWING_CODE,
+            artifacts={
+                "LANE_PLAN": plan,
+                "ACCEPTED_TEST_SUITE": suite,
+                "BUILDER_OUTPUT": builder,
+            },
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            candidate_sha=builder.payload["candidate_sha"],
+            public_contract=product_contract,
+            test_suite_digest=str(suite.payload.get("test_suite_digest") or ""),
+            # The reviewer is told which paths are the accepted suite, as the
+            # builder is. Without it the reviewer's `test_paths` was empty.
+            protected_test_paths=self._own_test_paths(lane, suite),
+        )
+        records, retired, receipts, prior_commit = self._accumulated_probes(lane_id)
+        solicit = self.max_probe_rounds > 0
+        budget_left = (
+            max(0, self.max_probe_rounds - self._probe_rounds_used(lane_id))
+            if solicit
+            else 0
+        )
+        ids = [plan.artifact_id, suite.artifact_id, builder.artifact_id]
+        suite_artifact = _record_as_lane_artifact(suite, lane)
+        request = _request(ctx)
+        constraints = tuple(lane.public_acceptance) or ("produce declared outputs",)
+        # Measure BEFORE the reviewer votes. A reviewer that does not know
+        # the suite is red votes PASS with no findings, the harness then
+        # downgrades it, and the builder is handed a canned sentence naming
+        # no file -- which is how a lane burns a round learning nothing.
+        self._say(
+            lane_id,
+            "provisioning review tree and running the accepted suite",
+            "candidate {0}".format(builder.payload["candidate_sha"][:12]),
+        )
+        measurement = cr.measure_candidate(
+            request=request,
+            state_root=self.runtime.path,
+            candidate_repo=Path(self.target.target_repository_root),
+            candidate_sha=builder.payload["candidate_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            builder_base_sha=builder.payload["builder_base_sha"],
+            accepted_suite=suite_artifact,
+            scratch_root=self.runtime.path / "worktrees",
+            gate=self._suite_gate(lane),
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
+            suite_timeout_s=self._suite_timeout_s,
+        )
+        counts = measurement.summary
+        self._say(
+            lane_id,
+            "accepted suite {0}".format(
+                "FAILED" if measurement.runner_failed else "passed"
+            ),
+            "{0} executed, {1} passed, {2} failed, {3} errored".format(
+                counts["executed"],
+                counts["passed"],
+                counts["failed"],
+                counts["errored"],
+            ),
+        )
+        ctx = dataclasses.replace(
+            ctx,
+            suite_result_summary=dict(measurement.summary),
+            existing_probes=probes.active_records(records, retired),
+            probe_budget_left=budget_left,
+        )
+        taken: tuple[Any, ...] = ((), (), ())
+
+        def ask(asked: LaneContext) -> Any:
+            """One reviewer turn, keeping the latest probes it submitted."""
+            nonlocal taken
+            answer = self._call_actor(asked, self.actor.review_code, asked)
+            if solicit:
+                got = self._take_probes(asked)
+                if any(got):
+                    taken = got
+            return answer
+
+        self._say(lane_id, "asking code reviewer")
+        verdict, findings = ask(ctx)
+        self._say(
+            lane_id,
+            "code reviewer answered {0}".format(verdict.value),
+            "{0} finding(s)".format(len(findings)),
+        )
+        gating, _standards = st.partition_findings_by_axis(findings)
+        if not gating and (
+            measurement.runner_failed or verdict is st.ReviewerVerdict.REVISE
+        ):
+            # It had nothing locatable to say: against a red suite, or as a
+            # REVISE whose findings were all standards (which cannot gate).
+            # Ask once more, saying so. One extra reviewer turn is cheap next
+            # to a builder round spent guessing what to change.
+            self._say(
+                lane_id,
+                "no actionable finding against a red suite, asking again"
+                if measurement.runner_failed
+                else "REVISE carried no gating finding, asking again",
+            )
+            verdict, findings = ask(
+                dataclasses.replace(ctx, suite_findings_required=True)
+            )
+            self._say(
+                lane_id,
+                "code reviewer answered {0} on the second ask".format(
+                    verdict.value
+                ),
+                "{0} finding(s)".format(len(findings)),
+            )
+        try:
+            findings = _bind_reviewer_findings(
+                findings,
+                contract_text=_public_contract_text(product_contract),
+            )
+        except st.CanonicalIdentityError as first:
+            self._say(
+                lane_id,
+                "reviewer finding does not cite the contract, asking again",
+            )
+            verdict, findings = ask(
+                dataclasses.replace(
+                    ctx, rejected_citation=_rejected_citation(first)
+                )
+            )
+            self._say(
+                lane_id,
+                "code reviewer answered {0} on the second ask".format(
+                    verdict.value
+                ),
+                "{0} finding(s)".format(len(findings)),
+            )
+            try:
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(product_contract),
+                )
+            except st.CanonicalIdentityError as exc:
+                citation = getattr(exc, "offending_requirement", "")
+                if not isinstance(citation, str):
+                    citation = ""
+                raise ReviewFindingUncited(
+                    "{0}:{1}:{2}".format(
+                        lane_id,
+                        "code-reviewer",
+                        citation[:120],
+                    )
+                ) from exc
+        probe_measurement = None
+        if records or any(taken):
+            probe_measurement, verdict, findings = self._probe_review(
+                ctx=ctx,
+                measurement=measurement,
+                product_contract=product_contract,
+                records=records,
+                retired=retired,
+                receipts=receipts,
+                prior_commit=prior_commit,
+                taken=taken,
+                solicit=solicit,
+                budget_left=budget_left,
+                verdict=verdict,
+                findings=findings,
+            )
+        artifact = cr.review_builder_output(
+            request=request,
+            state_root=self.runtime.path,
+            candidate_repo=Path(self.target.target_repository_root),
+            candidate_sha=builder.payload["candidate_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            builder_base_sha=builder.payload["builder_base_sha"],
+            accepted_suite=suite_artifact,
+            verdict=verdict,
+            findings=findings,
+            scratch_root=self.runtime.path / "worktrees",
+            architecture_constraints=constraints,
+            public_contract=product_contract,
+            gate=self._suite_gate(lane),
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
+            suite_timeout_s=self._suite_timeout_s,
+            measurement=measurement,
+            probe_measurement=probe_measurement,
+        )
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(artifact, ids),
+        )
+        settled = artifact.verdict
+        if settled is not None and settled is not verdict:
+            # The measurement outranked the reviewer, which it can do in one
+            # direction only: a failing runner or a failing admitted probe
+            # promoting a PASS. Say so, because the transition came from a
+            # measurement and not the vote.
+            self._say(
+                lane_id,
+                "measured result is authoritative; verdict recorded as {0}".format(
+                    settled.value
+                ),
+                "reviewer said {0}".format(verdict.value),
+            )
+        # The artifact carries the settled verdict, and the transition above
+        # was derived from it, so the guard has to read the same field or it
+        # would judge a lane the transition did not send back.
+        #
+        # `settled` is now the reviewer's own answer in every case but one: a
+        # failing runner still promotes a PASS to REVISE. That lane is going
+        # back to BUILDING too, and it is the lane likeliest to loop, so it
+        # belongs in the guard. Keying on the reviewer's raw `verdict` -- what
+        # this read before ad186ba -- would skip exactly that case.
+        #
+        # REVISE remains blocking even over a green suite. Repeated candidate
+        # content, measured plateau or regression parks only this lane.
+        if settled is st.ReviewerVerdict.REVISE:
+            if self._probe_budget_exhausted(lane_id):
+                # The REVISE above is complete and carries its probe, so no
+                # merge-eligible artifact exists with a measured failure
+                # unaddressed. Park at BUILDING; `_building` re-checks on
+                # entry, so a crash before this line reaches the same state.
+                self._park_no_progress(
+                    lane_id,
+                    st.LaneStage.BUILDING,
+                    "probe budget of {0} round(s) spent; resume grants another window".format(
+                        self.max_probe_rounds
+                    ),
+                )
+            else:
+                self._block_if_stalled(lane_id)
+
+    # -- reviewer-authored probes ------------------------------------------
+
+    def _take_probes(self, ctx: LaneContext) -> tuple[Any, ...]:
+        """(submissions, rejections, challenges) the actor kept from its last turn."""
+        take = getattr(self.actor, "take_probes", None)
+        if take is None:
+            return ((), (), ())
+        submissions, rejections, challenges = take(ctx)
+        return tuple(submissions), tuple(rejections), tuple(challenges)
+
+    def _accumulated_probes(
+        self, lane_id: str
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...], str]:
+        """Records, retirements, receipts and pinned commit the lane has so far.
+
+        Read only from the newest CODE_REVIEW of the current plan revision and
+        lane projection, so a revision or projection change drops them, and
+        validated on every read: nothing here trusts a transport stash.
+        """
+        row, lane = self._common(lane_id)
+        prior = _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.CODE_REVIEW,
+            plan_revision=row["plan_revision"],
+            projection_digest=lane.lane_projection_digest,
+        )
+        if prior is None or not prior.payload.get("probe_records"):
+            return (), (), (), ""
+        payload = prior.payload
+        records = tuple(payload["probe_records"])
+        retired = tuple(payload.get("probe_retired") or ())
+        receipts = tuple(payload.get("probe_receipts") or ())
+        try:
+            probes.validate_receipts(records, retired, receipts)
+        except probes.ProbeReceiptError as exc:
+            raise FactoryRefused("PROBE_RECEIPT_INVALID:{0}".format(exc)) from exc
+        return records, retired, receipts, str(payload.get("probe_commit") or "")
+
+    def _probe_sources(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        retired: Sequence[Mapping[str, Any]],
+        commit: str,
+    ) -> dict[str, str]:
+        """Active probe sources by path, read from the pinned commit alone."""
+        active = probes.active_records(records, retired)
+        if not active:
+            return {}
+        if not commit:
+            raise FactoryRefused("PROBE_SOURCES_UNPINNED")
+        pinned = probes.read_pinned_sources(self.target.git(), commit)
+        sources: dict[str, str] = {}
+        for record in active:
+            raw = pinned.get(str(record["path"]))
+            if raw is None or probes.source_digest(raw) != record["source_sha256"]:
+                raise FactoryRefused("PROBE_SOURCE_MISMATCH:{0}".format(record["path"]))
+            sources[str(record["path"])] = raw.decode("utf-8")
+        return sources
+
+    def _probe_rounds_used(self, lane_id: str) -> int:
+        """Code reviews since the latest USER_WAIT that admitted a probe."""
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        used = 0
+        for row in self.store.conn.execute(
+            "SELECT payload_json FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+            "AND artifact_kind=? AND sequence>? AND plan_revision=?",
+            (
+                self.run_id,
+                lane_id,
+                st.ArtifactKind.CODE_REVIEW.value,
+                _user_wait_marker(self.store, self.run_id, lane_id),
+                revision,
+            ),
+        ):
+            submitted = _loads(row["payload_json"]).get("probe_submissions") or ()
+            used += any(item.get("outcome") == PROBE_ADMITTED for item in submitted)
+        return used
+
+    def _probe_budget_exhausted(self, lane_id: str) -> bool:
+        return self.max_probe_rounds > 0 and (
+            self._probe_rounds_used(lane_id) >= self.max_probe_rounds
+        )
+
+    def _acceptor(self, ctx: LaneContext) -> tuple[str, str, str] | probes.Rejection:
+        """(role, author vendor, acceptor vendor), or why there is no acceptor.
+
+        The capability is mandatory once a probe needs deciding: an actor
+        without it yields a typed non-admission, never silent acceptance.
+        """
+        choose = getattr(self.actor, "acceptor_for", None)
+        if choose is None or getattr(self.actor, "accept_probes", None) is None:
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTOR_UNAVAILABLE, "the actor cannot accept probes"
+            )
+        chosen = choose(ctx)
+        if isinstance(chosen, probes.Rejection):
+            return chosen
+        if not (
+            isinstance(chosen, tuple)
+            and len(chosen) == 3
+            and all(isinstance(item, str) and item for item in chosen)
+        ):
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTOR_UNAVAILABLE, "acceptor_for returned no usable acceptor"
+            )
+        return chosen
+
+    def _decide(
+        self, ctx: LaneContext, items: Sequence[Mapping[str, Any]], mode: str
+    ) -> tuple[str, str, str, dict[str, tuple[str, str]]] | probes.Rejection:
+        """One acceptor pass over a batch. Nothing is mutated here."""
+        acceptor = self._acceptor(ctx)
+        if isinstance(acceptor, probes.Rejection):
+            return acceptor
+        role, author, accepting = acceptor
+        raw = self._call_actor(ctx, self.actor.accept_probes, ctx, role, items, mode)
+        try:
+            answers = probes.parse_acceptance(
+                raw, [str(item["probe_id"]) for item in items], mode
+            )
+        except probes.ProbeAcceptanceMalformed as exc:
+            return probes.Rejection(
+                "", probes.PROBE_ACCEPTANCE_MALFORMED, str(exc)[:200]
+            )
+        return role, author, accepting, answers
+
+    def _probe_review(
+        self,
+        *,
+        ctx: LaneContext,
+        measurement: cr.SuiteMeasurement,
+        product_contract: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+        retired: Sequence[Mapping[str, Any]],
+        receipts: Sequence[Mapping[str, Any]],
+        prior_commit: str,
+        taken: tuple[Any, ...],
+        solicit: bool,
+        budget_left: int,
+        verdict: st.ReviewerVerdict,
+        findings: Sequence[Mapping[str, Any]],
+    ) -> tuple[cr.ProbeMeasurement, st.ReviewerVerdict, Sequence[Mapping[str, Any]]]:
+        """Admit, challenge, measure and pin the lane's probes for one review.
+
+        Returns the measurement for `review_builder_output` and the reviewer's
+        verdict and findings -- the second ask's when a rejected submission
+        sent the reviewer back once. Every rejection path leaves the reviewer's
+        ordinary verdict alone; only a measured open probe can change it, and
+        that happens in `review_builder_output`.
+        """
+        lane = ctx.lane
+        lane_id = lane.lane_id
+        tree = measurement.tree
+        if tree is None:
+            raise FactoryRefused("probes need the materialized review tree")
+        tree = Path(tree)
+        scratch = self.runtime.path / "worktrees"
+        git = self.target.git()
+        contract_text = _public_contract_text(product_contract)
+        records, retired, receipts = list(records), list(retired), list(receipts)
+        sources = self._probe_sources(records, retired, prior_commit)
+        probes.write_probe_tree(tree, sources)
+        outcomes: dict[str, dict[str, str]] = {}
+
+        def note(key: str, path: str, outcome: str, pid: str = "", reason: str = "") -> None:
+            item = {"path": path, "outcome": outcome}
+            if pid:
+                item["probe_id"] = pid
+            if reason:
+                item["reason"] = reason
+            outcomes[key] = item
+
+        def keep(receipt: Mapping[str, Any]) -> None:
+            if receipt["receipt_id"] not in {r["receipt_id"] for r in receipts}:
+                receipts.append(dict(receipt))
+
+        def discard(path: str) -> None:
+            (tree / path).unlink(missing_ok=True)
+
+        def admit(
+            submissions: Sequence[probes.ProbeSubmission],
+            parse_rejections: Sequence[probes.Rejection],
+        ) -> list[probes.Rejection]:
+            """Screen, run and accept one batch. Returns the reviewer's rejections."""
+            rejected = list(parse_rejections)
+            for item in parse_rejections:
+                note(item.path, item.path, PROBE_REJECTED, reason=item.code)
+            if not submissions:
+                return rejected
+            if budget_left <= 0:
+                for sub in submissions:
+                    note(sub.path, sub.path, PROBE_IGNORED_BUDGET)
+                return rejected
+            # `tc._derive_runner`'s rule, read without its environment error:
+            # a suite that names no single runner gives a probe nothing to run on.
+            named = {r for r in map(tc._file_runner, measurement.files) if r is not None}
+            if len(named) != 1:
+                for sub in submissions:
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=probes.PROBE_RUNNER_UNSUPPORTED)
+                return rejected
+            runner = named.pop()
+            known_paths = {str(r["path"]) for r in records}
+            known_ids = {str(r["probe_id"]) for r in records}
+            survivors: list[probes.ProbeSubmission] = []
+            for sub in submissions:
+                digest = probes.source_digest(sub.source)
+                problems = list(
+                    probes.check_submission(
+                        sub,
+                        contract_text=contract_text,
+                        interface=lane.public_interface,
+                        runner=runner,
+                        tree=tree,
+                    )
+                )
+                if (
+                    sub.path in known_paths
+                    or probes.probe_id(sub.path, digest, sub.requirement) in known_ids
+                    or (tree / sub.path).exists()
+                ):
+                    problems.append(
+                        probes.Rejection(
+                            sub.path, probes.PROBE_PATH_REFUSED, "the path is already occupied"
+                        )
+                    )
+                if not problems:
+                    try:
+                        probes.write_probe_tree(tree, {sub.path: sub.source})
+                    except probes.ProbePathRefused as exc:
+                        problems.append(
+                            probes.Rejection(sub.path, probes.PROBE_PATH_REFUSED, str(exc)[:200])
+                        )
+                if problems:
+                    rejected.extend(problems)
+                    note(sub.path, sub.path, PROBE_REJECTED, reason=problems[0].code)
+                else:
+                    survivors.append(sub)
+            if not survivors:
+                return rejected
+            try:
+                resolved = rr.resolve(
+                    runner, tree, ".", paths=[sub.path for sub in survivors]
+                )
+            except rr.RunnerUnusable as exc:
+                for sub in survivors:
+                    discard(sub.path)
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=probes.PROBE_RUN_INCOMPLETE)
+                return rejected
+            pending: list[dict[str, Any]] = []
+            for sub in survivors:
+                execution = probes.run_probe(resolved, tree, sub.path, scratch)
+                kind = probes.classify_admission(execution)
+                lines = tuple(cr.failure_lines(execution.output))
+                if kind == probes.ADMISSION_FAILING:
+                    pending.append(
+                        {
+                            "sub": sub,
+                            "case_ids": probes.frozen_case_ids(execution),
+                            "lines": lines or ("the probe's cases fail",),
+                        }
+                    )
+                    continue
+                discard(sub.path)
+                if kind == probes.ADMISSION_PASSED_ON_FIRST_RUN:
+                    note(sub.path, sub.path, PROBE_PASSED_ON_FIRST_RUN)
+                elif kind in (probes.PROBE_INSTRUMENTATION_ERROR, probes.PROBE_TOO_MANY_CASES):
+                    rejected.append(
+                        probes.Rejection(sub.path, kind, "; ".join(lines[:3])[:200])
+                    )
+                    note(sub.path, sub.path, PROBE_REJECTED, reason=kind)
+                else:
+                    note(sub.path, sub.path, PROBE_NOT_ADMITTED, reason=kind)
+            if not pending:
+                return rejected
+            items = [
+                {
+                    "probe_id": probes.probe_id(
+                        p["sub"].path,
+                        probes.source_digest(p["sub"].source),
+                        p["sub"].requirement,
+                    ),
+                    "path": p["sub"].path,
+                    "source": p["sub"].source,
+                    "requirement": p["sub"].requirement,
+                    "intent": p["sub"].intent,
+                    "failing_case_ids": list(p["case_ids"]),
+                    "failure_lines": list(p["lines"]),
+                }
+                for p in pending
+            ]
+            decided = self._decide(ctx, items, probes.MODE_ACCEPT)
+            if isinstance(decided, probes.Rejection):
+                for item, p in zip(items, pending):
+                    discard(p["sub"].path)
+                    note(item["path"], item["path"], PROBE_NOT_ADMITTED, item["probe_id"], decided.code)
+                return rejected
+            role, author, accepting, answers = decided
+            for item, p in zip(items, pending):
+                sub = p["sub"]
+                answer, reason = answers[item["probe_id"]]
+                receipt = probes.make_receipt(
+                    mode=probes.MODE_ACCEPT,
+                    probe_id=item["probe_id"],
+                    source_sha256=probes.source_digest(sub.source),
+                    candidate_sha=ctx.candidate_sha,
+                    input_digest=ctx.input_digest,
+                    requirement_sha256=probes.requirement_digest(sub.requirement),
+                    failure_sha256=probes.failure_digest(p["case_ids"], p["lines"]),
+                    verdict=answer,
+                    acceptor_role=role,
+                    author_vendor=author,
+                    acceptor_vendor=accepting,
+                    reason=reason,
+                )
+                keep(receipt)
+                if answer == "PASS":
+                    records.append(
+                        probes.make_record(
+                            path=sub.path,
+                            source=sub.source,
+                            blob_oid=git.hash_object(sub.source.encode("utf-8")),
+                            requirement=sub.requirement,
+                            intent=sub.intent,
+                            case_ids=p["case_ids"],
+                            admitted_in=ctx.input_digest,
+                            acceptance_receipt_id=receipt["receipt_id"],
+                        )
+                    )
+                    sources[sub.path] = sub.source
+                    note(sub.path, sub.path, PROBE_ADMITTED, item["probe_id"])
+                else:
+                    discard(sub.path)
+                    rejected.append(
+                        probes.Rejection(sub.path, probes.PROBE_NOT_ACCEPTED, reason[:200])
+                    )
+                    note(sub.path, sub.path, PROBE_REJECTED, item["probe_id"], probes.PROBE_NOT_ACCEPTED)
+            return rejected
+
+        submissions, rejections, challenges = taken
+        existing = {str(r["probe_id"]) for r in probes.active_records(records, retired)}
+        rejected = admit(submissions, rejections)
+        if rejected and solicit and budget_left > 0:
+            self._say(lane_id, "probe submission rejected, asking the reviewer once more")
+            again = dataclasses.replace(
+                ctx,
+                rejected_probes=tuple(rejected),
+                existing_probes=probes.active_records(records, retired),
+            )
+            verdict2, findings2 = self._call_actor(again, self.actor.review_code, again)
+            submissions2, rejections2, challenges2 = self._take_probes(again)
+            try:
+                findings2 = _bind_reviewer_findings(findings2, contract_text=contract_text)
+            except st.CanonicalIdentityError:
+                pass  # an unbound second answer does not replace a bound first one
+            else:
+                verdict, findings = verdict2, findings2
+            held = {str(r["path"]) for r in records}
+            admit([s for s in submissions2 if s.path not in held], rejections2)
+            challenges = challenges2 or challenges
+        by_id = {str(r["probe_id"]): r for r in records}
+        if challenges and existing:
+            first = cr.measure_probes(
+                tree=tree,
+                records=records,
+                retired=retired,
+                receipts=receipts,
+                scratch_root=scratch,
+            )
+            items = []
+            for challenge in challenges:
+                record = by_id.get(challenge.probe_id)
+                if (
+                    record is None
+                    or challenge.probe_id not in existing
+                    or first.status.get(challenge.probe_id) != probes.STATUS_OPEN
+                    or any(item["probe_id"] == challenge.probe_id for item in items)
+                ):
+                    note(
+                        "challenge:" + challenge.probe_id, "", PROBE_REJECTED,
+                        challenge.probe_id, "PROBE_CHALLENGE_NOT_APPLICABLE",
+                    )
+                    continue
+                items.append(
+                    {
+                        "probe_id": challenge.probe_id,
+                        "path": record["path"],
+                        "source": sources[str(record["path"])],
+                        "requirement": record["requirement"],
+                        "intent": record["intent"],
+                        "failing_case_ids": list(record["case_ids"]),
+                        "failure_lines": list(first.evidence.get(challenge.probe_id, ())),
+                        "reason": challenge.reason,
+                    }
+                )
+            if items:
+                decided = self._decide(
+                    dataclasses.replace(ctx, challenges=tuple(challenges)),
+                    items,
+                    probes.MODE_CHALLENGE,
+                )
+                for item in items:
+                    record = by_id[item["probe_id"]]
+                    if isinstance(decided, probes.Rejection):
+                        note(item["path"], item["path"], PROBE_NOT_ADMITTED, item["probe_id"], decided.code)
+                        continue
+                    role, author, accepting, answers = decided
+                    answer, reason = answers[item["probe_id"]]
+                    receipt = probes.make_receipt(
+                        mode=probes.MODE_CHALLENGE,
+                        probe_id=item["probe_id"],
+                        source_sha256=str(record["source_sha256"]),
+                        candidate_sha=ctx.candidate_sha,
+                        input_digest=ctx.input_digest,
+                        requirement_sha256=probes.requirement_digest(str(record["requirement"])),
+                        failure_sha256=probes.failure_digest(
+                            item["failing_case_ids"], item["failure_lines"]
+                        ),
+                        verdict=answer,
+                        acceptor_role=role,
+                        author_vendor=author,
+                        acceptor_vendor=accepting,
+                        reason=reason,
+                    )
+                    keep(receipt)
+                    if answer == "REVISE":
+                        retired.append(
+                            {
+                                "probe_id": item["probe_id"],
+                                "retired_in": ctx.input_digest,
+                                "challenge_receipt_id": receipt["receipt_id"],
+                            }
+                        )
+        active = probes.active_records(records, retired)
+        measured = cr.measure_probes(
+            tree=tree,
+            records=records,
+            retired=retired,
+            receipts=receipts,
+            submissions=tuple(outcomes[key] for key in sorted(outcomes)),
+            scratch_root=scratch,
+        )
+        if active:
+            commit, ref = probes.pin_sources(
+                git,
+                self.run_id,
+                lane_id,
+                {str(r["path"]): sources[str(r["path"])] for r in active},
+            )
+            measured = dataclasses.replace(measured, commit=commit, ref=ref)
+        return measured, verdict, findings
+
+    def _block_if_stalled(self, lane_id: str) -> None:
+        """Pause a lane on measured stagnation or substantive repetition.
+
+        Called once the REVISE has been recorded, so the lane already sits at
+        the stage that will redo the work: BUILDING after a code review,
+        WRITING_TESTS after a test review. Blocking here rather than at the
+        reviewing stage means a resume redoes the work against the findings
+        instead of re-judging an artifact that was already judged.
+
+        The stage selects the outcome a round can move -- the review's findings
+        count on a tests round, the accepted suite's passed count on a build
+        round -- plus substantive content. A findings count measures whether
+        the same argument is shrinking; it still grants nothing and still
+        causes no transition.
+        """
+        stage = self.store.lane_stage(self.run_id, lane_id)
+        review_kind = (
+            st.ArtifactKind.TEST_REVIEW
+            if stage is st.LaneStage.WRITING_TESTS
+            else st.ArtifactKind.CODE_REVIEW
+        )
+        history = _review_content_history(
+            self.store, self.run_id, lane_id, review_kind
+        )
+        if not _stalled(
+            history,
+            review_kind,
+            regression_on_findings=self.regression_on_findings,
+        ):
+            return
+        self._park_no_progress(
+            lane_id,
+            stage,
+            "reviewed outcomes or substantive content stalled after {0} round(s); resume grants another {1}".format(
+                len(history),
+                st.NO_PROGRESS_GRACE_ROUNDS,
+            ),
+        )
+
+    def _park_no_progress(
+        self, lane_id: str, stage: st.LaneStage, detail: str
+    ) -> None:
+        """Pause a lane at `stage` with reason NO_PROGRESS."""
+        if stage not in st.PAUSEABLE_STAGES:
+            return
+        digest, observed = self._pause_input(lane_id, stage)
+        self.store.pause_lane(
+            self.run_id,
+            lane_id,
+            stage,
+            digest,
+            observed=observed,
+            reason=st.WaitReason.NO_PROGRESS,
+        )
+        self._say(lane_id, "no progress, blocking for the operator", detail)
+
+    def _ready_to_merge(self, lane_id: str) -> None:
+        """Merge the lane's accepted candidate into the integration ref.
+
+        For a build lane that is its reviewed BUILDER_OUTPUT; for a tests lane
+        it is its ACCEPTED_TEST_SUITE, the draft its test reviewer passed.
+        Both take the same three edges -- merge, revalidate, or base
+        invalidation -- and both leave the integration ref one merge commit
+        ahead, so a build lane that consumes a tests lane finds the suite in
+        its base the way it finds any predecessor's output there.
+        """
+        row, lane = self._common(lane_id)
+        builder, review = _merge_producers(self.store, self.run_id, lane)
+        if builder is None or review is None:
+            raise FactoryRefused("missing READY_TO_MERGE inputs")
+        head = self._integration_head()
+        decision = gitpub.decide_merge_action(
+            changed=bool(builder.payload.get("changed", True)),
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_sha=builder.payload["candidate_sha"],
+            integration_head=head,
+            base_head=_base_head(self.target, lane, builder.payload["builder_base_sha"]),
+        )
+        if decision.action == "BASE_INVALIDATION":
+            digest = st.base_invalidation_input_digest(
+                run_id=self.run_id,
+                lane_id=lane_id,
+                plan_revision=row["plan_revision"],
+                plan_digest=row["plan_digest"],
+                spec_digest=lane.spec_digest,
+                projection_digest=lane.lane_projection_digest,
+                builder_output_id=builder.artifact_id,
+                code_review_id=review.artifact_id,
+                stale_builder_base_sha=builder.payload["builder_base_sha"],
+                stale_candidate_sha=builder.payload["candidate_sha"],
+                integration_head=head,
+            )
+            ctx = LaneContext(
+                run_id=self.run_id,
+                lane=lane,
+                plan_revision=row["plan_revision"],
+                plan_digest=row["plan_digest"],
+                plan_artifact_ref=self._plan_artifact_ref(row),
+                input_digest=digest,
+                stage=st.LaneStage.READY_TO_MERGE,
+                artifacts=_merge_artifacts(lane, builder, review),
+                integration_head=head,
+            )
+            payload = gitpub.base_invalidation_payload(
+                stale_builder_output_artifact_id=builder.artifact_id,
+                stale_code_review_artifact_id=review.artifact_id,
+                stale_builder_base_sha=builder.payload["builder_base_sha"],
+                stale_candidate_sha=builder.payload["candidate_sha"],
+                observed_integration_head=head,
+                input_digest=digest,
+            )
+            payload["integration_head"] = head
+            artifact = rc.make_lane_artifact(
+                kind=st.ArtifactKind.BASE_INVALIDATION,
+                request=_request(ctx),
+                payload=payload,
+                artifact_ref=f"base-invalidation:{digest}",
+            )
+            _complete(self.store, ctx, artifact)
+            return
+        digest = st.ready_to_merge_input_digest(
+            run_id=self.run_id,
+            lane_id=lane_id,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            spec_digest=lane.spec_digest,
+            projection_digest=lane.lane_projection_digest,
+            builder_output_id=builder.artifact_id,
+            code_review_id=review.artifact_id,
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            candidate_sha=builder.payload["candidate_sha"],
+            integration_head=head,
+        )
+        ctx = LaneContext(
+            run_id=self.run_id,
+            lane=lane,
+            plan_revision=row["plan_revision"],
+            plan_digest=row["plan_digest"],
+            plan_artifact_ref=self._plan_artifact_ref(row),
+            input_digest=digest,
+            stage=st.LaneStage.READY_TO_MERGE,
+            artifacts=_merge_artifacts(lane, builder, review),
+            builder_base_sha=builder.payload["builder_base_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            candidate_sha=builder.payload["candidate_sha"],
+            integration_head=head,
+        )
+        if decision.action == "REVALIDATE":
+            payload = gitpub.revalidate_zero_delta(
+                self.target,
+                builder_artifact_id=builder.artifact_id,
+                code_review_artifact_id=review.artifact_id,
+                builder_base_sha=builder.payload["builder_base_sha"],
+                candidate_ref=builder.payload["candidate_ref"],
+                candidate_sha=builder.payload["candidate_sha"],
+                input_digest=digest,
+            )
+        else:
+            payload = gitpub.merge_or_reconcile(
+                self.target,
+                run_id=self.run_id,
+                lane_id=lane_id,
+                stage_input_digest=digest,
+                builder_artifact_id=builder.artifact_id,
+                code_review_artifact_id=review.artifact_id,
+                builder_base_sha=builder.payload["builder_base_sha"],
+                candidate_ref=builder.payload["candidate_ref"],
+                candidate_sha=builder.payload["candidate_sha"],
+                before_sha=head,
+                epoch_seconds=merge_epoch_seconds(row["created_at"]),
+                input_digest=digest,
+            )
+        payload = dict(payload)
+        payload["integration_head"] = head
+        payload["input_digest"] = digest
+        artifact = rc.make_lane_artifact(
+            kind=st.ArtifactKind.INTEGRATION_MERGE,
+            request=_request(ctx),
+            payload=payload,
+            artifact_ref=st.integration_ref(self.run_id),
+        )
+        _complete(self.store, ctx, artifact)
+        self._reclaim_lane_scratch(lane_id)
+
+    def _reclaim_lane_scratch(self, lane_id: str) -> None:
+        """Drop a merged lane's review trees.
+
+        `measure_candidate` provisions `review-<lane>-<digest>` per review round
+        and nothing ever removed it, so a lane's disk grew with its round count
+        and a finished run left every tree behind. Two build lanes on FDAdb run
+        f50638ab reached 87 of them, 5.8G, against 5.7G of live checkouts.
+
+        Safe because these are derived: each is rebuilt from an immutable
+        commit on demand. The merge is recorded before
+        this runs, so a failure here costs disk, never progress -- which is why
+        every error is swallowed rather than raised.
+        """
+        root = self.runtime.path / "worktrees"
+        prefix = "review-{0}-".format(lane_id)
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return
+        removed = 0
+        for path in entries:
+            if not path.is_dir() or path.is_symlink():
+                continue
+            if not path.name.startswith(prefix):
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                continue
+            removed += 1
+        if removed:
+            self._say(
+                lane_id,
+                "reclaimed review scratch",
+                "{0} tree(s)".format(removed),
+            )
+
+    def _run_gate_lanes(
+        self, lanes: Sequence[st.LaneProjection]
+    ) -> tuple[st.LaneProjection, ...]:
+        """Tests lanes no build lane consumes. Their suites gate the run, not a lane."""
+        consumed = {
+            need
+            for lane in lanes
+            if lane.lane_kind == st.LANE_KIND_BUILD
+            for need in lane.needs
+        }
+        return tuple(
+            lane
+            for lane in lanes
+            if lane.lane_kind == st.LANE_KIND_TESTS and lane.lane_id not in consumed
+        )
+
+    def _failed_run_gates(
+        self, lanes: Sequence[st.LaneProjection], head: str, fingerprint: str
+    ) -> tuple[str, ...]:
+        failures = []
+        for lane in self._run_gate_lanes(lanes):
+            suite = self._current_accepted_suite(lane.lane_id)
+            if suite is None:
+                continue
+            result = cr.run_integration_gate(
+                run_id=self.run_id,
+                lane_id=lane.lane_id,
+                input_digest=fingerprint,
+                state_root=self.runtime.path,
+                integration_repo=Path(self.target.target_repository_root),
+                integration_sha=head,
+                accepted_suite=_record_as_lane_artifact(suite, lane),
+                scratch_root=self.runtime.path / "worktrees",
+                gate=self._suite_gate(lane),
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
+                suite_timeout_s=self._suite_timeout_s,
+            )
+            if result["failed"]:
+                failures.append(lane.lane_id)
+        return tuple(failures)
+
+    def _final_review(self) -> None:
+        self.locks.acquire(2)
+        try:
+            head = self._integration_head()
+            fingerprint = self.store.active_final_review_fingerprint(self.run_id, head)
+            row = run_row(self.store, self.run_id)
+            lanes = self.store.active_projection(self.run_id)
+            ctx = LaneContext(
+                run_id=self.run_id,
+                lane=self._owner_lane(lanes),
+                plan_revision=row["plan_revision"],
+                plan_digest=row["plan_digest"],
+                plan_artifact_ref=self._plan_artifact_ref(row),
+                input_digest=fingerprint,
+                stage=st.LaneStage.MERGED,
+                artifacts={},
+                integration_head=head,
+            )
+            observed_main = self.target.git().rev_parse(row["target_main_ref"])
+            gate_failures = self._failed_run_gates(lanes, head, fingerprint)
+            if gate_failures:
+                verdict = st.ReviewerVerdict.REVISE
+                findings = (cr._INTEGRATION_GATE_REVISE,)
+                # A REVISE must name someone, so name the only lane there is
+                # evidence about: the one whose suite went red. Which side is
+                # wrong -- the suite or a build -- is not something a red gate
+                # says, and naming every build lane guessed it. On run
+                # f50638ab that guess named a gateway lane over a browser-route
+                # assertion, and because an amendment must change every lane a
+                # review names, correcting one bad test assertion could only be
+                # done by also editing two builds that were already right.
+                # Naming is a floor, not a ceiling: the operator may still amend
+                # any other lane in the same amendment.
+                affected = tuple(gate_failures)
+            else:
+                verdict, findings, affected = self.actor.review_integration(
+                    ctx, lanes, head
+                )
+                contract_text = " ".join(
+                    [
+                        *(item for lane in lanes for item in lane.public_acceptance),
+                        *(item for lane in lanes for item in lane.declared_outputs),
+                    ]
+                )
+                try:
+                    findings = _bind_reviewer_findings(
+                        findings,
+                        contract_text=contract_text,
+                    )
+                except st.CanonicalIdentityError as first:
+                    verdict, findings, affected = self.actor.review_integration(
+                        dataclasses.replace(
+                            ctx, rejected_citation=_rejected_citation(first)
+                        ),
+                        lanes,
+                        head,
+                    )
+                    try:
+                        findings = _bind_reviewer_findings(
+                            findings,
+                            contract_text=contract_text,
+                        )
+                    except st.CanonicalIdentityError as exc:
+                        citation = getattr(exc, "offending_requirement", "")
+                        if not isinstance(citation, str):
+                            citation = ""
+                        raise ReviewFindingUncited(
+                            "{0}:{1}:{2}".format(
+                                "RUN",
+                                "integration-reviewer",
+                                citation[:120],
+                            )
+                        ) from exc
+            checked = rc.actionable_findings(verdict, findings)
+            payload = {
+                "affected_lanes": list(affected)
+                if verdict is st.ReviewerVerdict.REVISE
+                else [],
+                "findings": list(checked),
+                "input_digest": fingerprint,
+                "integration_sha": head,
+                "observed_target_main_sha": observed_main,
+                "verdict": verdict.value,
+            }
+            artifact = st.RunArtifact(
+                kind=st.ArtifactKind.FINAL_INTEGRATION_REVIEW,
+                plan_revision=row["plan_revision"],
+                input_digest=fingerprint,
+                output_digest=st.digest_canonical(payload),
+                artifact_ref=f"final-review:{fingerprint}",
+                payload=payload,
+                verdict=verdict,
+            )
+            self.store.complete_final_review(
+                self.run_id,
+                fingerprint,
+                head,
+                observed_main,
+                artifact,
+                payload["affected_lanes"],
+            )
+        finally:
+            self.locks.release()
+
+    def _owner_lane(
+        self, lanes: Sequence[st.LaneProjection]
+    ) -> st.LaneProjection:
+        if self._compiled is not None:
+            order = self._compiled.integration_order
+        else:
+            order = st.topological_integration_order(lanes)
+        if not order:
+            raise FactoryRefused("missing owner lane")
+        owner_id = order[-1]
+        for lane in lanes:
+            if lane.lane_id == owner_id:
+                return lane
+        raise FactoryRefused("missing owner lane {0}".format(owner_id))
+
+
+    def _publish(self) -> None:
+        self.locks.acquire(3)
+        try:
+            head = self._integration_head()
+            fingerprint = self.store.active_final_review_fingerprint(self.run_id, head)
+            row = run_row(self.store, self.run_id)
+            review = _latest_run_artifact(
+                self.store, self.run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW
+            )
+            if review is None:
+                raise FactoryRefused("no final review")
+            expected_before = self.target.git().rev_parse(row["target_main_ref"])
+            payload = gitpub.publish_or_reconcile_locked(
+                self.target,
+                run_id=self.run_id,
+                review_input_fingerprint=fingerprint,
+                final_review_artifact_id=review.artifact_id,
+                expected_before_sha=expected_before,
+                reviewed_integration_sha=head,
+            )
+            _record_publication(self.store, self.run_id, fingerprint, payload)
+        finally:
+            self.locks.release()
+
+    def _complete_run_spaces(self) -> None:
+        if not _has_publication(self.store, self.run_id):
+            return
+        try:
+            self.actor.complete_run_spaces(self.run_id)
+        except Exception as extra:
+            if getattr(extra, "code", "") == "CLEANUP_REFUSED":
+                raise
+            raise FactoryRefused(
+                "complete_run_spaces:{0}".format(extra)
+            ) from extra
+
+
+
+def create_factory_run(
+    *,
+    store: ArtifactStore,
+    run_id: str,
+    compiled: st.CompiledPlan,
+    runtime: RuntimeStateRoot,
+    target: gitpub.TargetBinding,
+) -> st.RunBinding:
+    runtime.ensure_layout()
+    pinned = pin_target_from_plan(target, compiled)
+    binding = st.RunBinding(
+        runtime_state_root=str(runtime.path),
+        runtime_state_fingerprint=runtime.fingerprint,
+        integration_ref=st.integration_ref(run_id),
+        integration_initial_sha=pinned.integration_initial_sha,
+        target_repository_root=pinned.target_repository_root,
+        target_git_common_dir=pinned.target_git_common_dir,
+        target_worktree_git_dir=pinned.target_worktree_git_dir,
+        target_object_format=pinned.target_object_format,
+        target_repository_fingerprint=pinned.target_repository_fingerprint,
+        target_sync_journal_fingerprint=pinned.target_sync_journal_fingerprint,
+        target_initial_main_sha=pinned.target_initial_main_sha,
+        target_main_ref=pinned.target_main_ref,
+    )
+    try:
+        store.create_run(run_id, compiled, binding)
+    except RunAlreadyExists:
+        existing = binding_from_run(run_row(store, run_id))
+        if existing != binding:
+            raise
+    ensure_run_integration_ref(pinned, store, run_id)
+    return binding
+
+
+def amendment_resets(
+    store: ArtifactStore,
+    run_id: str,
+    compiled: st.CompiledPlan,
+) -> tuple[st.LaneReset, ...]:
+    row = run_row(store, run_id)
+    old = {lane.lane_id: lane for lane in store.active_projection(run_id)}
+    resets = []
+    for lane in compiled.lanes:
+        previous = old.get(lane.lane_id)
+        if previous is None:
+            resets.append(
+                st.LaneReset(lane.lane_id, st.LaneStage.PLANNED, st.LaneStage.PLANNED)
+            )
+            continue
+        changed = previous.lane_projection_digest != lane.lane_projection_digest
+        current = store.lane_stage(run_id, lane.lane_id)
+        wait = None
+        if current is st.LaneStage.WAITING_FOR_USER:
+            wait_row = _latest(store, run_id, lane.lane_id, st.ArtifactKind.USER_WAIT)
+            if wait_row is not None:
+                wait = st.WaitReason(wait_row.payload["wait_reason"])
+        target = st.amendment_reset_stage(
+            current,
+            changed=changed,
+            wait_reason=wait,
+            lane_kind=lane.lane_kind,
+        )
+        resets.append(st.LaneReset(lane.lane_id, current, target))
+    del row
+    return tuple(sorted(resets, key=lambda item: item.lane_id))
+
+
+def apply_factory_amendment(
+    store: ArtifactStore,
+    run_id: str,
+    compiled: st.CompiledPlan,
+    *,
+    runtime: RuntimeStateRoot,
+    target: gitpub.TargetBinding,
+    retained_inputs: Sequence[Mapping[str, Any]] = (),
+    invalidated_inputs: Sequence[Mapping[str, Any]] = (),
+) -> ArtifactRecord:
+    row = run_row(store, run_id)
+    runtime.revalidate(row["runtime_state_fingerprint"])
+    gitpub.revalidate_binding(target)
+    locks = OrderedLocks(runtime, row["target_worktree_git_dir"])
+    locks.acquire(3)
+    try:
+        review = _latest_run_artifact(
+            store, run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW
+        )
+        if (
+            review is not None
+            and review.payload.get("verdict") == st.ReviewerVerdict.PASS.value
+        ):
+            recon = gitpub.reconcile_publication_if_present_locked(
+                target,
+                run_id=run_id,
+                review_input_fingerprint=review.input_digest,
+                final_review_artifact_id=review.artifact_id,
+                expected_before_sha=str(review.payload["observed_target_main_sha"]),
+                reviewed_integration_sha=str(review.payload["integration_sha"]),
+            )
+            if recon is not None:
+                _record_publication(store, run_id, review.input_digest, recon)
+                raise AmendmentRefused("publication/in-progress")
+        if _has_publication(store, run_id):
+            raise AmendmentRefused("published runs are immutable")
+        reconcile_orphaned_integration_merge_locked(
+            store, target, run_id, runtime.path
+        )
+        tip = ensure_run_integration_ref(target, store, run_id)
+        resets = amendment_resets(store, run_id, compiled)
+        payload = {
+            "input_digest": "",
+            "invalidated_inputs": list(invalidated_inputs),
+            "new_plan_digest": compiled.plan_digest,
+            "new_plan_revision": compiled.plan_revision,
+            "prior_plan_digest": row["plan_digest"],
+            "prior_plan_revision": row["plan_revision"],
+            "projection": [
+                {
+                    **(
+                        {"lane_kind": lane.lane_kind}
+                        if lane.lane_kind is not None
+                        else {}
+                    ),
+                    "declared_outputs": list(lane.declared_outputs),
+                    "lane_id": lane.lane_id,
+                    "lane_projection_digest": lane.lane_projection_digest,
+                    "needs": list(lane.needs),
+                    "spec_digest": lane.spec_digest,
+                }
+                for lane in compiled.lanes
+            ],
+            "resets": [
+                {
+                    "from_stage": item.from_stage.value,
+                    "lane_id": item.lane_id,
+                    "to_stage": item.to_stage.value,
+                }
+                for item in resets
+            ],
+            "retained_inputs": list(retained_inputs),
+            "final_review_artifact_id": (
+                review.artifact_id if review is not None else st.NO_FINAL_REVIEW
+            ),
+            "integration_head": tip,
+        }
+        digest = st.digest_canonical(
+            {k: payload[k] for k in payload if k != "input_digest"}
+        )
+        payload["input_digest"] = digest
+        artifact = st.RunArtifact(
+            kind=st.ArtifactKind.PLAN_AMENDMENT,
+            plan_revision=compiled.plan_revision,
+            input_digest=digest,
+            output_digest=st.digest_canonical(payload),
+            artifact_ref=compiled.plan_artifact_ref,
+            payload=payload,
+        )
+        return store.apply_amendment(
+            run_id, row["plan_revision"], compiled, artifact, resets
+        )
+    finally:
+        locks.release()
+
+
+# Transport-only launch failure used by maestro when a pane cannot start.
+class LaunchFailed(RuntimeError):
+    def __init__(self, detail: str, *, pane_created: bool = False) -> None:
+        super().__init__(detail)
+        self.pane_created = pane_created
+        self.detail = detail
+
+
