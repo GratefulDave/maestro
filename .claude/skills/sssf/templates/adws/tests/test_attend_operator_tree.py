@@ -187,6 +187,7 @@ class ReviewerDispatch(unittest.TestCase):
             rationales=({"lane": "lane-a-build"},),
             findings_out_path=str(tmp / "rev" / "revisions" / "f.json"),
             amendment_rules="rules", allowed_lane_ids=("lane-a-build",),
+            revision_sha256=att.sha256_hex(b'{"rev": 2}'),
         )
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
         launched = {}
@@ -214,6 +215,44 @@ class ReviewerDispatch(unittest.TestCase):
         self.assertEqual(
             launched["extra"]["parked_lanes"][0]["lane_id"], "lane-a-build"
         )
+
+    def test_the_reviewer_is_never_handed_bytes_other_than_the_recorded_ones(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = Path(holder.name)
+        revision = tmp / "r2.ir.json"
+        revision.write_text('{"rev": "edited"}', encoding="utf-8")
+        request = att.ReviewRequest(
+            run_id="run-1", plan_revision=1, next_plan_revision=2, review_round=1,
+            lanes=(_lane({}),), current_ir_path=str(revision),
+            revision_ir_path=str(revision), question_surface="{}", rationales=(),
+            findings_out_path=str(tmp / "f.json"), amendment_rules="rules",
+            allowed_lane_ids=("lane-a-build",),
+            revision_sha256=att.sha256_hex(b'{"rev": 2}'),
+        )
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        with (
+            mock.patch.object(actor, "_role_dir", return_value=tmp / "rev", create=True),
+            mock.patch.object(actor, "_launch", create=True) as launch,
+        ):
+            with self.assertRaises(att.AttendRefused) as caught:
+                actor.attend_reviewer(SimpleNamespace(), request)
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        launch.assert_not_called()
+
+    def test_earlier_rounds_revisions_survive_a_later_dispatch(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        cwd = Path(holder.name)
+        (cwd / "revisions").mkdir()
+        kept = cwd / "revisions" / "r2.round1.ir.json"
+        kept.write_text("{}", encoding="utf-8")
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor._write_attend_tree(cwd, (_lane({}),), {})
+        self.assertTrue(kept.is_file())
 
     def test_the_reviewer_role_contract_forbids_editing_and_names_the_shape(self) -> None:
         holder = tempfile.TemporaryDirectory()

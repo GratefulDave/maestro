@@ -2948,10 +2948,15 @@ class HerdrStageActor:
         """
         inputs = cwd / self._OPERATOR_INPUTS
         suite = cwd / self._OPERATOR_SUITE
-        for directory in (inputs, suite, cwd / self._OPERATOR_OUT):
+        for directory in (inputs, suite):
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
+        # Never wiped: each round's revision and findings have their own
+        # path, and an ATTEND_REVIEW row's `revision_ref` must keep naming
+        # the bytes that round reviewed. The dispatchers unlink the one path
+        # they ask for, so a stale file cannot pass for a fresh answer.
+        (cwd / self._OPERATOR_OUT).mkdir(parents=True, exist_ok=True)
         for name, data in sorted(files.items()):
             (inputs / name).write_bytes(data)
         for lane in lanes:
@@ -3043,6 +3048,7 @@ class HerdrStageActor:
             extra["previous_revision_path"] = str(
                 (inputs / "previous_revision.ir.json").resolve()
             )
+        Path(request.revision_out_path).unlink(missing_ok=True)
         payload, _handle, _cwd_used = self._launch(
             ctx,
             "operator",
@@ -3069,9 +3075,14 @@ class HerdrStageActor:
         cwd = attempt / "checkout"
         cwd.mkdir(parents=True, exist_ok=True)
         inputs = cwd / self._OPERATOR_INPUTS
+        # The reviewer is handed exactly the bytes the round recorded, and
+        # those are the only bytes `project` will accept after a PASS.
+        revision = att.reviewed_bytes(
+            Path(request.revision_ir_path), request.revision_sha256
+        )
         files = {
             "current.ir.json": Path(request.current_ir_path).read_bytes(),
-            "revision.ir.json": Path(request.revision_ir_path).read_bytes(),
+            "revision.ir.json": revision,
             "question_surface.json": request.question_surface.encode("utf-8"),
             "rationales.json": json.dumps(
                 {"rationales": [dict(item) for item in request.rationales]},
@@ -3092,6 +3103,7 @@ class HerdrStageActor:
             "review_round": request.review_round,
             "revision_ir_path": str((inputs / "revision.ir.json").resolve()),
         }
+        Path(request.findings_out_path).unlink(missing_ok=True)
         payload, _handle, _cwd_used = self._launch(
             ctx,
             _ATTEND_REVIEWER_ROLE,
@@ -4225,7 +4237,7 @@ def _attend_request(
         revision_out_path=str(
             operator_cwd
             / HerdrStageActor._OPERATOR_OUT
-            / "r{0}.ir.json".format(next_revision)
+            / "r{0}.round{1}.ir.json".format(next_revision, review_round)
         ),
         amendment_rules=ATTEND_AMENDMENT_RULES,
         allowed_lane_ids=att.batch_scope(compiled.lanes, parked),
@@ -4241,15 +4253,24 @@ def _attend_review_request(
     revision: Path,
     rationales: Sequence[Mapping[str, Any]],
     review_round: int,
+    revision_sha256: str,
     reviewer_cwd: Path,
 ) -> att.ReviewRequest:
     """Everything the attend reviewer reads for one round.
 
-    The question surface is planctl's own rendering of the revision, the
-    same bytes `planctl review` binds the reviewer's findings to.
+    The revision is snapshotted from the bytes whose sha256 the round
+    recorded, and the question surface -- planctl's own rendering, the bytes
+    `planctl review` binds the reviewer's findings to -- is computed over
+    that snapshot, not over the author's live file.
     """
+    out = reviewer_cwd / HerdrStageActor._OPERATOR_OUT
+    out.mkdir(parents=True, exist_ok=True)
+    snapshot = out / "r{0}.round{1}.reviewed.ir.json".format(
+        request.next_plan_revision, review_round
+    )
+    snapshot.write_bytes(att.reviewed_bytes(revision, revision_sha256))
     surface = _run_planctl(
-        _planctl_binary(policy), ["question-surface", str(revision), "--json"]
+        _planctl_binary(policy), ["question-surface", str(snapshot), "--json"]
     )
     return att.ReviewRequest(
         run_id=request.run_id,
@@ -4258,7 +4279,8 @@ def _attend_review_request(
         review_round=review_round,
         lanes=request.lanes,
         current_ir_path=request.ir_path,
-        revision_ir_path=str(revision),
+        revision_ir_path=str(snapshot),
+        revision_sha256=revision_sha256,
         question_surface=surface,
         rationales=tuple(rationales),
         findings_out_path=str(
@@ -4276,8 +4298,9 @@ def _attend_review_request(
 def _attend_file_issue(repo: Path, title: str, body: str) -> dict[str, str]:
     """File one GitHub issue in the run's repository, deduplicated by title.
 
-    `gh issue list --search` is a fuzzy search, so a hit counts only when its
-    title is exactly this one. Any `gh` failure is reported, never raised:
+    The search is a quoted phrase restricted to titles (`"<title>" in:title`),
+    and it is still a search, so a hit counts only when its title is exactly
+    this one. Any `gh` failure is reported, never raised:
     the amendment is already applied, and an issue that could not be filed
     must not undo it.
     """
@@ -4301,7 +4324,8 @@ def _attend_file_issue(repo: Path, title: str, body: str) -> dict[str, str]:
     try:
         listed = gh(
             [
-                "issue", "list", "--state", "open", "--search", title,
+                "issue", "list", "--state", "open",
+                "--search", '"{0}" in:title'.format(title.replace('"', "")),
                 "--json", "title,url",
             ]
         )
@@ -4361,17 +4385,26 @@ def _attend_project(
     repo: Path,
     plans_dir: Path,
     run_id: str,
-    revision_ir: Path,
+    revision_bytes: bytes,
     revision: int,
     review_findings: Sequence[Any],
 ) -> tuple[st.CompiledPlan, Path]:
     """Validate, approve, project and compile one reviewed revision.
 
     The same four steps the human ran by hand on an earlier run, in the same
-    order and against the same binary. The IR is copied under the repository
-    first because `planctl --repo-root` refuses an IR outside the root it is
-    told to resolve sources against, and because a revision that is applied
-    has to survive the operator agent's scratch tree.
+    order and against the same binary. `revision_bytes` are exactly the bytes
+    the reviewer passed. They are written under the plans directory first
+    because `planctl --repo-root` refuses an IR outside the root it is told
+    to resolve sources against, and because a revision that is applied has
+    to survive the operator agent's scratch tree.
+
+    `approval.receipt_path` is where planctl requires the receipt to be
+    written, relative to the IR. Where Maestro writes the receipt is
+    Maestro's fact, not the author's, so it is set here on the copy before
+    findings, render and review -- an author that copied the previous
+    revision's value would otherwise be refused `receipt.path` every time.
+    `approval` is outside the question surface, so the reviewer's findings
+    still bind.
 
     `review_findings` is the independent reviewer agent's answer to the
     review question, and only the reviewer's: the author never answers its
@@ -4394,7 +4427,19 @@ def _attend_project(
     for stale in (rendered, receipt, plan_out, findings):
         if stale.exists():
             stale.unlink()
-    shutil.copyfile(revision_ir, ir)
+    try:
+        document = json.loads(revision_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise att.AttendRefused(
+            att.REVISION_REFUSED, "revision IR is not JSON: {0}".format(exc)
+        ) from exc
+    if not isinstance(document, dict):
+        raise att.AttendRefused(att.REVISION_REFUSED, "revision IR is not an object")
+    approval = document.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+    document["approval"] = {**approval, "receipt_path": receipt.name}
+    ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     root = ["--repo-root", str(repo)]
     _write_review_findings(binary, ir, findings, policy, review_findings)
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
@@ -4546,6 +4591,7 @@ def _run_attend(args: argparse.Namespace) -> int:
         revision: Path,
         rationales: Sequence[Mapping[str, Any]],
         review_round: int,
+        revision_sha256: str,
     ) -> att.ReviewRequest:
         return _attend_review_request(
             policy,
@@ -4553,6 +4599,7 @@ def _run_attend(args: argparse.Namespace) -> int:
             revision,
             rationales,
             review_round,
+            revision_sha256,
             role_cwd_for(request.lane_id, HerdrStageActor._ATTEND_REVIEWER),
         )
 
@@ -4601,10 +4648,10 @@ def _run_attend(args: argparse.Namespace) -> int:
         return judge(attend_ctx(request, HerdrStageActor._ATTEND_REVIEWER), request)
 
     def project(
-        revision_ir: Path, revision: int, review_findings: list
+        revision_bytes: bytes, revision: int, review_findings: list
     ) -> st.CompiledPlan:
         plan, plan_out = _attend_project(
-            policy, layout, repo, plans_dir, run_id, revision_ir, revision,
+            policy, layout, repo, plans_dir, run_id, revision_bytes, revision,
             review_findings,
         )
         state["plan_path"] = plan_out

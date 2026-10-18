@@ -41,6 +41,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ATTEND_REVIEW` (a record, not authority), one per review round. A v6
   ledger's `run_artifacts` is rebuilt with the wider kind check on open.
 
+### Changed — contract change (narrows a check): `attend.route` accepts `vendor:`
+
+- `attend.route.vendor` used to be refused at config load. It is now
+  accepted, read like a lane role's `vendor:` (strip, casefold) and kept out
+  of the route mapping that route admission binds, because the attend
+  reviewer's independence is checked against it. The route validator itself
+  still refuses a `vendor` key inside a route mapping.
+
+### Fixed — attended approval signs and applies only what was reviewed
+
+- `_attend_project` now sets the revision copy's `approval.receipt_path` to
+  the receipt it writes (`<run>.r<N>.receipt.json`) before findings, render
+  and review. planctl refuses `receipt.path` unless the two agree, and an
+  author has no way to know Maestro's receipt name. `links[]` were checked:
+  they name repository files resolved against `--repo-root`, not anything
+  `_attend_project` writes, so they are left as the author wrote them.
+- Each review round records the sha256 of the revision it reviewed
+  (`ReviewRequest.revision_sha256`, `ATTEND_REVIEW.revision_sha256`). The
+  reviewer is handed exactly those bytes, and `project` receives exactly
+  those bytes; a revision whose bytes changed after review is refused
+  `ATTEND_REVISION_REFUSED`.
+- Each round writes its own `r<N>.round<k>.ir.json`, and the attend trees no
+  longer wipe `revisions/`, so a REVISE round's `revision_ref` keeps its
+  bytes. The dispatcher unlinks the one path it asks for, so a stale file
+  cannot pass for a fresh answer.
+- The deviations file is rendered in a `finally` around each batch, so a
+  projection or apply refused after PASS still appears in it.
+- Issue dedup searches `"<title>" in:title`, keeping the exact-title filter.
+
 ### Fixed — attended approval passed no key to `planctl validate --require-approved`
 
 - `_attend_project` ran `validate --require-approved` without the reviewer

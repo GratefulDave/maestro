@@ -229,7 +229,7 @@ class ReviewSignsTheIndependentReviewersFindings(unittest.TestCase):
             with self.assertRaises(att.AttendRefused):
                 maestro._attend_project(
                     policy, {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
-                    "run", self.revision, 2, findings,
+                    "run", self.revision.read_bytes(), 2, findings,
                 )
         (review,) = [argv for argv in calls if argv[0] == "review"]
         return review
@@ -276,7 +276,7 @@ class ReviewSignsTheIndependentReviewersFindings(unittest.TestCase):
                 maestro._attend_project(
                     att.AttendPolicy(max_amendments_per_lane=1),
                     {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
-                    "run", self.revision, 2, [],
+                    "run", self.revision.read_bytes(), 2, [],
                 )
         self.assertEqual(caught.exception.code, att.REVIEWER_UNCONFIGURED)
         planctl.assert_not_called()
@@ -303,10 +303,43 @@ class ReviewSignsTheIndependentReviewersFindings(unittest.TestCase):
             with self.assertRaises(att.AttendRefused):
                 maestro._attend_project(
                     _REVIEWER, {"keys_dir": self.tmp / "keys"}, self.tmp,
-                    self.plans, "run", self.revision, 2, [],
+                    self.plans, "run", self.revision.read_bytes(), 2, [],
                 )
         self.assertEqual(keyed["review"], "k" * 32)
         self.assertEqual(keyed["validate"], "k" * 32)
+
+    def test_the_receipt_path_is_maestros_not_the_authors(self) -> None:
+        """F1: the IR planctl reviews names the receipt Maestro writes."""
+        self.revision.write_text(
+            json.dumps({"approval": {"required": True, "receipt_path": "old.receipt.json"}}),
+            encoding="utf-8",
+        )
+        review = self._review_argv(_REVIEWER, [])
+        written = json.loads((self.plans / "run.r2.ir.json").read_text())
+        self.assertEqual(
+            written["approval"], {"required": True, "receipt_path": "run.r2.receipt.json"}
+        )
+        receipt_out = Path(review[review.index("--receipt-out") + 1])
+        self.assertEqual(receipt_out.name, written["approval"]["receipt_path"])
+        self.assertEqual(receipt_out.parent, self.plans)
+
+    def test_a_revision_that_is_not_a_json_object_is_refused(self) -> None:
+        from unittest import mock
+
+        for raw in (b"not json", b"[1, 2]"):
+            with self.subTest(raw=raw):
+                with (
+                    mock.patch.object(maestro, "_planctl_binary", return_value=Path("p")),
+                    mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
+                    mock.patch.object(maestro, "_run_planctl") as planctl,
+                ):
+                    with self.assertRaises(att.AttendRefused) as caught:
+                        maestro._attend_project(
+                            _REVIEWER, {"keys_dir": self.tmp / "keys"}, self.tmp,
+                            self.plans, "run", raw, 2, [],
+                        )
+                self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+                planctl.assert_not_called()
 
     def test_the_reviewer_id_is_a_planctl_identifier(self) -> None:
         import re
@@ -409,24 +442,28 @@ class RealValidatorInvocation(unittest.TestCase):
 
 
 def _planctl_fixture(binary: Path, tmp: Path, run_id: str, revision: int) -> tuple:
-    """planctl's own valid fixture, re-homed for the paths `_attend_project` uses.
+    """planctl's own valid fixture, placed in a repository of its own.
 
     The fixture and its schema ship beside the binary, so this IR is one the
-    binary itself accepts; only the rendered link and the receipt path move
-    to where `_attend_project` writes them.
+    binary itself accepts. Nothing here knows where `_attend_project` writes:
+    `approval.receipt_path` keeps the fixture's own value, which names a
+    different receipt, so the case fails unless Maestro sets it. The
+    fixture's one link points at its own rendered page beside it; a plan's
+    links point at repository files, so the link is re-aimed at one, which
+    has nothing to do with Maestro's paths.
     """
     import shutil
 
+    del run_id
     skill = binary.parent.parent
     repo = tmp / "repo"
-    repo.mkdir()
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "target.md").write_text("target\n", encoding="utf-8")
     (tmp / "schemas").mkdir()
     shutil.copy(skill / "schemas" / "plan-ir-v1.schema.json", tmp / "schemas")
-    stem = "{0}.r{1}".format(run_id, revision)
     ir = json.loads((skill / "fixtures" / "valid-plan-ir.json").read_text())
-    ir["links"][0]["href"] = "../repo/plans/{0}.html".format(stem)
-    ir["links"][0]["canonical_target"] = "plans/{0}.html".format(stem)
-    ir["approval"]["receipt_path"] = "{0}.receipt.json".format(stem)
+    ir["links"][0]["href"] = "../repo/docs/target.md"
+    ir["links"][0]["canonical_target"] = "docs/target.md"
     authored = tmp / "out" / "r{0}.ir.json".format(revision)
     authored.parent.mkdir()
     authored.write_text(json.dumps(ir), encoding="utf-8")
@@ -457,6 +494,10 @@ class RealReviewerSigning(unittest.TestCase):
         from adw_modules import plan_approval
 
         repo, authored = _planctl_fixture(self.binary, self.tmp, "run-1", 2)
+        self.assertNotEqual(
+            json.loads(authored.read_text())["approval"]["receipt_path"],
+            "run-1.r2.receipt.json",
+        )
         keys = self.tmp / "keys"
         keys.mkdir()
         key = "ab" * 32
@@ -471,7 +512,7 @@ class RealReviewerSigning(unittest.TestCase):
         plans = repo / "plans"
         with self.assertRaises(att.AttendRefused) as caught:
             maestro._attend_project(
-                policy, {"keys_dir": keys}, repo, plans, "run-1", authored, 2, []
+                policy, {"keys_dir": keys}, repo, plans, "run-1", authored.read_bytes(), 2, []
             )
         # Past render, review and validate: refused only by ingress.
         self.assertEqual(caught.exception.code, att.REVISION_REFUSED)

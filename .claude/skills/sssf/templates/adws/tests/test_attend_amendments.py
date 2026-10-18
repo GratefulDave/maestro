@@ -167,7 +167,9 @@ class _Harness:
                  reviewer_crash: BaseException | None = None,
                  verdicts: Sequence[str] = ("PASS",),
                  stays_parked: bool = False,
-                 file_issue: Any = None) -> None:
+                 file_issue: Any = None,
+                 tamper_after_review: bool = False,
+                 project_refusal: BaseException | None = None) -> None:
         self.tmp = tmp
         self.store = _Store(parked)
         self.policy = policy
@@ -177,6 +179,9 @@ class _Harness:
         self.verdicts = list(verdicts)
         self.stays_parked = stays_parked
         self.file_issue = file_issue
+        self.tamper_after_review = tamper_after_review
+        self.project_refusal = project_refusal
+        self.projected_bytes: list[bytes] = []
         self.passes = 0
         self.dispatched: list[att.OperatorRequest] = []
         self.reviewed: list[att.ReviewRequest] = []
@@ -190,7 +195,9 @@ class _Harness:
         return st.RunStatus.COMPLETE
 
     def request_for(self, parked, plan, review_round, reviewer_findings, previous):
-        out = self.tmp / "operator" / "r{0}.ir.json".format(plan.plan_revision + 1)
+        out = self.tmp / "operator" / "r{0}.round{1}.ir.json".format(
+            plan.plan_revision + 1, review_round
+        )
         out.parent.mkdir(parents=True, exist_ok=True)
         return att.OperatorRequest(
             run_id="run-1",
@@ -223,13 +230,15 @@ class _Harness:
         self.dispatched.append(request)
         if self.crash is not None:
             raise self.crash
-        Path(request.revision_out_path).write_text("{}", encoding="utf-8")
+        Path(request.revision_out_path).write_text(
+            json.dumps({"round": request.review_round}), encoding="utf-8"
+        )
         return {
             "revision_path": request.revision_out_path,
             "rationales": [_rationale(lane.lane_id) for lane in request.lanes],
         }
 
-    def review_request_for(self, request, revision, rationales, review_round):
+    def review_request_for(self, request, revision, rationales, review_round, digest):
         return att.ReviewRequest(
             run_id=request.run_id,
             plan_revision=request.plan_revision,
@@ -245,10 +254,15 @@ class _Harness:
             ),
             amendment_rules=request.amendment_rules,
             allowed_lane_ids=request.allowed_lane_ids,
+            revision_sha256=digest,
         )
 
     def review(self, request: att.ReviewRequest) -> Mapping[str, Any]:
         self.reviewed.append(request)
+        if self.tamper_after_review:
+            # The author's tree is still the author's: it edits the file the
+            # reviewer was shown after the reviewer read it.
+            Path(request.revision_ir_path).write_text('{"edited": true}', encoding="utf-8")
         if self.reviewer_crash is not None:
             raise self.reviewer_crash
         verdict = self.verdicts.pop(0) if self.verdicts else "PASS"
@@ -259,9 +273,11 @@ class _Harness:
             return {"verdict": "PASS", "findings": []}
         return {"verdict": "REVISE", "findings": [_FINDING]}
 
-    def project(self, revision_ir: Path, revision: int, findings: list) -> st.CompiledPlan:
-        del revision_ir
+    def project(self, revision_bytes: bytes, revision: int, findings: list) -> st.CompiledPlan:
+        self.projected_bytes.append(revision_bytes)
         self.projected.append((revision, findings))
+        if self.project_refusal is not None:
+            raise self.project_refusal
         lanes = tuple(
             _lane(
                 lane.lane_id,
@@ -452,6 +468,61 @@ class AttendLoop(unittest.TestCase):
         self.assertEqual(row["reviewer_vendor"], "vendor-b")
         # And the PASS findings the reviewer wrote are what gets signed.
         self.assertEqual(harness.projected, [(2, [])])
+
+    def test_only_the_reviewed_bytes_are_projected(self) -> None:
+        """F2: the projected bytes are the bytes whose sha256 the round recorded."""
+        harness = _Harness(
+            self.tmp, parked={"lane-a-build": NO_PROGRESS}, policy=_policy()
+        )
+        harness.attend()
+        (row,) = harness.store.reviews
+        (projected,) = harness.projected_bytes
+        self.assertEqual(att.sha256_hex(projected), row["revision_sha256"])
+        self.assertEqual(harness.reviewed[0].revision_sha256, row["revision_sha256"])
+
+    def test_a_revision_edited_after_review_is_never_projected(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            tamper_after_review=True,
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            harness.attend()
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertIn("not the bytes that were reviewed", caught.exception.detail)
+        self.assertEqual(harness.projected, [])
+        self.assertEqual(harness.applied, [])
+
+    def test_each_round_keeps_its_own_revision_bytes(self) -> None:
+        """F3: a REVISE round's revision_ref still names the bytes it reviewed."""
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            verdicts=("REVISE", "PASS"),
+        )
+        harness.attend()
+        first, second = harness.store.reviews
+        self.assertNotEqual(first["revision_ref"], second["revision_ref"])
+        for row in (first, second):
+            self.assertEqual(
+                att.sha256_hex(Path(row["revision_ref"]).read_bytes()),
+                row["revision_sha256"],
+            )
+
+    def test_a_projection_refused_after_pass_still_renders_deviations(self) -> None:
+        """F4."""
+        deviations = self.tmp / "plans" / "run-1.deviations.md"
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(att.REVISION_REFUSED, "planctl said no"),
+        )
+        with self.assertRaises(att.AttendRefused):
+            harness.attend(deviations_path=deviations)
+        self.assertTrue(deviations.is_file())
 
     def test_a_lane_past_its_bound_parks(self) -> None:
         harness = _Harness(

@@ -32,7 +32,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, Tuple
+import hashlib
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from . import scheduler_types as st
 
@@ -191,6 +192,9 @@ class ReviewRequest:
     findings_out_path: str
     amendment_rules: str
     allowed_lane_ids: Tuple[str, ...]
+    #: sha256 of the revision bytes under review. The reviewer is handed
+    #: exactly these bytes, and only these bytes are ever projected.
+    revision_sha256: str = ""
 
     @property
     def lane_id(self) -> str:
@@ -199,16 +203,6 @@ class ReviewRequest:
     @property
     def stage(self) -> str:
         return self.lanes[0].stage
-
-
-class OperatorAgent(Protocol):
-    def propose(self, request: OperatorRequest) -> Mapping[str, Any]:
-        """Write the revision IR at `revision_out_path`; return the rationales.
-
-        The envelope is `{"revision_path": <str>, "rationales": [{...}]}`, one
-        rationale per parked lane. A refusal is an exception; a missing or
-        unwritten path is `ATTEND_OPERATOR_NO_REVISION`.
-        """
 
 
 RATIONALE_KEYS = (
@@ -511,6 +505,33 @@ TWO_IMPLEMENTATIONS_QUESTION = (
 )
 
 
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def reviewed_bytes(path: Path, expected_sha256: str) -> bytes:
+    """The revision bytes the reviewer judged, or a typed refusal.
+
+    The author's revision sits in the author's tree, which the author can
+    still write to. A revision is projected only if its bytes are the ones
+    the reviewer was handed; anything else is a revision nobody reviewed.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise AttendRefused(
+            REVISION_REFUSED, "reviewed revision {0}: {1}".format(path, exc)
+        ) from exc
+    if not expected_sha256 or sha256_hex(data) != expected_sha256:
+        raise AttendRefused(
+            REVISION_REFUSED,
+            "revision {0} is not the bytes that were reviewed (sha256 {1})".format(
+                path, expected_sha256 or "unrecorded"
+            ),
+        )
+    return data
+
+
 def revision_path(envelope: Any, expected: Path) -> Path:
     """The IR the operator agent says it wrote, proved to be the one asked for."""
     if not isinstance(envelope, Mapping):
@@ -758,7 +779,7 @@ def render_deviations(store: Any, run_id: str) -> str:
                 for name in RATIONALE_KEYS[2:]:
                     lines.append("  - {0}: {1}".format(name, rationale.get(name, "")))
         else:
-            lines.append("- amendment: none (review did not pass)")
+            lines.append("- amendment: none applied")
         lines += ["", "### Review rounds", ""]
         rounds = sorted(reviews.get(key, []), key=lambda item: int(item.get("review_round") or 0))
         if not rounds:
@@ -802,7 +823,7 @@ def attend_run(
     dispatch: Callable[[OperatorRequest], Mapping[str, Any]],
     review_request_for: Callable[..., ReviewRequest],
     review: Callable[[ReviewRequest], Mapping[str, Any]],
-    project: Callable[[Path, int, list], st.CompiledPlan],
+    project: Callable[[bytes, int, list], st.CompiledPlan],
     apply_amendment: Callable[[st.CompiledPlan], Any],
     file_issue: Optional[Callable[[str, str], Mapping[str, str]]] = None,
     deviations_path: Optional[Path] = None,
@@ -819,8 +840,9 @@ def attend_run(
 
     `request_for(parked, compiled, review_round, reviewer_findings,
     previous_revision)` and `review_request_for(request, revision,
-    rationales, review_round)` assemble the two agents' inputs; `project`
-    signs, projects and compiles a revision with the reviewer's findings.
+    rationales, review_round, revision_sha256)` assemble the two agents'
+    inputs; `project(revision_bytes, plan_revision, findings)` signs,
+    projects and compiles exactly the bytes the reviewer passed.
     """
     if not policy.enabled:
         raise AttendRefused(DISABLED, "attend.max_amendments_per_lane is not set")
@@ -846,133 +868,192 @@ def attend_run(
         lane_ids = tuple(lane_id for lane_id, _reason in parked)
         for lane_id, reason in parked:
             say(lane_id, "attending a {0} park".format(reason))
-        allowed = batch_scope(compiled.lanes, parked)
-        reviewer_findings: Tuple[Mapping[str, Any], ...] = ()
-        previous = ""
-        passed: Optional[Tuple[OperatorRequest, Path, Tuple[Mapping[str, Any], ...], list, str]] = None
-        for review_round in range(1, policy.max_review_rounds + 1):
-            request = request_for(
-                parked, compiled, review_round, reviewer_findings, previous
-            )
-            try:
-                envelope = dispatch(request)
-            except AttendRefused:
-                raise
-            except Exception as exc:
-                raise AttendRefused(
-                    OPERATOR_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
-                ) from exc
-            written = revision_path(envelope, Path(request.revision_out_path))
-            rationales = require_rationales(envelope.get("rationales"), lane_ids)
-            review_request = review_request_for(
-                request, written, rationales, review_round
-            )
-            try:
-                answer = review(review_request)
-            except AttendRefused:
-                raise
-            except Exception as exc:
-                raise AttendRefused(
-                    REVIEWER_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
-                ) from exc
-            verdict, located = require_review_verdict(answer)
-            store.record_attend_review(
-                run_id,
+        # Rendered whatever the batch's outcome: a review that never passed,
+        # and a projection or apply refused after PASS, are deviations too.
+        try:
+            revised = _attend_batch(
+                store=store,
+                run_id=run_id,
+                policy=policy,
+                compiled=compiled,
                 session_id=session_id,
-                plan_revision=request.next_plan_revision,
-                review_round=review_round,
-                payload={
-                    "verdict": verdict,
-                    "findings": [dict(item) for item in located],
-                    "reviewer_id": policy.reviewer_id,
-                    "reviewer_vendor": policy.reviewer_vendor,
-                    "revision_ref": str(written),
-                    "lanes": [
-                        {"lane_id": lane_id, "wait_reason": reason}
-                        for lane_id, reason in parked
-                    ],
-                },
+                parked=parked,
+                request_for=request_for,
+                dispatch=dispatch,
+                review_request_for=review_request_for,
+                review=review,
+                project=project,
+                apply_amendment=apply_amendment,
+                file_issue=file_issue,
+                deviations_path=deviations_path,
+                applied=applied,
+                say=say,
             )
-            say(lane_ids[0], "review round {0}: {1}".format(review_round, verdict))
-            if verdict == st.ReviewerVerdict.PASS.value:
-                findings = require_review_findings(
-                    Path(review_request.findings_out_path)
-                )
-                passed = (request, written, rationales, findings, verdict)
-                break
-            reviewer_findings = located
-            previous = str(written)
-        if passed is None:
+        finally:
             _write_deviations(store, run_id, deviations_path)
+        if revised is None:
             return AttendOutcome(
                 status, STOP_REVIEW_UNRESOLVED, tuple(applied), compiled
             )
-        request, written, rationales, findings, verdict = passed
-        revised = project(written, request.next_plan_revision, findings)
-        changed = require_amendment_scope(compiled.lanes, revised.lanes, allowed)
-        record = apply_amendment(revised)
-        amendment = _payload_of(
-            store, run_id, st.ArtifactKind.PLAN_AMENDMENT, record.artifact_id
-        )
-        material = classify_material(compiled, revised, amendment.get("resets") or ())
-        issue: Mapping[str, str] = {}
-        if material.material and file_issue is not None:
-            try:
-                issue = dict(
-                    file_issue(
-                        issue_title(run_id, revised.plan_revision),
-                        issue_body(
-                            run_id=run_id,
-                            plan_revision=revised.plan_revision,
-                            material=material,
-                            changed=changed,
-                            rationales=rationales,
-                            verdict=verdict,
-                            reviewer_id=policy.reviewer_id,
-                            reviewer_vendor=policy.reviewer_vendor,
-                            deviations_path=str(deviations_path or ""),
-                        ),
-                    )
-                )
-            except Exception as exc:  # a failed issue never undoes the amendment
-                issue = {
-                    "status": ISSUE_FAILED,
-                    "detail": "{0}: {1}".format(type(exc).__name__, exc),
-                }
-            if issue.get("status") == ISSUE_FAILED:
-                say(lane_ids[0], "issue not filed: {0}".format(issue.get("detail", "")))
-        batch = {
-            "lanes": list(lane_ids),
-            "changed_lanes": list(changed),
-            "material": material.material,
-            "material_hits": list(material.hits),
-            "obligations_touched": list(material.obligations_touched),
-            "issue": dict(issue),
-        }
-        for (lane_id, reason), rationale in zip(parked, rationales):
-            note = store.record_amendment_rationale(
-                run_id,
-                lane_id=lane_id,
-                amendment_artifact_id=record.artifact_id,
-                payload={
-                    "attend_session_id": session_id,
-                    "plan_revision": revised.plan_revision,
-                    "rationale": dict(rationale),
-                    "revision_ref": str(written),
-                    "wait_reason": reason,
-                    "batch": batch,
-                },
-            )
-            applied.append(
-                AppliedAmendment(
-                    lane_id=lane_id,
-                    plan_revision=revised.plan_revision,
-                    amendment_artifact_id=record.artifact_id,
-                    rationale_artifact_id=note.artifact_id,
-                )
-            )
+        for lane_id in lane_ids:
             per_lane[lane_id] = per_lane.get(lane_id, 0) + 1
         batches += 1
         compiled = revised
-        _write_deviations(store, run_id, deviations_path)
         say(lane_ids[0], "amended to revision {0}".format(revised.plan_revision))
+
+
+def _attend_batch(
+    *,
+    store: Any,
+    run_id: str,
+    policy: AttendPolicy,
+    compiled: st.CompiledPlan,
+    session_id: str,
+    parked: Tuple[Tuple[str, str], ...],
+    request_for: Callable[..., OperatorRequest],
+    dispatch: Callable[[OperatorRequest], Mapping[str, Any]],
+    review_request_for: Callable[..., ReviewRequest],
+    review: Callable[[ReviewRequest], Mapping[str, Any]],
+    project: Callable[[bytes, int, list], st.CompiledPlan],
+    apply_amendment: Callable[[st.CompiledPlan], Any],
+    file_issue: Optional[Callable[[str, str], Mapping[str, str]]],
+    deviations_path: Optional[Path],
+    applied: list,
+    say: Callable[[str, str], None],
+) -> Optional[st.CompiledPlan]:
+    """One batch: author, review rounds, sign, apply. None when unresolved.
+
+    Each round's revision has its own path, and the reviewer judges the
+    bytes whose sha256 the round records; only those bytes are projected.
+    """
+    lane_ids = tuple(lane_id for lane_id, _reason in parked)
+    allowed = batch_scope(compiled.lanes, parked)
+    reviewer_findings: Tuple[Mapping[str, Any], ...] = ()
+    previous = ""
+    passed: Optional[Tuple[OperatorRequest, Path, str, Tuple[Mapping[str, Any], ...], list, str]] = None
+    for review_round in range(1, policy.max_review_rounds + 1):
+        request = request_for(
+            parked, compiled, review_round, reviewer_findings, previous
+        )
+        try:
+            envelope = dispatch(request)
+        except AttendRefused:
+            raise
+        except Exception as exc:
+            raise AttendRefused(
+                OPERATOR_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
+            ) from exc
+        written = revision_path(envelope, Path(request.revision_out_path))
+        rationales = require_rationales(envelope.get("rationales"), lane_ids)
+        digest = sha256_hex(written.read_bytes())
+        review_request = review_request_for(
+            request, written, rationales, review_round, digest
+        )
+        if review_request.revision_sha256 != digest:
+            raise AttendRefused(
+                REVISION_REFUSED, "review request does not bind the written revision"
+            )
+        try:
+            answer = review(review_request)
+        except AttendRefused:
+            raise
+        except Exception as exc:
+            raise AttendRefused(
+                REVIEWER_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
+            ) from exc
+        verdict, located = require_review_verdict(answer)
+        store.record_attend_review(
+            run_id,
+            session_id=session_id,
+            plan_revision=request.next_plan_revision,
+            review_round=review_round,
+            payload={
+                "verdict": verdict,
+                "findings": [dict(item) for item in located],
+                "reviewer_id": policy.reviewer_id,
+                "reviewer_vendor": policy.reviewer_vendor,
+                "revision_ref": str(written),
+                "revision_sha256": digest,
+                "lanes": [
+                    {"lane_id": lane_id, "wait_reason": reason}
+                    for lane_id, reason in parked
+                ],
+            },
+        )
+        say(lane_ids[0], "review round {0}: {1}".format(review_round, verdict))
+        if verdict == st.ReviewerVerdict.PASS.value:
+            findings = require_review_findings(Path(review_request.findings_out_path))
+            passed = (request, written, digest, rationales, findings, verdict)
+            break
+        reviewer_findings = located
+        previous = str(written)
+    if passed is None:
+        return None
+    request, written, digest, rationales, findings, verdict = passed
+    revised = project(
+        reviewed_bytes(written, digest), request.next_plan_revision, findings
+    )
+    changed = require_amendment_scope(compiled.lanes, revised.lanes, allowed)
+    record = apply_amendment(revised)
+    amendment = _payload_of(
+        store, run_id, st.ArtifactKind.PLAN_AMENDMENT, record.artifact_id
+    )
+    material = classify_material(compiled, revised, amendment.get("resets") or ())
+    issue: Mapping[str, str] = {}
+    if material.material and file_issue is not None:
+        try:
+            issue = dict(
+                file_issue(
+                    issue_title(run_id, revised.plan_revision),
+                    issue_body(
+                        run_id=run_id,
+                        plan_revision=revised.plan_revision,
+                        material=material,
+                        changed=changed,
+                        rationales=rationales,
+                        verdict=verdict,
+                        reviewer_id=policy.reviewer_id,
+                        reviewer_vendor=policy.reviewer_vendor,
+                        deviations_path=str(deviations_path or ""),
+                    ),
+                )
+            )
+        except Exception as exc:  # a failed issue never undoes the amendment
+            issue = {
+                "status": ISSUE_FAILED,
+                "detail": "{0}: {1}".format(type(exc).__name__, exc),
+            }
+        if issue.get("status") == ISSUE_FAILED:
+            say(lane_ids[0], "issue not filed: {0}".format(issue.get("detail", "")))
+    batch = {
+        "lanes": list(lane_ids),
+        "changed_lanes": list(changed),
+        "material": material.material,
+        "material_hits": list(material.hits),
+        "obligations_touched": list(material.obligations_touched),
+        "issue": dict(issue),
+        "revision_sha256": digest,
+    }
+    for (lane_id, reason), rationale in zip(parked, rationales):
+        note = store.record_amendment_rationale(
+            run_id,
+            lane_id=lane_id,
+            amendment_artifact_id=record.artifact_id,
+            payload={
+                "attend_session_id": session_id,
+                "plan_revision": revised.plan_revision,
+                "rationale": dict(rationale),
+                "revision_ref": str(written),
+                "wait_reason": reason,
+                "batch": batch,
+            },
+        )
+        applied.append(
+            AppliedAmendment(
+                lane_id=lane_id,
+                plan_revision=revised.plan_revision,
+                amendment_artifact_id=record.artifact_id,
+                rationale_artifact_id=note.artifact_id,
+            )
+        )
+    return revised

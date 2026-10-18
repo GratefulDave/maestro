@@ -245,7 +245,8 @@ class IssueFiling(unittest.TestCase):
             [argv for argv, _cwd in calls],
             [
                 [
-                    "gh", "issue", "list", "--state", "open", "--search", self.title,
+                    "gh", "issue", "list", "--state", "open",
+                    "--search", '"{0}" in:title'.format(self.title),
                     "--json", "title,url",
                 ],
                 ["gh", "issue", "create", "--title", self.title, "--body", "body"],
@@ -332,7 +333,7 @@ class AttendLeavesIssueAndDeviations(unittest.TestCase):
         self.addCleanup(self.ledger.close)
         self.ledger.create_run(RUN_ID, make_plan(make_lane("A")), make_binding())
 
-    def _attend(self, edit, issue_result: dict) -> tuple:
+    def _attend(self, edit, issue_result: dict, apply_refusal=None) -> tuple:
         document = copy.deepcopy(_document())
         edit(document)
         after = _compile(document, 2)
@@ -380,14 +381,14 @@ class AttendLeavesIssueAndDeviations(unittest.TestCase):
                 ],
             }
 
-        def review_request_for(request, written, rationales, review_round):
+        def review_request_for(request, written, rationales, review_round, digest):
             return att.ReviewRequest(
                 run_id=RUN_ID, plan_revision=1, next_plan_revision=2,
                 review_round=review_round, lanes=request.lanes,
                 current_ir_path=request.ir_path, revision_ir_path=str(written),
                 question_surface="{}", rationales=tuple(rationales),
                 findings_out_path=str(findings), amendment_rules="rules",
-                allowed_lane_ids=request.allowed_lane_ids,
+                allowed_lane_ids=request.allowed_lane_ids, revision_sha256=digest,
             )
 
         def review(request):
@@ -395,6 +396,8 @@ class AttendLeavesIssueAndDeviations(unittest.TestCase):
             return {"verdict": "PASS", "findings": []}
 
         def apply(plan):
+            if apply_refusal is not None:
+                raise apply_refusal
             store.parked = {}
             store.lanes = plan.lanes
             # A real PLAN_AMENDMENT needs the scheduler's whole amend path;
@@ -425,6 +428,18 @@ class AttendLeavesIssueAndDeviations(unittest.TestCase):
 
     def _interface_edit(self, document: dict) -> None:
         _lane(document, "lane-b")["spec"]["interface"][0]["signature"]["returns"] = "list"
+
+    def test_an_apply_refused_after_pass_still_shows_in_deviations(self) -> None:
+        """F4: the file is rendered in a `finally` around the batch."""
+        deviations = self.tmp / "plans" / "{0}.deviations.md".format(RUN_ID)
+        with self.assertRaises(RuntimeError):
+            self._attend(
+                self._interface_edit, {}, apply_refusal=RuntimeError("amend refused")
+            )
+        text = deviations.read_text()
+        self.assertIn("## Revision r2 (session session-1)", text)
+        self.assertIn("- amendment: none applied", text)
+        self.assertIn("- round 1: PASS by attend-reviewer:omp:profile-b", text)
 
     def test_a_material_amendment_files_one_issue(self) -> None:
         outcome, filed, deviations, passes = self._attend(
