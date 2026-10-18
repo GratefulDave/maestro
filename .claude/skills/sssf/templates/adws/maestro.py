@@ -819,7 +819,7 @@ TEST_CRAFT_REVIEWER_QUESTION = (
     "named case is a located finding that discharges nothing, so the verdict "
     "is REVISE. The violated_requirement field is checked mechanically and "
     "must quote the public contract verbatim; a finding that does not quote "
-    "it is sent back once, and a second miss stops the run.\n"
+    "it is sent back once, and a second miss parks the lane.\n"
 )
 
 
@@ -1311,8 +1311,8 @@ class HerdrStageActor:
                 "test edit you demand. The "
                 "violated_requirement field is checked mechanically and must "
                 "quote the public contract verbatim; a finding that does not "
-                "quote it is sent back once, and a second miss stops the "
-                "run.\n"
+                "quote it is sent back once, and a second miss parks the "
+                "lane.\n"
                 "For every declared output the candidate changed, enumerate its "
                 "callers inside this checkout before deciding: "
                 "`codemap impact <file> --direction reverse`, then "
@@ -1791,7 +1791,8 @@ class HerdrStageActor:
                     "the contract sentence it violates into violated_requirement, "
                     "character for character, at least 12 characters, with no "
                     "paraphrase, summary, or added words. A second finding that "
-                    "does not quote the contract stops the run."
+                    "does not quote the contract parks the lane (the integration "
+                    "reviewer: stops the run)."
                 ).format(json.dumps(rejected[:300]))
         if role == "integration-reviewer":
             instructions += " PASS requires affected_lanes=[]. REVISE requires a nonempty affected_lanes subset."

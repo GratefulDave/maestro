@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): an uncited review finding parks its lane as LANE_FAULT instead of refusing the run
+
+- A test-reviewer or code-reviewer that twice returns a `REVISE` finding not
+  quoting the public contract used to raise `REVIEW_FINDING_UNCITED`, a
+  run-level refusal that ended `run resume` auto-attend. The lane now parks
+  `WAITING_FOR_USER` with `LANE_FAULT` (fault type `ReviewFindingUncited`,
+  message `lane:role:citation[:120]`), which `run attend` attends. The
+  integration reviewer is run-scoped and still refuses the run. No check is
+  weakened: the same two asks, the same matcher, the same citation requirement.
+  The park reuses the `LaunchFailed` parking code, factored into
+  `_park_lane_fault`.
+
+### Fixed
+- **The contract citation check compares decoded interface values.**
+  `_public_contract_text` searched only the JSON encoding of each interface
+  entry, which escapes backslashes and double quotes, so a verbatim quote of an
+  interface string containing either never bound. The decoded string values are
+  now searchable as well; paraphrases still refuse.
+
 ### Added — `run attend --local`; attend's planctl review runs its mutation pass on EC2 by default
 
 - planctl now runs the mutation pass on an EC2 spot instance by default.
