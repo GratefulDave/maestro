@@ -118,3 +118,51 @@ def provision_tree(
         raise ReviewProvisioningError(
             argv, result.returncode, (result.stderr or "")[-400:]
         )
+    if _TREE_PACKAGES:
+        install_tree_packages(Path(dest), _TREE_PACKAGES, bound)
+
+
+#: Packages the run preflight found missing from every tree's manifest and
+#: installs tree-local. Process-scoped: set by `set_tree_packages` once per
+#: preflight, before any lane is dispatched, and read by every tree
+#: `provision_tree` provisions afterwards -- an install that only the
+#: preflight's own tree received would be unlinked by the next
+#: materialization and missing from the tree an actor is dispatched into.
+_TREE_PACKAGES: tuple[str, ...] = ()
+
+
+def set_tree_packages(packages: Sequence[str]) -> None:
+    global _TREE_PACKAGES
+    _TREE_PACKAGES = tuple(sorted({str(item) for item in packages if str(item)}))
+
+
+def tree_packages() -> tuple[str, ...]:
+    return _TREE_PACKAGES
+
+
+def install_tree_packages(
+    dest: Path, packages: Sequence[str], timeout_s: float | None = None
+) -> None:
+    """`uv pip install` into the tree's own `.venv`. Never the manifest.
+
+    Refuses `ReviewProvisioningError` when the tree has no venv to install
+    into, the same typed failure as a `provision_argv` that fails.
+    """
+    wanted = tuple(str(item) for item in packages if str(item))
+    if not wanted:
+        return
+    python = Path(dest) / ".venv" / "bin" / "python"
+    argv = ("uv", "pip", "install", "--python", str(python), *wanted)
+    if not python.exists():
+        raise ReviewProvisioningError(argv, None, "tree has no .venv to install into")
+    bound = PROVISION_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    try:
+        result = run_harness_process(
+            argv, cwd=Path(dest), env=te.tree_environment(Path(dest)), timeout=bound
+        )
+    except OSError as exc:
+        raise ReviewProvisioningError(argv, None, str(exc)) from exc
+    if result.returncode != 0:
+        raise ReviewProvisioningError(
+            argv, result.returncode, (result.stderr or "")[-400:]
+        )

@@ -16,7 +16,8 @@ LEDGER_SCHEMA_VERSION_V3 = "artifact-factory.v3"
 LEDGER_SCHEMA_VERSION_V4 = "artifact-factory.v4"
 LEDGER_SCHEMA_VERSION_V5 = "artifact-factory.v5"
 LEDGER_SCHEMA_VERSION_V6 = "artifact-factory.v6"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v7"
+LEDGER_SCHEMA_VERSION_V7 = "artifact-factory.v7"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v8"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
@@ -129,6 +130,10 @@ class ArtifactKind(str, Enum):
     # typed verdict and located findings. A record, like the two above; the
     # PLAN_AMENDMENT is still the only thing a lane moves on.
     ATTEND_REVIEW = "ATTEND_REVIEW"
+    # What one `run start`/`run resume` preflight found per lane: verified,
+    # provisioned, skipped and refused dependencies. A record; no predicate
+    # reads it and no lane moves on it.
+    RUN_PREFLIGHT = "RUN_PREFLIGHT"
 
 
 class WaitReason(str, Enum):
@@ -294,6 +299,7 @@ RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.ATTEND_SESSION,
     ArtifactKind.AMENDMENT_RATIONALE,
     ArtifactKind.ATTEND_REVIEW,
+    ArtifactKind.RUN_PREFLIGHT,
 )
 
 
@@ -901,6 +907,17 @@ def attend_session_input_digest(
             "run_id": run_id,
             "schema_version": CANONICAL_SCHEMA_VERSION,
             "session_id": session_id,
+        }
+    )
+
+
+def run_preflight_input_digest(*, run_id: str, preflight_id: str) -> str:
+    """Identity of one preflight of one run; every start and resume has its own."""
+    return digest_canonical(
+        {
+            "preflight_id": preflight_id,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
         }
     )
 

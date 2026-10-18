@@ -75,6 +75,21 @@ class RunnerPreflightRefused(FactoryRefused):
     code = "RUNNER_PREFLIGHT_REFUSED"
 
 
+class RunPreflightRefused(FactoryRefused):
+    """A dependency the run can reach is missing and could not be provisioned.
+
+    Carries every refused item at once (`items`), never only the first. No
+    lane has been dispatched when it is raised.
+    """
+
+    code = "RUN_PREFLIGHT_REFUSED"
+
+    def __init__(self, items: Sequence[Any], report: str) -> None:
+        self.items = tuple(items)
+        self.report = report
+        super().__init__(report)
+
+
 class ReviewFindingUncited(FactoryRefused):
     """A reviewer that twice could not quote the contract it REVISEd against.
 
@@ -1849,6 +1864,7 @@ class FactoryScheduler:
         concurrency: int = 1,
         regression_on_findings: bool = False,
         max_probe_rounds: int = 5,
+        preflight: Optional[Callable[["FactoryScheduler"], None]] = None,
     ) -> None:
         if isinstance(concurrency, bool) or int(concurrency) < 1:
             raise ValueError("concurrency is >= 1")
@@ -1876,6 +1892,9 @@ class FactoryScheduler:
         self.stage_started = stage_started
         self.stage_completed = stage_completed
         self.step = step
+        #: The run preflight (`run_preflight`), which owns the runner check
+        #: when it is given; absent, the runner check runs alone as before.
+        self._preflight = preflight
         # An actor that can report its own dispatch and wait gets the same
         # channel; a fake in the tests simply has no attribute to set.
         try:
@@ -1900,7 +1919,11 @@ class FactoryScheduler:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._handle_sigint)
         try:
-            self._assert_runners_usable()
+            # Before anything is dispatched, and before the first transition.
+            if self._preflight is None:
+                self._assert_runners_usable()
+            else:
+                self._preflight(self)
             self._recover_legacy_retarget_journal()
             self._resume_orphaned_integration_merge()
             self._maybe_correct_legacy_integration_base()
@@ -2765,6 +2788,47 @@ class FactoryScheduler:
         if divergent:
             return _red_at_parent_findings(divergent), len(collected)
         return None, len(collected)
+
+    def preflight_lanes(self) -> tuple[dict[str, Any], ...]:
+        """What each lane this run can still dispatch reads, for the preflight.
+
+        Per lane not yet `MERGED`: its declared outputs, its spec, and the
+        Python import specifiers of the accepted suite it is graded against,
+        read off the run repository exactly as `_bound_surface` reads them. A
+        lane with no accepted suite yet (a tests lane before its tester
+        writes one) has no suite imports to need. Read-only.
+        """
+        lanes = []
+        specs = getattr(self.actor, "lane_specs", None) or {}
+        for lane in self.store.active_projection(self.run_id):
+            if self.store.lane_stage(self.run_id, lane.lane_id) is st.LaneStage.MERGED:
+                continue
+            specifiers: tuple[str, ...] = ()
+            suite_paths: tuple[str, ...] = ()
+            try:
+                suite = self._accepted_suite_for(lane)
+            except FactoryRefused:
+                suite = None
+            if suite is not None:
+                blobs = tc.suite_files(_record_as_lane_artifact(suite, lane))
+                suite_paths = tuple(sorted(blobs))
+                files = tc.read_suite(Path(self.target.target_repository_root), blobs)
+                python = {path: text for path, text in files.items() if path.endswith(".py")}
+                surface = bsf.derive_bound_surface(python)
+                specifiers = tuple(
+                    str(item["specifier"]) for item in surface.get("modules") or ()
+                )
+            lanes.append(
+                {
+                    "lane_id": lane.lane_id,
+                    "lane_kind": lane.lane_kind,
+                    "declared_outputs": tuple(lane.declared_outputs),
+                    "suite_paths": suite_paths,
+                    "python_specifiers": specifiers,
+                    "spec": specs.get(lane.lane_id) or {},
+                }
+            )
+        return tuple(lanes)
 
     def _assert_runners_usable(self) -> None:
         """Every runner the plan names must run, before any agent is dispatched.
