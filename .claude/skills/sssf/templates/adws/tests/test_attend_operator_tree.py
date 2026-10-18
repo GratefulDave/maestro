@@ -192,9 +192,9 @@ class ReviewerDispatch(unittest.TestCase):
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
         launched = {}
 
-        def launch(ctx, role, cwd, extra, prepare_cwd):
+        def launch(ctx, role, cwd, extra, prepare_cwd, provision=True):
             prepare_cwd(cwd)
-            launched.update(role=role, extra=extra, cwd=cwd)
+            launched.update(role=role, extra=extra, cwd=cwd, provision=provision)
             return {"verdict": "PASS", "findings": []}, None, cwd
 
         with (
@@ -211,6 +211,7 @@ class ReviewerDispatch(unittest.TestCase):
             json.loads((inputs / "question_surface.json").read_text()), {"plan_id": "p-1"}
         )
         self.assertFalse((launched["cwd"] / ".git").exists())
+        self.assertIs(launched["provision"], False)
         self.assertEqual(launched["extra"]["findings_out_path"], request.findings_out_path)
         self.assertEqual(
             launched["extra"]["parked_lanes"][0]["lane_id"], "lane-a-build"
@@ -265,6 +266,83 @@ class ReviewerDispatch(unittest.TestCase):
         text = written.read_text()
         self.assertIn("you do not edit it", text)
         self.assertIn("required_change", text)
+
+
+class AttendTreesAreNotProvisioned(unittest.TestCase):
+    """The deployment's `provision_argv` installs a project; an attend tree holds none.
+
+    `_launch` provisions every tree it prepares, and both attend roles reach it.
+    With `uv sync --frozen` configured, the operator's dispatch refused
+    `PROVISION_FAILED: No pyproject.toml found` and the batch was reported as
+    `ATTEND_OPERATOR_FAILED`. The tests above patch `_launch` away, so none of
+    them could see it; these drive the real one.
+    """
+
+    def setUp(self) -> None:
+        from unittest import mock
+
+        from adw_modules import provisioning
+        from test_prepare_once_per_dispatch import _AdoptingLauncher, _Bench
+
+        self.bench = _Bench(self, _AdoptingLauncher(target_cwd_fn=lambda tree: tree))
+        routes = dict(self.bench.actor.role_routes)
+        routes["operator"] = routes[maestro._ATTEND_REVIEWER_ROLE] = routes["code-reviewer"]
+        self.bench.actor.role_routes = routes
+        self.provisioned: list[Path] = []
+
+        def refuse(dest, argv, timeout_s=None):
+            self.provisioned.append(Path(dest))
+            raise provisioning.ReviewProvisioningError(
+                tuple(argv), 2, "error: No pyproject.toml found"
+            )
+
+        for patch in (
+            mock.patch.object(provisioning, "provision_tree", side_effect=refuse),
+            mock.patch.object(
+                self.bench.actor,
+                "_role_dir",
+                side_effect=lambda ctx, role, **_: self.bench.root / role,
+            ),
+            # What the agent replies is not this case's subject; the tree it is
+            # dispatched into is, and that is settled before the reply.
+            mock.patch.object(
+                self.bench.actor, "_await_envelope", return_value={"verdict": "PASS"}
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.ir = self.bench.root / "current.ir.json"
+        self.ir.write_text('{"rev": 1}', encoding="utf-8")
+
+    def test_the_operator_is_dispatched_without_provisioning_its_tree(self) -> None:
+        request = att.OperatorRequest(
+            run_id="run-once", plan_revision=1, next_plan_revision=2,
+            lanes=(_lane({"tests/a.spec.ts": "a"}),), ir_path=str(self.ir),
+            revision_out_path=str(self.bench.root / "operator" / "r2.ir.json"),
+            amendment_rules="rules", allowed_lane_ids=("lane-a-build",),
+        )
+        self.bench.actor.attend_operator(self.bench.ctx, request)
+        self.assertEqual(self.provisioned, [])
+
+    def test_the_attend_reviewer_is_dispatched_without_provisioning_its_tree(self) -> None:
+        revision = self.bench.root / "r2.ir.json"
+        revision.write_text('{"rev": 2}', encoding="utf-8")
+        request = att.ReviewRequest(
+            run_id="run-once", plan_revision=1, next_plan_revision=2, review_round=1,
+            lanes=(_lane({"tests/a.spec.ts": "a"}),), current_ir_path=str(self.ir),
+            revision_ir_path=str(revision), question_surface="{}", rationales=(),
+            findings_out_path=str(self.bench.root / "f.json"), amendment_rules="rules",
+            allowed_lane_ids=("lane-a-build",),
+            revision_sha256=att.sha256_hex(b'{"rev": 2}'),
+        )
+        self.bench.actor.attend_reviewer(self.bench.ctx, request)
+        self.assertEqual(self.provisioned, [])
+
+    def test_a_checkout_role_still_provisions_through_the_same_path(self) -> None:
+        with self.assertRaises(maestro.LaunchFailed) as caught:
+            self.bench.launch("builder")
+        self.assertIn("PROVISION_FAILED", str(caught.exception))
+        self.assertEqual(self.provisioned, [self.bench.cwd])
 
 
 if __name__ == "__main__":  # pragma: no cover

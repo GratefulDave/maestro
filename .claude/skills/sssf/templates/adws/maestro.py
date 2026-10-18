@@ -2309,7 +2309,9 @@ class HerdrStageActor:
             )
         return bool(stale)
 
-    def _prepared_cwd(self, cwd: Path, prepare_cwd: Callable[[Path], None]) -> None:
+    def _prepared_cwd(
+        self, cwd: Path, prepare_cwd: Callable[[Path], None], *, provision: bool = True
+    ) -> None:
         """Materialize the tree, then install its dependencies. In that order.
 
         A tree is provisioned after its *final* materialization, never before
@@ -2336,7 +2338,7 @@ class HerdrStageActor:
         """
         prepare_cwd(cwd)
         argv = _resolved_provision_argv(self, None)
-        if not argv:
+        if not provision or not argv:
             return
         try:
             provisioning.provision_tree(
@@ -2357,6 +2359,7 @@ class HerdrStageActor:
         extra: Mapping[str, Any],
         *,
         prepare_cwd: Callable[[Path], None],
+        provision: bool = True,
     ) -> tuple[Mapping[str, Any], object, Path]:
         key = self._role_key(ctx, role)
         # Every dispatch crosses here, which is why the release is here and
@@ -2473,7 +2476,7 @@ class HerdrStageActor:
         # reader was given, so `input_digest` moved every round while the
         # file did not.
         try:
-            self._prepared_cwd(cwd, prepare_cwd)
+            self._prepared_cwd(cwd, prepare_cwd, provision=provision)
         except lch.LaunchRefused as refused:
             raise self._launch_failed(refused) from refused
         # The path this dispatch already materialized and provisioned above.
@@ -2530,7 +2533,7 @@ class HerdrStageActor:
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
             if adopted != dispatch_prepared:
-                self._prepared_cwd(adopted, prepare_cwd)
+                self._prepared_cwd(adopted, prepare_cwd, provision=provision)
             self._materialize_role_instructions(
                 adopted, role, route["route"], ctx.lane.lane_kind
             )
@@ -3136,6 +3139,8 @@ class HerdrStageActor:
             prepare_cwd=lambda path: self._write_attend_tree(
                 path, request.lanes, files
             ),
+            # The attend tree is not a checkout and holds no project to install.
+            provision=False,
         )
         return payload
 
@@ -3191,6 +3196,8 @@ class HerdrStageActor:
             prepare_cwd=lambda path: self._write_attend_tree(
                 path, request.lanes, files
             ),
+            # The attend tree is not a checkout and holds no project to install.
+            provision=False,
         )
         return payload
 
