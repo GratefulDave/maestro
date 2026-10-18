@@ -71,7 +71,7 @@
     <main>
       <p class="eyebrow">Operations / deployment-drift.md</p>
       <h1>Declaring what is watched, and what the check says</h1>
-      <p>Two template copies of the ADW runtime are customized on purpose and reconciled on demand with <code>runtime_sync.py</code>: this repo’s <code>.claude/skills/sssf/templates/adws/</code> and the-library’s <code>skills/sssf/templates/adws/</code>.</p>
+      <p>Two template copies of the ADW runtime are held together by <code>tests/test_template_parity.py</code>: this repo’s <code>.claude/skills/sssf/templates/adws/</code> and the-library’s <code>skills/sssf/templates/adws/</code>.</p>
       <p>Every other copy is a <strong>deployment</strong>. <code>tests/test_deployment_parity.py</code> watches those if you declare them. Markdown source: <a href="deployment-drift.md">deployment-drift.md</a>.</p>
 
       <h2>Turning it on</h2>

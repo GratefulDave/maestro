@@ -200,7 +200,7 @@ display time.
   the bug.
 - A run whose plan lives outside the configured `MAESTRO_PLANS` directory still shows its
   name.
-- `runtime_sync.py check` reports template and
+- `tests/test_template_parity.py` green, and `runtime_sync.py check` reports template and
   the-library level. Mirror with `runtime_sync.py mirror --apply`, never `cp`.
 
 ---

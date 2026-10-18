@@ -52,8 +52,10 @@ Maestro is a dependency-DAG software factory. Repository materials define the fa
 ### Mirroring invariant (manual note, 2026-08-18)
 Anything changed under `.claude/skills/sssf/templates/adws/` must be mirrored into
 the-library's copy at `skills/sssf/templates/adws/` in the same change.
-No test enforces this: the copies are customized on purpose and are reconciled on demand with
-`runtime_sync.py check` / `mirror`. `lexgenius/adws/` is a deployed instance and is reconciled
+`.claude/skills/sssf/templates/adws/tests/test_template_parity.py` compares the two file by
+file and fails naming which files differ and in which direction; the-library re-exports the
+same check from its own side. It skips only when the peer repository is not checked out at
+all. `lexgenius/adws/` is a deployed instance, is not covered by that test, and is reconciled
 by hand — see `CLAUDE.md`.
 
 Do the mirroring with `.claude/skills/sssf/templates/adws/tools/runtime_sync.py`, not with

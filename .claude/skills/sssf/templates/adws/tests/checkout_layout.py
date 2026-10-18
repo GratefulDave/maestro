@@ -1,6 +1,6 @@
 """Locate this runtime's other checkouts from inside any working tree.
 
-A cross-checkout comparison must reach outside its own checkout to compare the two
+`test_template_parity` must reach outside its own checkout to compare the two
 template copies file by file. It first needs the directory that holds the
 sibling checkouts, and it used to derive that directory by walking up from
 ``__file__`` and taking the parent of the repository root.

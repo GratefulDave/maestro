@@ -175,7 +175,7 @@ class SchemaKeySetTests(unittest.TestCase):
         if not schema_path.is_file():
             # A deployed instance has no the-library beside it. The schema is the
             # only authority for these key sets, so without it there is nothing to
-            # compare -- the same shape the deleted template parity test used for an absent
+            # compare -- the same shape test_template_parity uses for an absent
             # peer checkout, and visible in a default run rather than silent.
             checkout_layout.skip_visibly(
                 "the plan-contract schema is not on this machine at {path}, so "
