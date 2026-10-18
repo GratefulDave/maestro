@@ -147,10 +147,104 @@ class AttendRecords(unittest.TestCase):
 
     def test_neither_kind_is_a_stage_edge(self) -> None:
         edges = {edge.kind for edge in st.COMPLETE_STAGE_EDGES}
-        self.assertNotIn(st.ArtifactKind.ATTEND_SESSION, edges)
-        self.assertNotIn(st.ArtifactKind.AMENDMENT_RATIONALE, edges)
-        self.assertNotIn(st.ArtifactKind.ATTEND_SESSION, st.LANE_ARTIFACT_KINDS)
-        self.assertNotIn(st.ArtifactKind.AMENDMENT_RATIONALE, st.LANE_ARTIFACT_KINDS)
+        for kind in (
+            st.ArtifactKind.ATTEND_SESSION,
+            st.ArtifactKind.AMENDMENT_RATIONALE,
+            st.ArtifactKind.ATTEND_REVIEW,
+        ):
+            self.assertNotIn(kind, edges)
+            self.assertNotIn(kind, st.LANE_ARTIFACT_KINDS)
+
+    def test_each_review_round_is_its_own_inert_record(self) -> None:
+        before = self._stages()
+        for review_round, verdict in ((1, "REVISE"), (2, "PASS")):
+            self.store.record_attend_review(
+                RUN_ID,
+                session_id="s-1",
+                plan_revision=2,
+                review_round=review_round,
+                payload={
+                    "verdict": verdict,
+                    "reviewer_id": "attend-reviewer/omp/profile-x",
+                    "reviewer_vendor": "vendor-b",
+                },
+            )
+        again = self.store.record_attend_review(
+            RUN_ID,
+            session_id="s-1",
+            plan_revision=2,
+            review_round=2,
+            payload={
+                "verdict": "PASS",
+                "reviewer_id": "attend-reviewer/omp/profile-x",
+                "reviewer_vendor": "vendor-b",
+            },
+        )
+        self.assertTrue(again.replayed)
+        rows = self.store.run_artifacts_of_kind(RUN_ID, st.ArtifactKind.ATTEND_REVIEW)
+        self.assertEqual(
+            [(row["payload"]["review_round"], row["payload"]["verdict"]) for row in rows],
+            [(1, "REVISE"), (2, "PASS")],
+        )
+        self.assertEqual(self._stages(), before)
+
+
+class LedgerV6Migration(unittest.TestCase):
+    """A v6 ledger's run-artifact kind check refuses ATTEND_REVIEW until rebuilt."""
+
+    def test_a_v6_ledger_is_widened_and_keeps_its_rows(self) -> None:
+        import sqlite3
+
+        from adw_modules import lifecycle
+
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        path = Path(holder.name) / "lifecycle.sqlite3"
+        store = ArtifactStore(path)
+        store.create_run(RUN_ID, make_plan(make_lane("A")), make_binding())
+        store.record_attend_session(
+            RUN_ID, session_id="s-0", phase=st.ATTEND_PHASE_START, payload={}
+        )
+        store.close()
+        # Put the table back the way a v6 runtime created it.
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        cols = ", ".join(lifecycle.RUN_ARTIFACT_COLUMNS)
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("ALTER TABLE run_artifacts RENAME TO ra_old")
+        conn.execute(lifecycle.V3_RUN_ARTIFACTS_SQL)
+        conn.execute(f"INSERT INTO run_artifacts ({cols}) SELECT {cols} FROM ra_old")
+        conn.execute("DROP TABLE ra_old")
+        conn.execute(
+            "UPDATE ledger_meta SET schema_version=?", (st.LEDGER_SCHEMA_VERSION_V6,)
+        )
+        conn.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO run_artifacts VALUES "
+                "('x', ?, 99, 'ATTEND_REVIEW', 1, 'd', 'o', 'r', '{}', 'now')",
+                (RUN_ID,),
+            )
+        conn.close()
+
+        migrated = ArtifactStore(path)
+        self.addCleanup(migrated.close)
+        version = migrated.conn.execute(
+            "SELECT schema_version FROM ledger_meta"
+        ).fetchone()[0]
+        self.assertEqual(version, st.LEDGER_SCHEMA_VERSION)
+        self.assertEqual(
+            len(migrated.run_artifacts_of_kind(RUN_ID, st.ArtifactKind.ATTEND_SESSION)),
+            1,
+        )
+        migrated.record_attend_review(
+            RUN_ID, session_id="s-0", plan_revision=1, review_round=1,
+            payload={"verdict": "PASS"},
+        )
+        self.assertEqual(
+            len(migrated.run_artifacts_of_kind(RUN_ID, st.ArtifactKind.ATTEND_REVIEW)),
+            1,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

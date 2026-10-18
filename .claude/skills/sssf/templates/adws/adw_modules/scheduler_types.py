@@ -15,7 +15,8 @@ LEDGER_SCHEMA_VERSION_V2 = "artifact-factory.v2"
 LEDGER_SCHEMA_VERSION_V3 = "artifact-factory.v3"
 LEDGER_SCHEMA_VERSION_V4 = "artifact-factory.v4"
 LEDGER_SCHEMA_VERSION_V5 = "artifact-factory.v5"
-LEDGER_SCHEMA_VERSION = "artifact-factory.v6"
+LEDGER_SCHEMA_VERSION_V6 = "artifact-factory.v6"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v7"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
@@ -124,6 +125,10 @@ class ArtifactKind(str, Enum):
     # them is still the only thing `apply_amendment` keys on.
     ATTEND_SESSION = "ATTEND_SESSION"
     AMENDMENT_RATIONALE = "AMENDMENT_RATIONALE"
+    # One independent review round over an attended revision: the reviewer's
+    # typed verdict and located findings. A record, like the two above; the
+    # PLAN_AMENDMENT is still the only thing a lane moves on.
+    ATTEND_REVIEW = "ATTEND_REVIEW"
 
 
 class WaitReason(str, Enum):
@@ -288,6 +293,7 @@ RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.PLAN_AMENDMENT,
     ArtifactKind.ATTEND_SESSION,
     ArtifactKind.AMENDMENT_RATIONALE,
+    ArtifactKind.ATTEND_REVIEW,
 )
 
 
@@ -919,6 +925,32 @@ def amendment_rationale_input_digest(
             "plan_revision": plan_revision,
             "run_id": run_id,
             "schema_version": CANONICAL_SCHEMA_VERSION,
+        }
+    )
+
+
+def attend_review_input_digest(
+    *,
+    run_id: str,
+    session_id: str,
+    plan_revision: int,
+    review_round: int,
+) -> str:
+    """Identity of one review round over one attended revision.
+
+    The session is part of the identity because two attend sessions on one
+    run can each review a revision with the same number, and the round is
+    because one revision is reviewed up to `attend.max_review_rounds` times.
+    """
+    if review_round < 1:
+        raise CanonicalIdentityError("attend review round")
+    return digest_canonical(
+        {
+            "plan_revision": plan_revision,
+            "review_round": review_round,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "session_id": session_id,
         }
     )
 

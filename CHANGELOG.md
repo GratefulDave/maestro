@@ -6,6 +6,78 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening): `run attend` covers every amendable park, reviewed by an independent agent
+
+- **D1.** `run attend` now attends `AMENDMENT_REQUIRED` (lanes named by a
+  final-review REVISE) as well as `NO_PROGRESS`. `PAUSE` and `LANE_FAULT`
+  still end the verb `WAIT_NOT_ATTENDABLE`. `apply_amendment` still refuses
+  `AMENDMENT_DOES_NOT_ADDRESS_REVIEW` unless every named lane's spec moved.
+- **D2.** One batch per settled scheduler run: one author dispatch covering
+  every attendable park, one revision, one `apply_amendment`, then the
+  scheduler runs again. Each lane in a batch counts toward
+  `max_amendments_per_lane`; a batch counts once toward
+  `max_amendments_per_run`.
+- **D3.** An independent reviewer agent (`attend.reviewer_route`,
+  `attend.reviewer_vendor`, `attend.max_review_rounds`, default 3) answers the
+  plan-review question for the revision and returns a typed `PASS` or a
+  `REVISE` whose findings are located (`location`, `defect`,
+  `required_change`). REVISE goes back to the author; at the bound the verb
+  stops `REVIEW_UNRESOLVED` and applies nothing. `planctl review` signs as the
+  reviewer agent (`attend-reviewer:<route>:<profile-or-model>`, its declared
+  vendor). The author's vendor is declared as `attend.route.vendor`; a
+  reviewer vendor equal to it, or either undeclared, is refused at config load.
+  **Removed:** the path where the author wrote its own review findings and
+  Maestro signed them as `attend.reviewer_id` (default `maestro-attend`); the
+  `attend.reviewer_id` key is now refused as unsupported.
+- **D4.** A material batch (changed declared outputs, `needs` or `lane_kind`;
+  changed build `spec.interface`; a gating obligation removed or a
+  `decided_by` example lost; a `MERGED` lane reset), computed from the two
+  compiled plans and the amendment's `resets`, files one deduplicated
+  `gh issue create` in the run's repository. A `gh` failure is recorded and
+  never undoes the amendment.
+- **D5.** `<plans_dir>/<run-id>.deviations.md` is re-rendered from ledger
+  records after every batch; a re-render is byte-identical.
+- **Ledger schema `artifact-factory.v7`.** New run-artifact kind
+  `ATTEND_REVIEW` (a record, not authority), one per review round. A v6
+  ledger's `run_artifacts` is rebuilt with the wider kind check on open.
+
+### Changed — contract change (narrows a check): `attend.route` accepts `vendor:`
+
+- `attend.route.vendor` used to be refused at config load. It is now
+  accepted, read like a lane role's `vendor:` (strip, casefold) and kept out
+  of the route mapping that route admission binds, because the attend
+  reviewer's independence is checked against it. The route validator itself
+  still refuses a `vendor` key inside a route mapping.
+
+### Fixed — attended approval signs and applies only what was reviewed
+
+- `_attend_project` now sets the revision copy's `approval.receipt_path` to
+  the receipt it writes (`<run>.r<N>.receipt.json`) before findings, render
+  and review. planctl refuses `receipt.path` unless the two agree, and an
+  author has no way to know Maestro's receipt name. `links[]` were checked:
+  they name repository files resolved against `--repo-root`, not anything
+  `_attend_project` writes, so they are left as the author wrote them.
+- Each review round records the sha256 of the revision it reviewed
+  (`ReviewRequest.revision_sha256`, `ATTEND_REVIEW.revision_sha256`). The
+  reviewer is handed exactly those bytes, and `project` receives exactly
+  those bytes; a revision whose bytes changed after review is refused
+  `ATTEND_REVISION_REFUSED`.
+- Each round writes its own `r<N>.<session>.round<k>.ir.json`, and the attend trees no
+  longer wipe `revisions/`, so a REVISE round's `revision_ref` keeps its
+  bytes. The dispatcher unlinks the one path it asks for, so a stale file
+  cannot pass for a fresh answer.
+- The deviations file is rendered in a `finally` around each batch, so a
+  projection or apply refused after PASS still appears in it.
+- Issue dedup searches `"<title>" in:title`, keeping the exact-title filter.
+
+### Fixed — attended approval passed no key to `planctl validate --require-approved`
+
+- `_attend_project` ran `validate --require-approved` without the reviewer
+  key, and `_run_planctl` strips any ambient one, so the real binary refused
+  every attended revision `receipt.key_missing`. The stubbed tests never ran
+  validate. It is now given the same key review signed with, and a test runs
+  review and validate against the real binary.
+
 ### Changed — contract change (narrows a check): projection private-key self-check skips verbatim IR values
 
 - The ingress self-check over each projected lane spec refused any key in

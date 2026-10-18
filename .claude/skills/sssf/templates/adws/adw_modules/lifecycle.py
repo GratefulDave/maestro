@@ -52,6 +52,15 @@ V2_RUN_ARTIFACT_KINDS = (
     "PLAN_AMENDMENT",
 )
 V2_RUN_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V2_RUN_ARTIFACT_KINDS)
+# The v3..v6 run-artifact kinds, verbatim for the same reason. v7 added
+# ATTEND_REVIEW.
+V3_RUN_ARTIFACT_KINDS = (
+    *V2_RUN_ARTIFACT_KINDS,
+    "ATTEND_SESSION",
+    "AMENDMENT_RATIONALE",
+)
+V3_RUN_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V3_RUN_ARTIFACT_KINDS)
+_RUN_ARTIFACTS_V6_BACKUP = "run_artifacts__v6_backup"
 RUN_ARTIFACT_COLUMNS = (
     "artifact_id",
     "run_id",
@@ -228,6 +237,7 @@ V1_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V1_LANE_KIND_CHECK)
 V4_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V4_LANE_KIND_CHECK)
 RUN_ARTIFACTS_SQL = _run_artifacts_ddl(RUN_KIND_CHECK)
 V2_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V2_RUN_KIND_CHECK)
+V3_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V3_RUN_KIND_CHECK)
 SCHEMA = _schema_script(LANE_KIND_CHECK, RUN_KIND_CHECK)
 V1_SCHEMA = _schema_script(V1_LANE_KIND_CHECK, V2_RUN_KIND_CHECK)
 
@@ -384,6 +394,9 @@ class ArtifactStore:
             version = st.LEDGER_SCHEMA_VERSION_V5
         if version == st.LEDGER_SCHEMA_VERSION_V5:
             self._migrate_v5_to_v6()
+            version = st.LEDGER_SCHEMA_VERSION_V6
+        if version == st.LEDGER_SCHEMA_VERSION_V6:
+            self._migrate_v6_to_v7()
             return
         self._refuse_schema()
 
@@ -549,7 +562,60 @@ class ArtifactStore:
                 )
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V5),
+                (st.LEDGER_SCHEMA_VERSION_V6, st.LEDGER_SCHEMA_VERSION_V5),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V6)
+            self.conn.execute("COMMIT")
+            self._end_migration()
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _run_artifacts_need_v7_rebuild(self) -> bool:
+        """True when run_artifacts still carries the v3..v6 kind check.
+
+        False when it already carries the current one: a crash between the
+        rebuild and the stamp leaves a correct table under a stale stamp.
+        """
+        names = _tables(self.conn)
+        if "run_artifacts" not in names or _RUN_ARTIFACTS_V6_BACKUP in names:
+            self._refuse_schema()
+        sql = _table_create_sql(self.conn, "run_artifacts")
+        if sql is not None and _normalize_sql(sql) == _normalize_sql(
+            RUN_ARTIFACTS_SQL
+        ):
+            return False
+        if sql is None or _normalize_sql(sql) != _normalize_sql(V3_RUN_ARTIFACTS_SQL):
+            self._refuse_schema()
+        return True
+
+    def _migrate_v6_to_v7(self) -> None:
+        """Widen the run-artifact kind check for `ATTEND_REVIEW`.
+
+        Same reason v3 was a schema version: the kind check is baked into the
+        table at creation, so a v6 ledger refuses an `ATTEND_REVIEW` insert no
+        matter what the enum says.
+        """
+        rebuild = self._run_artifacts_need_v7_rebuild()
+        self._require_supported_v2_run_artifacts()
+        self._begin_migration()
+        try:
+            if rebuild:
+                self._rebuild_run_artifacts_current_check(
+                    backup=_RUN_ARTIFACTS_V6_BACKUP
+                )
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V6),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
@@ -588,12 +654,17 @@ class ArtifactStore:
             st.LEDGER_SCHEMA_VERSION_V3,
             st.LEDGER_SCHEMA_VERSION_V4,
             st.LEDGER_SCHEMA_VERSION_V5,
+            st.LEDGER_SCHEMA_VERSION_V6,
             st.LEDGER_SCHEMA_VERSION,
         ):
+            # v3..v6 carry the v3 run kind check; v7 the current one. A
+            # crash between the v7 rebuild and its stamp leaves the current
+            # table under an older stamp, which is correct and not refused.
+            run_ddls = {_normalize_sql(RUN_ARTIFACTS_SQL)}
+            if expected != st.LEDGER_SCHEMA_VERSION:
+                run_ddls.add(_normalize_sql(V3_RUN_ARTIFACTS_SQL))
             run_sql = _table_create_sql(self.conn, "run_artifacts")
-            if run_sql is None or _normalize_sql(run_sql) != _normalize_sql(
-                RUN_ARTIFACTS_SQL
-            ):
+            if run_sql is None or _normalize_sql(run_sql) not in run_ddls:
                 raise ArtifactStoreError("run_artifacts ddl")
         version = self.conn.execute(
             "SELECT schema_version FROM ledger_meta"
@@ -663,8 +734,9 @@ class ArtifactStore:
         if "run_artifacts" not in names or _RUN_ARTIFACTS_V2_BACKUP in names:
             self._refuse_schema()
         sql = _table_create_sql(self.conn, "run_artifacts")
-        if sql is not None and _normalize_sql(sql) == _normalize_sql(
-            RUN_ARTIFACTS_SQL
+        if sql is not None and _normalize_sql(sql) in (
+            _normalize_sql(V3_RUN_ARTIFACTS_SQL),
+            _normalize_sql(RUN_ARTIFACTS_SQL),
         ):
             return False
         if sql is None or _normalize_sql(sql) != _normalize_sql(V2_RUN_ARTIFACTS_SQL):
@@ -686,15 +758,16 @@ class ArtifactStore:
         if extra_indexes:
             self._refuse_schema()
 
-    def _rebuild_run_artifacts_current_check(self) -> None:
+    def _rebuild_run_artifacts_current_check(
+        self, backup: str = _RUN_ARTIFACTS_V2_BACKUP, ddl: str = RUN_ARTIFACTS_SQL
+    ) -> None:
         cols = ", ".join(RUN_ARTIFACT_COLUMNS)
-        self._rename_for_rebuild("run_artifacts", _RUN_ARTIFACTS_V2_BACKUP)
-        self.conn.execute(RUN_ARTIFACTS_SQL)
+        self._rename_for_rebuild("run_artifacts", backup)
+        self.conn.execute(ddl)
         self.conn.execute(
-            f"INSERT INTO run_artifacts ({cols}) "
-            f"SELECT {cols} FROM {_RUN_ARTIFACTS_V2_BACKUP}"
+            f"INSERT INTO run_artifacts ({cols}) SELECT {cols} FROM {backup}"
         )
-        self.conn.execute(f"DROP TABLE {_RUN_ARTIFACTS_V2_BACKUP}")
+        self.conn.execute(f"DROP TABLE {backup}")
 
     def _migrate_v2_to_v3(self) -> None:
         """Widen the run-artifact kind check for the attend records.
@@ -710,7 +783,8 @@ class ArtifactStore:
         self._begin_migration()
         try:
             if rebuild:
-                self._rebuild_run_artifacts_current_check()
+                # The v3 table, so v7 finds what it expects and widens it.
+                self._rebuild_run_artifacts_current_check(ddl=V3_RUN_ARTIFACTS_SQL)
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
                 (st.LEDGER_SCHEMA_VERSION_V3, st.LEDGER_SCHEMA_VERSION_V2),
@@ -2613,7 +2687,7 @@ class ArtifactStore:
     ) -> ArtifactRecord:
         """Append a run artifact that records something and decides nothing.
 
-        Neither `ATTEND_SESSION` nor `AMENDMENT_RATIONALE` appears in
+        None of `ATTEND_SESSION`, `AMENDMENT_RATIONALE`, `ATTEND_REVIEW` appears in
         `COMPLETE_STAGE_EDGES`, touches `lane_state`, or is read by any
         predicate. They are durable because prose in a log is not evidence, and
         they are inert because a record of why a human-shaped decision was made
@@ -2691,6 +2765,35 @@ class ArtifactStore:
             "amendment-rationale/{0}/{1}".format(
                 int(run["plan_revision"]), lane_id
             ),
+            body,
+        )
+
+    @serialized
+    def record_attend_review(
+        self,
+        run_id: str,
+        *,
+        session_id: str,
+        plan_revision: int,
+        review_round: int,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        """One independent review round over one attended revision."""
+        digest = st.attend_review_input_digest(
+            run_id=run_id,
+            session_id=session_id,
+            plan_revision=plan_revision,
+            review_round=review_round,
+        )
+        body = dict(payload)
+        body["attend_session_id"] = session_id
+        body["plan_revision"] = plan_revision
+        body["review_round"] = review_round
+        return self._record_run_note(
+            run_id,
+            st.ArtifactKind.ATTEND_REVIEW,
+            digest,
+            "attend-review/{0}/r{1}/{2}".format(session_id, plan_revision, review_round),
             body,
         )
 
