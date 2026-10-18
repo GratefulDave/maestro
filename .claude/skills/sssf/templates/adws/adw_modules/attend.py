@@ -33,6 +33,11 @@ A declared defect files one deduplicated issue and leaves that lane parked
 for the rest of the session -- the scheduler never resumes it again -- while
 every other lane keeps running and every other park is still attended. The
 declaration moves no lane; it only withholds a resume.
+
+Attend's own agents are contained the same way. An author or reviewer that
+cannot be launched, crashes, or times out is retried once; a second failure
+holds the batch's lanes as a runtime defect, with the same deduplicated issue,
+instead of ending the run. A refusal about the revision is not contained.
 """
 
 from __future__ import annotations
@@ -751,19 +756,32 @@ def defect_issue_title(run_id: str, lane_id: str, fault: Mapping[str, Any]) -> s
 
 
 def defect_issue_body(
-    *, run_id: str, lane_id: str, fault: Mapping[str, Any], detail: str
+    *,
+    run_id: str,
+    lane_id: str,
+    fault: Mapping[str, Any],
+    detail: str,
+    declared: bool = True,
 ) -> str:
+    if declared:
+        opening = (
+            "Run `{0}` parked `{1}` with `LANE_FAULT`, and the attend operator "
+            "declared it a runtime defect rather than a plan gap."
+        )
+        heading = "## Operator's diagnosis"
+    else:
+        opening = "Run `{0}` could not attend `{1}`: attend itself failed twice."
+        heading = "## Attend failure"
     return "\n".join(
         [
-            "Run `{0}` parked `{1}` with `LANE_FAULT`, and the attend operator "
-            "declared it a runtime defect rather than a plan gap. The lane stays "
-            "parked; every other lane keeps running.".format(run_id, lane_id),
+            opening.format(run_id, lane_id)
+            + " The lane stays parked; every other lane keeps running.",
             "",
             "## Fault",
             "- exception_type: `{0}`".format(fault.get("exception_type", "")),
             "- message: {0}".format(fault.get("message", "")),
             "",
-            "## Operator's diagnosis",
+            heading,
             detail,
         ]
     ) + "\n"
@@ -1055,21 +1073,33 @@ def _escalate(
     file_issue: Optional[Callable[[str, str], Mapping[str, str]]],
     escalated: Optional[list],
     say: Callable[[str, str], None],
+    fault: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """File one deduplicated issue per declared defect; hold each lane."""
+    """File one deduplicated issue per declared defect; hold each lane.
+
+    `fault` is attend's own failure when attend, not the author, is the
+    defect; otherwise each lane's `USER_WAIT` fault is reported.
+    """
     for lane_id, detail in defects:
-        wait = store.latest_lane_artifact_payload(
-            run_id, lane_id, st.ArtifactKind.USER_WAIT
-        ) or {}
-        fault = dict(wait.get("fault") or {})
+        if fault is None:
+            wait = store.latest_lane_artifact_payload(
+                run_id, lane_id, st.ArtifactKind.USER_WAIT
+            ) or {}
+            lane_fault = dict(wait.get("fault") or {})
+        else:
+            lane_fault = dict(fault)
         issue: Mapping[str, str] = {}
         if file_issue is not None:
             try:
                 issue = dict(
                     file_issue(
-                        defect_issue_title(run_id, lane_id, fault),
+                        defect_issue_title(run_id, lane_id, lane_fault),
                         defect_issue_body(
-                            run_id=run_id, lane_id=lane_id, fault=fault, detail=detail
+                            run_id=run_id,
+                            lane_id=lane_id,
+                            fault=lane_fault,
+                            detail=detail,
+                            declared=fault is None,
                         ),
                     )
                 )
@@ -1079,13 +1109,62 @@ def _escalate(
                     "detail": "{0}: {1}".format(type(exc).__name__, exc),
                 }
         if escalated is not None:
-            escalated.append(RuntimeDefect(lane_id, fault, detail, issue))
+            escalated.append(RuntimeDefect(lane_id, lane_fault, detail, issue))
         say(
             lane_id,
             "runtime defect, lane stays parked: {0}".format(
                 issue.get("url") or issue.get("detail") or "no issue filed"
             ),
         )
+
+
+def _agent_twice(
+    step: Callable[[Any], Mapping[str, Any]],
+    request: Any,
+    code: str,
+    say: Callable[[str, str], None],
+) -> Tuple[Any, Optional[AttendRefused]]:
+    """One attend agent, retried once. `(answer, None)` or `(None, failure)`.
+
+    `code` is the agent's own failure: it could not be launched, crashed, or
+    timed out. Any other refusal is about the revision, never retried here.
+    """
+    failure: Optional[AttendRefused] = None
+    for attempt in (1, 2):
+        try:
+            return step(request), None
+        except AttendRefused as exc:
+            if exc.code != code:
+                raise
+            failure = exc
+        except Exception as exc:
+            failure = AttendRefused(code, "{0}: {1}".format(type(exc).__name__, exc))
+        if attempt == 1:
+            say(request.lane_id, "{0}, retrying once: {1}".format(code, failure.detail))
+    return None, failure
+
+
+def _contain(
+    store: Any,
+    run_id: str,
+    parked: Tuple[Tuple[str, str], ...],
+    failure: AttendRefused,
+    file_issue: Optional[Callable[[str, str], Mapping[str, str]]],
+    escalated: Optional[list],
+    say: Callable[[str, str], None],
+    compiled: st.CompiledPlan,
+) -> st.CompiledPlan:
+    """Attend failed twice: hold the batch's lanes as a runtime defect, not the run.
+
+    The same path a declared defect takes -- one deduplicated issue per lane,
+    the lane held for the session -- so every other lane keeps running and
+    only `PAUSE` stops the run. Nothing was revised, so `compiled` returns.
+    """
+    detail = "{0} twice: {1}".format(failure.code, failure.detail)
+    defects = tuple((lane_id, detail) for lane_id, _reason in parked)
+    fault = {"exception_type": failure.code, "message": failure.detail}
+    _escalate(store, run_id, defects, file_issue, escalated, say, fault=fault)
+    return compiled
 
 
 def _attend_batch(
@@ -1124,14 +1203,9 @@ def _attend_batch(
         request = request_for(
             parked, compiled, review_round, reviewer_findings, previous
         )
-        try:
-            envelope = dispatch(request)
-        except AttendRefused:
-            raise
-        except Exception as exc:
-            raise AttendRefused(
-                OPERATOR_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
-            ) from exc
+        envelope, failed = _agent_twice(dispatch, request, OPERATOR_FAILED, say)
+        if failed is not None:
+            return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
         if not isinstance(envelope, Mapping):
             raise AttendRefused(NO_REVISION, "envelope is not an object")
         defects = require_runtime_defects(envelope.get("runtime_defects"), parked)
@@ -1153,14 +1227,9 @@ def _attend_batch(
             raise AttendRefused(
                 REVISION_REFUSED, "review request does not bind the written revision"
             )
-        try:
-            answer = review(review_request)
-        except AttendRefused:
-            raise
-        except Exception as exc:
-            raise AttendRefused(
-                REVIEWER_FAILED, "{0}: {1}".format(type(exc).__name__, exc)
-            ) from exc
+        answer, failed = _agent_twice(review, review_request, REVIEWER_FAILED, say)
+        if failed is not None:
+            return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
         verdict, located = require_review_verdict(answer)
         store.record_attend_review(
             run_id,

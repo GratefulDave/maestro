@@ -103,7 +103,7 @@ def _launch(launcher: _ExitingRetainer):
         )
         actor._role_key = lambda ctx, role: (ctx.lane.lane_id, role, "digest")
         actor._release_superseded = lambda key: False
-        actor._prepared_cwd = lambda path, prepare: prepare(path)
+        actor._prepared_cwd = lambda path, prepare, provision=True: prepare(path)
         actor._materialize_role_instructions = lambda *args: root / "system.md"
         actor._prompt = lambda *args: {}
         actor._launch_environment = lambda path: {}

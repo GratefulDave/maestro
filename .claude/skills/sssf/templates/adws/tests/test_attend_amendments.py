@@ -15,7 +15,8 @@ without the human, and -- more importantly -- pin what it still refuses to do:
 - a reviewer REVISE goes back to the author with its located findings, and a
   revision still unresolved at the bound is never applied;
 - a lane past its bound parks, and so does a run past its own;
-- an author or reviewer that crashes is a typed refusal naming why;
+- an author or reviewer that crashes is retried once; crashing again holds
+  the batch's lanes as a runtime defect with one issue, and the run goes on;
 - a revision that reaches a lane outside the batch's scope is refused whole,
   and so is one that changes no projection at all;
 - the transition is still the `PLAN_AMENDMENT`. The agents' prose reaches the
@@ -168,6 +169,7 @@ class _Harness:
                  revision_lanes: Sequence[str] = ("lane-a-build",),
                  crash: BaseException | None = None,
                  reviewer_crash: BaseException | None = None,
+                 crash_times: int | None = None,
                  verdicts: Sequence[str] = ("PASS",),
                  stays_parked: bool = False,
                  file_issue: Any = None,
@@ -180,6 +182,8 @@ class _Harness:
         self.revision_lanes = tuple(revision_lanes)
         self.crash = crash
         self.reviewer_crash = reviewer_crash
+        #: How many calls crash before the agent answers; None is every call.
+        self.crash_times = crash_times
         self.verdicts = list(verdicts)
         self.stays_parked = stays_parked
         self.file_issue = file_issue
@@ -237,7 +241,7 @@ class _Harness:
 
     def dispatch(self, request: att.OperatorRequest) -> Mapping[str, Any]:
         self.dispatched.append(request)
-        if self.crash is not None:
+        if self.crash is not None and self._crashes(len(self.dispatched)):
             raise self.crash
         declared = [
             {"lane": lane.lane_id, "detail": self.defects[lane.lane_id]}
@@ -256,6 +260,9 @@ class _Harness:
             "revision_path": request.revision_out_path,
             "rationales": [_rationale(lane.lane_id) for lane in owed],
         }
+
+    def _crashes(self, call: int) -> bool:
+        return self.crash_times is None or call <= self.crash_times
 
     def review_request_for(self, request, revision, rationales, review_round, digest):
         return att.ReviewRequest(
@@ -282,7 +289,7 @@ class _Harness:
             # The author's tree is still the author's: it edits the file the
             # reviewer was shown after the reviewer read it.
             Path(request.revision_ir_path).write_text('{"edited": true}', encoding="utf-8")
-        if self.reviewer_crash is not None:
+        if self.reviewer_crash is not None and self._crashes(len(self.reviewed)):
             raise self.reviewer_crash
         verdict = self.verdicts.pop(0) if self.verdicts else "PASS"
         if verdict == "PASS":
@@ -662,32 +669,88 @@ class AttendLoop(unittest.TestCase):
         self.assertEqual(len(harness.applied), 1)
         self.assertEqual(len(outcome.applied), 2)
 
-    def test_an_operator_crash_is_a_typed_refusal_naming_the_exception(self) -> None:
+    def test_an_operator_crashing_twice_holds_its_lanes_and_the_run_goes_on(self) -> None:
+        filed: list[tuple[str, str]] = []
         harness = _Harness(
             self.tmp,
-            parked={"lane-a-build": NO_PROGRESS},
+            parked={"lane-a-build": NO_PROGRESS, "lane-b-build": AMENDMENT_REQUIRED},
             policy=_policy(),
             crash=RuntimeError("herdr pane died"),
+            file_issue=lambda title, body: filed.append((title, body)) or {
+                "status": att.ISSUE_CREATED, "url": "https://example.test/9"
+            },
         )
-        with self.assertRaises(att.AttendRefused) as caught:
-            harness.attend()
-        self.assertEqual(caught.exception.code, att.OPERATOR_FAILED)
-        self.assertIn("herdr pane died", caught.exception.detail)
+        outcome = harness.attend()
+        self.assertEqual(len(harness.dispatched), 2)
         self.assertEqual(harness.applied, [])
-        self.assertEqual(harness.store.rationales, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(
+            sorted(item.lane_id for item in outcome.escalated),
+            ["lane-a-build", "lane-b-build"],
+        )
+        self.assertEqual(
+            [title for title, _body in filed],
+            [
+                "Runtime defect on run run-1: lane-a-build ATTEND_OPERATOR_FAILED",
+                "Runtime defect on run run-1: lane-b-build ATTEND_OPERATOR_FAILED",
+            ],
+        )
+        self.assertIn("herdr pane died", filed[0][1])
+        self.assertIn("attend itself failed twice", filed[0][1])
+        self.assertEqual(outcome.escalated[0].fault["exception_type"], att.OPERATOR_FAILED)
 
-    def test_a_reviewer_crash_is_a_typed_refusal_naming_the_exception(self) -> None:
+    def test_a_reviewer_crashing_twice_holds_its_lanes_and_the_run_goes_on(self) -> None:
         harness = _Harness(
             self.tmp,
             parked={"lane-a-build": NO_PROGRESS},
             policy=_policy(),
             reviewer_crash=RuntimeError("reviewer pane died"),
         )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.reviewed), 2)
+        self.assertEqual(harness.applied, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a-build"])
+        self.assertIn("reviewer pane died", outcome.escalated[0].detail)
+        self.assertEqual(outcome.escalated[0].fault["exception_type"], att.REVIEWER_FAILED)
+
+    def test_an_operator_that_crashes_once_is_retried_and_the_amendment_lands(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            crash=RuntimeError("herdr pane died"),
+            crash_times=1,
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.dispatched), 2)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.escalated, ())
+
+    def test_a_reviewer_that_crashes_once_is_retried_and_the_amendment_lands(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            reviewer_crash=RuntimeError("reviewer pane died"),
+            crash_times=1,
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.reviewed), 2)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.escalated, ())
+
+    def test_a_refusal_about_the_revision_is_not_contained(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            crash=att.AttendRefused(att.REVISION_REFUSED, "bytes moved"),
+        )
         with self.assertRaises(att.AttendRefused) as caught:
             harness.attend()
-        self.assertEqual(caught.exception.code, att.REVIEWER_FAILED)
-        self.assertIn("reviewer pane died", caught.exception.detail)
-        self.assertEqual(harness.applied, [])
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertEqual(len(harness.dispatched), 1)
 
     def test_a_revision_reaching_an_unscoped_lane_is_refused_whole(self) -> None:
         harness = _Harness(
