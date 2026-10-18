@@ -175,6 +175,7 @@ class _Harness:
                  file_issue: Any = None,
                  tamper_after_review: bool = False,
                  project_refusal: BaseException | None = None,
+                 review_request_refusal: BaseException | None = None,
                  defects: Mapping[str, str] = {}) -> None:
         self.tmp = tmp
         self.store = _Store(parked)
@@ -189,6 +190,8 @@ class _Harness:
         self.file_issue = file_issue
         self.tamper_after_review = tamper_after_review
         self.project_refusal = project_refusal
+        self.review_request_refusal = review_request_refusal
+        self.review_requests = 0
         self.projected_bytes: list[bytes] = []
         self.passes = 0
         self.dispatched: list[att.OperatorRequest] = []
@@ -265,6 +268,9 @@ class _Harness:
         return self.crash_times is None or call <= self.crash_times
 
     def review_request_for(self, request, revision, rationales, review_round, digest):
+        self.review_requests += 1
+        if self.review_request_refusal is not None and self._crashes(self.review_requests):
+            raise self.review_request_refusal
         return att.ReviewRequest(
             run_id=request.run_id,
             plan_revision=request.plan_revision,
@@ -302,7 +308,7 @@ class _Harness:
     def project(self, revision_bytes: bytes, revision: int, findings: list) -> st.CompiledPlan:
         self.projected_bytes.append(revision_bytes)
         self.projected.append((revision, findings))
-        if self.project_refusal is not None:
+        if self.project_refusal is not None and self._crashes(len(self.projected)):
             raise self.project_refusal
         lanes = tuple(
             _lane(
@@ -751,6 +757,96 @@ class AttendLoop(unittest.TestCase):
             harness.attend()
         self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
         self.assertEqual(len(harness.dispatched), 1)
+
+    def test_a_planctl_harness_failing_twice_in_projection_holds_its_lanes(self) -> None:
+        filed: list[tuple[str, str]] = []
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS, "lane-b-build": AMENDMENT_REQUIRED},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.PLANCTL_FAILED, "planctl review exited 3: review.remote_runner"
+            ),
+            file_issue=lambda title, body: filed.append((title, body)) or {
+                "status": att.ISSUE_CREATED, "url": "https://example.test/9"
+            },
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.projected), 2)
+        self.assertEqual(harness.applied, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(
+            [title for title, _body in filed],
+            [
+                "Runtime defect on run run-1: lane-a-build ATTEND_PLANCTL_FAILED",
+                "Runtime defect on run run-1: lane-b-build ATTEND_PLANCTL_FAILED",
+            ],
+        )
+        self.assertIn("review.remote_runner", filed[0][1])
+        self.assertEqual(outcome.escalated[0].fault["exception_type"], att.PLANCTL_FAILED)
+
+    def test_a_planctl_harness_failing_twice_for_the_review_request_holds_its_lanes(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            review_request_refusal=att.AttendRefused(
+                att.PLANCTL_FAILED, "planctl question-surface exited -9"
+            ),
+        )
+        outcome = harness.attend()
+        self.assertEqual(harness.review_requests, 2)
+        self.assertEqual(harness.reviewed, [])
+        self.assertEqual(harness.applied, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a-build"])
+        self.assertEqual(outcome.escalated[0].fault["exception_type"], att.PLANCTL_FAILED)
+
+    def test_a_planctl_harness_failing_once_is_retried_and_the_amendment_lands(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(att.PLANCTL_FAILED, "spot capacity"),
+            review_request_refusal=att.AttendRefused(att.PLANCTL_FAILED, "crash"),
+            crash_times=1,
+        )
+        outcome = harness.attend()
+        self.assertEqual(harness.review_requests, 2)
+        self.assertEqual(len(harness.projected), 2)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.escalated, ())
+
+    def test_a_planctl_verdict_about_the_revision_is_not_retried_or_contained(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.REVISION_REFUSED, "planctl validate exited 1: schema"
+            ),
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            harness.attend()
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertEqual(len(harness.projected), 1)
+
+    def test_an_untyped_projection_error_is_not_contained_as_planctl(self) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=KeyError("plan_out"),
+        )
+        with self.assertRaises(KeyError):
+            harness.attend()
+        self.assertEqual(len(harness.projected), 1)
 
     def test_a_revision_reaching_an_unscoped_lane_is_refused_whole(self) -> None:
         harness = _Harness(

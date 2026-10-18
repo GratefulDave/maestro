@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): a planctl harness failure in attend holds its lanes instead of ending the run
+
+- `_run_planctl` reported every non-zero planctl exit as `ATTEND_REVISION_REFUSED`,
+  so an EC2 runner outage or a planctl crash ended the run like a refused
+  revision. Exit 1 (planctl's verdict) is still `ATTEND_REVISION_REFUSED`;
+  any other failure (interpreter cannot start, signal, exit 2, planctl's
+  harness exit 3) is the new `ATTEND_PLANCTL_FAILED`. attend retries the
+  review-request and projection steps once on it, then holds the batch's lanes
+  through the runtime-defect path and the run goes on.
+
 ### Changed — contract change (new path): attend's own agent failures hold their lanes instead of ending the run
 
 - An attend author or reviewer that could not be launched, crashed, or timed

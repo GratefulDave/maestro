@@ -78,6 +78,10 @@ REVIEWER_UNCONFIGURED = "ATTEND_REVIEWER_UNCONFIGURED"
 REVISION_REFUSED = "ATTEND_REVISION_REFUSED"
 #: No `planctl` was resolvable, so no revision can be approved.
 PLANCTL_UNRESOLVED = "ATTEND_PLANCTL_UNRESOLVED"
+#: `planctl` itself failed -- it could not start, was killed, crashed, or its
+#: remote mutation runner could not run -- so it said nothing about the
+#: revision. Decided by planctl's exit status, never by its output.
+PLANCTL_FAILED = "ATTEND_PLANCTL_FAILED"
 #: No reviewer key was resolvable, so no receipt can be minted.
 KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
 #: The Plan IR the live revision was projected from could not be located.
@@ -1129,18 +1133,37 @@ def _agent_twice(
     `code` is the agent's own failure: it could not be launched, crashed, or
     timed out. Any other refusal is about the revision, never retried here.
     """
+    return _twice(lambda: step(request), request.lane_id, code, say, untyped=True)
+
+
+def _twice(
+    call: Callable[[], Any],
+    lane_id: str,
+    code: str,
+    say: Callable[[str, str], None],
+    *,
+    untyped: bool,
+) -> Tuple[Any, Optional[AttendRefused]]:
+    """`call`, retried once on `code`. `(answer, None)` or `(None, failure)`.
+
+    Only a refusal typed `code` is retried. `untyped` also counts any other
+    exception as `code`: true for an agent, whose crash has no type of its
+    own, false for a planctl step, which types its own failure.
+    """
     failure: Optional[AttendRefused] = None
     for attempt in (1, 2):
         try:
-            return step(request), None
+            return call(), None
         except AttendRefused as exc:
             if exc.code != code:
                 raise
             failure = exc
         except Exception as exc:
+            if not untyped:
+                raise
             failure = AttendRefused(code, "{0}: {1}".format(type(exc).__name__, exc))
         if attempt == 1:
-            say(request.lane_id, "{0}, retrying once: {1}".format(code, failure.detail))
+            say(lane_id, "{0}, retrying once: {1}".format(code, failure.detail))
     return None, failure
 
 
@@ -1220,9 +1243,14 @@ def _attend_batch(
         written = revision_path(envelope, Path(request.revision_out_path))
         rationales = require_rationales(envelope.get("rationales"), lane_ids)
         digest = sha256_hex(written.read_bytes())
-        review_request = review_request_for(
-            request, written, rationales, review_round, digest
+        review_request, failed = _twice(
+            lambda: review_request_for(
+                request, written, rationales, review_round, digest
+            ),
+            lane_ids[0], PLANCTL_FAILED, say, untyped=False,
         )
+        if failed is not None:
+            return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
         if review_request.revision_sha256 != digest:
             raise AttendRefused(
                 REVISION_REFUSED, "review request does not bind the written revision"
@@ -1259,9 +1287,14 @@ def _attend_batch(
     if passed is None:
         return None
     request, written, digest, rationales, findings, verdict = passed
-    revised = project(
-        reviewed_bytes(written, digest), request.next_plan_revision, findings
+    revised, failed = _twice(
+        lambda: project(
+            reviewed_bytes(written, digest), request.next_plan_revision, findings
+        ),
+        lane_ids[0], PLANCTL_FAILED, say, untyped=False,
     )
+    if failed is not None:
+        return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
     changed = require_amendment_scope(compiled.lanes, revised.lanes, allowed)
     record = apply_amendment(revised)
     amendment = _payload_of(
