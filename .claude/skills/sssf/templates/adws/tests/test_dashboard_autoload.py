@@ -21,6 +21,13 @@ from adw_modules import dashboard_autoload as autoload
 from adw_modules import scheduler_types as st
 
 
+def _no_preflight():
+    """The run preflight is its own subject (`test_run_preflight.py`)."""
+    return mock.patch.multiple(
+        maestro._RunPreflight, run_wide=mock.DEFAULT, __call__=mock.DEFAULT
+    )
+
+
 def _role_routes() -> dict[str, dict[str, str]]:
     return {
         "tester": {"route": "omp", "profile": "grok-maestro"},
@@ -332,6 +339,7 @@ class DashboardCallPlacementTest(unittest.TestCase):
             mock.patch.object(maestro, "register_installation", side_effect=register),
             mock.patch.object(maestro, "maybe_autoload_dashboard", side_effect=load),
             mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
+            _no_preflight(),
             mock.patch.object(maestro, "FactoryScheduler", ImmediateScheduler),
         ):
             self.assertEqual(maestro._run_start(args), 0)
@@ -369,6 +377,7 @@ class DashboardCallPlacementTest(unittest.TestCase):
             mock.patch.object(maestro, "_bind_existing_run", return_value=bound),
             mock.patch.object(maestro, "maybe_autoload_dashboard", side_effect=load),
             mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
+            _no_preflight(),
             mock.patch.object(maestro, "FactoryScheduler", ImmediateScheduler),
             mock.patch.object(maestro, "_compile_plan", return_value=bound[5]),
             mock.patch.object(maestro, "apply_factory_amendment"),

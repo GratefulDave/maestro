@@ -41,6 +41,15 @@ TESTS_LANE = "lane-wp6-tests"
 BUILD_LANE = "lane-wp6-build"
 
 
+def _no_preflight():
+    """The run preflight is its own subject (`test_run_preflight.py`)."""
+    import maestro
+
+    return mock.patch.multiple(
+        maestro._RunPreflight, run_wide=mock.DEFAULT, __call__=mock.DEFAULT
+    )
+
+
 def _launcher(
     label: str,
     *,
@@ -411,6 +420,7 @@ class InvokingWorkspaceTest(unittest.TestCase):
                 with (
                     mock.patch.object(maestro, "_bind_existing_run", return_value=bound),
                     mock.patch.object(maestro, "_actor_for", return_value=bench.actor),
+                    _no_preflight(),
                     mock.patch.object(maestro, "maybe_autoload_dashboard"),
                     mock.patch.object(maestro.step_log, "RunReporter"),
                     mock.patch.object(maestro, "FactoryScheduler", side_effect=gate_boundary),
