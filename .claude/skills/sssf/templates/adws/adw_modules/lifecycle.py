@@ -2065,7 +2065,15 @@ class ArtifactStore:
                     replayed=True,
                 )
             resume_stage = st.LaneStage(wait_payload["resume_stage"])
-            if wait_payload.get("input_invalidated"):
+            # An amendment can take a need back off MERGED while this lane
+            # waits. Its stage inputs (the need's current-revision suite or
+            # merge) appear only when that need merges again, which is also
+            # the first moment the lane can be dispatched; `complete_stage`
+            # re-derives them then.
+            if wait_payload.get("input_invalidated") and all(
+                self.lane_stage(run_id, dep) is st.LaneStage.MERGED
+                for dep in self._needs(projection)
+            ):
                 observed = decision.get("observed") or {}
                 resume_input = self._reconstruct_stage_digest(
                     run, projection, resume_stage, observed=observed
@@ -2576,8 +2584,19 @@ class ArtifactStore:
         old = self._latest_lane_artifact(run_id, lane_id, st.ArtifactKind.USER_WAIT)
         old_payload = _loads(old["payload_json"]) if old is not None else {}
         predecessor_id, predecessor_seq = self._predecessor(run_id, lane_id)
-        resume_stage = st.LaneStage(
-            old_payload.get("resume_stage", st.LaneStage.BUILDING.value)
+        # The stage the lane resumes into takes the same amendment reset a
+        # lane that was not waiting takes: a tests lane paused READY_TO_MERGE
+        # must re-seal its suite under the new revision, exactly as a running
+        # one goes MERGED/READY_TO_MERGE -> TESTS_SEALED.
+        resume_stage = st.amendment_reset_stage(
+            st.LaneStage(
+                old_payload.get("resume_stage", st.LaneStage.BUILDING.value)
+            ),
+            changed=False,
+            wait_reason=None,
+            lane_kind=next(
+                lane.lane_kind for lane in plan.lanes if lane.lane_id == lane_id
+            ),
         )
         wait_digest = st.user_wait_input_digest(
             predecessor_artifact_id=predecessor_id,

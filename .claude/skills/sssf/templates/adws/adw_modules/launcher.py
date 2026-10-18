@@ -498,23 +498,17 @@ GRID_MAX = 3
 def grid_for(pane_count: int) -> Tuple[int, int]:
     """`(rows, cols)` for `pane_count` panes in one tab, capped at 3x3.
 
-    Rows first, columns from the rows, so the sequence widens before it
-    stacks: 2 panes are two columns side by side, 3 are three columns, and
-    only at 4 does a second row appear.
-
         1 -> 1x1    4 -> 2x2    7 -> 3x3
         2 -> 1x2    5 -> 2x3    8 -> 3x3
-        3 -> 1x3    6 -> 2x3    9 -> 3x3
+        3 -> 2x2    6 -> 2x3    9 -> 3x3
 
-    Beyond nine the grid does not grow: `split_plan` keeps filling columns
-    downward, so a tenth pane makes one column four cells tall rather than
-    making a fourth column nobody could read. A tab is meant to hold fewer
-    than six panes; nine is the ceiling, not the target.
+    One to four panes fill a 2x2 grid; five to nine grow it to 3x3. A tenth
+    pane does not fit: `_acquire_pane` opens the next tab for it, so a tab
+    never holds more than `GRID_MAX * GRID_MAX` panes.
     """
     count = max(1, int(pane_count))
-    rows = min(GRID_MAX, -(-count // GRID_MAX))
-    cols = min(GRID_MAX, -(-count // rows))
-    return rows, cols
+    cols = 1 if count == 1 else 2 if count <= 4 else GRID_MAX
+    return min(GRID_MAX, -(-count // cols)), cols
 
 
 def split_plan(index: int, cols: int) -> Tuple[int, str]:
@@ -4459,6 +4453,7 @@ class HerdrLauncher:
             with layout.lock:
                 role = str(spec.pane_role or "")
                 replace_pane = ""
+                new_tab_root = ""
                 try:
                     held = (
                         str(layout.role_panes.get(role) or "")
@@ -4526,12 +4521,38 @@ class HerdrLauncher:
                         # exists (below), exactly as the root pane is.
                         while index < len(layout.panes) and layout.panes[index]:
                             index += 1
-                        parent_index, direction = split_plan(index, layout.cols)
-                        parent_id = layout.nearest_live(parent_index)
-                        if parent_id is None:
-                            raise LaunchRefused(
-                                LaunchRefusal.TAB_UNRESOLVED, "NO_LIVE_PARENT"
+                        # A tab holds at most GRID_MAX**2 panes; the pane
+                        # after the last one opens the next tab, whose own
+                        # root pane it splits (and then replaces).
+                        base = index - index % (GRID_MAX * GRID_MAX)
+                        if base and index == base:
+                            opened_tab = self._herdr(
+                                "tab",
+                                "create",
+                                "--workspace",
+                                layout.child_workspace_id
+                                or workspace_of(layout.tab_id),
+                                "--cwd",
+                                str(worktree),
+                                "--no-focus",
+                                env=environment,
                             )
+                            root = _extract(opened_tab, "root_pane")
+                            if not isinstance(root, dict) or not root.get("pane_id"):
+                                raise LaunchRefused(
+                                    LaunchRefusal.TAB_UNRESOLVED, "NO_ROOT_PANE"
+                                )
+                            parent_id = new_tab_root = str(root["pane_id"])
+                            direction = "right"
+                        else:
+                            parent_index, direction = split_plan(
+                                index - base, layout.cols
+                            )
+                            parent_id = layout.nearest_live(base + parent_index)
+                            if parent_id is None:
+                                raise LaunchRefused(
+                                    LaunchRefusal.TAB_UNRESOLVED, "NO_LIVE_PARENT"
+                                )
                     split = self._herdr(
                         "pane",
                         "split",
@@ -4587,6 +4608,8 @@ class HerdrLauncher:
                     # role's; leaving one behind is the orphan a later role
                     # would otherwise be handed by grid position.
                     unconfigured: List[str] = []
+                    if new_tab_root:
+                        unconfigured.append(new_tab_root)
                     if replace_pane and replace_pane in layout.role_panes.values():
                         # A stale role pane is this role's by label; it is
                         # replaced whatever its cwd says.

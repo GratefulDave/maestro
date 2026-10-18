@@ -2061,7 +2061,17 @@ class FactoryScheduler:
         with self._inflight_lock:
             targets = list(self._inflight.values())
         if not targets:
+            # Only lanes the scheduler could dispatch next. A lane whose needs
+            # are not all MERGED cannot run, and its stage inputs need not
+            # exist: an amendment takes an unchanged tests lane MERGED ->
+            # TESTS_SEALED while its build lane stays BUILDING, and that
+            # lane's digest names a current-revision suite and merges that
+            # appear only once its needs merge again.
+            # Pausing every ready lane already stops all progress.
+            ready = set(self.store.ready_lane_ids(self.run_id))
             for lane in self.store.active_projection(self.run_id):
+                if lane.lane_id not in ready:
+                    continue
                 stage = self.store.lane_stage(self.run_id, lane.lane_id)
                 if stage not in st.PAUSEABLE_STAGES:
                     continue

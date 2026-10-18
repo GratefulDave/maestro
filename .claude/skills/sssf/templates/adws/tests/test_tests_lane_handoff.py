@@ -1017,6 +1017,151 @@ class TestsLaneHandoffTests(unittest.TestCase):
             st.LaneStage.MERGED,
         )
 
+    def test_interrupt_after_amendment_skips_build_lane_behind_unsealed_tests(
+        self,
+    ) -> None:
+        # An amendment took the tests lane back off MERGED while
+        # its resumed build lane stayed BUILDING. Ctrl-C with nothing in flight
+        # then asked that build lane for a pause digest whose inputs (the
+        # tests lane's current-revision suite, its deps' current-revision
+        # merges) cannot exist until the deps merge again, and the whole stop
+        # died on FACTORY_REFUSED:missing dependency accepted tests.
+        compiled = plan_compiler.compile_plan(
+            _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:stop"
+        )
+
+        class StopOnBuild(HandoffActor):
+            def build(self, ctx: sch.LaneContext):
+                del ctx
+                raise sch.LaunchFailed("stop-before-build")
+
+        actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
+        scheduler = self._start(compiled, actor, "run-stop")
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
+        scheduler.resume_waiting()
+        self.assertEqual(
+            self.store.lane_stage("run-stop", "lane-build"),
+            st.LaneStage.BUILDING,
+        )
+        target = gitpub.bind_target_worktree(self.repo, "refs/heads/main")
+        amended = plan_compiler.compile_plan(
+            _plan_bytes(tests_goal="author hidden tests with extra detail"),
+            plan_revision=2,
+            plan_artifact_ref="plan:stop-2",
+        )
+        sch.apply_factory_amendment(
+            self.store, "run-stop", amended, runtime=self.runtime, target=target
+        )
+        self.assertEqual(
+            self.store.lane_stage("run-stop", "lane-build"),
+            st.LaneStage.BUILDING,
+        )
+        self.assertIsNot(
+            self.store.lane_stage("run-stop", "lane-tests"), st.LaneStage.MERGED
+        )
+        scheduler = sch.FactoryScheduler(
+            self.store, "run-stop", actor, self.runtime, target, compiled=amended
+        )
+        self.assertIsNone(scheduler._current_accepted_suite("lane-tests"))
+
+        scheduler._pause_on_interrupt()
+
+        self.assertEqual(
+            self.store.lane_stage("run-stop", "lane-tests"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        self.assertEqual(
+            self.store.lane_stage("run-stop", "lane-build"),
+            st.LaneStage.BUILDING,
+        )
+
+    def test_build_lane_paused_then_amended_behind_tests_resumes(self) -> None:
+        # Stop, amend the tests lane, resume: the paused build lane's need is
+        # back off MERGED, so its BUILDING inputs cannot be rebuilt at resume
+        # time. Resume used to die on STALE_STAGE_INPUT for the whole run.
+        compiled = plan_compiler.compile_plan(
+            _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:paused"
+        )
+
+        class StopOnBuild(HandoffActor):
+            def build(self, ctx: sch.LaneContext):
+                del ctx
+                raise sch.LaunchFailed("stop-before-build")
+
+        actor = StopOnBuild(self.repo, self.runtime.path / "worktrees")
+        scheduler = self._start(compiled, actor, "run-paused")
+        self.assertIs(scheduler.run(), st.RunStatus.WAITING)
+        scheduler.resume_waiting()
+        scheduler._pause_on_interrupt()
+        self.assertEqual(
+            self.store.lane_stage("run-paused", "lane-build"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        target = gitpub.bind_target_worktree(self.repo, "refs/heads/main")
+        amended = plan_compiler.compile_plan(
+            _plan_bytes(tests_goal="author hidden tests with extra detail"),
+            plan_revision=2,
+            plan_artifact_ref="plan:paused-2",
+        )
+        sch.apply_factory_amendment(
+            self.store, "run-paused", amended, runtime=self.runtime, target=target
+        )
+        resume = HandoffActor(self.repo, self.runtime.path / "worktrees")
+        scheduler = sch.FactoryScheduler(
+            self.store, "run-paused", resume, self.runtime, target, compiled=amended
+        )
+
+        scheduler.resume_waiting()
+
+        self.assertEqual(
+            self.store.lane_stage("run-paused", "lane-build"),
+            st.LaneStage.BUILDING,
+        )
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+
+    def test_tests_lane_paused_ready_to_merge_reseals_after_amendment(self) -> None:
+        # A tests lane paused READY_TO_MERGE resumes into the reset a running
+        # one takes, TESTS_SEALED, so it records a current-revision suite
+        # instead of failing to find one at resume.
+        compiled = plan_compiler.compile_plan(
+            _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:rtm"
+        )
+        actor = HandoffActor(self.repo, self.runtime.path / "worktrees")
+        scheduler = self._start(compiled, actor, "run-rtm")
+        while (
+            self.store.lane_stage("run-rtm", "lane-tests")
+            is not st.LaneStage.READY_TO_MERGE
+        ):
+            scheduler._advance("lane-tests")
+        scheduler._pause_on_interrupt()
+        self.assertEqual(
+            self.store.lane_stage("run-rtm", "lane-tests"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        target = gitpub.bind_target_worktree(self.repo, "refs/heads/main")
+        amended = plan_compiler.compile_plan(
+            _plan_bytes(build_goal="implement product.py with extra detail"),
+            plan_revision=2,
+            plan_artifact_ref="plan:rtm-2",
+        )
+        sch.apply_factory_amendment(
+            self.store, "run-rtm", amended, runtime=self.runtime, target=target
+        )
+        scheduler = sch.FactoryScheduler(
+            self.store, "run-rtm", actor, self.runtime, target, compiled=amended
+        )
+
+        scheduler.resume_waiting()
+
+        self.assertEqual(
+            self.store.lane_stage("run-rtm", "lane-tests"),
+            st.LaneStage.TESTS_SEALED,
+        )
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+        current = scheduler._current_accepted_suite("lane-tests")
+        self.assertIsNotNone(current)
+        self.assertEqual(current.plan_revision, 2)
+
     def test_v3_plan_compiles_typed_kinds_and_preserves_semantics(self) -> None:
         self.assertTrue(V2_PLAN.is_file())
         self.assertTrue(V3_PLAN.is_file())
