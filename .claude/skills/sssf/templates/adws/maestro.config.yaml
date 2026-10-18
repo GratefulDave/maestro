@@ -11,20 +11,34 @@ concurrency: 1
 # worse round. Absent means false.
 stall:
   regression_on_findings: false
-# `run attend` authors the amendment a NO_PROGRESS park needs instead of
-# stopping for a human. Opt-in: 0 (and absent) refuses the verb with
-# ATTEND_DISABLED, so an upgraded deployment keeps parking for its operator
-# until someone sets this key in *this* file. The operator agent it dispatches
-# reads the accepted suite, as builders and reviewers do in their own checkouts.
+# `run attend` lets the scheduler settle, then answers every NO_PROGRESS and
+# AMENDMENT_REQUIRED park with one plan amendment instead of stopping for a
+# human. PAUSE and LANE_FAULT still stop it. Opt-in: 0 (and absent) refuses
+# the verb with ATTEND_DISABLED, so an upgraded deployment keeps parking for
+# its operator until someone sets this key in *this* file. The operator agent
+# it dispatches reads the accepted suite, as builders and reviewers do in
+# their own checkouts; an independent reviewer agent reviews what it wrote.
 attend:
   max_amendments_per_lane: 0
   max_amendments_per_run: 10
-  # Required once max_amendments_per_lane is set. Same shape as a role route,
-  # and admitted by the same executed route receipt.
+  # REVISE rounds the reviewer may return before the verb stops
+  # REVIEW_UNRESOLVED with nothing applied. Absent means 3.
+  # max_review_rounds: 3
+  # The author. Required once max_amendments_per_lane is set. Same shape as
+  # a role route, admitted by the same executed route receipt, plus the
+  # `vendor:` of the provider it runs on.
   # route:
   #   route: claude
   #   model: opus
-  #   effort: high
+  #   effort: medium
+  #   vendor: anthropic
+  # The independent reviewer. Required once max_amendments_per_lane is set,
+  # admitted by the same route receipt. reviewer_vendor is required with it
+  # and must differ from route.vendor; `planctl review` signs as this agent.
+  # reviewer_route:
+  #   route: omp
+  #   profile: openai-astra
+  # reviewer_vendor: openai
   # Absolute path to the plan-contract validator. Absent refuses
   # ATTEND_PLANCTL_UNRESOLVED rather than approving an unvalidated revision.
   # planctl: /absolute/path/to/planctl.py

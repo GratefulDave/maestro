@@ -1,4 +1,4 @@
-"""Operator-declared `vendor:` on the five lane roles, and only there."""
+"""Operator-declared `vendor:` on the five lane roles and on the attend author."""
 
 from __future__ import annotations
 
@@ -81,20 +81,26 @@ class RoleVendorTest(unittest.TestCase):
                 with self.assertRaises(maestro._MaestroConfigurationError):
                     _load(declare)
 
-    def test_attend_route_refuses_vendor(self) -> None:
+    def test_attend_route_vendor_rides_beside_the_route(self) -> None:
+        # The route validator itself still refuses a vendor key: route
+        # admission binds the route mapping, and a vendor must never ride in it.
         with self.assertRaises(maestro._MaestroConfigurationError):
             maestro._canonical_role_route(
                 {"route": "claude", "model": "opus", "effort": "high", "vendor": "x"},
                 "attend.route",
             )
 
+        # `attend.route.vendor` declares the attend author's vendor, read the
+        # way a lane role's is, so the attend reviewer can be checked
+        # independent of it. It is stripped before route validation.
         def declare(config: dict[str, Any]) -> None:
             config["attend"]["route"] = {
-                "route": "claude", "model": "opus", "effort": "high", "vendor": "x",
+                "route": "claude", "model": "opus", "effort": "high", "vendor": " X ",
             }
 
-        with self.assertRaises(maestro._MaestroConfigurationError):
-            _load(declare)
+        loaded = _load(declare)
+        self.assertNotIn("vendor", loaded["attend"]["route"])
+        self.assertEqual(loaded["attend"]["vendor"], "x")
 
     def test_canonical_routes_are_byte_identical_with_and_without_vendor(self) -> None:
         plain = _load()

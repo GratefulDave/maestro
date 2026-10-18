@@ -23,6 +23,13 @@ from adw_modules import attend as att  # noqa: E402
 
 
 CLAUDE_ROUTE = {"route": "claude", "model": "opus", "effort": "high"}
+#: The smallest enabled section: an author on a declared vendor and an
+#: independent reviewer on a different one.
+ENABLED = {
+    "route": dict(CLAUDE_ROUTE, vendor="vendor-a"),
+    "reviewer_route": {"route": "omp", "profile": "profile-b"},
+    "reviewer_vendor": "vendor-b",
+}
 
 
 class AttendConfig(unittest.TestCase):
@@ -41,7 +48,7 @@ class AttendConfig(unittest.TestCase):
 
     def test_a_bound_lane_cap_enables_the_verb(self) -> None:
         canonical = maestro._canonical_attend(
-            {"max_amendments_per_lane": 2, "route": CLAUDE_ROUTE}
+            {"max_amendments_per_lane": 2, **ENABLED}
         )
         policy = maestro._attend_policy({"attend": canonical})
         self.assertTrue(policy.enabled)
@@ -70,7 +77,7 @@ class AttendConfig(unittest.TestCase):
             maestro._canonical_attend(
                 {
                     "max_amendments_per_lane": 1,
-                    "route": CLAUDE_ROUTE,
+                    **ENABLED,
                     "planctl": "scripts/planctl.py",
                 }
             )
@@ -84,6 +91,106 @@ class AttendConfig(unittest.TestCase):
     def test_a_negative_bound_refuses(self) -> None:
         with self.assertRaises(maestro._MaestroConfigurationError):
             maestro._canonical_attend({"max_amendments_per_lane": -1})
+
+    def test_an_enabled_verb_binds_the_reviewer_agent_identity(self) -> None:
+        canonical = maestro._canonical_attend({"max_amendments_per_lane": 1, **ENABLED})
+        policy = maestro._attend_policy({"attend": canonical})
+        # The author's vendor rides beside the route, never inside it: route
+        # admission binds the route mapping.
+        self.assertNotIn("vendor", canonical["route"])
+        self.assertEqual(canonical["vendor"], "vendor-a")
+        self.assertEqual(policy.reviewer_vendor, "vendor-b")
+        self.assertEqual(policy.reviewer_id, "attend-reviewer:omp:profile-b")
+        self.assertNotEqual(policy.reviewer_id, "maestro-attend")
+        self.assertEqual(policy.max_review_rounds, 3)
+
+    def test_enabling_the_verb_without_a_reviewer_refuses(self) -> None:
+        section = {"max_amendments_per_lane": 1, **ENABLED}
+        del section["reviewer_route"]
+        with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+            maestro._canonical_attend(section)
+        self.assertIn("attend.reviewer_route", str(caught.exception))
+
+    def test_a_reviewer_on_the_authors_vendor_is_refused(self) -> None:
+        for reviewer_vendor in ("vendor-a", "  Vendor-A "):
+            with self.subTest(reviewer_vendor=reviewer_vendor):
+                with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+                    maestro._canonical_attend(
+                        {
+                            "max_amendments_per_lane": 1,
+                            **ENABLED,
+                            "reviewer_vendor": reviewer_vendor,
+                        }
+                    )
+                self.assertIn("must differ", str(caught.exception))
+
+    def test_an_undeclared_vendor_on_either_side_is_refused(self) -> None:
+        no_reviewer_vendor = {"max_amendments_per_lane": 1, **ENABLED}
+        del no_reviewer_vendor["reviewer_vendor"]
+        no_author_vendor = {
+            "max_amendments_per_lane": 1, **ENABLED, "route": CLAUDE_ROUTE
+        }
+        for section, key in (
+            (no_reviewer_vendor, "attend.reviewer_vendor"),
+            (no_author_vendor, "attend.route.vendor"),
+        ):
+            with self.subTest(key=key):
+                with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+                    maestro._canonical_attend(section)
+                self.assertIn(key, str(caught.exception))
+
+    def test_a_reviewer_route_is_validated_like_a_lane_route(self) -> None:
+        with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+            maestro._canonical_attend(
+                {
+                    "max_amendments_per_lane": 1,
+                    **ENABLED,
+                    "reviewer_route": {"route": "omp", "profile": "p", "model": "m"},
+                }
+            )
+        self.assertIn("attend.reviewer_route", str(caught.exception))
+
+    def test_zero_review_rounds_cannot_enable_the_verb(self) -> None:
+        with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+            maestro._canonical_attend(
+                {"max_amendments_per_lane": 1, **ENABLED, "max_review_rounds": 0}
+            )
+        self.assertIn("max_review_rounds", str(caught.exception))
+
+    def test_the_removed_self_signing_identity_key_is_refused(self) -> None:
+        # The author used to answer its own review and Maestro signed it as a
+        # configured `reviewer_id`. The reviewer is now an agent, and its
+        # identity is the admitted route, so the key is gone.
+        with self.assertRaises(maestro._MaestroConfigurationError) as caught:
+            maestro._canonical_attend(
+                {"max_amendments_per_lane": 1, **ENABLED, "reviewer_id": "x"}
+            )
+        self.assertIn("unsupported", str(caught.exception))
+
+    def test_the_reviewer_route_is_admitted_by_the_route_receipt(self) -> None:
+        """An unadmitted reviewer route refuses the actor, like the author's."""
+        from unittest import mock
+
+        admitted = mock.Mock()
+        admitted.admits.side_effect = lambda route: route == "claude"
+        layout = {
+            "role_routes": {
+                role: {"route": "claude", "model": "opus", "effort": "high", "profile": ""}
+                for role in maestro.lch.LANE_PANE_ROLES
+            },
+            "route_receipts": {"claude": "/nonexistent"},
+            "route_verify_keys": ("/nonexistent",),
+            "attend": maestro._canonical_attend(
+                {"max_amendments_per_lane": 1, **ENABLED}
+            ),
+        }
+        with mock.patch.object(maestro, "load_public_key"), mock.patch.object(
+            maestro, "load_admitted_routes", return_value=admitted
+        ):
+            with self.assertRaises(maestro.FactoryRefused) as caught:
+                maestro._actor_for(None, layout, None, "run-1", None)
+        self.assertIn("ROUTE_RECEIPTS_REQUIRED", str(caught.exception))
+        self.assertIn(mock.call("omp"), admitted.admits.call_args_list)
 
     def test_the_verb_is_on_the_parser(self) -> None:
         args = maestro.build_parser().parse_args(["run", "attend", "--run", "run-1"])
@@ -147,7 +254,7 @@ class PlanIrResolution(unittest.TestCase):
             maestro._canonical_attend(
                 {
                     "max_amendments_per_lane": 1,
-                    "route": CLAUDE_ROUTE,
+                    **ENABLED,
                     "plan_ir": ".maestro/plans/plan.ir.json",
                 }
             )

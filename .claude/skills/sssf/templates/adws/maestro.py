@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import shutil
 import stat
@@ -121,17 +122,20 @@ class CleanupRefused(RuntimeError):
 
 
 _ROLE_ROUTE_FIELDS = frozenset(("route", "model", "effort", "profile"))
+#: The independent reviewer `run attend` dispatches beside its operator.
+_ATTEND_REVIEWER_ROLE = "attend-reviewer"
 _DASHBOARD_FIELDS = frozenset(("enabled", "launcher", "api_port", "ui_port", "open"))
 _ATTEND_FIELDS = frozenset(
     (
         "max_amendments_per_lane",
         "max_amendments_per_run",
+        "max_review_rounds",
         "route",
+        "reviewer_route",
+        "reviewer_vendor",
         "planctl",
         "plan_ir",
         "validate_argv",
-        "reviewer_id",
-        "reviewer_vendor",
     )
 )
 
@@ -234,11 +238,11 @@ def _without_vendor(binding: object) -> object:
 def _canonical_role_vendors(value: object) -> Mapping[str, str | None]:
     """Operator-declared vendor per lane role. Absent is None.
 
-    Declared only on the five lane roles, never on `attend.route`. Normalized
-    (strip, casefold) because `probes.select_acceptor` compares them; a probe
-    acceptor is independent of the code reviewer only when both vendors are
-    declared and differ, so a route, profile or model difference is not read
-    as one.
+    Normalized (strip, casefold) because `probes.select_acceptor` compares
+    them; a probe acceptor is independent of the code reviewer only when both
+    vendors are declared and differ, so a route, profile or model difference
+    is not read as one. `attend.route.vendor` and `attend.reviewer_vendor`
+    are read by `_declared_vendor` under the same rule.
     """
     if not isinstance(value, Mapping):
         raise _MaestroConfigurationError("role_routes must be a mapping")
@@ -246,15 +250,20 @@ def _canonical_role_vendors(value: object) -> Mapping[str, str | None]:
     for role in lch.LANE_PANE_ROLES:
         binding = value.get(role)
         declared = binding.get("vendor") if isinstance(binding, Mapping) else None
-        if declared is None:
-            vendors[role] = None
-            continue
-        label = "role_routes.{}.vendor".format(role)
-        text = _optional_config_string(declared, label).casefold()
-        if not text:
-            raise _MaestroConfigurationError(label + " must not be blank")
-        vendors[role] = text
+        vendors[role] = _declared_vendor(
+            declared, "role_routes.{}.vendor".format(role)
+        )
     return MappingProxyType(vendors)
+
+
+def _declared_vendor(declared: object, label: str) -> str | None:
+    """One declared vendor, normalized (strip, casefold). Absent is None."""
+    if declared is None:
+        return None
+    text = _optional_config_string(declared, label).casefold()
+    if not text:
+        raise _MaestroConfigurationError(label + " must not be blank")
+    return text
 
 
 def _canonical_role_route(value: object, label: str) -> Mapping[str, str]:
@@ -310,19 +319,28 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
     `max_amendments_per_lane` defaults to 0, and 0 is what `run attend` refuses
     on. That default is the whole opt-in: an upgraded deployment keeps parking
     for its operator until someone sets the key in *that* deployment's config,
-    the same way `concurrency` stays 1 until someone raises it. The route is
+    the same way `concurrency` stays 1 until someone raises it. The routes are
     validated here rather than in `attend.py`, which must not name a route.
+
+    An enabled deployment declares two agents: the author on `attend.route`
+    and an independent reviewer on `attend.reviewer_route`. Independence is
+    the probe rule: both vendors declared (`attend.route.vendor`,
+    `attend.reviewer_vendor`) and different. A route, profile or model
+    difference is not read as one, and an undeclared vendor is not
+    independent of anything.
     """
     if value is None:
         return MappingProxyType(
             {
                 "max_amendments_per_lane": 0,
                 "max_amendments_per_run": 10,
+                "max_review_rounds": 3,
                 "route": MappingProxyType({}),
+                "vendor": None,
+                "reviewer_route": MappingProxyType({}),
+                "reviewer_vendor": None,
                 "planctl": None,
                 "validate_argv": (),
-                "reviewer_id": "maestro-attend",
-                "reviewer_vendor": "maestro",
             }
         )
     if not isinstance(value, Mapping):
@@ -338,11 +356,50 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
     per_run = _config_bound(
         value.get("max_amendments_per_run"), "attend.max_amendments_per_run", 10
     )
-    route = _canonical_role_route(value.get("route"), "attend.route")
+    raw_route = value.get("route")
+    route = _canonical_role_route(_without_vendor(raw_route), "attend.route")
+    vendor = _declared_vendor(
+        raw_route.get("vendor") if isinstance(raw_route, Mapping) else None,
+        "attend.route.vendor",
+    )
+    reviewer_route = _canonical_role_route(
+        value.get("reviewer_route"), "attend.reviewer_route"
+    )
+    reviewer_vendor = _declared_vendor(
+        value.get("reviewer_vendor"), "attend.reviewer_vendor"
+    )
+    review_rounds = _config_bound(
+        value.get("max_review_rounds"), "attend.max_review_rounds", 3
+    )
     if per_lane > 0 and not route:
         raise _MaestroConfigurationError(
             "attend.route is required once attend.max_amendments_per_lane is set"
         )
+    if per_lane > 0 and not reviewer_route:
+        raise _MaestroConfigurationError(
+            "attend.reviewer_route is required once "
+            "attend.max_amendments_per_lane is set"
+        )
+    if per_lane > 0 and review_rounds < 1:
+        raise _MaestroConfigurationError(
+            "attend.max_review_rounds must be >= 1 once "
+            "attend.max_amendments_per_lane is set"
+        )
+    if reviewer_route:
+        if reviewer_vendor is None:
+            raise _MaestroConfigurationError(
+                "attend.reviewer_vendor is required once attend.reviewer_route is set"
+            )
+        if vendor is None:
+            raise _MaestroConfigurationError(
+                "attend.route.vendor is required once attend.reviewer_route is "
+                "set: an undeclared author vendor is not independent of the "
+                "reviewer"
+            )
+        if vendor == reviewer_vendor:
+            raise _MaestroConfigurationError(
+                "attend.reviewer_vendor must differ from attend.route.vendor"
+            )
     planctl = _optional_config_string(value.get("planctl"), "attend.planctl")
     if planctl and not Path(planctl).is_absolute():
         raise _MaestroConfigurationError("attend.planctl must be absolute")
@@ -353,7 +410,11 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
         {
             "max_amendments_per_lane": per_lane,
             "max_amendments_per_run": per_run,
+            "max_review_rounds": review_rounds,
             "route": route,
+            "vendor": vendor,
+            "reviewer_route": reviewer_route,
+            "reviewer_vendor": reviewer_vendor,
             "planctl": Path(planctl) if planctl else None,
             "plan_ir": Path(plan_ir) if plan_ir else None,
             "validate_argv": _config_argv(
@@ -361,14 +422,6 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
             )
             if value.get("validate_argv") is not None
             else (),
-            "reviewer_id": _optional_config_string(
-                value.get("reviewer_id"), "attend.reviewer_id"
-            )
-            or "maestro-attend",
-            "reviewer_vendor": _optional_config_string(
-                value.get("reviewer_vendor"), "attend.reviewer_vendor"
-            )
-            or "maestro",
         }
     )
 
@@ -769,6 +822,7 @@ class HerdrStageActor:
         lane_specs: Mapping[str, Mapping[str, Any]] | None = None,
         operator_route: Mapping[str, str] | None = None,
         role_vendors: Mapping[str, str | None] | None = None,
+        attend_reviewer_route: Mapping[str, str] | None = None,
     ) -> None:
         self.launcher = launcher
         self.state_root = Path(state_root)
@@ -782,6 +836,10 @@ class HerdrStageActor:
         routes = dict(_canonical_role_routes(role_routes))
         if operator_route:
             routes["operator"] = MappingProxyType(dict(operator_route))
+        if attend_reviewer_route:
+            routes[_ATTEND_REVIEWER_ROLE] = MappingProxyType(
+                dict(attend_reviewer_route)
+            )
         self.role_routes = MappingProxyType(routes)
         # Beside the routes, never inside them: `routes` is what route
         # admission binds, and the declared vendor only decides whether a
@@ -1007,7 +1065,16 @@ class HerdrStageActor:
         if role == "operator":
             return {
                 "revision_path": "<revision_out_path, exactly as given>",
-                "rationale": {key: "<{0}>".format(key) for key in att.RATIONALE_KEYS},
+                "rationales": [
+                    {key: "<{0}>".format(key) for key in att.RATIONALE_KEYS}
+                ],
+            }
+        if role == _ATTEND_REVIEWER_ROLE:
+            return {
+                "verdict": "PASS|REVISE",
+                "findings": [
+                    {key: "<{0}>".format(key) for key in att.REVIEW_FINDING_KEYS}
+                ],
             }
         return {
             "verdict": "PASS|REVISE",
@@ -1202,28 +1269,55 @@ class HerdrStageActor:
             "operator": (
                 "## Operator obligations\n"
                 "You are authoring a plan revision, not implementing a lane. "
-                "A lane has parked because its reviewed rounds stopped moving "
-                "against the contract it was given; your job is to name the "
-                "gap between what the accepted suite asserts and what the "
-                "contract says, and to close it with the smallest edit that "
-                "reaches this lane's projection -- normally one seam contract "
-                "on the lane's own carrier.\n"
-                "The accepted acceptance suite is in this checkout under "
-                "`suite/`; the builder and every reviewer read the same files "
-                "in their own checkouts. Stating an expectation the suite "
-                "asserts, as a contract clause in your own words, is exactly "
-                "what you are here to do; pasting the test file into the "
-                "contract is not.\n"
+                "Every lane in `parked_lanes` is waiting on you, and one "
+                "revision answers all of them. A `NO_PROGRESS` lane parked "
+                "because its reviewed rounds stopped moving against the "
+                "contract it was given; an `AMENDMENT_REQUIRED` lane parked "
+                "because the final integration review named it, and its "
+                "findings are in that lane's `final_review.json`. For each, "
+                "name the gap between what the accepted suite (or the final "
+                "review) says and what the contract says, and close it with "
+                "the smallest edit that reaches that lane's projection -- "
+                "normally one seam contract on the lane's own carrier. An "
+                "`AMENDMENT_REQUIRED` lane's spec must change, or the "
+                "amendment is refused.\n"
+                "Each lane's accepted acceptance suite is in this checkout "
+                "under `suite/<lane_id>/`; the builder and every reviewer read "
+                "the same files in their own checkouts. Stating an expectation "
+                "the suite asserts, as a contract clause in your own words, is "
+                "exactly what you are here to do; pasting the test file into "
+                "the contract is not.\n"
                 "Write the revision IR at the path the per-turn JSON names, "
                 "and nowhere else. Do not edit the current IR in place. Do not "
-                "run any `maestro` verb, any git command, or `planctl` -- the "
-                "harness validates, mints the receipt, projects, and applies. "
+                "run any `maestro` verb, any git command, or `planctl` -- an "
+                "independent reviewer reads your revision, and the harness "
+                "validates, mints the receipt, projects, and applies. "
                 "Do not add, remove, or rewire a lane: an edit that reaches "
-                "any lane outside allowed_lane_ids is refused whole, and the "
-                "lane you were called for gets nothing.\n"
-                "Return the rationale in the envelope. `contract_gap` must "
-                "name the clause that was missing or wrong, not restate that "
-                "the lane failed."
+                "any lane outside allowed_lane_ids is refused whole, and no "
+                "lane gets anything.\n"
+                "When `reviewer_findings_path` is given, the reviewer said "
+                "REVISE to your previous revision (`previous_revision_path`): "
+                "fix every located finding in it.\n"
+                "Return one rationale per parked lane in the envelope. "
+                "`contract_gap` must name the clause that was missing or "
+                "wrong, not restate that the lane failed."
+            ),
+            _ATTEND_REVIEWER_ROLE: (
+                "## Attended-amendment reviewer obligations\n"
+                "You are the independent reviewer of a plan revision another "
+                "agent authored to clear parked lanes. You did not write it "
+                "and you do not edit it. Read the revision against the "
+                "current IR it revises, the planctl question surface of the "
+                "revision, the author's rationales, and each parked lane's "
+                "evidence under `lanes/<lane_id>/` and `suite/<lane_id>/`.\n"
+                "Return REVISE when the revision does not close each parked "
+                "lane's gap, weakens a check, verdict or error path, reaches "
+                "a lane outside allowed_lane_ids, or leaves a two-"
+                "implementations pair or interface defect unresolved. Every "
+                "REVISE finding names its `location` (a JSON pointer into the "
+                "revision IR), the `defect`, and the `required_change`. PASS "
+                "requires findings=[].\n"
+                "Do not run any `maestro` verb, any git command, or `planctl`."
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
@@ -1581,16 +1675,29 @@ class HerdrStageActor:
                 )
         elif role == "operator":
             instructions += (
-                " Read current_ir_path, the accepted suite under suite/, the "
-                "lane gate table, and the reviews. Write the revised IR at "
-                "revision_out_path and return that exact path plus the "
-                "rationale. Change only lanes in allowed_lane_ids. Run no "
-                "maestro verb, no git command, and no planctl. A tests lane "
-                "stalled on an undeclared binding is repaired by declaring "
-                "extensions.maestro.interfaces entries for the paired build "
-                "lane, naming each module, export and signature the suite "
-                "may call. "
+                " Read current_ir_path and, for every lane in parked_lanes, "
+                "its accepted suite under suite/<lane_id>/ and its gate "
+                "table, reviews and final review under lanes/<lane_id>/. "
+                "Write one revised IR answering every parked lane at "
+                "revision_out_path and return that exact path plus one "
+                "rationale per parked lane. Change only lanes in "
+                "allowed_lane_ids. Run no maestro verb, no git command, and "
+                "no planctl. A tests lane stalled on an undeclared binding is "
+                "repaired by declaring extensions.maestro.interfaces entries "
+                "for the paired build lane, naming each module, export and "
+                "signature the suite may call. For every claim a tests lane "
+                "discharges, make sure no two implementations can satisfy "
+                "every decided_by example and the observation_seam yet differ "
+                "observably: the independent reviewer asks exactly that."
+            )
+        elif role == _ATTEND_REVIEWER_ROLE:
+            instructions += (
+                " Read current_ir_path, revision_ir_path, question_surface_path, "
+                "rationales_path, and for every lane in parked_lanes its "
+                "evidence under lanes/<lane_id>/ and suite/<lane_id>/. "
                 + att.TWO_IMPLEMENTATIONS_QUESTION
+                + " Then return verdict PASS or REVISE; REVISE carries at "
+                "least one finding with location, defect and required_change."
             )
         if mandate:
             instructions += self._probe_instruction(extra)
@@ -1961,7 +2068,12 @@ class HerdrStageActor:
         return [str(item) for item in lines if str(item).strip()]
 
     def _payload_ok(self, role: str, payload: Mapping[str, Any]) -> bool:
-        if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
+        if role in (
+            "test-reviewer",
+            "code-reviewer",
+            "integration-reviewer",
+            _ATTEND_REVIEWER_ROLE,
+        ):
             return payload.get("verdict") in (
                 st.ReviewerVerdict.PASS.value,
                 st.ReviewerVerdict.REVISE.value,
@@ -2811,21 +2923,28 @@ class HerdrStageActor:
         verdict, findings = self._review_payload(payload)
         return verdict, findings, tuple(payload.get("affected_lanes") or ())
 
-    #: Files the operator agent's tree carries, relative to its CWD.
+    #: Files the operator's and the attend reviewer's trees carry, relative
+    #: to their CWD.
     _OPERATOR_INPUTS = "inputs"
     _OPERATOR_SUITE = "suite"
     _OPERATOR_OUT = "revisions"
+    _ATTEND_REVIEWER = _ATTEND_REVIEWER_ROLE
 
-    def _write_operator_tree(
-        self, cwd: Path, request: att.OperatorRequest
+    def _write_attend_tree(
+        self,
+        cwd: Path,
+        lanes: Sequence[att.LaneEvidence],
+        files: Mapping[str, bytes],
     ) -> None:
-        """Materialize everything the operator agent reads, on every dispatch.
+        """Materialize everything an attend agent reads, on every dispatch.
 
-        On disk rather than in the prompt: the accepted suite and four rounds of
-        findings are the bulk of this handoff, and B13's size check is made
-        against the route's window at launch. A prompt that carries them is a
-        prompt that can overflow, and an overflowing agent answers about a
-        different lane.
+        On disk rather than in the prompt: the accepted suites and four rounds
+        of findings per lane are the bulk of this handoff, and B13's size
+        check is made against the route's window at launch. A prompt that
+        carries them is a prompt that can overflow, and an overflowing agent
+        answers about a different lane. Each lane's evidence sits under its
+        own `lanes/<lane_id>/` and `suite/<lane_id>/` so one batch can carry
+        every parked lane without their files colliding.
         """
         inputs = cwd / self._OPERATOR_INPUTS
         suite = cwd / self._OPERATOR_SUITE
@@ -2833,28 +2952,53 @@ class HerdrStageActor:
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
-        (inputs / "current.ir.json").write_bytes(Path(request.ir_path).read_bytes())
-        (inputs / "lane_gates.txt").write_text(request.lane_gates, encoding="utf-8")
-        (inputs / "amendment_rules.md").write_text(
-            request.amendment_rules, encoding="utf-8"
-        )
-        (inputs / "reviews.json").write_text(
-            json.dumps(
-                {
-                    "public_contract": st.json_ready(request.public_contract),
-                    "failure_output": list(request.failure_output),
-                    "reviews": [st.json_ready(row) for row in request.reviews],
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        for relative, text in sorted(request.suite_files.items()):
-            destination = _resolved_under(suite, relative)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
+        for name, data in sorted(files.items()):
+            (inputs / name).write_bytes(data)
+        for lane in lanes:
+            lane_dir = _resolved_under(inputs / "lanes", lane.lane_id)
+            lane_dir.mkdir(parents=True, exist_ok=True)
+            (lane_dir / "lane_gates.txt").write_text(lane.lane_gates, encoding="utf-8")
+            (lane_dir / "reviews.json").write_text(
+                json.dumps(
+                    {
+                        "public_contract": st.json_ready(lane.public_contract),
+                        "failure_output": list(lane.failure_output),
+                        "reviews": [st.json_ready(row) for row in lane.reviews],
+                        "round": lane.round_number,
+                        "stage": lane.stage,
+                        "wait_reason": lane.wait_reason,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            (lane_dir / "final_review.json").write_text(
+                json.dumps(st.json_ready(lane.final_review), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            lane_suite = _resolved_under(suite, lane.lane_id)
+            for relative, text in sorted(lane.suite_files.items()):
+                destination = _resolved_under(lane_suite, relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(text, encoding="utf-8")
         lch.scratch_environment(cwd)
+
+    def _attend_lanes_extra(
+        self, cwd: Path, lanes: Sequence[att.LaneEvidence]
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "lane_id": lane.lane_id,
+                "wait_reason": lane.wait_reason,
+                "evidence_dir": str(
+                    (cwd / self._OPERATOR_INPUTS / "lanes" / lane.lane_id).resolve()
+                ),
+                "suite_dir": str((cwd / self._OPERATOR_SUITE / lane.lane_id).resolve()),
+                "suite_files": sorted(lane.suite_files),
+            }
+            for lane in lanes
+        ]
 
     def attend_operator(
         self, ctx: LaneContext, request: att.OperatorRequest
@@ -2869,36 +3013,93 @@ class HerdrStageActor:
         attempt = self._role_dir(ctx, "operator")
         cwd = attempt / "checkout"
         cwd.mkdir(parents=True, exist_ok=True)
-        extra = {
-            "allowed_lane_ids": list(request.allowed_lane_ids),
-            "amendment_rules_path": str(
-                (cwd / self._OPERATOR_INPUTS / "amendment_rules.md").resolve()
-            ),
-            "current_ir_path": str(
-                (cwd / self._OPERATOR_INPUTS / "current.ir.json").resolve()
-            ),
-            "lane_gates_path": str(
-                (cwd / self._OPERATOR_INPUTS / "lane_gates.txt").resolve()
-            ),
-            "next_plan_revision": request.next_plan_revision,
-            "parked_stage": request.stage,
-            "reviews_path": str(
-                (cwd / self._OPERATOR_INPUTS / "reviews.json").resolve()
-            ),
-            "revision_out_path": request.revision_out_path,
-            "review_findings_out_path": str(
-                att.findings_path_for(Path(request.revision_out_path))
-            ),
-            "round": request.round_number,
-            "suite_dir": str((cwd / self._OPERATOR_SUITE).resolve()),
-            "suite_files": sorted(request.suite_files),
+        inputs = cwd / self._OPERATOR_INPUTS
+        files = {
+            "current.ir.json": Path(request.ir_path).read_bytes(),
+            "amendment_rules.md": request.amendment_rules.encode("utf-8"),
         }
-        payload, _handle, cwd_used = self._launch(
+        extra: dict[str, Any] = {
+            "allowed_lane_ids": list(request.allowed_lane_ids),
+            "amendment_rules_path": str((inputs / "amendment_rules.md").resolve()),
+            "current_ir_path": str((inputs / "current.ir.json").resolve()),
+            "next_plan_revision": request.next_plan_revision,
+            "parked_lanes": self._attend_lanes_extra(cwd, request.lanes),
+            "revision_out_path": request.revision_out_path,
+            "review_round": request.review_round,
+        }
+        if request.reviewer_findings:
+            files["reviewer_findings.json"] = json.dumps(
+                {"findings": [dict(item) for item in request.reviewer_findings]},
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            extra["reviewer_findings_path"] = str(
+                (inputs / "reviewer_findings.json").resolve()
+            )
+        if request.previous_revision_path:
+            files["previous_revision.ir.json"] = Path(
+                request.previous_revision_path
+            ).read_bytes()
+            extra["previous_revision_path"] = str(
+                (inputs / "previous_revision.ir.json").resolve()
+            )
+        payload, _handle, _cwd_used = self._launch(
             ctx,
             "operator",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._write_operator_tree(path, request),
+            prepare_cwd=lambda path: self._write_attend_tree(
+                path, request.lanes, files
+            ),
+        )
+        return payload
+
+    def attend_reviewer(
+        self, ctx: LaneContext, request: att.ReviewRequest
+    ) -> Mapping[str, Any]:
+        """Dispatch the independent reviewer of an attended revision.
+
+        Beside `attend_operator` and shaped the same way: a non-git tree, its
+        inputs as files, one path to write (`findings_out_path`, the answer to
+        the independent review question that `planctl review` signs). It is a
+        different agent on a different declared vendor, so the author never
+        answers its own review.
+        """
+        attempt = self._role_dir(ctx, _ATTEND_REVIEWER_ROLE)
+        cwd = attempt / "checkout"
+        cwd.mkdir(parents=True, exist_ok=True)
+        inputs = cwd / self._OPERATOR_INPUTS
+        files = {
+            "current.ir.json": Path(request.current_ir_path).read_bytes(),
+            "revision.ir.json": Path(request.revision_ir_path).read_bytes(),
+            "question_surface.json": request.question_surface.encode("utf-8"),
+            "rationales.json": json.dumps(
+                {"rationales": [dict(item) for item in request.rationales]},
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8"),
+            "amendment_rules.md": request.amendment_rules.encode("utf-8"),
+        }
+        extra = {
+            "allowed_lane_ids": list(request.allowed_lane_ids),
+            "amendment_rules_path": str((inputs / "amendment_rules.md").resolve()),
+            "current_ir_path": str((inputs / "current.ir.json").resolve()),
+            "findings_out_path": request.findings_out_path,
+            "next_plan_revision": request.next_plan_revision,
+            "parked_lanes": self._attend_lanes_extra(cwd, request.lanes),
+            "question_surface_path": str((inputs / "question_surface.json").resolve()),
+            "rationales_path": str((inputs / "rationales.json").resolve()),
+            "review_round": request.review_round,
+            "revision_ir_path": str((inputs / "revision.ir.json").resolve()),
+        }
+        payload, _handle, _cwd_used = self._launch(
+            ctx,
+            _ATTEND_REVIEWER_ROLE,
+            cwd,
+            extra,
+            prepare_cwd=lambda path: self._write_attend_tree(
+                path, request.lanes, files
+            ),
         )
         return payload
 
@@ -3079,12 +3280,17 @@ def _actor_for(
         {str(name): Path(path) for name, path in receipts.items()},
         verify_keys=keys,
     )
-    attend_route = (layout.get("attend") or {}).get("route") or {}
-    # The operator agent is dispatched through the same launcher as every
-    # other role, so its route is admitted by the same executed receipt. A
-    # deployment cannot opt into `run attend` on a route it never captured.
+    attend = layout.get("attend") or {}
+    attend_route = attend.get("route") or {}
+    reviewer_route = attend.get("reviewer_route") or {}
+    # The operator and its reviewer are dispatched through the same launcher
+    # as every other role, so their routes are admitted by the same executed
+    # receipt. A deployment cannot opt into `run attend` on a route it never
+    # captured.
     configured_routes = {binding["route"] for binding in role_routes.values()} | {
-        binding for binding in (attend_route.get("route"),) if binding
+        binding
+        for binding in (attend_route.get("route"), reviewer_route.get("route"))
+        if binding
     }
     if not all(admitted.admits(route) for route in configured_routes):
         raise FactoryRefused("ROUTE_RECEIPTS_REQUIRED")
@@ -3111,6 +3317,7 @@ def _actor_for(
         role_routes,
         lane_specs=lane_specs,
         operator_route=attend_route or None,
+        attend_reviewer_route=reviewer_route or None,
         role_vendors=layout.get("role_vendors"),
     )
 
@@ -3736,17 +3943,37 @@ ATTEND_AMENDMENT_RULES = """# Amendment rules (from docs/plan-authoring.md)
 """
 
 
+def _attend_reviewer_id(route: Mapping[str, str]) -> str:
+    """The attend reviewer's identity, read off the route admission bound.
+
+    Not a name the agent gives itself -- an agent's claim about who it is is
+    prose. The route, and its profile or model, is what the executed route
+    receipt admitted and what the launcher dispatched. Shaped to planctl's
+    identifier rule (`[A-Za-z][A-Za-z0-9._:-]*`), which `planctl review`
+    refuses a reviewer id outside of.
+    """
+    if not route:
+        return ""
+    raw = "attend-reviewer:{0}:{1}".format(
+        route.get("route"), route.get("profile") or route.get("model")
+    )
+    return re.sub(r"[^A-Za-z0-9._:-]", "-", raw)
+
+
 def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
     raw = layout.get("attend") or {}
+    reviewer_route = raw.get("reviewer_route") or {}
     return att.AttendPolicy(
         max_amendments_per_lane=int(raw.get("max_amendments_per_lane") or 0),
         max_amendments_per_run=int(raw.get("max_amendments_per_run") or 0),
+        max_review_rounds=int(raw.get("max_review_rounds") or 3),
         route=raw.get("route") or {},
+        reviewer_route=reviewer_route,
         planctl=raw.get("planctl"),
         plan_ir=raw.get("plan_ir"),
         validate_argv=tuple(raw.get("validate_argv") or ()),
-        reviewer_id=str(raw.get("reviewer_id") or "maestro-attend"),
-        reviewer_vendor=str(raw.get("reviewer_vendor") or "maestro"),
+        reviewer_id=_attend_reviewer_id(reviewer_route),
+        reviewer_vendor=str(raw.get("reviewer_vendor") or ""),
     )
 
 
@@ -3895,17 +4122,37 @@ def _attend_plan_ir(
     )
 
 
-def _attend_request(
+def _attend_final_review(
+    store: ArtifactStore, run_id: str, wait: Mapping[str, Any] | None
+) -> Mapping[str, Any]:
+    """The final integration review an `AMENDMENT_REQUIRED` park answers.
+
+    Read by the artifact id the lane's own `USER_WAIT` names, so the author
+    and reviewer see the review that parked this lane and no other.
+    """
+    if not isinstance(wait, Mapping):
+        return {}
+    if wait.get("wait_reason") != st.WaitReason.AMENDMENT_REQUIRED.value:
+        return {}
+    artifact_id = wait.get("final_review_artifact_id")
+    for row in store.run_artifacts_of_kind(
+        run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW
+    ):
+        if row["artifact_id"] == artifact_id:
+            return dict(row["payload"])
+    return {}
+
+
+def _attend_lane_evidence(
     store: ArtifactStore,
     runtime: RuntimeStateRoot,
     layout: Mapping[str, Any],
     run_id: str,
     lane_id: str,
+    wait_reason: str,
     compiled: st.CompiledPlan,
-    ir_path: Path,
-    operator_cwd: Path,
-) -> att.OperatorRequest:
-    """Everything the operator agent reads, assembled from the ledger."""
+) -> att.LaneEvidence:
+    """What one parked lane contributes to a batch, assembled from the ledger."""
     lane = next(item for item in compiled.lanes if item.lane_id == lane_id)
     stage = store.lane_stage(run_id, lane_id)
     repo = Path(str(store._run(run_id)["target_repository_root"]))
@@ -3927,14 +4174,14 @@ def _attend_request(
         raw = latest_review.get("failure_output")
         if isinstance(raw, Sequence) and not isinstance(raw, str):
             failures = tuple(str(item) for item in raw)
-    next_revision = compiled.plan_revision + 1
-    return att.OperatorRequest(
-        run_id=run_id,
+    wait = store.latest_lane_artifact_payload(
+        run_id, lane_id, st.ArtifactKind.USER_WAIT
+    )
+    return att.LaneEvidence(
         lane_id=lane_id,
+        wait_reason=wait_reason,
         stage=stage.value,
         round_number=len(reviews),
-        plan_revision=compiled.plan_revision,
-        next_plan_revision=next_revision,
         public_contract=contract,
         reviews=tuple(reviews),
         failure_output=failures,
@@ -3944,15 +4191,167 @@ def _attend_request(
             lane_id,
             bool(layout.get("stall_regression_on_findings")),
         ),
+        suite_files=_attend_suite_files(store, repo, run_id, lane),
+        final_review=_attend_final_review(store, run_id, wait),
+    )
+
+
+def _attend_request(
+    store: ArtifactStore,
+    runtime: RuntimeStateRoot,
+    layout: Mapping[str, Any],
+    run_id: str,
+    parked: Sequence[tuple[str, str]],
+    compiled: st.CompiledPlan,
+    ir_path: Path,
+    operator_cwd: Path,
+    review_round: int = 1,
+    reviewer_findings: Sequence[Mapping[str, Any]] = (),
+    previous_revision: str = "",
+) -> att.OperatorRequest:
+    """Everything the operator agent reads for one batch, from the ledger."""
+    next_revision = compiled.plan_revision + 1
+    return att.OperatorRequest(
+        run_id=run_id,
+        plan_revision=compiled.plan_revision,
+        next_plan_revision=next_revision,
+        lanes=tuple(
+            _attend_lane_evidence(
+                store, runtime, layout, run_id, lane_id, reason, compiled
+            )
+            for lane_id, reason in parked
+        ),
         ir_path=str(ir_path),
         revision_out_path=str(
             operator_cwd
             / HerdrStageActor._OPERATOR_OUT
             / "r{0}.ir.json".format(next_revision)
         ),
-        suite_files=_attend_suite_files(store, repo, run_id, lane),
         amendment_rules=ATTEND_AMENDMENT_RULES,
-        allowed_lane_ids=att.paired_lane_ids(compiled.lanes, lane_id),
+        allowed_lane_ids=att.batch_scope(compiled.lanes, parked),
+        review_round=review_round,
+        reviewer_findings=tuple(reviewer_findings),
+        previous_revision_path=previous_revision,
+    )
+
+
+def _attend_review_request(
+    policy: att.AttendPolicy,
+    request: att.OperatorRequest,
+    revision: Path,
+    rationales: Sequence[Mapping[str, Any]],
+    review_round: int,
+    reviewer_cwd: Path,
+) -> att.ReviewRequest:
+    """Everything the attend reviewer reads for one round.
+
+    The question surface is planctl's own rendering of the revision, the
+    same bytes `planctl review` binds the reviewer's findings to.
+    """
+    surface = _run_planctl(
+        _planctl_binary(policy), ["question-surface", str(revision), "--json"]
+    )
+    return att.ReviewRequest(
+        run_id=request.run_id,
+        plan_revision=request.plan_revision,
+        next_plan_revision=request.next_plan_revision,
+        review_round=review_round,
+        lanes=request.lanes,
+        current_ir_path=request.ir_path,
+        revision_ir_path=str(revision),
+        question_surface=surface,
+        rationales=tuple(rationales),
+        findings_out_path=str(
+            reviewer_cwd
+            / HerdrStageActor._OPERATOR_OUT
+            / "r{0}.round{1}.review-findings.json".format(
+                request.next_plan_revision, review_round
+            )
+        ),
+        amendment_rules=request.amendment_rules,
+        allowed_lane_ids=request.allowed_lane_ids,
+    )
+
+
+def _attend_file_issue(repo: Path, title: str, body: str) -> dict[str, str]:
+    """File one GitHub issue in the run's repository, deduplicated by title.
+
+    `gh issue list --search` is a fuzzy search, so a hit counts only when its
+    title is exactly this one. Any `gh` failure is reported, never raised:
+    the amendment is already applied, and an issue that could not be filed
+    must not undo it.
+    """
+
+    def gh(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["gh", *argv],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def failed(result: subprocess.CompletedProcess) -> dict[str, str]:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        return {
+            "status": att.ISSUE_FAILED,
+            "detail": lines[0] if lines else "gh exited {0}".format(result.returncode),
+        }
+
+    try:
+        listed = gh(
+            [
+                "issue", "list", "--state", "open", "--search", title,
+                "--json", "title,url",
+            ]
+        )
+        if listed.returncode != 0:
+            return failed(listed)
+        for item in json.loads(listed.stdout or "[]"):
+            if isinstance(item, Mapping) and item.get("title") == title:
+                return {"status": att.ISSUE_EXISTS, "url": str(item.get("url") or "")}
+        created = gh(["issue", "create", "--title", title, "--body", body])
+    except (OSError, ValueError) as exc:
+        return {"status": att.ISSUE_FAILED, "detail": "{0}: {1}".format(type(exc).__name__, exc)}
+    if created.returncode != 0:
+        return failed(created)
+    return {"status": att.ISSUE_CREATED, "url": (created.stdout or "").strip()}
+
+
+def _write_review_findings(
+    binary: Path,
+    ir: Path,
+    out: Path,
+    policy: att.AttendPolicy,
+    review_findings: Sequence[Any],
+) -> None:
+    """Bind the reviewer's findings to the revision and to the reviewer.
+
+    planctl refuses a findings file whose plan id, question surface or
+    reviewer does not match what it is signing, so a stale or foreign answer
+    cannot ride on a later revision.
+    """
+    try:
+        surface = json.loads(
+            _run_planctl(binary, ["question-surface", str(ir), "--json"])
+        )
+    except ValueError as exc:
+        raise att.AttendRefused(
+            att.REVISION_REFUSED, "question surface: {0}".format(exc)
+        ) from exc
+    out.write_text(
+        json.dumps(
+            {
+                "schema_version": "plan-contract-review-findings.v2",
+                "plan_id": surface.get("plan_id"),
+                "question_surface_sha256": surface.get("question_surface_sha256"),
+                "reviewer_id": policy.reviewer_id,
+                "reviewer_vendor": policy.reviewer_vendor,
+                "findings": list(review_findings),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -3964,15 +4363,25 @@ def _attend_project(
     run_id: str,
     revision_ir: Path,
     revision: int,
+    review_findings: Sequence[Any],
 ) -> tuple[st.CompiledPlan, Path]:
-    """Validate, approve, project and compile one authored revision.
+    """Validate, approve, project and compile one reviewed revision.
 
-    The same four steps the human ran by hand on FDAdb `d246ae95`, in the same
+    The same four steps the human ran by hand on an earlier run, in the same
     order and against the same binary. The IR is copied under the repository
     first because `planctl --repo-root` refuses an IR outside the root it is
     told to resolve sources against, and because a revision that is applied
     has to survive the operator agent's scratch tree.
+
+    `review_findings` is the independent reviewer agent's answer to the
+    review question, and only the reviewer's: the author never answers its
+    own review. `planctl review` signs as that reviewer.
     """
+    if not policy.reviewer_id or not policy.reviewer_vendor:
+        raise att.AttendRefused(
+            att.REVIEWER_UNCONFIGURED,
+            "attend.reviewer_route and attend.reviewer_vendor name no reviewer",
+        )
     binary = _planctl_binary(policy)
     key = _reviewer_hmac_key(layout)
     plans_dir.mkdir(parents=True, exist_ok=True)
@@ -3986,37 +4395,8 @@ def _attend_project(
         if stale.exists():
             stale.unlink()
     shutil.copyfile(revision_ir, ir)
-    # The operator's two-implementations answer. Absent, planctl refuses
-    # `review.findings_missing` and the revision is refused by exit status.
     root = ["--repo-root", str(repo)]
-    authored_findings = att.findings_path_for(revision_ir)
-    if authored_findings.is_file():
-        # The operator answers the question; Maestro binds the answer to the
-        # revision it reviews and to the reviewer that signs it, so planctl can
-        # refuse a stale or foreign findings file.
-        try:
-            answered = json.loads(authored_findings.read_text(encoding="utf-8"))
-            surface = json.loads(
-                _run_planctl(binary, ["question-surface", str(ir), "--json"])
-            )
-        except (OSError, ValueError) as exc:
-            raise att.AttendRefused(
-                att.REVISION_REFUSED, "review findings: {0}".format(exc)
-            ) from exc
-        findings.write_text(
-            json.dumps(
-                {
-                    "schema_version": "plan-contract-review-findings.v2",
-                    "plan_id": surface.get("plan_id"),
-                    "question_surface_sha256": surface.get("question_surface_sha256"),
-                    "reviewer_id": policy.reviewer_id,
-                    "reviewer_vendor": policy.reviewer_vendor,
-                    "findings": answered.get("findings") if isinstance(answered, dict) else None,
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+    _write_review_findings(binary, ir, findings, policy, review_findings)
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
         binary,
@@ -4050,6 +4430,10 @@ def _attend_project(
             *root,
             *policy.validate_argv,
         ],
+        # `--require-approved` verifies the receipt's HMAC, so validate needs
+        # the same key review signed with; without it planctl refuses
+        # `receipt.key_missing` on every revision.
+        key=key,
     )
     try:
         ingress.author_from_plan_contract(
@@ -4068,15 +4452,16 @@ def _attend_project(
 
 
 def _run_attend(args: argparse.Namespace) -> int:
-    """Run the factory and author the amendment a NO_PROGRESS park needs.
+    """Run the factory and author the amendment its attendable parks need.
 
     Everything about a lane's lifecycle is unchanged. This verb runs the same
-    scheduler `run resume` runs, and when that scheduler parks a lane for
-    making no progress it does what the operator would have done by hand
-    instead of returning to a prompt: dispatches one agent to author a plan
-    revision, validates and projects it exactly as `run amend` requires, and
-    applies it through `apply_factory_amendment`. Any other wait reason, and
-    any lane past its bound, parks as it does today.
+    scheduler `run resume` runs, and when that scheduler settles with lanes
+    parked `NO_PROGRESS` or `AMENDMENT_REQUIRED` it does what the operator
+    would have done by hand instead of returning to a prompt: dispatches one
+    agent to author one plan revision for all of them, has a second agent of
+    a different declared vendor review it, validates and projects it exactly
+    as `run amend` requires, and applies it through `apply_factory_amendment`.
+    `PAUSE`, `LANE_FAULT`, and any lane past its bound park as they do today.
     """
     run_id = args.run_id
     layout, runtime, store, row, target, compiled = _bind_existing_run(run_id)
@@ -4132,34 +4517,52 @@ def _run_attend(args: argparse.Namespace) -> int:
         state["passes"] = state["passes"] + 1
         return status
 
-    def operator_cwd_for(lane_id: str) -> Path:
-        return runtime.path / "worktrees" / run_id / lane_id / "operator" / "checkout"
+    def role_cwd_for(lane_id: str, role: str) -> Path:
+        return runtime.path / "worktrees" / run_id / lane_id / role / "checkout"
 
-    def request_for(lane_id: str, plan: st.CompiledPlan) -> att.OperatorRequest:
+    def request_for(
+        parked: Sequence[tuple[str, str]],
+        plan: st.CompiledPlan,
+        review_round: int,
+        reviewer_findings: Sequence[Mapping[str, Any]],
+        previous_revision: str,
+    ) -> att.OperatorRequest:
         return _attend_request(
             store,
             runtime,
             layout,
             run_id,
-            lane_id,
+            parked,
             plan,
             _attend_plan_ir(policy, plans_dir, run_id, plan.plan_revision),
-            operator_cwd_for(lane_id),
+            role_cwd_for(parked[0][0], "operator"),
+            review_round,
+            reviewer_findings,
+            previous_revision,
         )
 
-    def dispatch(request: att.OperatorRequest) -> Mapping[str, Any]:
-        actor = state.get("actor")
-        propose = getattr(actor, "attend_operator", None)
-        if propose is None:
-            raise att.AttendRefused(
-                att.OPERATOR_FAILED, "actor cannot dispatch an operator agent"
-            )
+    def review_request_for(
+        request: att.OperatorRequest,
+        revision: Path,
+        rationales: Sequence[Mapping[str, Any]],
+        review_round: int,
+    ) -> att.ReviewRequest:
+        return _attend_review_request(
+            policy,
+            request,
+            revision,
+            rationales,
+            review_round,
+            role_cwd_for(request.lane_id, HerdrStageActor._ATTEND_REVIEWER),
+        )
+
+    def attend_ctx(request: Any, role: str) -> LaneContext:
         lane = next(
             item
             for item in store.active_projection(run_id)
             if item.lane_id == request.lane_id
         )
-        ctx = LaneContext(
+        return LaneContext(
             run_id=run_id,
             lane=lane,
             plan_revision=request.plan_revision,
@@ -4172,17 +4575,37 @@ def _run_attend(args: argparse.Namespace) -> int:
                     "attend_session_id": session_id,
                     "lane_id": request.lane_id,
                     "plan_revision": request.plan_revision,
+                    "review_round": request.review_round,
+                    "role": role,
                     "schema_version": st.CANONICAL_SCHEMA_VERSION,
                 }
             ),
             stage=st.LaneStage(request.stage),
             artifacts={},
         )
-        return propose(ctx, request)
 
-    def project(revision_ir: Path, revision: int) -> st.CompiledPlan:
+    def dispatch(request: att.OperatorRequest) -> Mapping[str, Any]:
+        propose = getattr(state.get("actor"), "attend_operator", None)
+        if propose is None:
+            raise att.AttendRefused(
+                att.OPERATOR_FAILED, "actor cannot dispatch an operator agent"
+            )
+        return propose(attend_ctx(request, "operator"), request)
+
+    def review(request: att.ReviewRequest) -> Mapping[str, Any]:
+        judge = getattr(state.get("actor"), "attend_reviewer", None)
+        if judge is None:
+            raise att.AttendRefused(
+                att.REVIEWER_FAILED, "actor cannot dispatch an attend reviewer"
+            )
+        return judge(attend_ctx(request, HerdrStageActor._ATTEND_REVIEWER), request)
+
+    def project(
+        revision_ir: Path, revision: int, review_findings: list
+    ) -> st.CompiledPlan:
         plan, plan_out = _attend_project(
-            policy, layout, repo, plans_dir, run_id, revision_ir, revision
+            policy, layout, repo, plans_dir, run_id, revision_ir, revision,
+            review_findings,
         )
         state["plan_path"] = plan_out
         return plan
@@ -4236,8 +4659,14 @@ def _run_attend(args: argparse.Namespace) -> int:
                     run_scheduler=run_scheduler,
                     request_for=request_for,
                     dispatch=dispatch,
+                    review_request_for=review_request_for,
+                    review=review,
                     project=project,
                     apply_amendment=apply,
+                    file_issue=lambda title, body: _attend_file_issue(
+                        repo, title, body
+                    ),
+                    deviations_path=plans_dir / "{0}.deviations.md".format(run_id),
                     say=console.step,
                 )
                 status = outcome.status
@@ -4258,7 +4687,9 @@ def _run_attend(args: argparse.Namespace) -> int:
                         "started_at": started,
                         "stopped_at": now_iso(),
                         "stop_reason": stop_reason or "UNRECORDED",
-                        "revisions_applied": len(applied),
+                        "revisions_applied": len(
+                            {item.amendment_artifact_id for item in applied}
+                        ),
                         "lanes_amended": sorted(
                             {item.lane_id for item in applied}
                         ),
@@ -4288,7 +4719,9 @@ def _run_attend(args: argparse.Namespace) -> int:
                 "status": status.value,
                 "stop_reason": stop_reason,
                 "session_id": session_id,
-                "revisions_applied": len(outcome.applied) if outcome else 0,
+                "revisions_applied": len(
+                    {item.amendment_artifact_id for item in applied}
+                ),
             },
             sort_keys=True,
         )

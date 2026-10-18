@@ -3,11 +3,12 @@
 An attended revision is not applied because an agent wrote it. It is applied
 because `planctl` validated it, a receipt approved it, and the ingress
 projection accepted that receipt -- the same four steps the human ran by hand
-on FDAdb `d246ae95`. These cases pin the parts of that step Maestro owns:
+on an earlier run. These cases pin the parts of that step Maestro owns:
 where the validator and the reviewer key are resolved from, what happens when
 either is absent, that a refusing planctl becomes a typed refusal carrying its
-own diagnostic, and that the receipt shape Maestro mints is the shape ingress
-verifies.
+own diagnostic, that the receipt is signed as the independent reviewer agent
+and never as Maestro, and that the receipt shape Maestro mints is the shape
+ingress verifies.
 
 `_run_planctl` is exercised against the real binary when one is configured on
 this machine. A stubbed `subprocess.run` cannot observe an argv parser: it
@@ -182,13 +183,19 @@ class ReceiptHandshake(unittest.TestCase):
                 self.assertIn(code, str(caught.exception))
 
 
-class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
-    """`planctl review` refuses without `--findings`; attend always passes one.
+_REVIEWER = att.AttendPolicy(
+    max_amendments_per_lane=1,
+    reviewer_id="attend-reviewer:omp:profile-b",
+    reviewer_vendor="vendor-b",
+)
 
-    The operator agent writes its answer beside the revision it authored
-    (`attend.findings_path_for`). `_attend_project` copies it next to the IR it
-    reviews and names it on the review argv. When the operator wrote none, the
-    path is still passed and planctl refuses `review.findings_missing`.
+
+class ReviewSignsTheIndependentReviewersFindings(unittest.TestCase):
+    """`planctl review --findings` signs the reviewer agent's answer, as it.
+
+    The author no longer answers its own review: `_attend_project` takes the
+    findings the attend reviewer wrote, binds them to the revision and to the
+    reviewer's identity, and names that identity on the review argv.
     """
 
     def setUp(self) -> None:
@@ -200,11 +207,10 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
         self.revision.write_text("{}", encoding="utf-8")
         self.plans = self.tmp / "plans"
 
-    def _review_argv(self) -> list:
+    def _review_argv(self, policy: att.AttendPolicy, findings: list) -> list:
         from unittest import mock
 
         calls = []
-        policy = att.AttendPolicy(max_amendments_per_lane=1, planctl=self.tmp / "p")
 
         def run_planctl(binary, argv, **kwargs):
             calls.append(argv)
@@ -223,44 +229,99 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
             with self.assertRaises(att.AttendRefused):
                 maestro._attend_project(
                     policy, {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
-                    "run", self.revision, 2,
+                    "run", self.revision, 2, findings,
                 )
         (review,) = [argv for argv in calls if argv[0] == "review"]
         return review
 
-    def test_the_operator_findings_are_bound_and_passed(self) -> None:
-        self.assertEqual(
-            self.tmp / "out" / "r2.review-findings.json",
-            att.findings_path_for(self.revision),
-        )
+    def test_the_reviewer_agents_findings_are_bound_and_signed_as_it(self) -> None:
         answer = [{"finding_id": "f-1", "claim_id": "claim-a"}]
-        att.findings_path_for(self.revision).write_text(
-            json.dumps({"findings": answer}), encoding="utf-8"
-        )
-        review = self._review_argv()
+        review = self._review_argv(_REVIEWER, answer)
         passed = Path(review[review.index("--findings") + 1])
         self.assertEqual(self.plans / "run.r2.review-findings.json", passed)
+        self.assertEqual(
+            review[review.index("--reviewer") + 1], "attend-reviewer:omp:profile-b"
+        )
+        self.assertEqual(review[review.index("--reviewer-vendor") + 1], "vendor-b")
+        self.assertNotIn("maestro-attend", review)
         self.assertEqual(
             {
                 "schema_version": "plan-contract-review-findings.v2",
                 "plan_id": "p-1",
                 "question_surface_sha256": "a" * 64,
-                "reviewer_id": review[review.index("--reviewer") + 1],
-                "reviewer_vendor": review[review.index("--reviewer-vendor") + 1],
+                "reviewer_id": "attend-reviewer:omp:profile-b",
+                "reviewer_vendor": "vendor-b",
                 "findings": answer,
             },
             json.loads(passed.read_text(encoding="utf-8")),
         )
 
-    def test_absent_findings_are_still_named_so_planctl_refuses(self) -> None:
-        review = self._review_argv()
-        self.assertIn("--findings", review)
-        self.assertFalse(Path(review[review.index("--findings") + 1]).exists())
+    def test_a_file_the_author_left_beside_its_revision_is_never_read(self) -> None:
+        """The removed path: an author-written findings file signs nothing."""
+        (self.revision.parent / "r2.review-findings.json").write_text(
+            json.dumps({"findings": [{"finding_id": "author-wrote-this"}]}),
+            encoding="utf-8",
+        )
+        review = self._review_argv(_REVIEWER, [])
+        passed = json.loads(
+            Path(review[review.index("--findings") + 1]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(passed["findings"], [])
 
-    def test_the_operator_launch_asks_the_full_question(self) -> None:
-        """The dispatched operator prompt carries the question and the findings path."""
-        from types import SimpleNamespace
+    def test_no_reviewer_identity_refuses_before_any_planctl_call(self) -> None:
         from unittest import mock
+
+        with mock.patch.object(maestro, "_run_planctl") as planctl:
+            with self.assertRaises(att.AttendRefused) as caught:
+                maestro._attend_project(
+                    att.AttendPolicy(max_amendments_per_lane=1),
+                    {"keys_dir": self.tmp / "keys"}, self.tmp, self.plans,
+                    "run", self.revision, 2, [],
+                )
+        self.assertEqual(caught.exception.code, att.REVIEWER_UNCONFIGURED)
+        planctl.assert_not_called()
+
+    def test_validate_is_given_the_key_review_signed_with(self) -> None:
+        from unittest import mock
+
+        keyed = {}
+
+        def run_planctl(binary, argv, **kwargs):
+            keyed[argv[0]] = kwargs.get("key")
+            if argv[0] == "question-surface":
+                return json.dumps({"plan_id": "p-1", "question_surface_sha256": "a" * 64})
+            return ""
+
+        with (
+            mock.patch.object(maestro, "_planctl_binary", return_value=Path("planctl")),
+            mock.patch.object(maestro, "_reviewer_hmac_key", return_value="k" * 32),
+            mock.patch.object(maestro, "_run_planctl", side_effect=run_planctl),
+            mock.patch.object(
+                ingress, "author_from_plan_contract", side_effect=RuntimeError("stop")
+            ),
+        ):
+            with self.assertRaises(att.AttendRefused):
+                maestro._attend_project(
+                    _REVIEWER, {"keys_dir": self.tmp / "keys"}, self.tmp,
+                    self.plans, "run", self.revision, 2, [],
+                )
+        self.assertEqual(keyed["review"], "k" * 32)
+        self.assertEqual(keyed["validate"], "k" * 32)
+
+    def test_the_reviewer_id_is_a_planctl_identifier(self) -> None:
+        import re
+
+        for route in (
+            {"route": "omp", "profile": "openai astra/x", "model": "", "effort": ""},
+            {"route": "claude", "model": "opus", "effort": "medium", "profile": ""},
+        ):
+            with self.subTest(route=route):
+                reviewer = maestro._attend_reviewer_id(route)
+                # planctl's ID_RE; `planctl review` refuses anything else.
+                self.assertRegex(reviewer, re.compile(r"^[A-Za-z][A-Za-z0-9._:-]*$"))
+
+    def _prompt(self, role: str, extra: dict) -> dict:
+        from types import SimpleNamespace
 
         from adw_modules import scheduler_types as st
 
@@ -272,42 +333,16 @@ class ReviewCarriesTheTwoImplementationsFindings(unittest.TestCase):
             run_id="run1",
             stage=st.LaneStage.WAITING_FOR_USER,
         )
-        request = att.OperatorRequest(
-            run_id="run1",
-            lane_id="lane-a",
-            stage=st.LaneStage.WAITING_FOR_USER.value,
-            round_number=4,
-            plan_revision=2,
-            next_plan_revision=3,
-            public_contract={"acceptance_criteria": ["x"]},
-            reviews=(),
-            failure_output=(),
-            lane_gates="",
-            ir_path=str(self.revision),
-            revision_out_path=str(self.revision),
-            suite_files={},
-            amendment_rules="rules",
-            allowed_lane_ids=("lane-a",),
+        return maestro.HerdrStageActor._prompt(
+            actor, ctx, role, self.tmp / "envelope.json", self.tmp, extra
         )
-        launched = {}
 
-        def launch(ctx_, role, cwd, extra, prepare_cwd):
-            launched["body"] = maestro.HerdrStageActor._prompt(
-                actor, ctx_, role, self.tmp / "envelope.json", cwd, extra
-            )
-            return {}, None, cwd
-
-        with (
-            mock.patch.object(actor, "_role_dir", return_value=self.tmp / "operator", create=True),
-            mock.patch.object(actor, "_launch", side_effect=launch, create=True),
-        ):
-            actor.attend_operator(ctx, request)
-
-        body = launched["body"]
-        self.assertIn(att.TWO_IMPLEMENTATIONS_QUESTION, body["instructions"])
-        self.assertEqual(
-            str(att.findings_path_for(self.revision)), body["review_findings_out_path"]
-        )
+    def test_the_reviewer_is_asked_the_question_and_the_author_is_not(self) -> None:
+        reviewer = self._prompt("attend-reviewer", {"findings_out_path": "x"})
+        operator = self._prompt("operator", {})
+        self.assertIn(att.TWO_IMPLEMENTATIONS_QUESTION, reviewer["instructions"])
+        self.assertNotIn(att.TWO_IMPLEMENTATIONS_QUESTION, operator["instructions"])
+        self.assertNotIn("findings_out_path", operator["instructions"])
 
 
 class RealValidatorInvocation(unittest.TestCase):
@@ -371,6 +406,87 @@ class RealValidatorInvocation(unittest.TestCase):
         )
         self.assertEqual(usage.returncode, 0, usage.stderr)
         self.assertIn("--findings", usage.stdout)
+
+
+def _planctl_fixture(binary: Path, tmp: Path, run_id: str, revision: int) -> tuple:
+    """planctl's own valid fixture, re-homed for the paths `_attend_project` uses.
+
+    The fixture and its schema ship beside the binary, so this IR is one the
+    binary itself accepts; only the rendered link and the receipt path move
+    to where `_attend_project` writes them.
+    """
+    import shutil
+
+    skill = binary.parent.parent
+    repo = tmp / "repo"
+    repo.mkdir()
+    (tmp / "schemas").mkdir()
+    shutil.copy(skill / "schemas" / "plan-ir-v1.schema.json", tmp / "schemas")
+    stem = "{0}.r{1}".format(run_id, revision)
+    ir = json.loads((skill / "fixtures" / "valid-plan-ir.json").read_text())
+    ir["links"][0]["href"] = "../repo/plans/{0}.html".format(stem)
+    ir["links"][0]["canonical_target"] = "plans/{0}.html".format(stem)
+    ir["approval"]["receipt_path"] = "{0}.receipt.json".format(stem)
+    authored = tmp / "out" / "r{0}.ir.json".format(revision)
+    authored.parent.mkdir()
+    authored.write_text(json.dumps(ir), encoding="utf-8")
+    return repo, authored
+
+
+class RealReviewerSigning(unittest.TestCase):
+    """The review, validate and receipt steps against the real binary.
+
+    A stubbed planctl accepted `attend-reviewer/omp/x` as a reviewer id and
+    a `validate --require-approved` run with no key; the binary refuses
+    both. This case runs `_attend_project` unstubbed until ingress, which the
+    planctl fixture (it carries no Maestro extension) is expected to refuse.
+    """
+
+    def setUp(self) -> None:
+        self.binary = _configured_planctl()
+        if self.binary is None:
+            self.skipTest(
+                "no plan-contract validator on this machine: set {0} to its "
+                "path to run this case".format(_PLANCTL_ENV)
+            )
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+
+    def test_the_receipt_is_signed_as_the_reviewer_agent_and_verifies(self) -> None:
+        from adw_modules import plan_approval
+
+        repo, authored = _planctl_fixture(self.binary, self.tmp, "run-1", 2)
+        keys = self.tmp / "keys"
+        keys.mkdir()
+        key = "ab" * 32
+        (keys / admission.REVIEWER_HMAC_KEY_FILE).write_text(key)
+        route = {"route": "omp", "profile": "profile-b", "model": "", "effort": ""}
+        policy = att.AttendPolicy(
+            max_amendments_per_lane=1,
+            planctl=self.binary,
+            reviewer_id=maestro._attend_reviewer_id(route),
+            reviewer_vendor="vendor-b",
+        )
+        plans = repo / "plans"
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._attend_project(
+                policy, {"keys_dir": keys}, repo, plans, "run-1", authored, 2, []
+            )
+        # Past render, review and validate: refused only by ingress.
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertIn("MAESTRO_EXTENSION_MISSING", caught.exception.detail)
+        receipt = json.loads((plans / "run-1.r2.receipt.json").read_text())
+        self.assertEqual(
+            receipt["reviewer"],
+            {"id": "attend-reviewer:omp:profile-b", "vendor": "vendor-b"},
+        )
+        ingress._verify_receipt(
+            (plans / "run-1.r2.ir.json").read_bytes(),
+            receipt,
+            None,
+            plan_approval.key_bytes(key),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

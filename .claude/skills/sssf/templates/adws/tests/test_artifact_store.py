@@ -1889,7 +1889,7 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
 
         migrated = ArtifactStore(dest)
         self.addCleanup(migrated.close)
-        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v6")
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v7")
         self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
         # v3 widened the run-artifact kind check the same way v2 widened the
         # lane one. A migration that stops at the stamp leaves an ATTEND_SESSION
@@ -1899,6 +1899,8 @@ class LedgerSchemaMigrationTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertIn("ATTEND_SESSION", run_sql)
         self.assertIn("AMENDMENT_RATIONALE", run_sql)
+        # v7 widened it again for the attend reviewer's round record.
+        self.assertIn("ATTEND_REVIEW", run_sql)
         after_sql = migrated.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
         ).fetchone()[0]

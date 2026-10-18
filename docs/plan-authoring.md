@@ -605,16 +605,27 @@ round.
 
 `run attend --run <run-id>` automates that authoring loop where a deployment opts into it
 (`attend.max_amendments_per_lane` in that deployment's `maestro.config.yaml`; absent means off, and
-a runtime mirror never carries the key). It dispatches one operator agent, which reads the lane's
-public contract, its recent reviews, its gate table, the current Plan IR and the accepted suite,
-and writes one revision IR. Maestro then validates and approves that revision with `planctl`,
-projects it, and applies it exactly as `run amend` would.
+a runtime mirror never carries the key). It lets the scheduler settle, then answers every lane
+parked `NO_PROGRESS` or `AMENDMENT_REQUIRED` (named by a final-review REVISE) in one batch. One
+operator agent reads each lane's public contract, recent reviews, gate table, final review and
+accepted suite, plus the current Plan IR, and writes one revision IR. An independent reviewer
+agent on a different declared vendor (`attend.reviewer_route`, `attend.reviewer_vendor`) answers
+the plan-review question for that revision and returns `PASS` or a located `REVISE`, which goes
+back to the author, up to `attend.max_review_rounds`. On `PASS`, Maestro approves the revision
+with `planctl` signed as that reviewer, projects it, and applies it exactly as `run amend` would.
+`PAUSE` and `LANE_FAULT` are never attended.
 
-Three authoring consequences.
+Four authoring consequences.
 
 - **The revision is an IR edit, not a plan edit.** Everything under *The compiler boundary* still
   holds: the executable plan is a projection, and a hand-edit of it is discarded by the next one.
-- **Scope is the parked lane and its pair.** A revision that moves any other lane's
+- **The author never reviews itself.** The reviewer writes the two-implementations and interface
+  findings; the author fixes what a REVISE locates.
+- **A material change files an issue.** Changing a lane's outputs, `needs` or `lane_kind`, a build
+  lane's `spec.interface`, removing a gating obligation or one of its `decided_by` examples, or
+  resetting a merged lane files a GitHub issue in the run's repository, and every batch is written
+  to `<plans_dir>/<run-id>.deviations.md`.
+- **Scope is the parked lanes and their pairs.** A revision that moves any other lane's
   `lane_projection_digest` is refused whole with `ATTEND_AMENDMENT_TOO_WIDE`, because a lane whose
   digest moves restarts at `PLANNED` and loses every input it had. This is the failure §5 records
   from `d246ae95`: an amendment editing one FAQ claim un-merged both finished geo lanes, because a
