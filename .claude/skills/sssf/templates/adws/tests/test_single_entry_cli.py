@@ -44,6 +44,13 @@ FINDING = {
 }
 
 
+def _no_preflight():
+    """The run preflight is its own subject (`test_run_preflight.py`)."""
+    return mock.patch.multiple(
+        maestro._RunPreflight, run_wide=mock.DEFAULT, __call__=mock.DEFAULT
+    )
+
+
 def _finding_for(ctx) -> dict:
     clause = next(
         iter(getattr(ctx.lane, "public_acceptance", ()) or ()),
@@ -709,7 +716,7 @@ class RegisteredRunRoutingTest(SingleEntryBase):
     def test_repository_local_run_verbs_recover_registered_target(self) -> None:
         run_id, foreign = self.foreign_invocation()
         actor = ScriptedActor(self.repo, self.root / "worktrees")
-        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+        with mock.patch.object(maestro, "_actor_for", return_value=actor), _no_preflight():
             code, payload = self.invoke(
                 ["run", "status", run_id], cwd=foreign, record=False
             )
@@ -730,7 +737,7 @@ class RegisteredRunRoutingTest(SingleEntryBase):
         amended = self.root / "amended-plan.v1"
         amended.write_bytes(plan_bytes(goal="emit b.txt", output="b.txt"))
         actor = ScriptedActor(self.repo, self.root / "worktrees")
-        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+        with mock.patch.object(maestro, "_actor_for", return_value=actor), _no_preflight():
             code, payload = self.invoke(
                 ["run", "amend", str(amended), "--run", run_id], cwd=foreign, record=False
             )
@@ -786,7 +793,7 @@ class RegisteredRunRoutingTest(SingleEntryBase):
 
     def test_explicit_start_infers_cwd_repo_and_head(self) -> None:
         actor = ScriptedActor(self.repo, self.root / "worktrees")
-        with mock.patch.object(maestro, "_actor_for", return_value=actor):
+        with mock.patch.object(maestro, "_actor_for", return_value=actor), _no_preflight():
             code, payload = self.invoke(
                 ["run", "start", str(self.plan_path)], record=False
             )
@@ -896,6 +903,7 @@ class PlanFileMappingTest(SingleEntryBase):
                 maestro, "_executing_maestro_file", return_value=self.maestro_file
             ),
             mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
+            _no_preflight(),
             mock.patch.object(maestro, "FactoryScheduler", ExplodingScheduler),
             mock.patch("sys.stdout", buf),
             working_directory(self.repo),

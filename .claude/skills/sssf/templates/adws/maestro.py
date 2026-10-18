@@ -19,7 +19,7 @@ import time
 import uuid
 from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 # This must run before third-party and local imports can dirty a deployed checkout.
@@ -41,6 +41,7 @@ from adw_modules import plan_compiler
 from adw_modules import plan_contract_ingress as ingress
 from adw_modules import probes
 from adw_modules import route_admission as admission
+from adw_modules import run_preflight as rp
 from adw_modules import review_contract as rc
 from adw_modules import provisioning
 from adw_modules import review_standards as rvs
@@ -65,6 +66,7 @@ from adw_modules.scheduler import (
     LaneContext,
     LaunchFailed,
     OrderedLocks,
+    RunPreflightRefused,
     RunRepositoryMismatch,
     StageActor,
     apply_factory_amendment,
@@ -92,6 +94,19 @@ from adw_modules.plan_model import PlanCompileError
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
 _MAESTRO_SCHEMA = "maestro-config.v1"
 _INVOCATION_WORKSPACE: ContextVar[str] = ContextVar("invocation_workspace", default="")
+#: Set while the run preflight drives a real dispatch path. `_launch` stops
+#: right after the tree is prepared, before a prompt, a pane or an agent
+#: exists, so the preflight asserts the launch path's own decisions about a
+#: tree instead of a reimplementation of them.
+_PREPARE_ONLY: ContextVar[bool] = ContextVar("prepare_only", default=False)
+
+
+class _PreparedOnly(Exception):
+    """`_launch` reached the end of tree preparation under `_PREPARE_ONLY`."""
+
+    def __init__(self, cwd: Path) -> None:
+        super().__init__(str(cwd))
+        self.cwd = cwd
 
 
 class _MaestroConfigurationError(ValueError):
@@ -2479,6 +2494,8 @@ class HerdrStageActor:
             self._prepared_cwd(cwd, prepare_cwd, provision=provision)
         except lch.LaunchRefused as refused:
             raise self._launch_failed(refused) from refused
+        if _PREPARE_ONLY.get():
+            raise _PreparedOnly(cwd)
         # The path this dispatch already materialized and provisioned above.
         # `prepare_adopted_cwd` below is called on the two paths that reach a
         # pane which already exists (a reused role pane, an adopted agent);
@@ -3420,6 +3437,480 @@ def _actor_for(
     )
 
 
+#: The AWS profile `planctl review` runs its EC2 mutation pass under.
+_PLANCTL_RUNNER_PROFILE = "planctl-runner"
+#: Where omp keeps a profile's auth, sessions and settings.
+_OMP_PROFILES_DIR = Path.home() / ".omp" / "profiles"
+#: Seconds a route capture gets per turn when the preflight mints a receipt.
+_ROUTE_CAPTURE_TIMEOUT_S = 120.0
+
+
+class _RunPreflight:
+    """Every dependency `run start` / `run resume` can reach, before dispatch.
+
+    Two halves, because route admission sits between them: the run-wide
+    checks run before the actor is built (`_actor_for` refuses on the first
+    unadmitted route, and a receipt is one of the things this provisions), and
+    the per-lane checks run inside the scheduler's preflight hook, where the
+    integration head, the accepted suites and the actor's own tree path exist.
+    One record and one refusal cover both. See `adw_modules/run_preflight.py`
+    for what is provisioned and what only refuses, and `docs/run-preflight.md`
+    for the checklist.
+    """
+
+    def __init__(
+        self,
+        layout: Mapping[str, Any],
+        runtime: RuntimeStateRoot,
+        store: ArtifactStore,
+        run_id: str,
+        target: gitpub.TargetBinding,
+        console: Any,
+        *,
+        verb: str,
+        attend: bool,
+        local: bool = False,
+        plan_ir: Optional[Path] = None,
+        runner: rp.Runner = rp.real_runner,
+        which: Callable[[str], Optional[str]] = shutil.which,
+        file_issue: Optional[Callable[[str, str], Mapping[str, str]]] = None,
+    ) -> None:
+        self.layout = layout
+        self.runtime = runtime
+        self.store = store
+        self.run_id = run_id
+        self.target = target
+        self.console = console
+        self.verb = verb
+        self.attend = attend
+        self.local = local
+        self.plan_ir = plan_ir
+        self.runner = runner
+        self.which = which
+        self.repo = Path(target.target_repository_root)
+        self.file_issue = file_issue or (
+            lambda title, body: _attend_file_issue(self.repo, title, body)
+        )
+        self.preflight_id = uuid.uuid4().hex
+        self.items: tuple[rp.PreflightItem, ...] = ()
+        self._added_packages: dict[str, list[str]] = {}
+
+    # -- channel ----------------------------------------------------------
+
+    def say(self, lane_id: str, message: str, detail: str = "") -> None:
+        step = getattr(self.console, "step", None)
+        if step is not None:
+            step(lane_id or step_log.RUN_LANE_ID, message, detail)
+
+    # -- run-wide ---------------------------------------------------------
+
+    def _routes(self) -> list[tuple[str, Mapping[str, Any]]]:
+        """Every (role, binding) the run can dispatch. Attend's only when on."""
+        routes = [
+            (str(role), binding)
+            for role, binding in sorted((self.layout.get("role_routes") or {}).items())
+        ]
+        if self.attend:
+            attend = self.layout.get("attend") or {}
+            for role, key in (("operator", "route"), (_ATTEND_REVIEWER_ROLE, "reviewer_route")):
+                binding = attend.get(key) or {}
+                if binding.get("route"):
+                    routes.append((role, binding))
+        return routes
+
+    def _executable(self, route: str) -> str:
+        executables = self.layout.get("executables") or {}
+        return str(executables.get(route) or route)
+
+    def run_wide_checks(self) -> list[rp.Check]:
+        layout = self.layout
+        keys_dir = Path(layout["keys_dir"])
+        checks: list[rp.Check] = [
+            rp.binary_check("binary:uv", "uv", "install uv (https://docs.astral.sh/uv/)", which=self.which),
+            rp.binary_check(
+                "binary:herdr", self._executable("herdr"),
+                "install herdr, or set executables.herdr", which=self.which,
+            ),
+            rp.command_check(
+                "herdr:server", [self._executable("herdr"), "workspace", "list"],
+                "start the herdr server (open herdr) and rerun", self.runner,
+            ),
+        ]
+        checks.append(self._requires_python_check())
+        seen_binaries: set[str] = set()
+        seen_profiles: set[str] = set()
+        seen_routes: dict[str, Mapping[str, Any]] = {}
+        for role, binding in self._routes():
+            route = str(binding.get("route") or "")
+            binary = self._executable(route)
+            if binary not in seen_binaries:
+                seen_binaries.add(binary)
+                checks.append(
+                    rp.binary_check(
+                        "binary:{0}".format(route), binary,
+                        "install {0}, or set executables.{0}".format(route),
+                        which=self.which,
+                    )
+                )
+            profile = str(binding.get("profile") or "")
+            if route == "omp" and profile and profile not in seen_profiles:
+                seen_profiles.add(profile)
+                # A profile holds the provider's login. Nothing here can log
+                # in for anyone, so a missing one is a person's to create.
+                checks.append(
+                    rp.directory_check(
+                        "omp-profile:{0}".format(profile), _OMP_PROFILES_DIR / profile,
+                        "create it and log in: omp --profile {0}".format(profile),
+                        human_secret=True,
+                    )
+                )
+            seen_routes.setdefault(route, binding)
+        verify_keys = tuple(Path(path) for path in layout.get("route_verify_keys") or ())
+        for path in verify_keys:
+            checks.append(
+                rp.readable_file_check(
+                    "key:route-verify:{0}".format(path.name), path,
+                    "restore the route verify key; it is never regenerated",
+                    human_secret=True,
+                )
+            )
+        for route, binding in sorted(seen_routes.items()):
+            checks.append(self._receipt_check(route, binding, verify_keys))
+        checks.append(
+            rp.readable_file_check(
+                "key:reviewer-hmac", keys_dir / admission.REVIEWER_HMAC_KEY_FILE,
+                "restore {0}; it is never regenerated".format(admission.REVIEWER_HMAC_KEY_FILE),
+                human_secret=True,
+            )
+        )
+        checks.extend(self._attend_run_checks())
+        return checks
+
+    def _requires_python_check(self) -> rp.Check:
+        pyproject = Path(__file__).resolve().parent / "pyproject.toml"
+        declared = tchain._requires_python(pyproject.parent) if pyproject.is_file() else None
+        if not declared:
+            return rp.Check(
+                "python:runtime", lambda: (True, ""),
+                skip="no requires-python is declared for the ADW runtime",
+            )
+
+        def verify() -> tuple[bool, str]:
+            from packaging.specifiers import SpecifierSet
+
+            version = "{0}.{1}.{2}".format(*sys.version_info[:3])
+            return (version in SpecifierSet(declared), "python {0} vs {1}".format(version, declared))
+
+        return rp.Check("python:runtime", verify, "run maestro under a python matching " + declared)
+
+    def _receipt_check(
+        self, route: str, binding: Mapping[str, Any], verify_keys: Sequence[Path]
+    ) -> rp.Check:
+        receipts = self.layout.get("route_receipts") or {}
+        path = receipts.get(route)
+
+        def verify() -> tuple[bool, str]:
+            if not path:
+                return False, "route_receipts.{0} is not configured".format(route)
+            keys = tuple(load_public_key(Path(item)) for item in verify_keys)
+            if not keys:
+                return False, "route_verify_keys is not configured"
+            admitted = load_admitted_routes({route: Path(path)}, verify_keys=keys)
+            return admitted.admits(route), str(path)
+
+        def mint() -> str:
+            # The one minting path, signed with the deployment's existing
+            # route seed. The seed is read, never created: a missing seed is
+            # a key, and keys are a person's.
+            seed_path = Path(self.layout["keys_dir"]) / "route.seed"
+            seed = bytes.fromhex(seed_path.read_text(encoding="ascii").strip())
+            session = self.runtime.path / "route-admission"
+            spec = admission.RouteCaptureSpec(
+                route=route,
+                cwd=self.repo,
+                herdr=Path(self._executable("herdr")),
+                binary=Path(self._executable(route)),
+                model=str(binding.get("model") or ""),
+                effort=str(binding.get("effort") or ""),
+                profile=binding.get("profile") or None,
+                session_dir=session,
+                timeout_s=_ROUTE_CAPTURE_TIMEOUT_S,
+            )
+            admission.admit_routes((spec,), {route: Path(path)}, route_seed=seed)
+            return "captured and signed a {0} route receipt at {1}".format(route, path)
+
+        missing_file = bool(path) and not Path(path).exists()
+        return rp.Check(
+            "route-receipt:{0}".format(route),
+            verify,
+            "capture it with route admission (needs keys_dir/route.seed); an "
+            "existing invalid receipt is never overwritten",
+            provision=mint if missing_file else None,
+        )
+
+    def _attend_run_checks(self) -> list[rp.Check]:
+        if not self.attend:
+            reason = "attend is disabled in this deployment"
+            return [
+                rp.Check(item, lambda: (True, ""), skip=reason)
+                for item in ("attend:planctl", "attend:plan-ir", "aws:planctl-runner", "gh:auth", "gh:repo-permission")
+            ]
+        policy = _attend_policy(self.layout)
+        checks = [
+            rp.readable_file_check(
+                "attend:planctl", policy.planctl,
+                "set attend.planctl to the plan-contract validator; there is no "
+                "source the runtime can fetch it from",
+            ),
+            rp.readable_file_check(
+                "attend:plan-ir", self.plan_ir,
+                "set attend.plan_ir to the Plan IR this revision was projected from",
+                parse=json.loads,
+            ),
+        ]
+        if self.local:
+            checks.append(
+                rp.Check("aws:planctl-runner", lambda: (True, ""), skip="run attend --local: planctl review runs here")
+            )
+        else:
+            checks.append(
+                rp.command_check(
+                    "aws:planctl-runner",
+                    ["aws", "sts", "get-caller-identity", "--profile", _PLANCTL_RUNNER_PROFILE],
+                    "refresh the {0} AWS credentials (aws sso login --profile {0}), "
+                    "or rerun with --local".format(_PLANCTL_RUNNER_PROFILE),
+                    self.runner,
+                    human_secret=True,
+                )
+            )
+        checks.append(
+            rp.command_check("gh:auth", ["gh", "auth", "status"], "gh auth login", self.runner, human_secret=True)
+        )
+        checks.append(
+            rp.command_check(
+                "gh:repo-permission", ["gh", "repo", "view", "--json", "viewerPermission"],
+                "grant this account triage or write on the run's repository",
+                self.runner, human_secret=True, cwd=self.repo,
+                accept=rp.gh_permission_accept,
+            )
+        )
+        return checks
+
+    def run_wide(self) -> None:
+        provisioning.set_tree_packages(())
+        self.items = rp.evaluate(self.run_wide_checks(), self.say)
+
+    def actor_for(self, compiled: st.CompiledPlan) -> StageActor:
+        """`_actor_for`, with its refusal folded into this preflight's report."""
+        try:
+            return _actor_for(self.runtime, self.layout, self.target, self.run_id, compiled)
+        except FactoryRefused as exc:
+            self.items = self.items + (
+                rp.PreflightItem(
+                    "actor", rp.REFUSED, str(exc),
+                    "fix the route items above; lane trees were not checked",
+                ),
+            )
+            self.finish()
+            raise
+
+    # -- per lane ---------------------------------------------------------
+
+    def __call__(self, scheduler: FactoryScheduler) -> None:
+        actor = scheduler.actor
+        trees: list[Path] = []
+        try:
+            lanes = scheduler.preflight_lanes()
+            items = rp.evaluate(self._lane_checks(scheduler, actor, lanes, trees), self.say)
+            items += rp.evaluate(self._attend_tree_checks(actor, trees), self.say)
+            items += rp.evaluate(
+                [
+                    rp.Check(
+                        "runners",
+                        lambda: (scheduler._assert_runners_usable() or True, "every runner the plan names resolves"),
+                        "fix provision_argv so the runner loads; the runner tree is kept for inspection",
+                    )
+                ],
+                self.say,
+            )
+        finally:
+            for tree in trees:
+                self._remove_tree(tree)
+        self.items = self.items + items
+        self.finish(lanes)
+
+    def _lane_checks(self, scheduler: FactoryScheduler, actor: Any, lanes: Sequence[Mapping[str, Any]], trees: list[Path]):
+        """Lazily, so a later check can see whether the tree exists."""
+        if not lanes:
+            return
+        base = scheduler._integration_head()
+        tree = self.runtime.path / "worktrees" / "preflight-{0}".format(self.preflight_id) / "checkout"
+        trees.append(tree)
+        state = {"ready": False}
+
+        def prepare() -> tuple[bool, str]:
+            # A lane checkout exactly as a role gets one: a worktree at the
+            # integration head, then the launch path's own `_prepared_cwd`,
+            # which refreshes it and runs `provision_argv` in it.
+            actor._add_worktree(tree, base)
+            try:
+                actor._prepared_cwd(tree, lambda path: actor._refresh_git_checkout(path, base))
+            except lch.LaunchRefused as exc:
+                return False, str(exc)
+            state["ready"] = True
+            return True, "worktree at {0} provisioned".format(base[:12])
+
+        yield rp.Check("lane-tree", prepare, "fix provision_argv so it succeeds in a lane checkout")
+        local = rp.tree_modules(tree) if tree.is_dir() else frozenset()
+        outputs = rp.output_modules(
+            path for lane in lanes for path in (*lane["declared_outputs"], *lane["suite_paths"])
+        )
+        for lane in lanes:
+            lane_id = str(lane["lane_id"])
+            needs = rp.python_needs(lane["python_specifiers"], local=local, outputs=outputs)
+            gate = (lane["spec"] or {}).get("gate") or {}
+            cwd = tree / str(gate.get("cwd") or ".")
+            for module in needs:
+                if not state["ready"]:
+                    yield rp.Check("python:" + module, lambda: (True, ""), lane_id=lane_id, skip="lane tree could not be prepared")
+                    continue
+                yield rp.module_check(lane_id, module, tree, cwd, self.runner, lambda name, lane_id=lane_id: self._install(tree, name, lane_id))
+            produced = set(lane["declared_outputs"]) | set(lane["suite_paths"])
+            for path in rp.declared_fixture_paths(lane["spec"] or {}):
+                if path in produced or any(path in set(other["declared_outputs"]) for other in lanes):
+                    continue
+                if not state["ready"]:
+                    yield rp.Check("fixture:" + path, lambda: (True, ""), lane_id=lane_id, skip="lane tree could not be prepared")
+                    continue
+                yield rp.fixture_check(lane_id, path, tree)
+
+    def _install(self, tree: Path, module: str, lane_id: str) -> str:
+        provisioning.install_tree_packages(tree, (module,), _resolved_provision_timeout(None))
+        provisioning.set_tree_packages((*provisioning.tree_packages(), module))
+        self._added_packages.setdefault(module, []).append(lane_id)
+        return "installed {0} tree-local (uv pip install into the tree's .venv); it is not in the project's manifest".format(module)
+
+    def _attend_tree_checks(self, actor: Any, trees: list[Path]):
+        if not self.attend:
+            yield rp.Check("attend-tree:operator", lambda: (True, ""), skip="attend is disabled in this deployment")
+            yield rp.Check("attend-tree:reviewer", lambda: (True, ""), skip="attend is disabled in this deployment")
+            return
+        lane_id = "preflight-{0}".format(self.preflight_id)
+        scratch = self.runtime.path / "worktrees" / self.run_id / lane_id
+        trees.append(scratch)
+        ctx = SimpleNamespace(
+            run_id=self.run_id,
+            lane=SimpleNamespace(lane_id=lane_id, spec_digest="0" * 64, lane_kind=None),
+            artifacts={},
+            input_digest="",
+            plan_revision=0,
+            stage=st.LaneStage.WAITING_FOR_USER,
+        )
+        ir = scratch / "preflight.ir.json"
+        ir_bytes = b"{}"
+
+        def dispatch(call: Callable[[], Any]) -> tuple[bool, str]:
+            scratch.mkdir(parents=True, exist_ok=True)
+            ir.write_bytes(ir_bytes)
+            token = _PREPARE_ONLY.set(True)
+            try:
+                call()
+            except _PreparedOnly as prepared:
+                return True, "tree prepared by the launch path at {0}".format(prepared.cwd)
+            except LaunchFailed as exc:
+                return False, exc.detail
+            finally:
+                _PREPARE_ONLY.reset(token)
+            return False, "the dispatch path returned without preparing a tree"
+
+        def operator() -> tuple[bool, str]:
+            return dispatch(
+                lambda: actor.attend_operator(
+                    ctx,
+                    att.OperatorRequest(
+                        run_id=self.run_id, plan_revision=0, next_plan_revision=1, lanes=(),
+                        ir_path=str(ir), revision_out_path=str(scratch / "revision.ir.json"),
+                        amendment_rules="", allowed_lane_ids=(),
+                    ),
+                )
+            )
+
+        def reviewer() -> tuple[bool, str]:
+            return dispatch(
+                lambda: actor.attend_reviewer(
+                    ctx,
+                    att.ReviewRequest(
+                        run_id=self.run_id, plan_revision=0, next_plan_revision=1, review_round=1,
+                        lanes=(), current_ir_path=str(ir), revision_ir_path=str(ir),
+                        question_surface="{}", rationales=(),
+                        findings_out_path=str(scratch / "findings.json"), amendment_rules="",
+                        allowed_lane_ids=(), revision_sha256=att.sha256_hex(ir_bytes),
+                    ),
+                )
+            )
+
+        remedy = (
+            "the attend tree is not a checkout and must not be provisioned; a "
+            "launch path that provisions it is a runtime defect, not configuration"
+        )
+        yield rp.Check("attend-tree:operator", operator, remedy)
+        yield rp.Check("attend-tree:reviewer", reviewer, remedy)
+
+    def _remove_tree(self, tree: Path) -> None:
+        if (tree / ".git").exists():
+            subprocess.run(
+                ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)],
+                capture_output=True, text=True, check=False,
+            )
+        root = tree.parent if tree.name == "checkout" else tree
+        shutil.rmtree(root, ignore_errors=True)
+
+    # -- record -----------------------------------------------------------
+
+    def finish(self, lanes: Sequence[Mapping[str, Any]] = ()) -> None:
+        """One ledger record, one step per lane, then refuse or return."""
+        issues = []
+        for module, lane_ids in sorted(self._added_packages.items()):
+            title = "Run preflight installed {0} tree-local: missing from the project manifest".format(module)
+            body = (
+                "The run preflight found `{0}` imported by the accepted suite of "
+                "{1}, not installed by `provision_argv`, and installed it into each "
+                "lane tree's venv only. Add it to the project's dependency manifest "
+                "through a reviewed lane or amendment.".format(module, ", ".join(sorted(lane_ids)))
+            )
+            issues.append({"module": module, **dict(self.file_issue(title, body))})
+        by_lane: dict[str, dict[str, list[str]]] = {}
+        for item in self.items:
+            if item.status == rp.SKIPPED:
+                continue
+            record = by_lane.setdefault(
+                item.lane_id or step_log.RUN_LANE_ID,
+                {"needs": [], "verified": [], "added": [], "refused": []},
+            )
+            record["needs"].append(item.item_id)
+            record[item.status].append(item.item_id)
+        payload = {
+            "verb": self.verb,
+            "items": [item.as_payload() for item in self.items],
+            "lanes": by_lane,
+            "needs_manifest": sorted(self._added_packages),
+            "issues": issues,
+        }
+        self.store.record_run_preflight(self.run_id, preflight_id=self.preflight_id, payload=payload)
+        for lane in lanes:
+            lane_id = str(lane["lane_id"])
+            record = by_lane.get(lane_id) or {"verified": [], "added": [], "refused": []}
+            self.say(
+                lane_id, "preflight",
+                "verified {0}, added {1}, refused {2}".format(
+                    len(record["verified"]), len(record["added"]), len(record["refused"])
+                ),
+            )
+        refused = rp.refused(self.items)
+        if refused:
+            raise RunPreflightRefused(refused, rp.render(self.items))
+
+
 def _compile_plan(
     path: Path, *, revision: int, ref: str, bound_run: bool = False
 ) -> st.CompiledPlan:
@@ -3730,10 +4221,15 @@ def _run_start(args: argparse.Namespace) -> int:
                     target.target_main_ref,
                     (lane.lane_id for lane in compiled.lanes),
                 )
+                preflight = _RunPreflight(
+                    layout, runtime, store, run_id, target, console,
+                    verb="start", attend=False,
+                )
+                preflight.run_wide()
                 scheduler = FactoryScheduler(
                     store,
                     run_id,
-                    _actor_for(runtime, layout, target, run_id, compiled),
+                    preflight.actor_for(compiled),
                     runtime,
                     target,
                     stage_started=console.stage_started,
@@ -3745,6 +4241,7 @@ def _run_start(args: argparse.Namespace) -> int:
                         layout.get("stall_regression_on_findings")
                     ),
                     max_probe_rounds=_max_probe_rounds(layout),
+                    preflight=preflight,
                 )
                 status = scheduler.run()
                 console.finished(run_id, status)
@@ -3932,7 +4429,12 @@ def _run_resume(args: argparse.Namespace) -> int:
                 row["target_main_ref"],
                 (lane.lane_id for lane in store.active_projection(run_id)),
             )
-            actor = _actor_for(runtime, layout, target, run_id, compiled)
+            preflight = _RunPreflight(
+                layout, runtime, store, run_id, target, console,
+                verb="resume", attend=False,
+            )
+            preflight.run_wide()
+            actor = preflight.actor_for(compiled)
             actor.restore_layout(run_id, store.active_projection(run_id))
             scheduler = FactoryScheduler(
                 store,
@@ -3949,6 +4451,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                     layout.get("stall_regression_on_findings")
                 ),
                 max_probe_rounds=_max_probe_rounds(layout),
+                preflight=preflight,
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -4654,7 +5157,26 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     state: dict[str, Any] = {"passes": 0}
 
     def build_scheduler(plan: st.CompiledPlan) -> tuple[Any, Any]:
-        actor = _actor_for(runtime, layout, target, run_id, plan)
+        preflight = None
+        if state["passes"]:
+            actor = _actor_for(runtime, layout, target, run_id, plan)
+        else:
+            # Once per invocation, before the first dispatch: a later pass
+            # runs after an amendment this session applied, in the same
+            # environment the first pass already proved.
+            try:
+                plan_ir: Optional[Path] = _attend_plan_ir(
+                    policy, plans_dir, run_id, plan.plan_revision
+                )
+            except att.AttendRefused:
+                plan_ir = None
+            preflight = _RunPreflight(
+                layout, runtime, store, run_id, target, console,
+                verb=verb, attend=True, local=bool(getattr(args, "local", False)),
+                plan_ir=plan_ir,
+            )
+            preflight.run_wide()
+            actor = preflight.actor_for(plan)
         if state["passes"]:
             close_panes = getattr(actor, "close_run_panes", None)
             if close_panes is not None:
@@ -4672,6 +5194,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             concurrency=layout.get("concurrency") or 1,
             regression_on_findings=bool(layout.get("stall_regression_on_findings")),
             max_probe_rounds=_max_probe_rounds(layout),
+            preflight=preflight,
         )
         return actor, scheduler
 
@@ -5054,6 +5577,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _RunRefused("LEDGER_SCHEMA_UNSUPPORTED", str(exc)).emit()
     except RuntimeStateRefused as exc:
         return _RunRefused("RUNTIME_STATE_REFUSED", str(exc)).emit()
+    except RunPreflightRefused as exc:
+        # The structured list beside the rendered report: one refusal names
+        # every missing item, each with its lane and remedy.
+        print(
+            json.dumps(
+                {
+                    "detail": exc.report,
+                    "outcome": exc.code,
+                    "refused": [item.as_payload() for item in exc.items],
+                },
+                sort_keys=True,
+            )
+        )
+        return 3
     except FactoryRefused as exc:
         return _RunRefused(exc.code, str(exc)).emit()
     except st.LiveRunCutoverRequired as exc:

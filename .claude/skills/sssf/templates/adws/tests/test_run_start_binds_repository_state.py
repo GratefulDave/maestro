@@ -19,6 +19,13 @@ import yaml
 import maestro
 
 
+def _no_preflight():
+    """The run preflight is its own subject (`test_run_preflight.py`)."""
+    return mock.patch.multiple(
+        maestro._RunPreflight, run_wide=mock.DEFAULT, __call__=mock.DEFAULT
+    )
+
+
 def _role_routes() -> dict[str, dict[str, str]]:
     return {
         "tester": {"route": "omp", "profile": "grok"},
@@ -270,6 +277,7 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
             mock.patch.object(maestro, "target_from_binding", return_value=target),
             mock.patch.object(maestro, "register_installation"),
             mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
+            _no_preflight(),
             mock.patch.object(maestro, "FactoryScheduler", BlockingScheduler),
         ):
             thread = threading.Thread(target=invoke)

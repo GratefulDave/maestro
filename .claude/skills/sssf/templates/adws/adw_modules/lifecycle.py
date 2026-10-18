@@ -60,7 +60,15 @@ V3_RUN_ARTIFACT_KINDS = (
     "AMENDMENT_RATIONALE",
 )
 V3_RUN_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V3_RUN_ARTIFACT_KINDS)
+# The v7 run-artifact kinds, verbatim for the same reason. v8 added
+# RUN_PREFLIGHT.
+V7_RUN_ARTIFACT_KINDS = (
+    *V3_RUN_ARTIFACT_KINDS,
+    "ATTEND_REVIEW",
+)
+V7_RUN_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V7_RUN_ARTIFACT_KINDS)
 _RUN_ARTIFACTS_V6_BACKUP = "run_artifacts__v6_backup"
+_RUN_ARTIFACTS_V7_BACKUP = "run_artifacts__v7_backup"
 RUN_ARTIFACT_COLUMNS = (
     "artifact_id",
     "run_id",
@@ -238,6 +246,7 @@ V4_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V4_LANE_KIND_CHECK)
 RUN_ARTIFACTS_SQL = _run_artifacts_ddl(RUN_KIND_CHECK)
 V2_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V2_RUN_KIND_CHECK)
 V3_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V3_RUN_KIND_CHECK)
+V7_RUN_ARTIFACTS_SQL = _run_artifacts_ddl(V7_RUN_KIND_CHECK)
 SCHEMA = _schema_script(LANE_KIND_CHECK, RUN_KIND_CHECK)
 V1_SCHEMA = _schema_script(V1_LANE_KIND_CHECK, V2_RUN_KIND_CHECK)
 
@@ -397,6 +406,9 @@ class ArtifactStore:
             version = st.LEDGER_SCHEMA_VERSION_V6
         if version == st.LEDGER_SCHEMA_VERSION_V6:
             self._migrate_v6_to_v7()
+            version = st.LEDGER_SCHEMA_VERSION_V7
+        if version == st.LEDGER_SCHEMA_VERSION_V7:
+            self._migrate_v7_to_v8()
             return
         self._refuse_schema()
 
@@ -590,8 +602,9 @@ class ArtifactStore:
         if "run_artifacts" not in names or _RUN_ARTIFACTS_V6_BACKUP in names:
             self._refuse_schema()
         sql = _table_create_sql(self.conn, "run_artifacts")
-        if sql is not None and _normalize_sql(sql) == _normalize_sql(
-            RUN_ARTIFACTS_SQL
+        if sql is not None and _normalize_sql(sql) in (
+            _normalize_sql(RUN_ARTIFACTS_SQL),
+            _normalize_sql(V7_RUN_ARTIFACTS_SQL),
         ):
             return False
         if sql is None or _normalize_sql(sql) != _normalize_sql(V3_RUN_ARTIFACTS_SQL):
@@ -610,12 +623,62 @@ class ArtifactStore:
         self._begin_migration()
         try:
             if rebuild:
+                # The v7 table, so v8 finds what it expects and widens it.
                 self._rebuild_run_artifacts_current_check(
-                    backup=_RUN_ARTIFACTS_V6_BACKUP
+                    backup=_RUN_ARTIFACTS_V6_BACKUP, ddl=V7_RUN_ARTIFACTS_SQL
                 )
             cursor = self.conn.execute(
                 "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
-                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V6),
+                (st.LEDGER_SCHEMA_VERSION_V7, st.LEDGER_SCHEMA_VERSION_V6),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity(st.LEDGER_SCHEMA_VERSION_V7)
+            self.conn.execute("COMMIT")
+            self._end_migration()
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+
+    def _run_artifacts_need_v8_rebuild(self) -> bool:
+        """True when run_artifacts still carries the v7 kind check."""
+        names = _tables(self.conn)
+        if "run_artifacts" not in names or _RUN_ARTIFACTS_V7_BACKUP in names:
+            self._refuse_schema()
+        sql = _table_create_sql(self.conn, "run_artifacts")
+        if sql is not None and _normalize_sql(sql) == _normalize_sql(
+            RUN_ARTIFACTS_SQL
+        ):
+            return False
+        if sql is None or _normalize_sql(sql) != _normalize_sql(V7_RUN_ARTIFACTS_SQL):
+            self._refuse_schema()
+        return True
+
+    def _migrate_v7_to_v8(self) -> None:
+        """Widen the run-artifact kind check for `RUN_PREFLIGHT`.
+
+        Same reason as v7: the kind check is baked into the table at
+        creation, so a v7 ledger refuses a `RUN_PREFLIGHT` insert.
+        """
+        rebuild = self._run_artifacts_need_v8_rebuild()
+        self._require_supported_v2_run_artifacts()
+        self._begin_migration()
+        try:
+            if rebuild:
+                self._rebuild_run_artifacts_current_check(
+                    backup=_RUN_ARTIFACTS_V7_BACKUP
+                )
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V7),
             )
             if cursor.rowcount != 1:
                 raise ArtifactStoreError("ledger_meta schema_version stamp")
@@ -632,7 +695,6 @@ class ArtifactStore:
             except sqlite3.Error:
                 pass
             raise
-
 
     def _require_post_migration_integrity(self, expected: str) -> None:
         fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
@@ -655,14 +717,16 @@ class ArtifactStore:
             st.LEDGER_SCHEMA_VERSION_V4,
             st.LEDGER_SCHEMA_VERSION_V5,
             st.LEDGER_SCHEMA_VERSION_V6,
+            st.LEDGER_SCHEMA_VERSION_V7,
             st.LEDGER_SCHEMA_VERSION,
         ):
-            # v3..v6 carry the v3 run kind check; v7 the current one. A
-            # crash between the v7 rebuild and its stamp leaves the current
+            # v3..v6 carry the v3 run kind check, v7 its own, v8 the current
+            # one. A crash between a rebuild and its stamp leaves a newer
             # table under an older stamp, which is correct and not refused.
             run_ddls = {_normalize_sql(RUN_ARTIFACTS_SQL)}
             if expected != st.LEDGER_SCHEMA_VERSION:
                 run_ddls.add(_normalize_sql(V3_RUN_ARTIFACTS_SQL))
+                run_ddls.add(_normalize_sql(V7_RUN_ARTIFACTS_SQL))
             run_sql = _table_create_sql(self.conn, "run_artifacts")
             if run_sql is None or _normalize_sql(run_sql) not in run_ddls:
                 raise ArtifactStoreError("run_artifacts ddl")
@@ -2813,6 +2877,26 @@ class ArtifactStore:
             st.ArtifactKind.ATTEND_REVIEW,
             digest,
             "attend-review/{0}/r{1}/{2}".format(session_id, plan_revision, review_round),
+            body,
+        )
+
+    @serialized
+    def record_run_preflight(
+        self,
+        run_id: str,
+        *,
+        preflight_id: str,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        """What one start/resume preflight verified, provisioned and refused."""
+        digest = st.run_preflight_input_digest(run_id=run_id, preflight_id=preflight_id)
+        body = dict(payload)
+        body["preflight_id"] = preflight_id
+        return self._record_run_note(
+            run_id,
+            st.ArtifactKind.RUN_PREFLIGHT,
+            digest,
+            "preflight/{0}".format(preflight_id),
             body,
         )
 

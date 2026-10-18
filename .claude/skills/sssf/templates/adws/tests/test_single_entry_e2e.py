@@ -403,6 +403,13 @@ class FactoryEndToEndBase(SingleEntryBase):
         self.final_graph: dict[str, Any] = {}
         self.graphs: list[dict[str, Any]] = []
         self.reset_herdr("transcripts")
+        # The run preflight checks real binaries and credentials on this
+        # machine; it is its own subject (`test_run_preflight.py`).
+        no_preflight = mock.patch.multiple(
+            maestro._RunPreflight, run_wide=mock.DEFAULT, __call__=mock.DEFAULT
+        )
+        no_preflight.start()
+        self.addCleanup(no_preflight.stop)
 
     def reset_herdr(self, transcripts: str, **panes: Any) -> None:
         """A fresh Herdr, the operator's Space in it, and a clean baseline."""
