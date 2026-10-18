@@ -1,0 +1,33 @@
+name: adws tests
+
+on:
+  push:
+    branches: [main]
+    paths: [".claude/skills/sssf/templates/adws/**", ".github/workflows/adws-tests.yml"]
+  pull_request:
+    paths: [".claude/skills/sssf/templates/adws/**", ".github/workflows/adws-tests.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: orbstack
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .claude/skills/sssf/templates/adws
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      # Deps mirror the PEP 723 header of adw_test.py (no pyproject in this repo).
+      # Deselected: reads a hardcoded operator path, https://github.com/GratefulDave/maestro/issues/320
+      - name: Run adws tests
+        run: >
+          uv run --with pytest --with pytest-xdist --with pydantic --with python-dotenv --with pyyaml --with rich
+          pytest -q -n 8
+          --deselect tests/test_tests_lane_handoff.py::TestsLaneHandoffTests::test_v3_plan_compiles_typed_kinds_and_preserves_semantics
