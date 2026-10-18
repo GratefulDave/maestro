@@ -1,0 +1,31 @@
+name: adws tests
+
+on:
+  push:
+    branches: [main]
+    paths: [".claude/skills/sssf/templates/adws/**", ".github/workflows/adws-tests.yml"]
+  pull_request:
+    paths: [".claude/skills/sssf/templates/adws/**", ".github/workflows/adws-tests.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: orbstack
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .claude/skills/sssf/templates/adws
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      # Deps mirror the PEP 723 header of adw_test.py (no pyproject in this repo).
+      - name: Run adws tests
+        run: >
+          uv run --with pytest --with pytest-xdist --with pydantic --with python-dotenv --with pyyaml --with rich
+          pytest -q -n 8
