@@ -1058,9 +1058,9 @@ class RediscoveryTest(unittest.TestCase):
             with self.assertRaises(lch.LaunchRefused) as blocked_raised:
                 blocked._reconnect_live_agent(spec, dict(spec.environment))
             self.assertEqual(
-                blocked_raised.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH
+                blocked_raised.exception.refusal, lch.LaunchRefusal.AGENT_START_BLOCKED
             )
-            self.assertIn("AGENT_STATUS_UNOBSERVABLE", blocked_raised.exception.detail)
+            self.assertIn("pane {0}".format(handle.pane_id), blocked_raised.exception.detail)
 
     def test_wrong_agent_name_refuses_reconnect(self) -> None:
         herdr = FakeHerdr()
@@ -2361,7 +2361,13 @@ class OwnershipMatrixTest(unittest.TestCase):
                 else:
                     with self.assertRaises(lch.LaunchRefused) as raised:
                         _launch(run.launcher(), run.herdr, tester)
-                    self.assertIn("AGENT_STATUS_UNOBSERVABLE", raised.exception.detail)
+                    if status == "blocked":
+                        self.assertEqual(
+                            raised.exception.refusal, lch.LaunchRefusal.AGENT_START_BLOCKED
+                        )
+                        self.assertIn("pane {0}".format(first.pane_id), raised.exception.detail)
+                    else:
+                        self.assertIn("AGENT_STATUS_UNOBSERVABLE", raised.exception.detail)
                     self.assertEqual(_calls_after(run.herdr, mark, CREATE, OPEN, SPLIT, START), [])
                     self.assertNotIn(first.pane_id, run.herdr.closed_panes)
 
@@ -2372,12 +2378,25 @@ class OwnershipMatrixTest(unittest.TestCase):
             tester = run.spec(TESTS_LANE, "tester")
             with self.assertRaises(lch.LaunchRefused) as raised:
                 _launch(run.launcher(), run.herdr, tester)
-            self.assertEqual(raised.exception.refusal, lch.LaunchRefusal.AGENT_START_REFUSED)
-            self.assertIn(lch.AGENT_NOT_READY, raised.exception.detail)
+            # A startup prompt is a typed condition naming the pane, not a
+            # generic start failure.
+            self.assertEqual(raised.exception.refusal, lch.LaunchRefusal.AGENT_START_BLOCKED)
             self.assertTrue(raised.exception.pane_created)
             name = lch.agent_name_for(tester.correlation_token)
+            pane_id = run.herdr.agents[name]["pane_id"]
+            self.assertIn("waiting on a prompt in pane {0}".format(pane_id), raised.exception.detail)
             self.assertEqual(run.herdr.agents[name]["agent_status"], "blocked")
-            self.assertNotIn(run.herdr.agents[name]["pane_id"], run.herdr.closed_panes)
+            self.assertNotIn(pane_id, run.herdr.closed_panes)
+            # The retry while a human may be answering it: still typed, and
+            # the pane is neither replaced nor closed.
+            run.herdr.agent_start_refusal = ""
+            mark = len(run.herdr.calls)
+            with self.assertRaises(lch.LaunchRefused) as again:
+                _launch(run.launcher(), run.herdr, tester)
+            self.assertEqual(again.exception.refusal, lch.LaunchRefusal.AGENT_START_BLOCKED)
+            self.assertIn("pane {0}".format(pane_id), again.exception.detail)
+            self.assertEqual(_calls_after(run.herdr, mark, CREATE, OPEN, SPLIT, START), [])
+            self.assertNotIn(pane_id, run.herdr.closed_panes)
             # The operator answered the startup prompt; the agent is idle.
             run.herdr.agent_start_refusal = ""
             run.herdr.set_agent_status(name, "idle")

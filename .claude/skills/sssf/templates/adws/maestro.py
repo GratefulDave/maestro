@@ -3028,6 +3028,28 @@ class HerdrStageActor:
     _OPERATOR_OUT = "revisions"
     _ATTEND_REVIEWER = _ATTEND_REVIEWER_ROLE
 
+    def _attend_checkout(self, ctx: LaneContext, cwd: Path) -> None:
+        """Make `cwd` a detached `--no-checkout` worktree of the target repo.
+
+        The same `_add_worktree` the lane trees and UI anchors use, so Claude
+        Code resolves the tree to the target repository's already-trusted
+        project instead of stopping at a folder-trust prompt nobody is there
+        to answer (a plain directory has no project entry). `--no-checkout`
+        leaves no product file in it. Whatever an earlier dispatch left --
+        `revisions/` named by ATTEND_REVIEW rows, a pre-worktree plain tree --
+        is moved aside and back, so every recorded path keeps its bytes.
+        """
+        if (cwd / ".git").exists():
+            return
+        held = cwd.parent / ".checkout-{0}".format(uuid.uuid4().hex)
+        if cwd.is_dir():
+            cwd.rename(held)
+        self._add_worktree(cwd, self._base_sha(ctx, "tester"), no_checkout=True)
+        if held.is_dir():
+            for child in held.iterdir():
+                child.rename(cwd / child.name)
+            held.rmdir()
+
     def _write_attend_tree(
         self,
         cwd: Path,
@@ -3109,14 +3131,16 @@ class HerdrStageActor:
     ) -> Mapping[str, Any]:
         """Dispatch the operator agent that authors an attended amendment.
 
-        Its tree is not a git checkout. That is deliberate: this role authors a
-        plan, never a candidate, and giving it a worktree would give it a HEAD
-        to commit against and the product repo to wander into. It gets its
-        inputs as files and one path to write.
+        Its tree is a detached `--no-checkout` worktree of the target repo,
+        made by the lane trees' own helper: a plain directory has no trusted
+        Claude Code project, and the agent stopped at the folder-trust prompt
+        in it. `--no-checkout` keeps every product file out, because this role
+        authors a plan, never a candidate. It gets its inputs as files and one
+        path to write.
         """
         attempt = self._role_dir(ctx, "operator")
         cwd = attempt / "checkout"
-        cwd.mkdir(parents=True, exist_ok=True)
+        self._attend_checkout(ctx, cwd)
         inputs = cwd / self._OPERATOR_INPUTS
         files = {
             "current.ir.json": Path(request.ir_path).read_bytes(),
@@ -3148,7 +3172,7 @@ class HerdrStageActor:
                 (inputs / "previous_revision.ir.json").resolve()
             )
         Path(request.revision_out_path).unlink(missing_ok=True)
-        payload, _handle, _cwd_used = self._launch(
+        payload, _handle, cwd_used = self._launch(
             ctx,
             "operator",
             cwd,
@@ -3156,9 +3180,11 @@ class HerdrStageActor:
             prepare_cwd=lambda path: self._write_attend_tree(
                 path, request.lanes, files
             ),
-            # The attend tree is not a checkout and holds no project to install.
+            # A --no-checkout tree holds no project to install.
             provision=False,
         )
+        # Records the worktree, so removal is the lanes' `git worktree remove`.
+        self._bind_checkout(self._role_key(ctx, "operator"), attempt, cwd, cwd_used)
         return payload
 
     def attend_reviewer(
@@ -3166,21 +3192,21 @@ class HerdrStageActor:
     ) -> Mapping[str, Any]:
         """Dispatch the independent reviewer of an attended revision.
 
-        Beside `attend_operator` and shaped the same way: a non-git tree, its
-        inputs as files, one path to write (`findings_out_path`, the answer to
-        the independent review question that `planctl review` signs). It is a
-        different agent on a different declared vendor, so the author never
-        answers its own review.
+        Beside `attend_operator` and shaped the same way: a `--no-checkout`
+        worktree, its inputs as files, one path to write (`findings_out_path`,
+        the answer to the independent review question that `planctl review`
+        signs). It is a different agent on a different declared vendor, so the
+        author never answers its own review.
         """
         attempt = self._role_dir(ctx, _ATTEND_REVIEWER_ROLE)
         cwd = attempt / "checkout"
-        cwd.mkdir(parents=True, exist_ok=True)
         inputs = cwd / self._OPERATOR_INPUTS
         # The reviewer is handed exactly the bytes the round recorded, and
         # those are the only bytes `project` will accept after a PASS.
         revision = att.reviewed_bytes(
             Path(request.revision_ir_path), request.revision_sha256
         )
+        self._attend_checkout(ctx, cwd)
         files = {
             "current.ir.json": Path(request.current_ir_path).read_bytes(),
             "revision.ir.json": revision,
@@ -3205,7 +3231,7 @@ class HerdrStageActor:
             "revision_ir_path": str((inputs / "revision.ir.json").resolve()),
         }
         Path(request.findings_out_path).unlink(missing_ok=True)
-        payload, _handle, _cwd_used = self._launch(
+        payload, _handle, cwd_used = self._launch(
             ctx,
             _ATTEND_REVIEWER_ROLE,
             cwd,
@@ -3213,8 +3239,11 @@ class HerdrStageActor:
             prepare_cwd=lambda path: self._write_attend_tree(
                 path, request.lanes, files
             ),
-            # The attend tree is not a checkout and holds no project to install.
+            # A --no-checkout tree holds no project to install.
             provision=False,
+        )
+        self._bind_checkout(
+            self._role_key(ctx, _ATTEND_REVIEWER_ROLE), attempt, cwd, cwd_used
         )
         return payload
 
@@ -3797,7 +3826,15 @@ class _RunPreflight:
             return
         lane_id = "preflight-{0}".format(self.preflight_id)
         scratch = self.runtime.path / "worktrees" / self.run_id / lane_id
-        trees.append(scratch)
+        # The attend trees are git worktrees: removed by `git worktree remove`
+        # before their parent is deleted, or the target repo keeps the entries.
+        trees.extend(
+            (
+                scratch / "operator" / "checkout",
+                scratch / _ATTEND_REVIEWER_ROLE / "checkout",
+                scratch,
+            )
+        )
         ctx = SimpleNamespace(
             run_id=self.run_id,
             lane=SimpleNamespace(lane_id=lane_id, spec_digest="0" * 64, lane_kind=None),
@@ -3805,6 +3842,7 @@ class _RunPreflight:
             input_digest="",
             plan_revision=0,
             stage=st.LaneStage.WAITING_FOR_USER,
+            integration_head="",
         )
         ir = scratch / "preflight.ir.json"
         ir_bytes = b"{}"
@@ -3850,8 +3888,8 @@ class _RunPreflight:
             )
 
         remedy = (
-            "the attend tree is not a checkout and must not be provisioned; a "
-            "launch path that provisions it is a runtime defect, not configuration"
+            "the attend tree is a --no-checkout worktree and must not be provisioned; "
+            "a launch path that provisions it is a runtime defect, not configuration"
         )
         yield rp.Check("attend-tree:operator", operator, remedy)
         yield rp.Check("attend-tree:reviewer", reviewer, remedy)
@@ -4707,7 +4745,7 @@ def _attend_suite_files(
     """The accepted suite, read off the run repository for the operator agent.
 
     The same bytes the builder and every reviewer have in their checkouts,
-    written into the operator's own tree, which is not a git checkout and is
+    written into the operator's own `--no-checkout` worktree, which is
     never merged.
     """
     artifact_id = store.accepted_suite_artifact_id(run_id, lane.lane_id)
