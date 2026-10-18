@@ -125,8 +125,7 @@ separately, which exist in one copy and not the other, because that is a deletio
 an edit); `mirror <source> <destination>` plans and `--apply` writes, with a sha256 assertion
 per file. It never deletes, it refuses a destination that looks ahead of the source unless you
 pass `--overwrite-ahead`, and it holds `maestro.config.yaml` back whenever either endpoint is
-a deployment. `tests/test_template_parity.py` calls the same comparison, so the test's failure
-and the mirror's repair are the same definition of level. Do not use `cp`, `rsync`, or
+a deployment. Do not use `cp`, `rsync`, or
 `git apply` — `git apply` reports success and changes nothing on this machine.
 
 Before it existed there was nothing, and the drift was only discovered when something broke: on
@@ -135,17 +134,14 @@ plan verb in daily use, and a revert in a consuming repo silently deleted 6009 l
 from another copy. Nothing *schedules* the new script either. It makes a reconciliation provable
 and refusable; it does not make one happen.
 
-The two **template** copies are now held together by a test rather than by discipline:
-`.claude/skills/sssf/templates/adws/tests/test_template_parity.py` compares this repo's template
-against the-library's file by file and fails naming the files that differ and in which direction.
-It is mirrored into the-library along with the runtime, and re-exported into that repo's own
-suite by `the-library/tests/test_sssf_adws_copy_parity.py`, so both repositories check the
-invariant from their own side. A file present in one copy and not the other fails, which is the
-6009-line loss mode. It skips only when the peer repository is not checked out at all; a peer that
-is checked out with its runtime directory missing fails.
+No test holds any of the copies together. The template, the-library's copy and every deployment
+are customized on purpose, and a parity test between them was deleted on the user's decision
+(a contract change that removes a check). They are reconciled on demand with
+`runtime_sync.py check` and `mirror`, which reports a file present in one copy and not the other
+(the 6009-line loss mode) separately from a file that differs.
 
-`lexgenius/adws/` is **not** covered by that test. A deployed instance carries its own
-`maestro.config.yaml` and legitimately runs ahead of the template, so it is reconciled by hand.
+A deployed instance carries its own `maestro.config.yaml` and legitimately runs ahead of the
+template, so it is reconciled by hand.
 Treat this repo's template as authoritative for what the factory *ships*, but **verify before
 assuming it is current against a deployment** — run `runtime_sync.py check` against the instance
 rather than trusting this file, which can itself go stale. When landing a change, say explicitly which copies
@@ -153,9 +149,7 @@ you touched, and mirror deliberately rather than assuming a mirror already happe
 
 **Historical snapshot as of 2026-08-22** (attempt-host / retry-policy PRs named below
 are not factory diagnostics; the parity counts are a dated observation):
-`tests/test_template_parity.py` **passes** from this repo — 2 passed in 0.32s,
-both assertions, same-files and byte-identical-contents — and
-`runtime_sync.py check` agrees: template and the-library are level over **214**
+`runtime_sync.py check` reported: template and the-library are level over **214**
 compared files. That is after #127 (console stops reading an in-review attempt
 as dead), #128 (`attempts.attempt_host` + `attempt_start_epoch`; attempt
 liveness declinable; `tester_vendor` bound to `lane_vendor`), and #130
@@ -239,8 +233,8 @@ why, before reaching for it. And **the repair is not durable until it is
 committed in the destination repository**, which is a separate act from writing
 it. That is not hypothetical here: on 2026-09-02 the overwrite was applied, a
 check confirmed the copies level, and a later git operation in that repository
-discarded the uncommitted file and put the divergence straight back. A green
-`test_template_parity` proves the bytes on disk agree; it says nothing about
+discarded the uncommitted file and put the divergence straight back. A level
+`runtime_sync.py check` proves the bytes on disk agree; it says nothing about
 whether they are committed, so confirm with `git status` there, never with
 parity.
 

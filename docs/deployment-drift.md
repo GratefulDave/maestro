@@ -2,8 +2,8 @@
 
 The ADW runtime exists in more than one checkout. Two of them are *templates* —
 this repository's `.claude/skills/sssf/templates/adws/` and the-library's
-`skills/sssf/templates/adws/` — and `tests/test_template_parity.py` holds those
-two together automatically, failing when they diverge.
+`skills/sssf/templates/adws/` — and no test holds those two together: they are customized
+on purpose and reconciled on demand with `runtime_sync.py`.
 
 Every other copy is a **deployment**: a repository the factory has been
 installed into, running the runtime rather than shipping it. Until now nothing
@@ -66,7 +66,7 @@ Three properties of that file are deliberate:
   deployment that is not installed on this machine, skips while naming the exact
   path it looked for and how it chose it. This suite runs in CI and on machines
   that have never installed the factory. A silent skip is what hid a
-  wrongly-resolved peer path for the whole life of `test_template_parity`.
+  wrongly-resolved peer path for the whole life of the deleted template parity test.
 
 ## What it reports, and why the findings are separate
 

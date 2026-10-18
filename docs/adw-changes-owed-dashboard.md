@@ -120,9 +120,8 @@ comments.
 
 ## A5 — the mirror already owed
 
-The plan-facts columns that landed on `lane/dashboard-port` make `tests/test_template_parity.py`
-fail against the-library, and deployment parity fail against lexgenius and lexgenius-pipeline. Not
-mirrored; the parity test was **not** edited to hide it.
+The plan-facts columns that landed on `lane/dashboard-port` leave the-library and the
+deployments (lexgenius, lexgenius-pipeline) behind the template. Not mirrored.
 
 Sequencing hazard: mirroring into a deployment holding shipped `maestro-plan.v1` plans makes them
 unrunnable (`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`, from #104) until re-shipped from IR, and that
