@@ -1703,13 +1703,26 @@ HARNESS_VIOLATED_REQUIREMENTS = frozenset(
 )
 
 
+def _string_leaves(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [leaf for key in sorted(value) for leaf in _string_leaves(value[key])]
+    if isinstance(value, (list, tuple)):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return []
+
+
 def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
     """The public contract the reviewer was handed, as searchable text.
 
     Same mapping `pr.public_contract` / `tests_chain.write_test_draft` /
     `code_review.builder_view` project -- acceptance_criteria plus
     declared_outputs plus the declared interface entries -- not a second
-    projection.
+    projection. Each interface entry appears twice: JSON-encoded, and as its
+    decoded string values, because the reviewer is handed the decoded values
+    and a verbatim quote of one containing a backslash or double quote does
+    not survive JSON escaping.
     """
     if not isinstance(contract, Mapping):
         return ""
@@ -1723,6 +1736,7 @@ def _public_contract_text(contract: Mapping[str, Any] | None) -> str:
             json.dumps(entry, sort_keys=True, ensure_ascii=False)
             for entry in interface
         ]
+        + [leaf for entry in interface for leaf in _string_leaves(entry)]
     )
 
 

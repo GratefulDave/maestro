@@ -545,5 +545,38 @@ class ReviewKindSites(unittest.TestCase):
         self.assertEqual(blocked, ["lane-a"])
 
 
+class InterfaceValuesAreQuotedDecoded(unittest.TestCase):
+    """The reviewer is handed decoded interface strings, so a verbatim quote of
+    one containing a backslash or double quote must bind."""
+
+    RETURNS = (
+        "pathlib.Path: writes json.dumps(baseline, sort_keys=True) + '\\n' "
+        'to reports_dir/"stage1_baseline.json" and returns it'
+    )
+    CONTRACT = {
+        "acceptance_criteria": [CONTRACT_CLAUSE],
+        "declared_outputs": ["services/api/app.py"],
+        "interface": [
+            {
+                "kind": "function",
+                "name": "write_baseline",
+                "signature": {"params": ["reports_dir"], "returns": RETURNS},
+            }
+        ],
+    }
+
+    def test_a_verbatim_quote_of_a_decoded_value_binds(self) -> None:
+        self.assertIn("\\n", self.RETURNS)
+        contract = sch._public_contract_text(self.CONTRACT)
+        bound = _bind((_finding(self.RETURNS),), contract)
+        self.assertEqual(bound[0]["violated_requirement"], self.RETURNS)
+
+    def test_a_paraphrase_of_the_value_is_still_refused(self) -> None:
+        contract = sch._public_contract_text(self.CONTRACT)
+        paraphrase = "write_baseline returns the path of the written baseline file"
+        with self.assertRaises(st.CanonicalIdentityError):
+            _bind((_finding(paraphrase),), contract)
+
+
 if __name__ == "__main__":
     unittest.main()
