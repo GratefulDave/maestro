@@ -4208,6 +4208,19 @@ def _attend_lane_evidence(
     )
 
 
+def _attend_round_stem(next_revision: int, session_id: str, review_round: int) -> str:
+    """`r<N>.<session>.round<k>`: one path per round per attend session.
+
+    The session is in the name because two attend sessions on one run can
+    author the same revision number; without it the second would overwrite
+    the first's round files and leave an `ATTEND_REVIEW.revision_ref` naming
+    bytes it never reviewed.
+    """
+    if not session_id:
+        raise att.AttendRefused(att.NO_REVISION, "no attend session id")
+    return "r{0}.{1}.round{2}".format(next_revision, session_id, review_round)
+
+
 def _attend_request(
     store: ArtifactStore,
     runtime: RuntimeStateRoot,
@@ -4220,6 +4233,8 @@ def _attend_request(
     review_round: int = 1,
     reviewer_findings: Sequence[Mapping[str, Any]] = (),
     previous_revision: str = "",
+    *,
+    session_id: str,
 ) -> att.OperatorRequest:
     """Everything the operator agent reads for one batch, from the ledger."""
     next_revision = compiled.plan_revision + 1
@@ -4237,7 +4252,7 @@ def _attend_request(
         revision_out_path=str(
             operator_cwd
             / HerdrStageActor._OPERATOR_OUT
-            / "r{0}.round{1}.ir.json".format(next_revision, review_round)
+            / (_attend_round_stem(next_revision, session_id, review_round) + ".ir.json")
         ),
         amendment_rules=ATTEND_AMENDMENT_RULES,
         allowed_lane_ids=att.batch_scope(compiled.lanes, parked),
@@ -4255,6 +4270,8 @@ def _attend_review_request(
     review_round: int,
     revision_sha256: str,
     reviewer_cwd: Path,
+    *,
+    session_id: str,
 ) -> att.ReviewRequest:
     """Everything the attend reviewer reads for one round.
 
@@ -4265,9 +4282,8 @@ def _attend_review_request(
     """
     out = reviewer_cwd / HerdrStageActor._OPERATOR_OUT
     out.mkdir(parents=True, exist_ok=True)
-    snapshot = out / "r{0}.round{1}.reviewed.ir.json".format(
-        request.next_plan_revision, review_round
-    )
+    stem = _attend_round_stem(request.next_plan_revision, session_id, review_round)
+    snapshot = out / (stem + ".reviewed.ir.json")
     snapshot.write_bytes(att.reviewed_bytes(revision, revision_sha256))
     surface = _run_planctl(
         _planctl_binary(policy), ["question-surface", str(snapshot), "--json"]
@@ -4283,13 +4299,7 @@ def _attend_review_request(
         revision_sha256=revision_sha256,
         question_surface=surface,
         rationales=tuple(rationales),
-        findings_out_path=str(
-            reviewer_cwd
-            / HerdrStageActor._OPERATOR_OUT
-            / "r{0}.round{1}.review-findings.json".format(
-                request.next_plan_revision, review_round
-            )
-        ),
+        findings_out_path=str(out / (stem + ".review-findings.json")),
         amendment_rules=request.amendment_rules,
         allowed_lane_ids=request.allowed_lane_ids,
     )
@@ -4584,6 +4594,7 @@ def _run_attend(args: argparse.Namespace) -> int:
             review_round,
             reviewer_findings,
             previous_revision,
+            session_id=session_id,
         )
 
     def review_request_for(
@@ -4601,6 +4612,7 @@ def _run_attend(args: argparse.Namespace) -> int:
             review_round,
             revision_sha256,
             role_cwd_for(request.lane_id, HerdrStageActor._ATTEND_REVIEWER),
+            session_id=session_id,
         )
 
     def attend_ctx(request: Any, role: str) -> LaneContext:

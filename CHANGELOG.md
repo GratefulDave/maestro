@@ -62,7 +62,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   reviewer is handed exactly those bytes, and `project` receives exactly
   those bytes; a revision whose bytes changed after review is refused
   `ATTEND_REVISION_REFUSED`.
-- Each round writes its own `r<N>.round<k>.ir.json`, and the attend trees no
+- Each round writes its own `r<N>.<session>.round<k>.ir.json`, and the attend trees no
   longer wipe `revisions/`, so a REVISE round's `revision_ref` keeps its
   bytes. The dispatcher unlinks the one path it asks for, so a stale file
   cannot pass for a fresh answer.

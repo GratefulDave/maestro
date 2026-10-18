@@ -341,6 +341,40 @@ class ReviewSignsTheIndependentReviewersFindings(unittest.TestCase):
                 self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
                 planctl.assert_not_called()
 
+    def test_two_sessions_never_share_a_round_file(self) -> None:
+        """F9: same run, same revision, same round, different sessions."""
+        from unittest import mock
+
+        compiled = mock.Mock(plan_revision=1, lanes=())
+        operator_cwd = self.tmp / "operator"
+        reviewer_cwd = self.tmp / "reviewer"
+        paths = {}
+        for session, content in (("session-a", b'{"a": 1}'), ("session-b", b'{"b": 2}')):
+            request = maestro._attend_request(
+                None, None, {}, "run", (), compiled, self.revision, operator_cwd,
+                1, (), "", session_id=session,
+            )
+            out = Path(request.revision_out_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(content)
+            with (
+                mock.patch.object(maestro, "_planctl_binary", return_value=Path("p")),
+                mock.patch.object(maestro, "_run_planctl", return_value="{}"),
+            ):
+                review = maestro._attend_review_request(
+                    _REVIEWER, request, out, (), 1, att.sha256_hex(content),
+                    reviewer_cwd, session_id=session,
+                )
+            paths[session] = (out, Path(review.revision_ir_path), review.findings_out_path)
+            self.assertIn(session, out.name)
+        (a_out, a_snap, a_find), (b_out, b_snap, b_find) = paths.values()
+        self.assertNotEqual(a_out, b_out)
+        self.assertNotEqual(a_snap, b_snap)
+        self.assertNotEqual(a_find, b_find)
+        # The first session's bytes survive the second session's round.
+        self.assertEqual(a_out.read_bytes(), b'{"a": 1}')
+        self.assertEqual(a_snap.read_bytes(), b'{"a": 1}')
+
     def test_the_reviewer_id_is_a_planctl_identifier(self) -> None:
         import re
 
