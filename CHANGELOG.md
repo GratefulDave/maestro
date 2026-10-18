@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): attend's own agent failures hold their lanes instead of ending the run
+
+- An attend author or reviewer that could not be launched, crashed, or timed
+  out (`ATTEND_OPERATOR_FAILED` / `ATTEND_REVIEWER_FAILED`) used to end `run
+  start` / `run resume` / `run attend`. The call is now retried once; a second
+  failure holds every lane in the batch through the runtime-defect path (one
+  deduplicated issue per lane, the lane withheld from resume for the session)
+  and every other lane keeps running. Refusals about the revision are
+  unchanged.
+
+### Fixed
+- **Attend agents' scratch trees are not provisioned.** `attend_operator` and
+  `attend_reviewer` dispatch into a non-git tree that holds no project, but
+  `_launch` ran the deployment's `provision_argv` there, so `uv sync --frozen`
+  refused `PROVISION_FAILED: No pyproject.toml found`. `_launch` and
+  `_prepared_cwd` take keyword-only `provision`; only the two attend roles pass
+  `False`.
+
 ### Changed — contract change (new path): an uncited review finding parks its lane as LANE_FAULT instead of refusing the run
 
 - A test-reviewer or code-reviewer that twice returns a `REVISE` finding not

@@ -269,6 +269,28 @@ class AttendedLaneFault(unittest.TestCase):
         )
 
 
+    def test_attend_failing_twice_holds_the_lane_while_its_sibling_merges(self) -> None:
+        def dispatch(request: att.OperatorRequest) -> Mapping[str, Any]:
+            self.dispatched.append(request)
+            raise sch.LaunchFailed("PROVISION_FAILED:error: No pyproject.toml found")
+
+        outcome = self.attend(dispatch)
+        self.assertIs(outcome.status, st.RunStatus.WAITING)
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual(len(self.dispatched), 2)
+        self.assertEqual(outcome.applied, ())
+        self.assertEqual(self.store.lane_stage(RUN_ID, "lane-c"), st.LaneStage.MERGED)
+        self.assertEqual(
+            self.store.lane_stage(RUN_ID, "lane-a"), st.LaneStage.WAITING_FOR_USER
+        )
+        self.assertEqual(
+            [title for title, _body in self.filed],
+            ["Runtime defect on run {0}: lane-a ATTEND_OPERATOR_FAILED".format(RUN_ID)],
+        )
+        self.assertIn("No pyproject.toml found", self.filed[0][1])
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a"])
+
+
 class ResumeAttends(unittest.TestCase):
     """A3: `run resume` and `run start` need no separate verb."""
 
