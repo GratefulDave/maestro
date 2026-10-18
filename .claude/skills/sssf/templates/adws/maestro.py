@@ -652,6 +652,63 @@ def _role_agent_scratch(relative: str) -> bool:
     return bool(parts) and parts[0] == lch.ROLE_AGENT_DIR
 
 
+#: Prompt sections whose size scales with the plan rather than with the role.
+#: A tests lane's `obligations` carries its paired build lanes' whole obligation
+#: sets, so one section reached 547 KB and put a test-reviewer prompt at ~287k
+#: tokens against a 262k window (PROMPT_TOO_LARGE). Each section is written to
+#: its own file beside the prompt and the prompt carries a reference instead,
+#: so the launch size check measures the bytes that enter the prompt.
+PLAN_SCALED_PROMPT_SECTIONS: tuple[tuple[str, ...], ...] = (
+    ("lane_spec", "obligations"),
+    ("lane_spec", "interface"),
+    ("public_contract", "acceptance_criteria"),
+    ("public_contract", "interface"),
+    ("public_acceptance",),
+)
+
+_CONTEXT_FILE_INSTRUCTION = (
+    " A prompt value of the form {\"context_file\": <path>, \"sha256\": ..., "
+    "\"bytes\": ...} is a section of this prompt stored as JSON in that file "
+    "inside CWD. Read every such file before you act; it carries the same "
+    "authority as the prompt text."
+)
+
+
+def write_role_prompt(prompt: Path, sections: Mapping[str, Any]) -> None:
+    """Write a role prompt, moving plan-scaled sections into context files.
+
+    The files live under `.maestro-agent/context/<prompt stem>/`, which is the
+    harness's own directory inside the role's CWD: never a product path, never
+    collected as role output, and one directory per turn so a prompt and the
+    sections it references are never out of step.
+    """
+    body: dict[str, Any] = st.json_ready(sections)
+    context = prompt.parent / "context" / prompt.stem
+    moved = False
+    for section in PLAN_SCALED_PROMPT_SECTIONS:
+        parent: Any = body
+        for key in section[:-1]:
+            parent = parent.get(key) if isinstance(parent, dict) else None
+        if not isinstance(parent, dict) or section[-1] not in parent:
+            continue
+        data = st.canonical_bytes(parent[section[-1]])
+        path = context / (".".join(section) + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        parent[section[-1]] = {
+            "context_file": str(path.resolve()),
+            "sha256": st.digest_bytes(data),
+            "bytes": len(data),
+        }
+        moved = True
+    if moved:
+        body["instructions"] = str(body.get("instructions") or "") + (
+            _CONTEXT_FILE_INSTRUCTION
+        )
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_bytes(st.canonical_bytes(body))
+
+
 def _open_regular_under(root: Path, path: Path) -> tuple[str, int]:
     """Open a regular file under `root` without ever following a symlink.
 
@@ -2413,9 +2470,8 @@ class HerdrStageActor:
         prompt = lch.role_prompt_path(cwd, turn)
 
         def write_prompt(actual_cwd: Path) -> None:
-            prompt.parent.mkdir(parents=True, exist_ok=True)
-            prompt.write_bytes(
-                st.canonical_bytes(self._prompt(ctx, role, envelope, actual_cwd, extra))
+            write_role_prompt(
+                prompt, self._prompt(ctx, role, envelope, actual_cwd, extra)
             )
 
         def write_identity() -> None:
