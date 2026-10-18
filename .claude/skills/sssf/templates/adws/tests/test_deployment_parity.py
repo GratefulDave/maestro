@@ -1,7 +1,6 @@
 """Make deployment drift report itself instead of waiting to be looked for.
 
-`tests/test_template_parity.py` holds the two *template* checkouts together, and
-that pair is enforced. The deployed instances are not. They are level only for as
+The two *template* checkouts were once held together by a parity test, since deleted. The deployed instances are not. They are level only for as
 long as somebody remembers to run `tools/runtime_sync.py`, and what that costs
 has already been measured: `lexgenius/adws/adw_modules/code_review.py` sat 639
 lines behind the template long enough to corrupt a real run's reviews, answering
@@ -21,7 +20,7 @@ being right about nowhere. No registry means no declared deployments, which
 skips. A declared deployment that is not on this machine skips too. Both skips
 name the exact path that was looked for and why the conclusion was drawn, via
 `checkout_layout.skip_visibly`, because a silent skip is what hid the
-wrongly-resolved peer path for the whole life of `test_template_parity`.
+wrongly-resolved peer path for the whole life of the deleted template parity test.
 
 ## The three findings, which are not interchangeable
 
