@@ -595,5 +595,8 @@ Herdr and OMP are transport for agent dispatch. Pane text, process liveness, idl
 `lane-geo-corpus-tests` TEST_REVIEW seq 35 wrote a finding that named no
 clause of the public contract and REVISEd anyway; the lane parked
 `NO_PROGRESS` after nine amendments (A9). The field is now read: a REVISE
-finding must quote the contract or name a harness key.
+finding must quote the contract or name a harness key. A second uncited
+finding from the test or code reviewer parks that lane `LANE_FAULT` (fault type
+`ReviewFindingUncited`, which `run attend` attends); from the integration
+reviewer it still refuses the run `REVIEW_FINDING_UNCITED`.
 

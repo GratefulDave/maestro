@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,9 +163,9 @@ class RubricNamesTheCheck(unittest.TestCase):
         source = Path(maestro.__file__).read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count("checked mechanically"), 2)
         # The rubric must describe what the code does: an uncited finding is
-        # sent back once and a second miss stops the run. It is never advisory.
+        # sent back once and a second miss parks the lane. It is never advisory.
         self.assertNotIn("is advisory and does not make", source)
-        self.assertIn("a second miss stops the run", maestro.TEST_CRAFT_REVIEWER_QUESTION)
+        self.assertIn("a second miss parks the lane", maestro.TEST_CRAFT_REVIEWER_QUESTION)
 
 
 class TheSecondAskNamesTheRejectedCitation(unittest.TestCase):
@@ -205,9 +206,13 @@ class _EmptyStore:
 
     def __init__(self):
         self.conn = self._Conn()
+        self.pauses: list[tuple] = []
 
     def lane_stage(self, _run_id, _lane_id):
         return st.LaneStage.BUILDING
+
+    def pause_lane(self, run_id, lane_id, stage, digest, **kwargs):
+        self.pauses.append((run_id, lane_id, stage, digest, kwargs))
 
 
 class _ScriptedReviewer:
@@ -256,6 +261,9 @@ def _drive_reviewing_tests(actor):
     scheduler.store = _EmptyStore()
     scheduler.runtime = SimpleNamespace(path=Path("/state"))
     scheduler.actor = actor
+    scheduler._inflight_lock = threading.Lock()
+    scheduler._inflight = {}
+    scheduler._pause_input = lambda lane_id, stage: (_digest("input"), {})
     lane = SimpleNamespace(
         lane_id="lane-a",
         spec_digest=_digest("spec"),
@@ -314,6 +322,9 @@ def _drive_reviewing_code(actor):
     scheduler.runtime = SimpleNamespace(path=Path("/state"))
     scheduler.target = SimpleNamespace(target_repository_root="/repo")
     scheduler.actor = actor
+    scheduler._inflight_lock = threading.Lock()
+    scheduler._inflight = {}
+    scheduler._pause_input = lambda lane_id, stage: (_digest("input"), {})
     lane = SimpleNamespace(
         lane_id="lane-a",
         spec_digest=_digest("spec"),
@@ -486,37 +497,51 @@ class ReviewKindSites(unittest.TestCase):
         self.assertEqual(recorded["payload"]["verdict"], st.ReviewerVerdict.PASS.value)
         self.assertEqual(recorded["affected"], ())
 
-    def test_a_twice_uncited_test_review_refuses_typed(self) -> None:
+    def test_a_twice_uncited_test_review_parks_the_lane(self) -> None:
         actor = _ScriptedReviewer(
             [
                 (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
                 (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
             ]
         )
-        with self.assertRaises(sch.ReviewFindingUncited) as raised:
-            _drive_reviewing_tests(actor)
-        message = str(raised.exception)
-        self.assertEqual(raised.exception.code, "REVIEW_FINDING_UNCITED")
+        pauses: list[tuple] = []
+        with mock.patch.object(
+            _EmptyStore, "pause_lane", lambda self, *a, **k: pauses.append((a, k))
+        ):
+            with self.assertRaises(sch._ActorFaultParked):
+                _drive_reviewing_tests(actor)
+        self.assertEqual(len(pauses), 1)
+        args, kwargs = pauses[0]
+        self.assertEqual(args[1], "lane-a")
+        self.assertIs(kwargs["reason"], st.WaitReason.LANE_FAULT)
+        self.assertEqual(kwargs["fault"].exception_type, "ReviewFindingUncited")
         self.assertTrue(
-            message.startswith("REVIEW_FINDING_UNCITED:lane-a:test-reviewer:")
+            kwargs["fault"].message.startswith("lane-a:test-reviewer:")
         )
-        self.assertIn(PROBE_35[:120], message)
+        self.assertIn(PROBE_35[:120], kwargs["fault"].message)
 
-    def test_a_twice_uncited_code_review_refuses_typed(self) -> None:
+    def test_a_twice_uncited_code_review_parks_the_lane(self) -> None:
         actor = _ScriptedReviewer(
             [
                 (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
                 (st.ReviewerVerdict.REVISE, (_finding(PROBE_35),)),
             ]
         )
-        with self.assertRaises(sch.ReviewFindingUncited) as raised:
-            _drive_reviewing_code(actor)
-        message = str(raised.exception)
-        self.assertEqual(raised.exception.code, "REVIEW_FINDING_UNCITED")
+        pauses: list[tuple] = []
+        with mock.patch.object(
+            _EmptyStore, "pause_lane", lambda self, *a, **k: pauses.append((a, k))
+        ):
+            with self.assertRaises(sch._ActorFaultParked):
+                _drive_reviewing_code(actor)
+        self.assertEqual(len(pauses), 1)
+        args, kwargs = pauses[0]
+        self.assertEqual(args[1], "lane-a")
+        self.assertIs(kwargs["reason"], st.WaitReason.LANE_FAULT)
+        self.assertEqual(kwargs["fault"].exception_type, "ReviewFindingUncited")
         self.assertTrue(
-            message.startswith("REVIEW_FINDING_UNCITED:lane-a:code-reviewer:")
+            kwargs["fault"].message.startswith("lane-a:code-reviewer:")
         )
-        self.assertIn(PROBE_35[:120], message)
+        self.assertIn(PROBE_35[:120], kwargs["fault"].message)
 
     def test_a_twice_uncited_final_review_refuses_typed(self) -> None:
         actor = _ScriptedReviewer(

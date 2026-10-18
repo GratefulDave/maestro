@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, Protocol
+from typing import Any, NoReturn, Optional, Protocol
 
 from . import bound_surface as bsf
 from . import code_review as cr
@@ -78,8 +78,11 @@ class RunnerPreflightRefused(FactoryRefused):
 class ReviewFindingUncited(FactoryRefused):
     """A reviewer that twice could not quote the contract it REVISEd against.
 
-    The run refuses rather than guessing. The operator reads the citation
-    to decide whether the contract or the reviewer is wrong.
+    The integration reviewer is run-scoped, so it refuses the run. The test
+    and code reviewers are lane-scoped: their lane parks as LANE_FAULT
+    (fault type `ReviewFindingUncited`) and the run keeps advancing every
+    other lane. Either way the operator reads the citation to decide whether
+    the contract or the reviewer is wrong.
     """
 
     code = "REVIEW_FINDING_UNCITED"
@@ -2330,27 +2333,33 @@ class FactoryScheduler:
         # even if they arise while a role method is executing.
         except LaunchFailed as exc:
             detail = exc.detail + (":pane_retained" if exc.pane_created else "")
-            with self._inflight_lock:
-                inflight = self._inflight.get(ctx.lane.lane_id)
-            if inflight is not None and inflight[1] is ctx.stage:
-                _, _, digest, observed = inflight
-            else:
-                digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
-            self.store.pause_lane(
-                self.run_id,
-                ctx.lane.lane_id,
-                ctx.stage,
-                digest,
-                observed=observed,
-                reason=st.WaitReason.LANE_FAULT,
-                fault=st.LaneFault(type(exc).__name__, detail),
-            )
-            self._say(
-                ctx.lane.lane_id,
-                "lane fault, blocking for the operator",
-                detail,
-            )
-            raise _ActorFaultParked from exc
+            self._park_lane_fault(ctx, type(exc).__name__, detail, exc)
+
+    def _park_lane_fault(
+        self, ctx: LaneContext, fault_type: str, detail: str, cause: BaseException
+    ) -> NoReturn:
+        """Park one lane as LANE_FAULT for the operator; the run keeps going."""
+        with self._inflight_lock:
+            inflight = self._inflight.get(ctx.lane.lane_id)
+        if inflight is not None and inflight[1] is ctx.stage:
+            _, _, digest, observed = inflight
+        else:
+            digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
+        self.store.pause_lane(
+            self.run_id,
+            ctx.lane.lane_id,
+            ctx.stage,
+            digest,
+            observed=observed,
+            reason=st.WaitReason.LANE_FAULT,
+            fault=st.LaneFault(fault_type, detail),
+        )
+        self._say(
+            ctx.lane.lane_id,
+            "lane fault, blocking for the operator",
+            detail,
+        )
+        raise _ActorFaultParked from cause
 
 
     def _advance(self, lane_id: str) -> None:
@@ -3014,13 +3023,12 @@ class FactoryScheduler:
                     citation = getattr(exc, "offending_requirement", "")
                     if not isinstance(citation, str):
                         citation = ""
-                    raise ReviewFindingUncited(
-                        "{0}:{1}:{2}".format(
-                            lane_id,
-                            "test-reviewer",
-                            citation[:120],
-                        )
-                    ) from exc
+                    self._park_lane_fault(
+                        ctx,
+                        "ReviewFindingUncited",
+                        "{0}:{1}:{2}".format(lane_id, "test-reviewer", citation[:120]),
+                        exc,
+                    )
         artifact = tc.review_test_draft(
             request=_request(ctx),
             verdict=verdict,
@@ -3493,13 +3501,12 @@ class FactoryScheduler:
                 citation = getattr(exc, "offending_requirement", "")
                 if not isinstance(citation, str):
                     citation = ""
-                raise ReviewFindingUncited(
-                    "{0}:{1}:{2}".format(
-                        lane_id,
-                        "code-reviewer",
-                        citation[:120],
-                    )
-                ) from exc
+                self._park_lane_fault(
+                    ctx,
+                    "ReviewFindingUncited",
+                    "{0}:{1}:{2}".format(lane_id, "code-reviewer", citation[:120]),
+                    exc,
+                )
         probe_measurement = None
         if records or any(taken):
             probe_measurement, verdict, findings = self._probe_review(
