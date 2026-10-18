@@ -12,6 +12,7 @@ again, and one refusal lists exactly what only a person can supply.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,6 +64,7 @@ class _FakeRunner:
 
     def __init__(self, failing=(), outputs=None) -> None:
         self.failing = set(failing)
+        self.failing_argv: set[str] = set()
         self.outputs = dict(outputs or {})
         self.calls: list[tuple[str, ...]] = []
         self.importable: set[str] = set()
@@ -73,6 +75,8 @@ class _FakeRunner:
         if len(argv) == 4 and argv[1] == "-c" and "find_spec" in argv[2]:
             return rp.Proc(0 if argv[3] in self.importable else 1)
         key = " ".join(argv[:3])
+        if " ".join(argv) in self.failing_argv:
+            return rp.Proc(1, "", "{0}: failed".format(" ".join(argv)))
         if key in self.failing:
             return rp.Proc(1, "", "{0}: failed".format(key))
         return rp.Proc(0, self.outputs.get(key, ""), "")
@@ -283,6 +287,39 @@ class TheRealRunner(unittest.TestCase):
         self.assertEqual(proc.returncode, 127)
 
 
+class FixtureSupply(unittest.TestCase):
+    def _trees(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        root = Path(holder.name)
+        repo, tree = root / "repo", root / "tree"
+        repo.mkdir()
+        for argv in (["init", "-q", str(repo)],):
+            subprocess.run(["git", *argv], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(tree)], check=True)
+        return repo, tree
+
+    def test_an_untracked_fixture_in_the_target_is_copied_and_kept_out_of_git(self) -> None:
+        repo, tree = self._trees()
+        (repo / "plans").mkdir()
+        (repo / "plans" / "p.md").write_text("plan")
+        check = rp.fixture_check("lane-a", "plans/p.md", tree, repo)
+        items = rp.evaluate([check], lambda *args: None)
+        self.assertEqual([item.status for item in items], [rp.ADDED])
+        self.assertEqual((tree / "plans" / "p.md").read_text(), "plan")
+        status = subprocess.run(["git", "-C", str(tree), "status", "--porcelain"],
+                                capture_output=True, text=True).stdout
+        self.assertNotIn("plans", status)
+
+    def test_a_fixture_that_exists_nowhere_is_refused(self) -> None:
+        repo, tree = self._trees()
+        items = rp.evaluate([rp.fixture_check("lane-a", "plans/none.md", tree, repo)], lambda *args: None)
+        self.assertEqual([item.status for item in items], [rp.REFUSED])
+        self.assertFalse((tree / "plans" / "none.md").exists())
+
+
 class RunWideChecks(unittest.TestCase):
     def test_a_complete_deployment_verifies_and_skips_what_it_cannot_reach(self) -> None:
         bed = _Bed(self, attend=False)
@@ -450,6 +487,14 @@ class PerLaneChecks(unittest.TestCase):
         self.assertEqual([item.item_id for item in caught.exception.items], ["lane-tree"])
         self.assertIn("PROVISION_FAILED", caught.exception.items[0].detail)
         self.assertEqual(_by_id(preflight.items, "lane-d")["python:requests"].status, rp.SKIPPED)
+
+    def test_a_stale_inactive_gh_account_does_not_refuse_gh_auth(self) -> None:
+        bed = _Bed(self, attend=True)
+        bed.runner.failing_argv = {"gh auth status"}
+        preflight = bed.preflight()
+        preflight.run_wide()
+        self.assertEqual(_by_id(preflight.items)["gh:auth"].status, rp.VERIFIED)
+        self.assertIn(("gh", "auth", "status", "--active"), bed.runner.calls)
 
     def test_mixed_provisionable_items_are_fixed_and_only_secrets_refuse(self) -> None:
         bed = _Bed(self, attend=True)

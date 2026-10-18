@@ -2008,6 +2008,29 @@ class HerdrStageActor:
     def _clean_checkout(self, checkout: Path) -> None:
         self._git(checkout, "clean", "-fdx", "-e", lch.ROLE_AGENT_DIR)
 
+    def _with_fixtures(self, ctx: LaneContext, prepare: Callable[[Path], None]) -> Callable[[Path], None]:
+        """`prepare`, then copy in the lane's plan-declared fixtures the tree lacks.
+
+        A fixture that is untracked in the target working tree is not in any
+        lane worktree, and the refresh's `git clean` removes a copy made
+        earlier, so the copy is always the last step.
+        """
+        spec = self.lane_specs.get(ctx.lane.lane_id) or {}
+
+        def run(path: Path) -> None:
+            prepare(path)
+            if not (path / ".git").exists():
+                return
+            for relative in rp.declared_fixture_paths(spec):
+                if relative in ctx.lane.declared_outputs or (path / relative).exists():
+                    continue
+                try:
+                    rp.supply_fixture(Path(self.target.target_repository_root), path, relative)
+                except (FileNotFoundError, ValueError):
+                    pass
+
+        return run
+
     def _refresh_git_checkout(self, checkout: Path, sha: str) -> None:
         if not (checkout / ".git").exists():
             raise FactoryRefused("ROLE_CHECKOUT_MISSING")
@@ -2668,11 +2691,13 @@ class HerdrStageActor:
         # Filled in below once the turn is known to be a review revise.
         revise_draft: list[tuple[str, tuple[str, ...]]] = []
 
-        def prepare(path: Path) -> None:
+        def refresh(path: Path) -> None:
             if (path / ".git").exists():
                 self._refresh_git_checkout(path, sha)
                 for draft_sha, draft_files in revise_draft:
                     self._restore_draft(path, draft_sha, draft_files)
+
+        prepare = self._with_fixtures(ctx, refresh)
 
         if stored is None:
             attempt, checkout = self._prepare(ctx, "tester", sha=sha)
@@ -2765,7 +2790,7 @@ class HerdrStageActor:
             "test-reviewer",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
+            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_git_checkout(path, sha)),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
         return self._review_payload(payload)
@@ -2826,9 +2851,9 @@ class HerdrStageActor:
             "builder",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_builder_checkout(
+            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_builder_checkout(
                 path, ctx.lane.declared_outputs, sha
-            ),
+            )),
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         candidate_sha, changed = self._commit_declared(
@@ -2882,7 +2907,7 @@ class HerdrStageActor:
             "code-reviewer",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
+            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_git_checkout(path, sha)),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
         result = self._review_payload(payload)
@@ -2985,7 +3010,7 @@ class HerdrStageActor:
             role,
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
+            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_git_checkout(path, sha)),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
         return payload
@@ -3015,7 +3040,7 @@ class HerdrStageActor:
             "integration-reviewer",
             cwd,
             extra,
-            prepare_cwd=lambda path: self._refresh_git_checkout(path, sha),
+            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_git_checkout(path, sha)),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
         verdict, findings = self._review_payload(payload)
@@ -3713,7 +3738,9 @@ class _RunPreflight:
                 )
             )
         checks.append(
-            rp.command_check("gh:auth", ["gh", "auth", "status"], "gh auth login", self.runner, human_secret=True)
+            rp.command_check(
+                "gh:auth", ["gh", "auth", "status", "--active"], "gh auth login", self.runner, human_secret=True
+            )
         )
         checks.append(
             rp.command_check(
@@ -3811,7 +3838,7 @@ class _RunPreflight:
                 if not state["ready"]:
                     yield rp.Check("fixture:" + path, lambda: (True, ""), lane_id=lane_id, skip="lane tree could not be prepared")
                     continue
-                yield rp.fixture_check(lane_id, path, tree)
+                yield rp.fixture_check(lane_id, path, tree, self.repo)
 
     def _install(self, tree: Path, module: str, lane_id: str) -> str:
         provisioning.install_tree_packages(tree, (module,), _resolved_provision_timeout(None))

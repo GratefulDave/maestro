@@ -13,6 +13,9 @@ What may be provisioned is fixed by where it comes from, never guessed:
 * a Python module the accepted suite imports and the tree lacks is installed
   into that tree's own venv, tree-local, and recorded -- never written to the
   target repository's manifest, which is a published surface;
+* a plan-declared fixture missing from a lane tree but present in the target
+  repository's working tree (untracked there) is copied into the lane tree and
+  excluded from git, so it is readable but can never be committed;
 * a route receipt is captured by `route_admission.admit_routes`, the one
   minting path, signed with the deployment's existing route seed.
 
@@ -367,7 +370,42 @@ def module_check(
     )
 
 
-def fixture_check(lane_id: str, relative: str, tree: Path) -> Check:
+def supply_fixture(source_root: Optional[Path], tree: Path, relative: str) -> str:
+    """Copy `relative` from the target working tree into `tree`, uncommittable.
+
+    The path is added to the tree's git exclude (the worktrees share the
+    repository's `info/exclude`), so no builder can commit it.
+    """
+    if source_root is None:
+        raise FileNotFoundError(relative)
+    root = Path(tree).resolve()
+    source = (Path(source_root) / relative).resolve()
+    destination = (root / relative).resolve()
+    destination.relative_to(root)
+    source.relative_to(Path(source_root).resolve())
+    if not source.exists():
+        raise FileNotFoundError(relative)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source, destination)
+    probe = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode == 0 and probe.stdout.strip():
+        exclude = Path(probe.stdout.strip())
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        line = "/" + relative.lstrip("/")
+        present = exclude.read_text().splitlines() if exclude.exists() else []
+        if line not in present:
+            with exclude.open("a") as handle:
+                handle.write(line + "\n")
+    return "copied {0} from the target working tree (untracked there); excluded from git".format(relative)
+
+
+def fixture_check(lane_id: str, relative: str, tree: Path, source_root: Optional[Path] = None) -> Check:
     """A fixture the plan says exists before the lane runs."""
 
     def verify() -> Tuple[bool, str]:
@@ -384,6 +422,7 @@ def fixture_check(lane_id: str, relative: str, tree: Path) -> Check:
         "the plan declares this fixture as already present; commit it to the "
         "target repository or amend the fixture's path",
         lane_id=lane_id,
+        provision=lambda: supply_fixture(source_root, tree, relative),
     )
 
 
