@@ -181,8 +181,8 @@ DEPLOYMENT_OWNED = frozenset({"maestro.config.yaml"})
 #: The list is *not* part of the runtime and is deliberately not shipped inside
 #: it. It names absolute or checkout-relative paths on one machine, so a copy
 #: committed into the template would be wrong in every checkout but the one it
-#: was written in, and would then have to be identical in the-library to be level.
-#: It lives beside the repository
+#: was written in, and would then have to be identical in the-library for
+#: `tests/test_template_parity.py` to pass. It lives beside the repository
 #: instead, at `<repository>/.maestro/deployments.json`, or wherever
 #: ``MAESTRO_DEPLOYMENT_REGISTRY`` points.
 #:
@@ -358,7 +358,7 @@ def excluded_relative_paths(
     one installation's lane vendors, models and concurrency, and holding it back
     needs no per-deployment declaration. It applies only when a deployment is
     one of the endpoints; between two *template* checkouts it is
-    template-shaped on both sides and the check compares
+    template-shaped on both sides and `tests/test_template_parity.py` compares
     it like any other file.
 
     Everything else is *declared* — `RuntimeCopy.pinned`, populated from a

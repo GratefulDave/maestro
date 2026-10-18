@@ -130,8 +130,13 @@ this environment and reports success.
 
 Never copy `maestro.config.yaml` between copies. It is deployment-specific by design.
 
-**No parity test exists.** The template and its mirrors are customized on purpose. Never
-"fix" a difference by copying files into another repository.
+**The parity tests are expected to fail inside this worktree.**
+`tests/test_template_parity.py` here, and `tests/test_sssf_adws_copy_parity.py` in
+`the-library`, compare the template against the-library's copy. Editing the template without
+mirroring makes them red by construction, and they stay red until the operator mirrors at
+landing time. A red parity test is not a finding for this sweep, is not a blocker, and must
+never be "fixed" by copying files into another repository. Do not run them and do not report
+them.
 
 **Environment hazards, all of which have cost time here:**
 

@@ -6,10 +6,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Changed
-
-- Contract change (removes a check): `test_template_parity` deleted; template mirrors are customized by design.
-
 ### Changed — contract change (strengthening): `run attend` covers every amendable park, reviewed by an independent agent
 
 - **D1.** `run attend` now attends `AMENDMENT_REQUIRED` (lanes named by a
