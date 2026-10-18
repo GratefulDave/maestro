@@ -1,7 +1,7 @@
 """What the attend agents are handed, and where they are handed it.
 
-The operator's and the attend reviewer's trees are not git checkouts, so each
-parked lane's accepted suite and evidence are written into them as files. Two things have to hold: the bytes land inside the
+The operator's and the attend reviewer's trees are `--no-checkout` worktrees
+holding no product file, so each parked lane's accepted suite and evidence are written into them as files. Two things have to hold: the bytes land inside the
 tree the role contract confines the agent to, and the handoff is files rather
 than prompt text. B13's size check is made against the
 route's window at launch, and four rounds of findings plus a suite is a prompt
@@ -166,7 +166,7 @@ class OperatorPrompt(unittest.TestCase):
 
 
 class ReviewerDispatch(unittest.TestCase):
-    """The attend reviewer gets a non-git tree with its inputs as files."""
+    """The attend reviewer gets its inputs as files in its own tree."""
 
     def test_the_reviewer_tree_carries_both_irs_and_the_question_surface(self) -> None:
         from types import SimpleNamespace
@@ -200,6 +200,10 @@ class ReviewerDispatch(unittest.TestCase):
         with (
             mock.patch.object(actor, "_role_dir", return_value=tmp / "rev", create=True),
             mock.patch.object(actor, "_launch", side_effect=launch, create=True),
+            # The tree's git shape is AttendTreesAreWorktreesOfTheTarget's.
+            mock.patch.object(actor, "_attend_checkout", create=True),
+            mock.patch.object(actor, "_bind_checkout", create=True),
+            mock.patch.object(actor, "_role_key", create=True),
         ):
             payload = actor.attend_reviewer(SimpleNamespace(), request)
         self.assertEqual(payload["verdict"], "PASS")
@@ -210,7 +214,6 @@ class ReviewerDispatch(unittest.TestCase):
         self.assertEqual(
             json.loads((inputs / "question_surface.json").read_text()), {"plan_id": "p-1"}
         )
-        self.assertFalse((launched["cwd"] / ".git").exists())
         self.assertIs(launched["provision"], False)
         self.assertEqual(launched["extra"]["findings_out_path"], request.findings_out_path)
         self.assertEqual(
@@ -343,6 +346,90 @@ class AttendTreesAreNotProvisioned(unittest.TestCase):
             self.bench.launch("builder")
         self.assertIn("PROVISION_FAILED", str(caught.exception))
         self.assertEqual(self.provisioned, [self.bench.cwd])
+
+
+class AttendTreesAreWorktreesOfTheTarget(unittest.TestCase):
+    """Both attend trees get the lane trees' shape: a worktree of the target repo.
+
+    A plain directory has no trusted Claude Code project, so the operator
+    agent stopped at the folder-trust prompt and herdr reported `blocked`,
+    while every lane worktree resolved to the trusted repository. Driven
+    through the real `_launch` and a real git repository.
+    """
+
+    def setUp(self) -> None:
+        from unittest import mock
+
+        from test_prepare_once_per_dispatch import _AdoptingLauncher, _Bench
+
+        self.bench = _Bench(self, _AdoptingLauncher(target_cwd_fn=lambda tree: tree))
+        routes = dict(self.bench.actor.role_routes)
+        routes["operator"] = routes[maestro._ATTEND_REVIEWER_ROLE] = routes["code-reviewer"]
+        self.bench.actor.role_routes = routes
+        patch = mock.patch.object(
+            self.bench.actor, "_await_envelope", return_value={"verdict": "PASS"}
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.product = self.bench.root / "product"
+        self.ir = self.bench.root / "current.ir.json"
+        self.ir.write_text('{"rev": 1}', encoding="utf-8")
+
+    def _git(self, *args: str) -> str:
+        import subprocess
+
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    def _assert_target_worktree(self, role: str) -> None:
+        cwd = self.bench.actor._role_dir(self.bench.ctx, role) / "checkout"
+        common = Path(self._git("-C", str(cwd), "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = cwd / common
+        self.assertEqual(common.resolve(), (self.product / ".git").resolve())
+        listed = self._git("-C", str(self.product), "worktree", "list", "--porcelain")
+        self.assertIn("worktree {0}".format(cwd.resolve()), listed)
+        # --no-checkout: no product file is in the agent's tree.
+        self.assertFalse((cwd / "seed.txt").exists())
+        # Removal is the lanes' path, so no `git worktree` entry is orphaned.
+        key = self.bench.actor._role_key(self.bench.ctx, role)
+        stored = self.bench.actor._roles.pop(key)
+        self.assertEqual(stored.checkout, cwd.resolve())
+        self.bench.actor._safe_remove_attempt(stored.attempt, stored.checkout)
+        listed = self._git("-C", str(self.product), "worktree", "list", "--porcelain")
+        self.assertNotIn(str(cwd.resolve()), listed)
+
+    def test_the_operator_tree_is_a_no_checkout_worktree_of_the_target(self) -> None:
+        cwd = self.bench.actor._role_dir(self.bench.ctx, "operator") / "checkout"
+        # A plain tree an earlier dispatch left keeps every recorded revision.
+        kept = cwd / "revisions" / "r2.round1.ir.json"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("{}", encoding="utf-8")
+        request = att.OperatorRequest(
+            run_id="run-once", plan_revision=1, next_plan_revision=2,
+            lanes=(_lane({"tests/a.spec.ts": "a"}),), ir_path=str(self.ir),
+            revision_out_path=str(cwd / "revisions" / "r2.round2.ir.json"),
+            amendment_rules="rules", allowed_lane_ids=("lane-a-build",),
+        )
+        self.bench.actor.attend_operator(self.bench.ctx, request)
+        self.assertEqual(kept.read_text(), "{}")
+        self.assertTrue((cwd / "inputs" / "current.ir.json").is_file())
+        self._assert_target_worktree("operator")
+
+    def test_the_attend_reviewer_tree_is_a_no_checkout_worktree_of_the_target(self) -> None:
+        revision = self.bench.root / "r2.ir.json"
+        revision.write_text('{"rev": 2}', encoding="utf-8")
+        request = att.ReviewRequest(
+            run_id="run-once", plan_revision=1, next_plan_revision=2, review_round=1,
+            lanes=(_lane({"tests/a.spec.ts": "a"}),), current_ir_path=str(self.ir),
+            revision_ir_path=str(revision), question_surface="{}", rationales=(),
+            findings_out_path=str(self.bench.root / "f.json"), amendment_rules="rules",
+            allowed_lane_ids=("lane-a-build",),
+            revision_sha256=att.sha256_hex(b'{"rev": 2}'),
+        )
+        self.bench.actor.attend_reviewer(self.bench.ctx, request)
+        self._assert_target_worktree(maestro._ATTEND_REVIEWER_ROLE)
 
 
 if __name__ == "__main__":  # pragma: no cover

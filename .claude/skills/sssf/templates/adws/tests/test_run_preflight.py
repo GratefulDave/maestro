@@ -516,6 +516,14 @@ class AttendTrees(unittest.TestCase):
         # No pane: the launcher was never reached.
         self.assertEqual(bed.launcher.specs, [])
         self.assertEqual(list((bed.state / "worktrees" / RUN_ID).glob("preflight-*")), [])
+        # The attend trees are worktrees; removing them leaves no entry behind.
+        import subprocess
+
+        listed = subprocess.run(
+            ["git", "-C", str(bed.product), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertNotIn("preflight-", listed)
 
     def test_attend_tree_checks_are_skipped_when_attend_is_disabled(self) -> None:
         bed = _Bed(self, attend=False)

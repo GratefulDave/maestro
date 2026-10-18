@@ -112,6 +112,11 @@ class LaunchRefusal(Enum):
     #: which is not a `LaunchRefused` and therefore says nothing about the
     #: pane the handler just closed.
     AGENT_START_REFUSED = ("AGENT_START_REFUSED", None, False)
+    #: The agent is in its pane and reports `blocked`: it is waiting on a
+    #: prompt (folder trust, a permission) that only a human can answer. The
+    #: pane is never closed -- someone may be answering it -- and the detail
+    #: names the pane and the remedy instead of a generic start failure.
+    AGENT_START_BLOCKED = ("AGENT_START_BLOCKED", None, False)
     #: An agent started but its interactive composer or prompt submission did
     #: not complete. The launch path cancels that agent before reporting the
     #: refusal; another attempt may succeed.
@@ -314,6 +319,20 @@ def herdr_error_code(text: str) -> str:
         return ""
     code = error.get("code")
     return code if isinstance(code, str) else ""
+
+
+def agent_start_blocked(
+    pane_id: str, name: str = "", *, pane_created: bool = False
+) -> "LaunchRefused":
+    """The typed refusal for an agent that is `blocked` waiting on a prompt."""
+    return LaunchRefused(
+        LaunchRefusal.AGENT_START_BLOCKED,
+        "pane {0}{1}: the agent is waiting on a prompt in pane {0}; approve it "
+        "or fix the tree's trust".format(
+            pane_id or "<unknown>", " agent {0}".format(name) if name else ""
+        ),
+        pane_created=pane_created,
+    )
 
 
 #: Herdr's refusal when it holds no record of the requested agent. A finished
@@ -3650,6 +3669,10 @@ class HerdrLauncher:
             self._discard_role_handle(spec, handle)
             return None
         status = _agent_status_of(agent)
+        if status == "blocked":
+            raise agent_start_blocked(
+                str(agent.get("pane_id") or ""), handle.agent_name
+            )
         if status not in REUSABLE_AGENT_STATUSES:
             self._refuse_live_pane(
                 "AGENT_STATUS_UNOBSERVABLE:{}".format(status or "<missing>")
@@ -4135,6 +4158,10 @@ class HerdrLauncher:
         if agent is None:
             return None
         status = _agent_status_of(agent)
+        if status == "blocked":
+            raise agent_start_blocked(
+                str(agent.get("pane_id") or ""), stable_name
+            )
         if status not in REUSABLE_AGENT_STATUSES:
             self._refuse_live_pane(
                 "AGENT_STATUS_UNOBSERVABLE:{}".format(status or "<missing>")
@@ -4987,10 +5014,8 @@ class HerdrLauncher:
                 # running agent and the next attempt would block the same
                 # way. The pane stays, and the next dispatch reconnects to
                 # the stable name once the agent is idle.
-                raise LaunchRefused(
-                    LaunchRefusal.AGENT_START_REFUSED,
-                    "{0}:{1}".format(AGENT_NOT_READY, name),
-                    pane_created=True,
+                raise agent_start_blocked(
+                    pane_id, name, pane_created=True
                 ) from exc
             if self._stable_agent_in_pane(name, pane_id, environment):
                 # A concurrent dispatch of this role won the start in this
