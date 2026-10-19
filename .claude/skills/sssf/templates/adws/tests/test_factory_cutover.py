@@ -17,7 +17,11 @@ from adw_modules import git_publication as gitpub
 from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
-from adw_modules.lifecycle import AmendmentRefused, ArtifactStore
+from adw_modules.lifecycle import (
+    AmendmentAlreadyApplied,
+    AmendmentRefused,
+    ArtifactStore,
+)
 from adw_modules.runtime_state import RuntimeStateRoot
 
 FINDING = {
@@ -923,6 +927,32 @@ class FactoryCutoverTests(unittest.TestCase):
             _git(self.repo, "rev-parse", ref),
         )
         self.assertEqual(record.payload["integration_head"], git_head)
+
+    def test_reapplying_an_applied_amendment_is_typed_not_an_integrity_error(self) -> None:
+        compiled = self._compile(revision=1, ref="plan:reapply")
+        target = self._binding_target()
+        run_id = "run-reapply"
+        sch.create_factory_run(
+            store=self.store,
+            run_id=run_id,
+            compiled=compiled,
+            runtime=self.runtime,
+            target=target,
+        )
+        amended = self._compile(revision=2, ref="plan:reapply-2", a_goal="changed a")
+        sch.apply_factory_amendment(
+            self.store, run_id, amended, runtime=self.runtime, target=target
+        )
+        with self.assertRaises(AmendmentAlreadyApplied) as caught:
+            sch.apply_factory_amendment(
+                self.store,
+                run_id,
+                self._compile(revision=3, ref="plan:reapply-2", a_goal="changed a"),
+                runtime=self.runtime,
+                target=target,
+            )
+        self.assertEqual(caught.exception.code, "AMENDMENT_ALREADY_APPLIED")
+        self.assertIsInstance(caught.exception, AmendmentRefused)
 
     def test_amendment_after_pass_before_publication(self) -> None:
         compiled = self._compile(revision=1, ref="plan:pass-unpub")

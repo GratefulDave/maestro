@@ -51,6 +51,7 @@ from adw_modules import step_log
 from adw_modules import tests_chain as tchain
 from adw_modules import tree_materialize as tm
 from adw_modules.lifecycle import (
+    AmendmentAlreadyApplied,
     ArtifactStore,
     LedgerSchemaUnsupported,
     RunAlreadyExists,
@@ -4894,13 +4895,37 @@ def _run_amend(args: argparse.Namespace) -> int:
                 revision=row["plan_revision"] + 1,
                 ref=str(Path(args.plan).resolve()),
             )
-            apply_factory_amendment(
-                store,
-                run_id,
-                compiled,
-                runtime=runtime,
-                target=target,
-            )
+            try:
+                apply_factory_amendment(
+                    store,
+                    run_id,
+                    compiled,
+                    runtime=runtime,
+                    target=target,
+                )
+            except AmendmentAlreadyApplied as already:
+                gitpub.revalidate_binding(target)
+                current = FactoryScheduler(
+                    store,
+                    run_id,
+                    _actor_for(runtime, layout, target, run_id, _previous),
+                    runtime,
+                    target,
+                    compiled=_previous,
+                    max_probe_rounds=_max_probe_rounds(layout),
+                ).status()
+                print(
+                    json.dumps(
+                        {
+                            "detail": str(already),
+                            "outcome": "AMENDMENT_ALREADY_APPLIED",
+                            "run_id": run_id,
+                            "status": current.value,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
             _pin_plan_artifact(
                 Path(args.plan),
                 _pinned_plan_artifact(runtime, run_id, row["plan_revision"] + 1),

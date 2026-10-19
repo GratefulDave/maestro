@@ -287,6 +287,12 @@ class AmendmentRefused(ArtifactStoreError):
     code = "AMENDMENT_REFUSED"
 
 
+class AmendmentAlreadyApplied(AmendmentRefused):
+    """The amendment's plan digest is already a revision of this run."""
+
+    code = "AMENDMENT_ALREADY_APPLIED"
+
+
 class PublicationRefused(ArtifactStoreError):
     code = "PUBLICATION_REFUSED"
 
