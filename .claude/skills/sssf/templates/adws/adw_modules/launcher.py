@@ -1098,6 +1098,11 @@ LANE_PANE_ROLES: Tuple[str, ...] = (
     "integration-reviewer",
 )
 
+#: The attended amendment's author and its reviewer: dispatched per batch,
+#: each answering one file, so neither keeps a session worth reconnecting to
+#: across trees.
+ATTEND_PANE_ROLES: Tuple[str, ...] = ("operator", "attend-reviewer")
+
 #: Internal pane_role -> operator-visible Herdr pane label.
 PANE_ROLE_LABELS = {
     "tester": "tester",
@@ -4147,6 +4152,67 @@ class HerdrLauncher:
         return handle
 
 
+    def close_agent(self, token: str, environment: Mapping[str, str]) -> bool:
+        """Close the pane of the stable agent `token` names, if Herdr holds one.
+
+        The attend dispatchers' cleanup, run once whether their file was
+        answered or their launch failed. An attend role keeps no session worth
+        reconnecting to, and a launch that stopped `blocked` leaves its pane
+        on purpose (`AGENT_NOT_READY` above), so without this every failed
+        attend launch left a pane for the next one to trip over. Answers
+        whether a pane was closed.
+        """
+        with self._handles_lock:
+            handle = self._handles.get(token)
+        if handle is None:
+            name = _agent_name(token)
+            agent = self._fetch_agent(name, environment)
+            if agent is None:
+                return False
+            handle = LaunchHandle(
+                token,
+                str(agent.get("pane_id") or ""),
+                name,
+                Path("/"),
+                environment=environment,
+            )
+        self.cancel(handle, time.monotonic() + 5.0)
+        return True
+
+    def _retire_unbound_agent(
+        self,
+        spec: LaunchSpec,
+        name: str,
+        agent: Mapping[str, object],
+        environment: Mapping[str, str],
+    ) -> bool:
+        """Close an attend agent whose pane is bound to another tree.
+
+        An attend role answers one file per dispatch, and its dispatcher
+        removes that file before asking, so an earlier attempt's agent holds
+        nothing a later one needs. One whose pane is not in this dispatch's
+        tree is that leftover -- an operator pane left in a plain tree that
+        was later moved aside made every later dispatch refuse
+        BINDING_MISMATCH against it. Answers whether it was closed; an agent
+        in this very tree is reconnected as every role's is.
+        """
+        pane_id = str(agent.get("pane_id") or "")
+        pane = _extract(self._herdr("pane", "get", pane_id, env=environment), "pane")
+        cwd = pane.get("cwd") if isinstance(pane, dict) else None
+        if not cwd or Path(str(cwd)).resolve() == spec.worktree.resolve():
+            return False
+        self.cancel(
+            LaunchHandle(
+                spec.correlation_token,
+                pane_id,
+                name,
+                Path(str(cwd)),
+                environment=environment,
+            ),
+            time.monotonic() + 5.0,
+        )
+        return True
+
     def _reconnect_live_agent(
         self, spec: LaunchSpec, environment: Mapping[str, str]
     ) -> Optional[LaunchHandle]:
@@ -4156,6 +4222,10 @@ class HerdrLauncher:
         stable_name = _agent_name(spec.correlation_token)
         agent = self._fetch_agent(stable_name, environment)
         if agent is None:
+            return None
+        if spec.pane_role in ATTEND_PANE_ROLES and self._retire_unbound_agent(
+            spec, stable_name, agent, environment
+        ):
             return None
         status = _agent_status_of(agent)
         if status == "blocked":
