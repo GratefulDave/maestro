@@ -123,6 +123,76 @@ class SessionCapTest(unittest.TestCase):
         self.assertEqual(handoff["open_obligations"], ["alpha returns one"])
         self.assertEqual(handoff["last_answer"]["test_files"], ["tests/a.py"])
 
+    def _actor(self, cap: int):
+        actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
+        actor.role_session_max_tokens = cap
+        actor.launcher = _Launcher()
+        return actor
+
+    def _turns(self, cwd: Path, count: int, prompt_bytes: int) -> None:
+        lch.role_result_path(cwd, 1).parent.mkdir(parents=True, exist_ok=True)
+        for turn in range(1, count + 1):
+            lch.role_prompt_path(cwd, turn).write_text("p" * prompt_bytes)
+            lch.role_result_path(cwd, turn).write_text("r" * 30)
+
+    def test_turns_before_the_last_replacement_do_not_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd, session = Path(tmp) / "checkout", Path(tmp) / "session"
+            cwd.mkdir()
+            session.mkdir()
+            self._turns(cwd, 5, 3_000)
+            actor = self._actor(1_000)
+            before, _ = actor._session_tokens(cwd, session, 5)
+            actor._start_session_epoch(session, 5)
+            after, _ = actor._session_tokens(cwd, session, 5)
+            self.assertGreater(before, 4_000)
+            self.assertLess(after, 1_100)
+            self.assertEqual(actor._session_tokens(cwd, session, 4)[0], 1)
+
+    def test_a_replaced_session_is_reused_on_the_next_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd, session = Path(tmp) / "checkout", Path(tmp) / "session"
+            cwd.mkdir()
+            session.mkdir()
+            self._turns(cwd, 4, 3_000)
+            actor = self._actor(1_000)
+            ctx = SimpleNamespace(lane=SimpleNamespace(lane_id=LANE))
+            actor._say = lambda *args: None
+            actor._roles = {}
+            key = ("run", LANE, "tester")
+            actor._session_handoff = lambda *args: {"reason": "ROLE_SESSION_OVER_CAP"}
+            first = actor._cap_reused_session(ctx, "tester", key, None, cwd, session, 5)
+            self.assertIsNotNone(first)
+            self._turns(cwd, 5, 3_000)
+            second = actor._cap_reused_session(ctx, "tester", key, None, cwd, session, 6)
+            self.assertIsNone(second)
+            self._turns(cwd, 9, 3_000)
+            third = actor._cap_reused_session(ctx, "tester", key, None, cwd, session, 10)
+            self.assertIsNotNone(third)
+            self.assertEqual(actor._session_epoch(session), 10)
+
+    def test_a_prompt_larger_than_the_cap_does_not_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd, session = Path(tmp) / "checkout", Path(tmp) / "session"
+            cwd.mkdir()
+            session.mkdir()
+            self._turns(cwd, 1, 30_000)
+            actor = self._actor(1_000)
+            actor._say = lambda *args: None
+            ctx = SimpleNamespace(lane=SimpleNamespace(lane_id=LANE))
+            self.assertIsNone(
+                actor._cap_reused_session(ctx, "tester", ("r", LANE, "tester"), None, cwd, session, 2)
+            )
+
+    def test_the_transcript_counts_only_the_live_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd, session = Path(tmp) / "checkout", Path(tmp) / "session"
+            cwd.mkdir()
+            (session / "superseded-1").mkdir(parents=True)
+            (session / "superseded-1" / "old.jsonl").write_text("x" * 900_000)
+            (session / "live.jsonl").write_text("x" * 3_000)
+            self.assertLess(self._actor(1_000)._session_tokens(cwd, session, 0)[0], 1_100)
+
     def test_a_zero_cap_turns_it_off(self) -> None:
         launcher, _, prompts, _, moved, _ = self._dispatch(0, 6_000_000)
         self.assertEqual((launcher.cancelled, moved), ([], []))
