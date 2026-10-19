@@ -2141,6 +2141,7 @@ class HerdrStageActor:
                         profile=route["profile"], session_dir=lane_root / role,
                         environment=self._launch_environment(cwd),
                         lane_key=lane.lane_id, lane_label=lane.lane_id, pane_role=role,
+                        spec_digest=lane.spec_digest,
                         run_id=run_id,
                         repository_fingerprint=self.target.target_repository_fingerprint,
                         repository_root=Path(self.target.target_repository_root),
@@ -2582,6 +2583,11 @@ class HerdrStageActor:
 
         lane_id = ctx.lane.lane_id
         token = lch.role_session_token(ctx.run_id, lane_id, role)
+        if not ctx.lane.spec_digest:
+            raise FactoryRefused("ROLE_SESSION_SPEC_DIGEST_MISSING")
+
+        def session_replaced(reason: str, detail: str) -> None:
+            self._say(lane_id, "{0}: fresh {1} session".format(reason, role), detail)
 
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
@@ -2607,6 +2613,8 @@ class HerdrStageActor:
             lane_key=lane_id,
             lane_label=lane_id,
             pane_role=role,
+            spec_digest=ctx.lane.spec_digest,
+            on_session_replaced=session_replaced,
             run_id=ctx.run_id,
             repository_fingerprint=self.target.target_repository_fingerprint,
             repository_root=Path(self.target.target_repository_root),

@@ -6,6 +6,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening, new path): a role session is reused only for its own lane, role and spec digest
+
+- Run 2acd2f5f resumed after an amendment changed `lane-eval-build` and
+  `lane-eval-tests`, and their code reviewer and test reviewer reconnected to
+  the omp sessions they had carried through ten pre-amendment rounds. The
+  actor's in-memory role key held the spec digest, but nothing the launcher
+  read did: a restarted scheduler adopted the live agent by its stable
+  `run:lane:role` name, and omp's `-c` continued the newest transcript in a
+  session directory shared across digests.
+- The session identity (lane, role, `spec_digest`) is now recorded on the role
+  pane (`spec` report-metadata token beside `lane`/`role`) and in the omp
+  session directory (`maestro-session.json`), and `HerdrLauncher` checks it
+  before every reuse: the in-process role handle and the restart-adopted agent.
+  Another lane or role on the pane is refused `BINDING_MISMATCH`
+  (`SESSION_LANE_MISMATCH` / `SESSION_ROLE_MISMATCH`) and the pane left open;
+  the same lane and role under another or no digest
+  (`SESSION_SPEC_DIGEST_CHANGED` / `SESSION_UNRECORDED`) is closed and a fresh
+  session started, or the launch refused if the close is unconfirmed. A
+  mismatched omp session directory has its transcripts moved to
+  `superseded-*` and is not continued. Each replacement writes a steps line.
+  An unchanged lane keeps reusing its session.
+- Deploying this replaces each live role session once, since panes and
+  session directories created before it record no digest.
+
 ### Changed — contract change (new path): a planctl harness failure in attend holds its lanes instead of ending the run
 
 - `_run_planctl` reported every non-zero planctl exit as `ATTEND_REVISION_REFUSED`,
