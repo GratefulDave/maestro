@@ -1775,6 +1775,18 @@ def _bind_reviewer_findings(
     )
 
 
+def _cites_suite_line(area: str, suite_paths: Sequence[str]) -> bool:
+    """Whether `area` names an accepted-suite path with a line: `<path>:<line>`."""
+    for path in suite_paths:
+        start = area.find(path + ":")
+        while start != -1:
+            rest = area[start + len(path) + 1 :]
+            if rest[:1].isdigit():
+                return True
+            start = area.find(path + ":", start + 1)
+    return False
+
+
 def _remove_collect_tree(dest: Path) -> None:
     tm.remove_tree(dest)
 
@@ -2074,12 +2086,24 @@ class FactoryScheduler:
         finally:
             self.locks.release()
 
-    def resume_waiting(self, held: Sequence[str] = ()) -> None:
+    def resume_waiting(
+        self, held: Sequence[str] = (), *, hold_no_progress: bool = False
+    ) -> None:
         """Resume every resumable park except the lanes in `held`.
 
         `held` is `run attend`'s: a `LANE_FAULT` its author declared a runtime
         defect stays parked for the rest of that session.
+
+        `hold_no_progress` is also attend's (maestro#331). Resuming a
+        `NO_PROGRESS` park regrants `NO_PROGRESS_GRACE_ROUNDS` rounds, which
+        on a lane that cannot converge spends them before attend is asked. With
+        it set, a `NO_PROGRESS` park recorded under the current plan revision is
+        resumed only to send its accepted suite back to its tests lane, when
+        the recorded reviews attribute the defect to that suite; otherwise it
+        stays parked for attend. A park an amendment has since answered (the
+        revision moved) resumes as before.
         """
+        revision = run_row(self.store, self.run_id)["plan_revision"]
         for lane in self.store.active_projection(self.run_id):
             if lane.lane_id in held:
                 continue
@@ -2095,6 +2119,22 @@ class FactoryScheduler:
                 continue
             reasons = {r.value for r in st.RESUMABLE_WAIT_REASONS}
             if wait.payload.get("wait_reason") not in reasons:
+                continue
+            if (
+                hold_no_progress
+                and wait.payload.get("wait_reason") == st.WaitReason.NO_PROGRESS.value
+                and wait.plan_revision == revision
+            ):
+                reopen = self._suite_reopen_plan(lane.lane_id)
+                if reopen is None:
+                    self._say(
+                        lane.lane_id,
+                        "no progress park held for attend",
+                        "no amendment since the park; no rounds regranted",
+                    )
+                    continue
+                self.store.resume_lane(self.run_id, lane.lane_id)
+                self._reopen_suite(lane.lane_id, reopen)
                 continue
             self.store.resume_lane(self.run_id, lane.lane_id)
 
@@ -3476,7 +3516,9 @@ class FactoryScheduler:
         self._say(
             lane_id,
             "accepted suite {0}".format(
-                "FAILED" if measurement.runner_failed else "passed"
+                counts["crashed"]
+                if counts.get("crashed")
+                else "FAILED" if measurement.runner_failed else "passed"
             ),
             "{0} executed, {1} passed, {2} failed, {3} errored".format(
                 counts["executed"],
@@ -3638,6 +3680,13 @@ class FactoryScheduler:
         # REVISE remains blocking even over a green suite. Repeated candidate
         # content, measured plateau or regression parks only this lane.
         if settled is st.ReviewerVerdict.REVISE:
+            reopen = self._suite_reopen_plan(lane_id)
+            if reopen is not None:
+                # The defect is in the accepted suite, which the builder may
+                # not edit. Its tests lane redrafts it; this lane waits at
+                # BUILDING until the re-sealed suite merges.
+                self._reopen_suite(lane_id, reopen)
+                return
             if self._probe_budget_exhausted(lane_id):
                 # The REVISE above is complete and carries its probe, so no
                 # merge-eligible artifact exists with a measured failure
@@ -4161,6 +4210,209 @@ class FactoryScheduler:
             reason=st.WaitReason.NO_PROGRESS,
         )
         self._say(lane_id, "no progress, blocking for the operator", detail)
+
+    # -- accepted-suite reopen ---------------------------------------------
+
+    def _paired_tests_lane(self, lane: st.LaneProjection) -> str | None:
+        if lane.lane_kind != st.LANE_KIND_BUILD:
+            return None
+        for dep in lane.needs:
+            if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                return dep
+        return None
+
+    def _suite_reopens(self, tests_id: str) -> list[Mapping[str, Any]]:
+        """`suite_reopen` records on this tests lane in the current revision."""
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        found = []
+        for row in self.store.conn.execute(
+            "SELECT payload_json FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+            "AND artifact_kind=? AND plan_revision=? ORDER BY sequence ASC",
+            (self.run_id, tests_id, st.ArtifactKind.TEST_REVIEW.value, revision),
+        ):
+            reopen = _loads(row["payload_json"]).get("suite_reopen")
+            if isinstance(reopen, Mapping):
+                found.append(reopen)
+        return found
+
+    def _suite_reopen_plan(self, lane_id: str) -> Mapping[str, Any] | None:
+        """Why this build lane's accepted suite goes back to its tests lane, if it does.
+
+        Two typed triggers, both read off recorded CODE_REVIEW artifacts against
+        the current accepted suite, never off prose:
+
+        - the latest review is a REVISE whose findings carry
+          `attribution: accepted_suite` and cite a suite path and line in
+          `implementation_area` (`<path>:<line>`);
+        - the suite crashed the same way (`SUITE_CRASHED:<signal>`) on two
+          different candidates.
+
+        None when the lane has no merged paired tests lane, when those reviews
+        already reopened the suite once, or when the tests lane has been reopened
+        `MAX_SUITE_REOPENS` times this revision -- the lane then takes the
+        ordinary REVISE path to NO_PROGRESS and attend.
+        """
+        _row, lane = self._common(lane_id)
+        tests_id = self._paired_tests_lane(lane)
+        if tests_id is None:
+            return None
+        if self.store.lane_stage(self.run_id, tests_id) is not st.LaneStage.MERGED:
+            return None
+        suite = self._current_accepted_suite(tests_id)
+        if suite is None:
+            return None
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        prior = self._suite_reopens(tests_id)
+        used = {rid for item in prior for rid in item.get("code_review_artifact_ids") or ()}
+        digest = suite.payload.get("test_suite_digest")
+        reviews = [
+            (row["artifact_id"], _loads(row["payload_json"]))
+            for row in self.store.conn.execute(
+                "SELECT artifact_id, payload_json FROM lane_artifacts WHERE run_id=? "
+                "AND lane_id=? AND artifact_kind=? AND plan_revision=? "
+                "ORDER BY sequence ASC",
+                (self.run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, revision),
+            )
+        ]
+        reviews = [
+            (rid, payload)
+            for rid, payload in reviews
+            if payload.get("test_suite_digest") == digest and rid not in used
+        ]
+        if not reviews:
+            return None
+        latest_id, latest = reviews[-1]
+        if latest.get("verdict") != st.ReviewerVerdict.REVISE.value:
+            return None
+        paths = self._own_test_paths(lane, suite)
+        attributed = [
+            dict(item)
+            for item in latest.get("findings") or ()
+            if isinstance(item, Mapping)
+            and item.get("attribution") == st.FINDING_ATTRIBUTION_SUITE
+            and _cites_suite_line(str(item.get("implementation_area") or ""), paths)
+        ]
+        plan: dict[str, Any] | None = None
+        if attributed:
+            plan = {
+                "trigger": "REVIEWER_ATTRIBUTED",
+                "code_review_artifact_ids": [latest_id],
+                "findings": attributed,
+            }
+        else:
+            crashed = str((latest.get("public_result_summary") or {}).get("crashed") or "")
+            if crashed:
+                same = [
+                    (rid, payload)
+                    for rid, payload in reviews
+                    if (payload.get("public_result_summary") or {}).get("crashed")
+                    == crashed
+                ]
+                candidates = sorted({str(p.get("candidate_sha")) for _r, p in same})
+                if len(candidates) >= 2:
+                    tail = list(
+                        (latest.get("public_result_summary") or {}).get("crash_tail") or ()
+                    )
+                    plan = {
+                        "trigger": "SUITE_CRASHED",
+                        "code_review_artifact_ids": [rid for rid, _p in same],
+                        "findings": [
+                            {
+                                "attribution": st.FINDING_ATTRIBUTION_SUITE,
+                                "implementation_area": ", ".join(paths),
+                                "observed_behavior": (
+                                    "{0} on {1} different candidates ({2}): the "
+                                    "accepted suite's runner process was killed, "
+                                    "so no case outcome was measured. Runner's "
+                                    "last lines: {3}"
+                                ).format(
+                                    crashed,
+                                    len(candidates),
+                                    ", ".join(sha[:12] for sha in candidates),
+                                    " | ".join(tail) or "(none)",
+                                ),
+                                "required_behavior": (
+                                    "the accepted suite runs to completion in the "
+                                    "review tree and reports an outcome for every "
+                                    "case; repair the fixture or harness that kills "
+                                    "the runner, without changing the public contract"
+                                ),
+                                "violated_requirement": (
+                                    "the accepted suite must measure the candidate"
+                                ),
+                            }
+                        ],
+                    }
+        if plan is None:
+            return None
+        if len(prior) >= st.MAX_SUITE_REOPENS:
+            self._say(
+                lane_id,
+                "accepted suite defect attributed, reopen cap reached",
+                "{0} reopened {1} time(s); taking the REVISE path".format(
+                    tests_id, len(prior)
+                ),
+            )
+            return None
+        plan["tests_lane_id"] = tests_id
+        plan["accepted_suite_artifact_id"] = suite.artifact_id
+        return plan
+
+    def _reopen_suite(self, lane_id: str, plan: Mapping[str, Any]) -> None:
+        """Record the suite REVISE on the tests lane and send it to WRITING_TESTS."""
+        tests_id = str(plan["tests_lane_id"])
+        row, tests_lane = self._common(tests_id)
+        lane_plan = _latest(self.store, self.run_id, tests_id, st.ArtifactKind.LANE_PLAN)
+        draft = _latest(self.store, self.run_id, tests_id, st.ArtifactKind.TEST_DRAFT)
+        if lane_plan is None or draft is None:
+            raise FactoryRefused("missing suite reopen inputs")
+        reopen = {
+            "accepted_suite_artifact_id": plan["accepted_suite_artifact_id"],
+            "build_lane_id": lane_id,
+            "code_review_artifact_ids": list(plan["code_review_artifact_ids"]),
+            "trigger": plan["trigger"],
+        }
+        digest = st.digest_canonical(
+            {
+                "kind": "SUITE_REOPEN",
+                "lane_id": tests_id,
+                "plan_revision": row["plan_revision"],
+                "run_id": self.run_id,
+                "schema_version": st.CANONICAL_SCHEMA_VERSION,
+                "suite_reopen": reopen,
+            }
+        )
+        request = rc.LaneRequest(
+            run_id=self.run_id,
+            lane_id=tests_id,
+            plan_revision=row["plan_revision"],
+            spec_digest=tests_lane.spec_digest,
+            lane_projection_digest=tests_lane.lane_projection_digest,
+            input_digest=digest,
+            input_artifact_ids=(
+                lane_plan.artifact_id,
+                draft.artifact_id,
+                str(plan["accepted_suite_artifact_id"]),
+            ),
+        )
+        artifact = tc.review_test_draft(
+            request=request,
+            verdict=st.ReviewerVerdict.REVISE,
+            findings=plan["findings"],
+            test_draft=_record_as_lane_artifact(draft, tests_lane),
+        )
+        payload = dict(artifact.payload, suite_reopen=reopen)
+        artifact = dataclasses.replace(
+            artifact, payload=payload, output_digest=st.digest_canonical(payload)
+        )
+        self.store.reopen_suite(self.run_id, tests_id, artifact)
+        self._say(
+            lane_id,
+            "accepted suite sent back to its tests lane",
+            "{0}: {1}, {2} finding(s); this lane rebuilds once it re-merges".format(
+                tests_id, plan["trigger"], len(plan["findings"])
+            ),
+        )
 
     def _ready_to_merge(self, lane_id: str) -> None:
         """Merge the lane's accepted candidate into the integration ref.

@@ -73,7 +73,23 @@ STANDARDS_MAX_SEVERITY = SEVERITY_WARNING
 # Keys a finding may carry beyond the four required ones. A present key is
 # preserved through normalization; an absent one is not invented, so a spec
 # finding submitted without them comes back with exactly REVISE_FINDING_KEYS.
-FINDING_OPTIONAL_KEYS = ("axis", "severity")
+FINDING_OPTIONAL_KEYS = ("axis", "severity", "attribution")
+
+# Whose defect a code-review finding names. `candidate` is the default and what
+# every finding meant before this key existed. `accepted_suite` says the
+# failure is in the accepted suite itself -- a fixture or harness defect the
+# builder cannot fix, because it may not edit a suite path. Such a finding
+# counts only when its `implementation_area` cites a suite path and line
+# (`<path>:<line>`); the scheduler then sends the suite back to its tests lane
+# (`FactoryScheduler._maybe_reopen_suite`) instead of to the builder.
+FINDING_ATTRIBUTION_CANDIDATE = "candidate"
+FINDING_ATTRIBUTION_SUITE = "accepted_suite"
+FINDING_ATTRIBUTIONS = (FINDING_ATTRIBUTION_CANDIDATE, FINDING_ATTRIBUTION_SUITE)
+
+# How many times one tests lane's accepted suite may be reopened by its build
+# lane within one plan revision. Past it the build lane takes the ordinary
+# REVISE path, so a suite that keeps coming back reaches NO_PROGRESS and attend.
+MAX_SUITE_REOPENS = 2
 
 # A finding may carry one typed `code`, and the set is closed. `PROBE_FAILED`
 # is synthesized by the harness from a probe it executed; no reviewer envelope
@@ -467,6 +483,13 @@ def require_revise_findings(
                     "finding severity is not a known severity"
                 )
             row["severity"] = severity
+        if "attribution" in keys:
+            attribution = finding["attribution"]
+            if not isinstance(attribution, str) or attribution not in FINDING_ATTRIBUTIONS:
+                raise CanonicalIdentityError(
+                    "finding attribution is not a known attribution"
+                )
+            row["attribution"] = attribution
         if "code" in keys:
             code = finding["code"]
             if not isinstance(code, str) or code not in FINDING_CODES:

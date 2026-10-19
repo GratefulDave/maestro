@@ -1113,6 +1113,9 @@ class HerdrStageActor:
             example["severity"] = "<optional: {0}>".format(
                 "|".join(st.FINDING_SEVERITIES)
             )
+            example["attribution"] = "<optional: {0}>".format(
+                "|".join(st.FINDING_ATTRIBUTIONS)
+            )
             envelope: dict[str, Any] = {
                 "verdict": "PASS|REVISE",
                 "findings": [example],
@@ -1323,7 +1326,15 @@ class HerdrStageActor:
                 "the candidate against public_contract and the lane plan's "
                 "acceptance criteria, not against the suite. An assertion that "
                 "contradicts the public contract is a finding you report, not a "
-                "test edit you demand. The "
+                "test edit you demand. When a failure is a defect in the "
+                "accepted suite itself -- a fixture, harness or example the "
+                "suite builds wrongly, which no candidate could satisfy -- set "
+                "that finding's attribution to accepted_suite and start "
+                "implementation_area with the suite path and line, "
+                "<path>:<line>. Such a finding sends the suite back to its "
+                "tests lane, whose test reviewer still grades the repair "
+                "against the unchanged public contract; it is never a way to "
+                "relax an assertion the contract supports. The "
                 "violated_requirement field is checked mechanically and must "
                 "quote the public contract verbatim; a finding that does not "
                 "quote it is sent back once, and a second miss parks the "
@@ -1723,6 +1734,16 @@ class HerdrStageActor:
             )
             counts = extra.get("suite_result_summary")
             red = isinstance(counts, Mapping) and self._suite_counts_red(counts)
+            if isinstance(counts, Mapping) and counts.get("crashed"):
+                instructions += (
+                    " The accepted suite's runner process did not finish: {0}. "
+                    "Its counts are not a measurement of this candidate. The "
+                    "runner's last lines: {1}"
+                ).format(
+                    counts["crashed"],
+                    " | ".join(str(line) for line in counts.get("crash_tail") or ())
+                    or "(none)",
+                )
             if red:
                 instructions += (
                     " suite_result_summary is the already-measured result of "
@@ -5341,7 +5362,9 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
         actor, scheduler = build_scheduler(plan)
         state["actor"] = actor
         actor.restore_layout(run_id, store.active_projection(run_id))
-        scheduler.resume_waiting(held)
+        # Attend answers a NO_PROGRESS park; resuming it here first would
+        # regrant rounds the lane has already shown it cannot use (#331).
+        scheduler.resume_waiting(held, hold_no_progress=True)
         status = scheduler.run()
         state["passes"] = state["passes"] + 1
         return status
