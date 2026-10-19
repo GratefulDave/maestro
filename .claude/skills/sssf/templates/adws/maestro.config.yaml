@@ -92,3 +92,8 @@ executables:
 # the next dispatch by a fresh one seeded with a compact handoff. 0 turns the
 # cap off. Absent means 150000.
 # role_session_max_tokens: 150000
+# A dispatched agent that reads idle, with no envelope and a transcript that
+# has not grown, for this many seconds is refused DISPATCH_NOT_CONSUMED (the
+# lane parks LANE_FAULT; attend retries once). 0 turns the bound off. Absent
+# means 600.
+# dispatch_idle_timeout_s: 600

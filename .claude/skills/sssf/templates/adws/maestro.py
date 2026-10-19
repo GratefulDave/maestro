@@ -203,6 +203,21 @@ def _config_concurrency(value: object, label: str) -> int:
 DEFAULT_ROLE_SESSION_MAX_TOKENS = 1_000_000
 
 
+#: Seconds a dispatched agent may sit `idle` with no envelope and a transcript
+#: that does not grow before the dispatch is refused `DISPATCH_NOT_CONSUMED`.
+#: `0` turns the bound off.
+DEFAULT_DISPATCH_IDLE_TIMEOUT_S = 600
+
+
+def _config_dispatch_idle_timeout_s(value: object, label: str) -> int:
+    """`dispatch_idle_timeout_s`: the idle bound on a dispatch. Absent keeps the default."""
+    if value is None:
+        return DEFAULT_DISPATCH_IDLE_TIMEOUT_S
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _MaestroConfigurationError(label + " must be an integer >= 0")
+    return int(value)
+
+
 def _config_role_session_max_tokens(value: object, label: str) -> int:
     """`role_session_max_tokens`: the largest reused session. Absent keeps the default."""
     if value is None:
@@ -556,6 +571,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["role_session_max_tokens"] = _config_role_session_max_tokens(
         loaded.get("role_session_max_tokens"), "role_session_max_tokens"
     )
+    loaded["dispatch_idle_timeout_s"] = _config_dispatch_idle_timeout_s(
+        loaded.get("dispatch_idle_timeout_s"), "dispatch_idle_timeout_s"
+    )
     # One key, read where the tool reads it, so a deployment cannot be told two
     # different things about when a tests lane stops.
     try:
@@ -908,6 +926,7 @@ class HerdrStageActor:
     """Persistent role panes. Envelope bytes are payload, not stage."""
 
     role_session_max_tokens: int = DEFAULT_ROLE_SESSION_MAX_TOKENS
+    dispatch_idle_timeout_s: int = DEFAULT_DISPATCH_IDLE_TIMEOUT_S
 
     def __init__(
         self,
@@ -920,8 +939,10 @@ class HerdrStageActor:
         role_vendors: Mapping[str, str | None] | None = None,
         attend_reviewer_route: Mapping[str, str] | None = None,
         role_session_max_tokens: int = DEFAULT_ROLE_SESSION_MAX_TOKENS,
+        dispatch_idle_timeout_s: int = DEFAULT_DISPATCH_IDLE_TIMEOUT_S,
     ) -> None:
         self.role_session_max_tokens = int(role_session_max_tokens)
+        self.dispatch_idle_timeout_s = int(dispatch_idle_timeout_s)
         self.launcher = launcher
         self.state_root = Path(state_root)
         self.worktrees = self.state_root / "worktrees"
@@ -2320,6 +2341,10 @@ class HerdrStageActor:
     ) -> Mapping[str, Any]:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
         waited = 0.0
+        activity = getattr(self.launcher, "turn_activity", None)
+        limit = int(getattr(self, "dispatch_idle_timeout_s", 0) or 0)
+        last_seen: object = None
+        quiet_since = 0.0
         while True:
             try:
                 raw = _read_regular_text_under(bound, envelope)
@@ -2377,6 +2402,16 @@ class HerdrStageActor:
             # no longer a second thing that can end the wait -- the envelope
             # ends it, and an agent that never declares leaves a lane visibly
             # waiting for the operator who is watching the run.
+            #
+            # Contract change (strengthening, new path): "visibly waiting" was
+            # unbounded, and on run 2acd2f5f an attend operator whose prompt
+            # never reached it logged "waiting on operator" for over an hour.
+            # One bound is added, and it is not a single transport sample: the
+            # agent must read `idle`, with no envelope, and a transcript that
+            # has not grown, on every sample for `dispatch_idle_timeout_s`.
+            # Any other status, any growth, or an unreadable agent restarts
+            # it. The refusal is the typed launch failure every caller already
+            # contains (a lane parks LANE_FAULT; attend retries once).
             time.sleep(0.1)
             waited += 0.1
             # A silent minute is indistinguishable from a hung agent. Say the
@@ -2387,6 +2422,24 @@ class HerdrStageActor:
                     "waiting on {0}".format(role),
                     "{0}s elapsed".format(int(waited)),
                 )
+                if activity is None or limit <= 0:
+                    continue
+                try:
+                    seen = activity(handle)
+                except Exception:
+                    seen = None
+                if seen is None or seen[0] != "idle" or seen != last_seen:
+                    last_seen = seen
+                    quiet_since = waited
+                    continue
+                if waited - quiet_since >= limit:
+                    raise LaunchFailed(
+                        "DISPATCH_NOT_CONSUMED:{0} idle {1}s with no envelope "
+                        "and no transcript activity".format(
+                            role, int(waited - quiet_since)
+                        ),
+                        pane_created=True,
+                    )
 
     def _launch_failed(self, exc: lch.LaunchRefused) -> LaunchFailed:
         return LaunchFailed(
@@ -3823,6 +3876,9 @@ def _actor_for(
         role_vendors=layout.get("role_vendors"),
         role_session_max_tokens=_config_role_session_max_tokens(
             layout.get("role_session_max_tokens"), "role_session_max_tokens"
+        ),
+        dispatch_idle_timeout_s=_config_dispatch_idle_timeout_s(
+            layout.get("dispatch_idle_timeout_s"), "dispatch_idle_timeout_s"
         ),
     )
 
