@@ -2143,6 +2143,10 @@ class FactoryScheduler:
                 self._reopen_suite(lane.lane_id, reopen)
                 continue
             self.store.resume_lane(self.run_id, lane.lane_id)
+            if wait.payload.get("wait_reason") == st.WaitReason.PAUSE.value:
+                capped = self._suite_reopen_plan(lane.lane_id, cap_park=True)
+                if capped is not None and capped.get("park"):
+                    self._park_suite_only(lane.lane_id, capped["findings"])
 
     def _integration_head(self) -> str:
         return ensure_run_integration_ref(self.target, self.store, self.run_id)
@@ -3772,7 +3776,10 @@ class FactoryScheduler:
         # REVISE remains blocking even over a green suite. Repeated candidate
         # content, measured plateau or regression parks only this lane.
         if settled is st.ReviewerVerdict.REVISE:
-            reopen = self._suite_reopen_plan(lane_id)
+            reopen = self._suite_reopen_plan(lane_id, cap_park=True)
+            if reopen is not None and reopen.get("park"):
+                self._park_suite_only(lane_id, reopen["findings"])
+                return
             if reopen is not None:
                 # The defect is in the accepted suite, which the builder may
                 # not edit. Its tests lane redrafts it; this lane waits at
@@ -4286,6 +4293,22 @@ class FactoryScheduler:
             ),
         )
 
+    def _park_suite_only(self, lane_id: str, findings: Sequence[Any]) -> None:
+        """Park a build lane whose settled REVISE is wholly about the accepted suite.
+
+        The reopen cap is spent and the builder may not edit the suite, so a
+        builder round cannot answer these findings. The CODE_REVIEW artifact
+        already records them with their attribution; attend reads it.
+        """
+        self._park_no_progress(
+            lane_id,
+            st.LaneStage.BUILDING,
+            "{0} finding(s) attribute the accepted suite and its reopen cap is "
+            "spent; no builder round can answer them, parked for attend".format(
+                len(findings)
+            ),
+        )
+
     def _park_no_progress(
         self, lane_id: str, stage: st.LaneStage, detail: str
     ) -> None:
@@ -4327,7 +4350,9 @@ class FactoryScheduler:
                 found.append(reopen)
         return found
 
-    def _suite_reopen_plan(self, lane_id: str) -> Mapping[str, Any] | None:
+    def _suite_reopen_plan(
+        self, lane_id: str, *, cap_park: bool = False
+    ) -> Mapping[str, Any] | None:
         """Why this build lane's accepted suite goes back to its tests lane, if it does.
 
         Two typed triggers, both read off recorded CODE_REVIEW artifacts against
@@ -4343,6 +4368,12 @@ class FactoryScheduler:
         already reopened the suite once, or when the tests lane has been reopened
         `MAX_SUITE_REOPENS` times this revision -- the lane then takes the
         ordinary REVISE path to NO_PROGRESS and attend.
+
+        With `cap_park`, the cap-reached case whose review holds ONLY suite
+        findings answers `{"park": True, "findings": [...]}` instead of None:
+        the builder cannot edit the suite, so another builder round is waste
+        and the lane parks for attend. A review with any other finding still
+        answers None and goes to the builder.
         """
         _row, lane = self._common(lane_id)
         tests_id = self._paired_tests_lane(lane)
@@ -4445,6 +4476,14 @@ class FactoryScheduler:
                     tests_id, len(prior)
                 ),
             )
+            others = [
+                item
+                for item in latest.get("findings") or ()
+                if not isinstance(item, Mapping)
+                or item.get("attribution") != st.FINDING_ATTRIBUTION_SUITE
+            ]
+            if cap_park and not others:
+                return {"park": True, "findings": plan["findings"]}
             return None
         plan["tests_lane_id"] = tests_id
         plan["accepted_suite_artifact_id"] = suite.artifact_id
