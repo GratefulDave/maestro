@@ -27,6 +27,7 @@ from . import plan_model
 from . import probes
 from . import provisioning as prov
 from . import review_contract as rc
+from . import suite_increment as inc
 from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
@@ -1225,6 +1226,11 @@ class LaneContext:
     #: still saves a builder from guessing a symbol nineteen times before
     #: opening the file. Derived from the accepted files by `bound_surface`.
     bound_surface: Mapping[str, Any] | None = None
+    #: Set on a tests lane that already has an accepted suite (a suite reopen
+    #: or an amendment that reset the lane): the suite to start from and, after
+    #: an amendment, the spec items that changed. `suite_increment` measures
+    #: the redraft against it.
+    redraft_baseline: Mapping[str, Any] | None = None
     #: The paths of THIS lane's own accepted suite -- for a build lane, its
     #: tests-lane predecessor's; for an untyped lane, its own. They are in
     #: the builder's checkout, and the builder may read them. It may not
@@ -2686,6 +2692,7 @@ class FactoryScheduler:
             artifacts=artifacts,
             integration_head=tip,
             public_contract=contract,
+            redraft_baseline=self._redraft_baseline(lane, contract),
         )
         self._say(lane_id, "asking tester for a test draft")
         extra = dict(self._call_actor(ctx, self.actor.write_tests, ctx))
@@ -2719,6 +2726,82 @@ class FactoryScheduler:
             ctx,
             _with_input_artifact_ids(artifact, [plan.artifact_id, review_id]),
         )
+
+    def _redraft_baseline(
+        self, lane: st.LaneProjection, contract: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """The accepted suite a tests lane's redraft starts from, if it has one.
+
+        Any ACCEPTED_TEST_SUITE for the lane, of any plan revision: a lane that
+        has been accepted once is only ever redrafted by a suite reopen or by
+        an amendment that reset it, and in both the tester changes what a
+        finding or a changed spec item names and nothing else. A lane with no
+        accepted suite gets a full draft.
+        """
+        if lane.lane_kind != st.LANE_KIND_TESTS:
+            return None
+        suite = _latest(
+            self.store, self.run_id, lane.lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
+        )
+        if suite is None:
+            return None
+        files = tc.read_suite(
+            Path(self.target.target_repository_root),
+            tc.suite_files(_record_as_lane_artifact(suite, lane)),
+        )
+        texts: list[str] = []
+        for row in self.store.conn.execute(
+            "SELECT payload_json FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+            "AND artifact_kind=? AND sequence>? ORDER BY sequence",
+            (
+                self.run_id,
+                lane.lane_id,
+                st.ArtifactKind.TEST_REVIEW.value,
+                suite.sequence,
+            ),
+        ):
+            payload = _loads(row["payload_json"])
+            if payload.get("verdict") != st.ReviewerVerdict.REVISE.value:
+                continue
+            # The harness's own refusal names the units it refused; counting it
+            # as a citation would excuse them on the next round.
+            texts.extend(
+                text
+                for finding in payload.get("findings") or ()
+                if finding.get("violated_requirement") != inc.OUT_OF_SCOPE
+                for text in inc._strings(finding)
+            )
+        old = suite.payload.get("public_contract")
+        amendment = st.canonical_bytes(st.json_ready(old)) != st.canonical_bytes(
+            st.json_ready(dict(contract))
+        )
+        return {
+            "suite_files": files,
+            "finding_texts": texts,
+            "old_contract": old,
+            "new_contract": dict(contract),
+            "amendment": amendment,
+            "spec_diff": inc.spec_diff(old, contract) if amendment else None,
+        }
+
+    def _incremental_findings(
+        self, ctx: LaneContext, draft: st.LaneArtifact
+    ) -> tuple[Mapping[str, str], ...] | None:
+        """REVISE findings when a redraft touched what nothing asked it to touch."""
+        base = self._redraft_baseline(ctx.lane, ctx.public_contract or {})
+        if base is None:
+            return None
+        found = inc.out_of_scope(
+            base["suite_files"],
+            self._draft_files(draft),
+            finding_texts=base["finding_texts"],
+            old_contract=base["old_contract"],
+            new_contract=base["new_contract"],
+            amendment=base["amendment"],
+        )
+        if not found:
+            return None
+        return st.require_revise_findings(found)
 
     def _require_typed_test_outputs(
         self, lane: st.LaneProjection, files: Mapping[str, str]
@@ -3075,7 +3158,16 @@ class FactoryScheduler:
             public_contract=draft.payload.get("public_contract"),
         )
         draft_artifact = _record_as_lane_artifact(draft, lane)
-        measured, collected = self._measure_draft_gate(ctx, draft_artifact)
+        measured = self._incremental_findings(ctx, draft_artifact)
+        collected = None
+        if measured is not None:
+            self._say(
+                lane_id,
+                "redraft changed units no finding or spec change names",
+                "{0} unit(s); {1}".format(len(measured), inc.OUT_OF_SCOPE),
+            )
+        if measured is None:
+            measured, collected = self._measure_draft_gate(ctx, draft_artifact)
         if measured is not None:
             verdict: st.ReviewerVerdict = st.ReviewerVerdict.REVISE
             findings: Sequence[Mapping[str, str]] = measured
