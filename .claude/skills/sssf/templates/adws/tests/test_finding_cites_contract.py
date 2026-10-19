@@ -297,6 +297,8 @@ def _drive_reviewing_tests(actor):
         return draft
 
     with mock.patch.object(sch, "_latest", side_effect=latest), mock.patch.object(
+        scheduler, "_incremental_findings", return_value=None
+    ), mock.patch.object(
         scheduler, "_measure_draft_gate", return_value=(None, None)
     ), mock.patch.object(
         sch, "_record_as_lane_artifact", side_effect=lambda art, lane_arg: art

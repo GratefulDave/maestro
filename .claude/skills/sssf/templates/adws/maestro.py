@@ -903,6 +903,8 @@ _PROBE_VIEW_KEYS = ("probe_id", "path", "requirement", "intent")
 class HerdrStageActor:
     """Persistent role panes. Envelope bytes are payload, not stage."""
 
+    role_session_max_tokens: int = DEFAULT_ROLE_SESSION_MAX_TOKENS
+
     def __init__(
         self,
         launcher: lch.LauncherAdapter,
