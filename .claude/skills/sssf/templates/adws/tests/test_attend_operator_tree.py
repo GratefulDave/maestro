@@ -195,6 +195,10 @@ class ReviewerDispatch(unittest.TestCase):
         def launch(ctx, role, cwd, extra, prepare_cwd, provision=True):
             prepare_cwd(cwd)
             launched.update(role=role, extra=extra, cwd=cwd, provision=provision)
+            # A PASS owes the findings file `planctl review` signs over.
+            findings = Path(extra["findings_out_path"])
+            findings.parent.mkdir(parents=True, exist_ok=True)
+            findings.write_text('{"findings": []}')
             return {"verdict": "PASS", "findings": []}, None, cwd
 
         with (
