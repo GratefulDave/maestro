@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (weakening): a pytest suite killed by a signal after its JUnit report is complete is measured from the report
+
+- An accepted suite printed `2 failed, 106 passed in 58.70s` and then
+  SIGSEGV'd in CPython 3.14 interpreter teardown (torch, cv2 loaded) on every
+  round. `run_suite` read only the signal, recorded `SUITE_CRASHED:SIGSEGV`
+  with zero counts, and the lane spent its rounds on a crash no candidate
+  could cause or fix.
+- `run_suite` now runs pytest with a per-run `--junitxml` report written
+  outside the tree under test. pytest writes that report once, whole, in
+  `pytest_sessionfinish`. When the runner dies by signal and the report is
+  well formed, its per-case results are the counts, the exit status is the
+  one those results imply, and the crash is a non-blocking note:
+  `crash_note: SUITE_CRASHED_AFTER_COMPLETION:<signal>` plus `crash_tail` in
+  the `CODE_REVIEW` public result summary, appended to `failure_output` for
+  the builder, and stated in the code reviewer's prompt.
+- A crash with no report, or a truncated one, is still `SUITE_CRASHED` and
+  blocking. vitest is unchanged.
+- The printed totals line is not required: measured on the real binary, a
+  SIGSEGV in `pytest_unconfigure` leaves the report complete and loses the
+  totals line from a pipe buffer the signal never flushed.
+
 ### Changed — contract change (weakening, new path): an attend envelope-shape refusal is asked back once in the same session, and a malformed `runtime_defects` never discards a valid revision
 
 - The first live auto-attend ended the run on its operator's first answer: a
@@ -29,6 +50,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The operator schema and role contract state the `runtime_defects` entry
   shape with `lane` required.
 
+||||||| parent of a0359d9 (Contract change (weakening): a pytest suite killed by a signal after its JUnit report is complete is measured from the report)
 ### Changed — contract change (strengthening, new path): a role session is reused only for its own lane, role and spec digest
 
 - Run 2acd2f5f resumed after an amendment changed `lane-eval-build` and

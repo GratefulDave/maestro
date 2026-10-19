@@ -666,6 +666,11 @@ def measure_candidate(
         # Present only on a crash, so every other summary is byte-identical.
         summary["crashed"] = crashed
         summary["crash_tail"] = list(run.get("crash_tail") or ())
+    elif run.get("crash_note"):
+        # The runner died by signal after every case had an outcome. The
+        # counts above are those outcomes; the crash is reported, not counted.
+        summary["crash_note"] = str(run["crash_note"])
+        summary["crash_tail"] = list(run.get("crash_tail") or ())
     min_cases = int(run.get("min_cases") or 1)
     runner_failed = bool(
         run["returncode"] != 0
@@ -938,6 +943,11 @@ def review_builder_output(
             [str(run["crashed"]), *run.get("crash_tail", ())]
             if run.get("crashed")
             else list(failure_lines(str(run["output"])))
+            + (
+                [str(run["crash_note"]), *run.get("crash_tail", ())]
+                if run.get("crash_note")
+                else []
+            )
         )
         + probe_lines,
         "findings": [dict(item) for item in findings_out],

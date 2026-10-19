@@ -1796,6 +1796,17 @@ class HerdrStageActor:
                     " | ".join(str(line) for line in counts.get("crash_tail") or ())
                     or "(none)",
                 )
+            elif isinstance(counts, Mapping) and counts.get("crash_note"):
+                instructions += (
+                    " The accepted suite's runner finished every case and then "
+                    "died: {0}. The counts are the per-case results and stand; "
+                    "the crash came after them and is not a finding against "
+                    "this candidate. The runner's last lines: {1}"
+                ).format(
+                    counts["crash_note"],
+                    " | ".join(str(line) for line in counts.get("crash_tail") or ())
+                    or "(none)",
+                )
             if red:
                 instructions += (
                     " suite_result_summary is the already-measured result of "
