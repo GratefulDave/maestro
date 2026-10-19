@@ -471,7 +471,8 @@ def require_runtime_defects(
     Absent means none. Only a parked `LANE_FAULT` lane can be declared one:
     a `NO_PROGRESS` or `AMENDMENT_REQUIRED` park is a contract gap by
     definition, and letting the author call it a harness defect would be a
-    way to stop answering it.
+    way to stop answering it. An entry naming no lane in a one-lane batch
+    names that lane: there is no other it could mean.
     """
     if payload is None:
         return ()
@@ -490,6 +491,8 @@ def require_runtime_defects(
             )
         lane = item.get("lane")
         detail = item.get("detail")
+        if len(parked) == 1 and (lane is None or (isinstance(lane, str) and not lane.strip())):
+            lane = parked[0][0]
         if not (isinstance(lane, str) and lane.strip()):
             raise AttendRefused(
                 DEFECT_INVALID, "runtime_defects[{0}] names no lane".format(index)
@@ -650,6 +653,88 @@ def revision_path(envelope: Any, expected: Path) -> Path:
     if not written.is_file():
         raise AttendRefused(NO_REVISION, "revision file was not written")
     return written
+
+
+@dataclass(frozen=True)
+class OperatorAnswer:
+    """What one operator envelope says, once every shape check has held.
+
+    `held` are declared runtime defects on lanes the revision does not
+    answer: their issues are filed and the lanes held. `reported` are
+    declared defects on lanes the revision does answer: their issues are
+    filed, and the revision still moves the lane. `ignored` is the refusal of
+    a malformed `runtime_defects` that a complete revision outranked.
+    """
+
+    revision: Optional[Path]
+    rationales: Tuple[Mapping[str, Any], ...]
+    lane_ids: Tuple[str, ...]
+    held: Tuple[Tuple[str, str], ...] = ()
+    reported: Tuple[Tuple[str, str], ...] = ()
+    ignored: str = ""
+
+
+def read_operator_envelope(
+    envelope: Any, request: OperatorRequest, *, strict: bool
+) -> OperatorAnswer:
+    """Every envelope-shape check on an operator's answer, in one place.
+
+    The harness runs it `strict` before the operator's pane closes, and asks
+    the same session once more with the exact refusal; the attend loop runs it
+    again, not `strict`, on whatever came back. A revision answering every
+    parked lane is never discarded over its `runtime_defects`: a malformed
+    list is refused only when `strict`, and a well-formed one only files
+    issues for lanes the revision already answers.
+    """
+    if not isinstance(envelope, Mapping):
+        raise AttendRefused(NO_REVISION, "envelope is not an object")
+    parked = tuple((lane.lane_id, lane.wait_reason) for lane in request.lanes)
+    lane_ids = tuple(lane_id for lane_id, _reason in parked)
+    expected = Path(request.revision_out_path)
+    defect_error: Optional[AttendRefused] = None
+    try:
+        defects = require_runtime_defects(envelope.get("runtime_defects"), parked)
+    except AttendRefused as exc:
+        defects, defect_error = (), exc
+    try:
+        written: Optional[Path] = revision_path(envelope, expected)
+        rationales = require_rationales(envelope.get("rationales"), lane_ids)
+    except AttendRefused:
+        written, rationales = None, ()
+    if written is not None:
+        if defect_error is not None and strict:
+            raise defect_error
+        return OperatorAnswer(
+            written,
+            rationales,
+            lane_ids,
+            reported=defects,
+            ignored=defect_error.detail if defect_error is not None else "",
+        )
+    if defect_error is not None:
+        raise defect_error
+    declared = {lane_id for lane_id, _detail in defects}
+    remaining = tuple(lane_id for lane_id in lane_ids if lane_id not in declared)
+    if not remaining:
+        return OperatorAnswer(None, (), (), held=defects)
+    return OperatorAnswer(
+        revision_path(envelope, expected),
+        require_rationales(envelope.get("rationales"), remaining),
+        remaining,
+        held=defects,
+    )
+
+
+def check_review_answer(answer: Any, request: ReviewRequest) -> None:
+    """Every shape check on an attend reviewer's answer, as the loop runs them.
+
+    The verdict and located findings, and on PASS the findings file
+    `planctl review` signs over. The harness runs it before the reviewer's
+    pane closes and asks the same session once more with the exact refusal.
+    """
+    verdict, _located = require_review_verdict(answer)
+    if verdict == st.ReviewerVerdict.PASS.value:
+        require_review_findings(Path(request.findings_out_path))
 
 
 def _plan_lanes(compiled: st.CompiledPlan) -> dict:
@@ -1078,11 +1163,14 @@ def _escalate(
     escalated: Optional[list],
     say: Callable[[str, str], None],
     fault: Optional[Mapping[str, Any]] = None,
+    held: bool = True,
 ) -> None:
     """File one deduplicated issue per declared defect; hold each lane.
 
     `fault` is attend's own failure when attend, not the author, is the
-    defect; otherwise each lane's `USER_WAIT` fault is reported.
+    defect; otherwise each lane's `USER_WAIT` fault is reported. With
+    `held=False` the issue is filed and the lane is not held: a revision
+    answers it.
     """
     for lane_id, detail in defects:
         if fault is None:
@@ -1116,8 +1204,9 @@ def _escalate(
             escalated.append(RuntimeDefect(lane_id, lane_fault, detail, issue))
         say(
             lane_id,
-            "runtime defect, lane stays parked: {0}".format(
-                issue.get("url") or issue.get("detail") or "no issue filed"
+            "runtime defect{0}: {1}".format(
+                ", lane stays parked" if held else " reported, the revision answers the lane",
+                issue.get("url") or issue.get("detail") or "no issue filed",
             ),
         )
 
@@ -1229,19 +1318,26 @@ def _attend_batch(
         envelope, failed = _agent_twice(dispatch, request, OPERATOR_FAILED, say)
         if failed is not None:
             return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
-        if not isinstance(envelope, Mapping):
-            raise AttendRefused(NO_REVISION, "envelope is not an object")
-        defects = require_runtime_defects(envelope.get("runtime_defects"), parked)
-        if defects:
-            _escalate(store, run_id, defects, file_issue, escalated, say)
-            declared = {lane_id for lane_id, _detail in defects}
+        answer = read_operator_envelope(envelope, request, strict=False)
+        if answer.ignored:
+            say(
+                request.lane_id,
+                "runtime_defects ignored, the revision answers every lane: "
+                + answer.ignored,
+            )
+        if answer.reported:
+            _escalate(
+                store, run_id, answer.reported, file_issue, None, say, held=False
+            )
+        if answer.held:
+            _escalate(store, run_id, answer.held, file_issue, escalated, say)
+            declared = {lane_id for lane_id, _detail in answer.held}
             parked = tuple(item for item in parked if item[0] not in declared)
             if not parked:
                 return compiled
-            lane_ids = tuple(lane_id for lane_id, _reason in parked)
             allowed = batch_scope(compiled.lanes, parked)
-        written = revision_path(envelope, Path(request.revision_out_path))
-        rationales = require_rationales(envelope.get("rationales"), lane_ids)
+        lane_ids = answer.lane_ids
+        written, rationales = answer.revision, answer.rationales
         digest = sha256_hex(written.read_bytes())
         review_request, failed = _twice(
             lambda: review_request_for(

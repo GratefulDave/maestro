@@ -1167,7 +1167,7 @@ class HerdrStageActor:
                 ],
                 "runtime_defects": [
                     {
-                        "lane": "<optional: a parked LANE_FAULT lane id>",
+                        "lane": "<required: the id of a parked LANE_FAULT lane>",
                         "detail": "<why no plan edit can fix this fault>",
                     }
                 ],
@@ -1397,8 +1397,11 @@ class HerdrStageActor:
                 "`reviews.json`. If the plan caused it -- an oversized or "
                 "mis-specified lane -- answer it with the same kind of edit "
                 "and a rationale. If no plan edit can fix it, it is a runtime "
-                "defect: list it under `runtime_defects` with a `detail` "
-                "naming the defect, give it no rationale, and leave its "
+                "defect: list it under `runtime_defects` as "
+                "`{\"lane\": \"<parked LANE_FAULT lane id>\", \"detail\": "
+                "\"<the defect>\"}` -- `lane` is required, and only a "
+                "parked `LANE_FAULT` lane can be one -- give it no rationale, "
+                "and leave its "
                 "contract alone. That lane stays parked and an issue is "
                 "filed; when every parked lane is a runtime defect, write no "
                 "revision.\n"
@@ -1419,6 +1422,10 @@ class HerdrStageActor:
                 "When `reviewer_findings_path` is given, the reviewer said "
                 "REVISE to your previous revision (`previous_revision_path`): "
                 "fix every located finding in it.\n"
+                "When `envelope_error` is given, your previous envelope was "
+                "refused with exactly that error: return a corrected envelope "
+                "for the same turn, keeping a revision that was already "
+                "valid.\n"
                 "Return one rationale per parked lane in the envelope. "
                 "`contract_gap` must name the clause that was missing or "
                 "wrong, not restate that the lane failed."
@@ -1438,6 +1445,9 @@ class HerdrStageActor:
                 "REVISE finding names its `location` (a JSON pointer into the "
                 "revision IR), the `defect`, and the `required_change`. PASS "
                 "requires findings=[].\n"
+                "When `envelope_error` is given, your previous envelope was "
+                "refused with exactly that error: return a corrected "
+                "envelope for the same review.\n"
                 "Do not run any `maestro` verb, any git command, or `planctl`."
             ),
             "integration-reviewer": (
@@ -1874,6 +1884,11 @@ class HerdrStageActor:
                 ).format(json.dumps(rejected[:300]))
         if role == "integration-reviewer":
             instructions += " PASS requires affected_lanes=[]. REVISE requires a nonempty affected_lanes subset."
+        if extra.get("envelope_error"):
+            instructions += (
+                " Your previous envelope was refused: {0}. Write a corrected "
+                "envelope; this is the one correction turn."
+            ).format(extra["envelope_error"])
         if extra.get("session_handoff"):
             instructions += (
                 " This is a fresh session replacing one that grew past its "
@@ -3403,19 +3418,17 @@ class HerdrStageActor:
             )
         Path(request.revision_out_path).unlink(missing_ok=True)
         try:
-            payload, _handle, cwd_used = self._launch(
+            payload = self._attend_launch(
                 ctx,
                 "operator",
+                attempt,
                 cwd,
                 extra,
-                prepare_cwd=lambda path: self._write_attend_tree(
-                    path, request.lanes, files
+                lambda path: self._write_attend_tree(path, request.lanes, files),
+                lambda answer: att.read_operator_envelope(
+                    answer, request, strict=True
                 ),
-                # A --no-checkout tree holds no project to install.
-                provision=False,
             )
-            # Records the worktree, so removal is the lanes' `git worktree remove`.
-            self._bind_checkout(self._role_key(ctx, "operator"), attempt, cwd, cwd_used)
         finally:
             self._close_attend_pane(ctx, "operator", cwd)
         return payload
@@ -3465,22 +3478,58 @@ class HerdrStageActor:
         }
         Path(request.findings_out_path).unlink(missing_ok=True)
         try:
-            payload, _handle, cwd_used = self._launch(
+            payload = self._attend_launch(
                 ctx,
                 _ATTEND_REVIEWER_ROLE,
+                attempt,
                 cwd,
                 extra,
-                prepare_cwd=lambda path: self._write_attend_tree(
-                    path, request.lanes, files
-                ),
-                # A --no-checkout tree holds no project to install.
-                provision=False,
-            )
-            self._bind_checkout(
-                self._role_key(ctx, _ATTEND_REVIEWER_ROLE), attempt, cwd, cwd_used
+                lambda path: self._write_attend_tree(path, request.lanes, files),
+                lambda answer: att.check_review_answer(answer, request),
             )
         finally:
             self._close_attend_pane(ctx, _ATTEND_REVIEWER_ROLE, cwd)
+        return payload
+
+    def _attend_launch(
+        self,
+        ctx: LaneContext,
+        role: str,
+        attempt: Path,
+        cwd: Path,
+        extra: Mapping[str, Any],
+        prepare_cwd: Callable[[Path], None],
+        check: Callable[[Mapping[str, Any]], Any],
+    ) -> Mapping[str, Any]:
+        """One attend dispatch, and one more turn in the same session if its
+        envelope is refused.
+
+        `check` is the attend loop's own shape check on the answer. Its exact
+        refusal goes back to the agent that wrote the envelope, while its pane
+        is still open, as `envelope_error`; whatever the second turn returns
+        is the answer, and the loop refuses it if it is still malformed. An
+        envelope the agent could have corrected used to end the whole verb.
+        """
+        key = self._role_key(ctx, role)
+        payload, _handle, cwd_used = self._launch(
+            ctx, role, cwd, extra, prepare_cwd=prepare_cwd,
+            # A --no-checkout tree holds no project to install.
+            provision=False,
+        )
+        # Records the worktree, so removal is the lanes' `git worktree remove`.
+        self._bind_checkout(key, attempt, cwd, cwd_used)
+        try:
+            check(payload)
+            return payload
+        except att.AttendRefused as refused:
+            error = "{0}: {1}".format(refused.code, refused.detail or refused.code)
+        self._say(ctx.lane.lane_id, "{0} envelope refused, asking once more".format(role), error)
+        payload, _handle, cwd_used = self._launch(
+            ctx, role, cwd, {**extra, "envelope_error": error},
+            prepare_cwd=prepare_cwd, provision=False,
+        )
+        # `_launch` records a fresh session for the turn; bind its tree again.
+        self._bind_checkout(key, attempt, cwd, cwd_used)
         return payload
 
     def _close_attend_pane(self, ctx: LaneContext, role: str, cwd: Path) -> None:

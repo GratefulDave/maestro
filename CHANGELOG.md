@@ -6,6 +6,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (weakening, new path): an attend envelope-shape refusal is asked back once in the same session, and a malformed `runtime_defects` never discards a valid revision
+
+- The first live auto-attend ended the run on its operator's first answer: a
+  valid `revision_path`, a valid rationale, and one `runtime_defects` entry
+  with a `detail` and no `lane`. `require_runtime_defects` refused the whole
+  envelope `ATTEND_RUNTIME_DEFECT_INVALID: runtime_defects[0] names no lane`
+  and `attend_run` raised it, discarding the revision.
+- Every envelope-shape check now lives in one place
+  (`attend.read_operator_envelope`, `attend.check_review_answer`) and the
+  actor runs it before the attend pane closes. A refusal -- runtime_defects,
+  revision_path, rationales, the reviewer's verdict and located findings, a
+  PASS with no findings file -- is sent back to the same session once as
+  `envelope_error`, verbatim. The attend loop then reads the second answer
+  with the same checks and refuses it if it is still malformed.
+- In a one-lane batch, a `runtime_defects` entry naming no lane names that
+  lane.
+- Weakening: a revision answering every parked lane is applied even when
+  `runtime_defects` is malformed (the refusal is reported in the steps log),
+  and a well-formed defect on a lane that revision answers files its issue
+  without holding the lane. Before, both refused the envelope whole.
+- The operator schema and role contract state the `runtime_defects` entry
+  shape with `lane` required.
+
 ### Changed — contract change (strengthening, new path): a role session is reused only for its own lane, role and spec digest
 
 - Run 2acd2f5f resumed after an amendment changed `lane-eval-build` and
