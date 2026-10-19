@@ -112,7 +112,7 @@ def _launch(launcher: _ExitingRetainer):
         actor._lane_child_anchor = lambda ctx, path: None
         ctx = SimpleNamespace(
             run_id="run-1",
-            lane=SimpleNamespace(lane_id="lane-a", lane_kind=None),
+            lane=SimpleNamespace(lane_id="lane-a", lane_kind=None, spec_digest="0" * 64),
             plan_revision=1,
             input_digest="digest",
             stage=SimpleNamespace(value="testing"),

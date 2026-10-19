@@ -358,6 +358,9 @@ METADATA_TOKEN_ROLE = "role"
 METADATA_TOKEN_SCRATCH = "scratch"
 METADATA_SCRATCH_REDIRECT = "redirect-v1"
 METADATA_TOKEN_PARENT = "parent"
+#: The lane spec digest a role pane's agent session was started under. With
+#: `lane` and `role` it is the session's identity; see `session_reuse_refusal`.
+METADATA_TOKEN_SPEC = "spec"
 METADATA_KIND_RUN = "run"
 METADATA_KIND_LANE = "lane"
 METADATA_TOKEN_VALUE_MAX = 80
@@ -615,6 +618,12 @@ class LaunchSpec:
     prepare_adopted_cwd: Optional[Callable[[Path], None]] = None
     #: Optional callback once launch holds pane/actor ids. Transport only.
     on_identity: Optional[Callable[["LaunchHandle"], None]] = None
+    #: The lane spec digest this role session belongs to. Recorded on the pane
+    #: and in `session_dir`, and compared before any reuse.
+    spec_digest: str = ""
+    #: Called with `(reason, detail)` when a recorded session was refused for
+    #: reuse and replaced by a fresh one. Reporting only.
+    on_session_replaced: Optional[Callable[[str, str], None]] = None
 
 
 
@@ -890,9 +899,120 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         argv.extend(
             ("--append-system-prompt", str(spec.system_prompt_path.resolve()))
         )
-    if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
+    if (
+        spec.session_dir.is_dir()
+        and any(spec.session_dir.glob("*.jsonl"))
+        and session_dir_reuse_refusal(spec) is None
+    ):
         argv.append("-c")
     return tuple(argv)
+
+
+#: Why a recorded agent session was not reused. Each one starts a fresh
+#: session; none of them fails the launch.
+SESSION_LANE_MISMATCH = "SESSION_LANE_MISMATCH"
+SESSION_ROLE_MISMATCH = "SESSION_ROLE_MISMATCH"
+SESSION_SPEC_DIGEST_CHANGED = "SESSION_SPEC_DIGEST_CHANGED"
+#: Nothing records whose session it is, so nothing proves it is this one.
+SESSION_UNRECORDED = "SESSION_UNRECORDED"
+#: The file in an omp `session_dir` recording whose session it holds.
+SESSION_IDENTITY_FILE = "maestro-session.json"
+
+
+def session_identity(spec: LaunchSpec) -> Dict[str, str]:
+    """The identity a role session is recorded under: lane, role, spec digest."""
+    return {
+        "lane": str(spec.lane_label or spec.lane_key or ""),
+        "role": str(spec.pane_role or ""),
+        "spec_digest": str(spec.spec_digest or ""),
+    }
+
+
+def session_reuse_refusal(
+    spec: LaunchSpec, recorded: Mapping[str, str]
+) -> Optional[str]:
+    """Why the session `recorded` names may not serve `spec`, or `None`.
+
+    Only the same lane, the same role and the same lane spec digest may reuse
+    a session. A lane an amendment changed is a new lane: its old agents hold
+    the superseded contract in their context window. A missing record is
+    refused too, because a session nobody can prove is this one is not reused.
+    """
+    expected = session_identity(spec)
+    if not any(recorded.get(key) for key in expected):
+        return SESSION_UNRECORDED
+    if str(recorded.get("lane") or "") != expected["lane"]:
+        return SESSION_LANE_MISMATCH
+    if str(recorded.get("role") or "") != expected["role"]:
+        return SESSION_ROLE_MISMATCH
+    if str(recorded.get("spec_digest") or "") != expected["spec_digest"]:
+        return SESSION_SPEC_DIGEST_CHANGED
+    return None
+
+
+def _pane_session_record(pane: Mapping[str, object]) -> Dict[str, str]:
+    tokens = _herdr_tokens(pane)
+    return {
+        "lane": tokens.get(METADATA_TOKEN_LANE, ""),
+        "role": tokens.get(METADATA_TOKEN_ROLE, ""),
+        "spec_digest": tokens.get(METADATA_TOKEN_SPEC, ""),
+    }
+
+
+def session_dir_reuse_refusal(spec: LaunchSpec) -> Optional[str]:
+    """`session_reuse_refusal` against the identity recorded in `session_dir`."""
+    try:
+        recorded = json.loads(
+            (spec.session_dir / SESSION_IDENTITY_FILE).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError):
+        recorded = {}
+    if not isinstance(recorded, dict):
+        recorded = {}
+    return session_reuse_refusal(spec, recorded)
+
+
+def retire_superseded_session_dir(spec: LaunchSpec) -> Optional[str]:
+    """Make `session_dir` hold only `spec`'s session; answer why it did not.
+
+    omp's `-c` continues the newest transcript in the directory, so a
+    transcript recorded for another lane, role or spec digest is moved into a
+    `superseded-*` subdirectory -- kept, never deleted, and out of `-c`'s
+    reach -- before the directory is re-recorded for `spec`. Recording only
+    after moving is what keeps a launch that dies before omp writes anything
+    from leaving the old transcript continuable under the new identity.
+    """
+    reason = None
+    transcripts = (
+        sorted(spec.session_dir.glob("*.jsonl")) if spec.session_dir.is_dir() else []
+    )
+    if transcripts:
+        reason = session_dir_reuse_refusal(spec)
+    if reason is not None:
+        aside = spec.session_dir / "superseded-{0}".format(time.time_ns())
+        aside.mkdir()
+        for transcript in transcripts:
+            os.replace(transcript, aside / transcript.name)
+        if spec.on_session_replaced is not None:
+            spec.on_session_replaced(
+                reason,
+                "omp session dir {0}: {1} transcript(s) moved to {2}".format(
+                    spec.session_dir, len(transcripts), aside.name
+                ),
+            )
+    record_session_dir_identity(spec)
+    return reason
+
+
+def record_session_dir_identity(spec: LaunchSpec) -> None:
+    """Write `session_identity(spec)` into `session_dir`, atomically."""
+    spec.session_dir.mkdir(parents=True, exist_ok=True)
+    target = spec.session_dir / SESSION_IDENTITY_FILE
+    partial = target.with_name(".{0}.{1}.part".format(target.name, os.getpid()))
+    partial.write_text(
+        json.dumps(session_identity(spec), sort_keys=True), encoding="utf-8"
+    )
+    os.replace(partial, target)
 
 
 def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
@@ -3663,6 +3783,53 @@ class HerdrLauncher:
                 self._handles.pop(token, None)
             self._tailers.pop(token, None)
 
+    def _refused_session_replaced(
+        self,
+        spec: LaunchSpec,
+        handle: LaunchHandle,
+        pane: Mapping[str, object],
+    ) -> bool:
+        """Close `handle`'s session if it may not serve `spec`; say if it did.
+
+        Both reuse paths -- the in-process role handle and an agent adopted
+        by its stable name after a restart -- call this once the pane is
+        proven to be theirs and before they resubmit, so a session is reused
+        only for the lane, role and lane spec digest recorded on its pane.
+
+        A pane recording another lane or role is refused and left open: its
+        identity contradicts the agent name that found it, so nothing proves
+        it is Maestro's to close. A pane recording this lane and role under
+        another spec digest -- or none -- is this lane's own superseded
+        session: it is closed and the caller starts a fresh one. If that close
+        is not confirmed the launch is refused, because starting beside it
+        would leave two sessions for one role.
+        """
+        recorded = _pane_session_record(pane)
+        reason = session_reuse_refusal(spec, recorded)
+        if reason is None:
+            return False
+        detail = "pane {0}: recorded {1}, wanted {2}".format(
+            handle.pane_id,
+            json.dumps(recorded, sort_keys=True),
+            json.dumps(session_identity(spec), sort_keys=True),
+        )
+        if reason in (SESSION_LANE_MISMATCH, SESSION_ROLE_MISMATCH):
+            self._refuse_live_pane("{0}:{1}".format(reason, detail))
+        try:
+            self.cancel(handle, time.monotonic() + 5.0)
+        except Exception as exc:
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{0}:CLOSE_UNCONFIRMED:{1}: {2}: {3}".format(
+                    reason, handle.pane_id, type(exc).__name__, exc
+                ),
+                pane_created=False,
+            ) from exc
+        self._discard_role_handle(spec, handle)
+        if spec.on_session_replaced is not None:
+            spec.on_session_replaced(reason, detail)
+        return True
+
     def _validated_existing_role_handle(
         self, spec: LaunchSpec, environment: Mapping[str, str]
     ) -> Optional[LaunchHandle]:
@@ -3709,6 +3876,8 @@ class HerdrLauncher:
             self._refuse_live_pane("{}!={}".format(tab_id, handle.tab_id))
         if handle.workspace_id and workspace_id != handle.workspace_id:
             self._refuse_live_pane("{}!={}".format(workspace_id, handle.workspace_id))
+        if self._refused_session_replaced(spec, handle, pane):
+            return None
         return handle
 
     def _stable_agent_in_pane(
@@ -3815,7 +3984,11 @@ class HerdrLauncher:
             )
             name = _agent_name(spec.correlation_token)
             agent = self._fetch_agent(name, environment)
-            if agent is not None:
+            # A session recorded for another spec digest is left for the
+            # next launch, whose reconnect closes and replaces it.
+            if agent is not None and session_reuse_refusal(
+                spec, _pane_session_record(pane)
+            ) is None:
                 if str(agent.get("pane_id") or "") != pane_id:
                     self._refuse_live_pane("RESTORED_AGENT_PANE_MISMATCH")
                 self._handle_from_live_agent(spec, name, agent, pane, environment)
@@ -4249,6 +4422,18 @@ class HerdrLauncher:
             self.workspace_label
             and _herdr_tokens(pane).get(METADATA_TOKEN_SCRATCH)
             != METADATA_SCRATCH_REDIRECT
+        ):
+            return None
+        if self._refused_session_replaced(
+            spec,
+            LaunchHandle(
+                spec.correlation_token,
+                str(pane.get("pane_id") or ""),
+                stable_name,
+                spec.worktree,
+                environment=environment,
+            ),
+            pane,
         ):
             return None
         return self._handle_from_live_agent(spec, stable_name, agent, pane, environment)
@@ -4795,11 +4980,10 @@ class HerdrLauncher:
                 raise RuntimeError("PANE_LABEL_UNCONFIRMED:{}".format(pane_id))
             parent_id = self._parent_workspace_id
             lane_id = str(spec.lane_label or spec.lane_key or "")
-            self._tag_pane(
-                pane_id,
-                self._pane_identity_tokens(lane_id, role, parent_id),
-                environment,
-            )
+            tokens = self._pane_identity_tokens(lane_id, role, parent_id)
+            if spec.spec_digest:
+                tokens[METADATA_TOKEN_SPEC] = str(spec.spec_digest)
+            self._tag_pane(pane_id, tokens, environment)
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
@@ -4922,7 +5106,14 @@ class HerdrLauncher:
         prepare_route_prompt(spec)
         preflight_launch_prompt(spec)
         if spec.route == "omp":
-
+            try:
+                retire_superseded_session_dir(spec)
+            except OSError as exc:
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH,
+                    "SESSION_DIR_UNRECORDED:{0}: {1}".format(type(exc).__name__, exc),
+                    pane_created=False,
+                ) from exc
             try:
                 route_argv = build_omp_argv(self.omp_path, spec)
             except ValueError as exc:
