@@ -121,6 +121,11 @@ class LaunchRefusal(Enum):
     #: not complete. The launch path cancels that agent before reporting the
     #: refusal; another attempt may succeed.
     PROMPT_SUBMISSION_REFUSED = ("PROMPT_SUBMISSION_REFUSED", False, False)
+    #: The prompt text never reached the agent: idle, no transcript record of
+    #: it, and on no line of the pane, after every bounded full resend. The
+    #: raise site states whether the pane survived; another attempt may
+    #: succeed.
+    DISPATCH_NOT_CONSUMED = ("DISPATCH_NOT_CONSUMED", None, False)
     #: The pane herdr split is not bound to the worktree the spec named.
     #: Non-deterministic: the binding is herdr's to get right and another
     #: split may land correctly.
@@ -1849,7 +1854,98 @@ def pane_revision(
     return revision if isinstance(revision, int) else None
 
 
+#: How many times a prompt whose text never reached the agent is sent again,
+#: in full, before the dispatch is refused `DISPATCH_NOT_CONSUMED`.
+PROMPT_RESENDS = 2
+
+
+class DispatchNotConsumed(PromptNotSubmitted):
+    """The prompt text never reached the agent, after every bounded resend.
+
+    Distinct from `AGENT_PROMPT_HELD_IN_COMPOSER`, where the text is on screen
+    and will not submit: here it is on no line of the pane and no transcript
+    record names it, so no Enter could ever have sent it.
+    """
+
+
+def pane_lacks_offer(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    prompt_path: Path,
+) -> Optional[bool]:
+    """Whether the offered path appears on NO line of the pane's recent screen.
+
+    `composer_holds_offer` reads the composer tail and answers "still unsent".
+    This is its complement over the whole snapshot: the text is neither in the
+    composer nor echoed into the transcript above it, so it never landed --
+    typed before the input box was ready, or swallowed by a startup repaint.
+    `None` is an unreadable pane, never a "yes".
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        return None
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    if not text.strip():
+        return None
+    return str(Path(prompt_path).resolve()) not in text
+
+
 def submit_agent_prompt(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    text: str,
+    agent_name: Optional[str] = None,
+    *,
+    delivery_lost: Optional[Callable[[], bool]] = None,
+    resends: int = PROMPT_RESENDS,
+    sleep: Callable[[float], None] = time.sleep,
+    **offer: Any,
+) -> None:
+    """Offer a prompt and, where it is not proven, prove it was not LOST.
+
+    `_offer_prompt` presses Enter on whatever the composer holds. When the
+    text itself never landed -- sent before the TUI accepted input, or
+    swallowed by a startup repaint -- no Enter can recover it, and the lane
+    path's "offered, unproven" return handed an idle agent with an empty
+    composer to a waiter that ends on the envelope alone. Run 2acd2f5f: an
+    attend operator (Claude, `--remote-control`) sat at `session 0m` with an
+    empty composer and a transcript holding no user turn while its lane
+    logged "waiting on operator" for over an hour.
+
+    `delivery_lost` answers True only on observations that are not a clock:
+    the agent `idle`, no transcript record naming the prompt, and the prompt
+    path on no line of the pane -- read twice, a settle apart. Then the FULL
+    text is sent again (the composer is empty, so nothing is appended to a
+    held line), at most `resends` times, after which the dispatch raises
+    `DispatchNotConsumed`. Without the predicate the offer behaves as before.
+    """
+    sends = max(0, resends) + 1
+    for _ in range(sends):
+        if _offer_prompt(herdr_call, pane_id, text, agent_name, sleep=sleep, **offer):
+            return
+        if delivery_lost is None:
+            return
+        try:
+            lost = delivery_lost()
+            if lost:
+                sleep(PASTE_SETTLE_S)
+                lost = delivery_lost()
+        except Exception:
+            lost = False
+        if not lost:
+            return
+    raise DispatchNotConsumed(
+        "DISPATCH_NOT_CONSUMED:{0} prompt never reached the agent after {1} sends".format(
+            agent_name or pane_id, sends
+        )
+    )
+
+
+def _offer_prompt(
     herdr_call: Callable[..., dict],
     pane_id: str,
     text: str,
@@ -1863,8 +1959,11 @@ def submit_agent_prompt(
     refuse_unproven: bool = True,
     submission_recorded: Optional[Callable[[], bool]] = None,
     composer_holds: Optional[Callable[[], Optional[bool]]] = None,
-) -> None:
+) -> bool:
     """Offer one prompt to an agent composer and press it until it takes.
+
+    Answers True when the submission was proven, False when the lane path
+    returned "offered, unproven"; `submit_agent_prompt` decides from there.
 
     **`herdr agent prompt` is not used here, and reviving it reinstates a
     known production stall.** That verb submits an encoded Enter atomically
@@ -2225,7 +2324,7 @@ def submit_agent_prompt(
     # the round's own read skipped too, left the whole call with no reading at
     # all to reason from.
     if consumed(revision_only=stalled):
-        return
+        return True
 
     rounds = max(1, attempts)
     # Kept above herdr's own five-second lifecycle-observation floor, or the
@@ -2243,7 +2342,7 @@ def submit_agent_prompt(
         # only on a composer that has demonstrably done nothing, and a prompt
         # that did go through costs zero further keystrokes.
         if wait_for(per_round):
-            return
+            return True
         try:
             # NO `esc` here, ever. In omp `esc` is the interrupt key -- the
             # composer renders `Working... <esc>` while a turn runs -- so an
@@ -2284,7 +2383,7 @@ def submit_agent_prompt(
                         pane_exc,
                     )
         if consumed():
-            return
+            return True
         # Stop keying a composer that has visibly let the offer go. The text
         # is gone from the screen, so a further Enter cannot rescue anything
         # and would land on an empty composer as a stray blank turn. Only a
@@ -2354,7 +2453,7 @@ def submit_agent_prompt(
             grace_deadline = monotonic() + TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
             while True:
                 if consumed():
-                    return
+                    return True
                 if monotonic() >= grace_deadline:
                     break
                 sleep(0.1)
@@ -2376,7 +2475,7 @@ def submit_agent_prompt(
             if refusal is not None:
                 raise refusal
             if not refuse_unproven:
-                return
+                return False
             raise PromptSubmissionUnobservable(
                 "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts{2}".format(
                     target, rounds, summary
@@ -2394,7 +2493,7 @@ def submit_agent_prompt(
             # The node's liveness and quiescence machinery adjudicates from
             # here (B14), and it is the only reader that can, because it is
             # the only one whose evidence keeps arriving.
-            return
+            return False
         raise PromptNotSubmitted(
             "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
                 target, rounds, summary
@@ -2430,7 +2529,7 @@ def submit_agent_prompt(
         # Same reasoning as the transcript branch above, over a weaker meter:
         # a legible revision that did not move is not proof the composer
         # refused the text, because pasting repaints and a turn need not.
-        return
+        return False
     raise PromptNotSubmitted(
         "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
             target, rounds, summary
@@ -5059,6 +5158,76 @@ class HerdrLauncher:
 
         return holds
 
+    def _agent_transcript_bound(self, handle: LaunchHandle) -> Optional[str]:
+        """The agent's raw status, binding a transcript discovered since launch.
+
+        Claude `--remote-control` keeps an ID-valued session whose JSONL may
+        appear only after start, so a handle can be launched without a
+        transcript; this attaches it the moment Herdr's record resolves one.
+        """
+        agent = _agent_record(
+            self._herdr(
+                "agent", "get", handle.agent_name, env=handle.environment, timeout=15.0
+            )
+        )
+        if not isinstance(agent, dict):
+            return None
+        if handle.transcript_path is None:
+            found = _agent_transcript_path(
+                agent, handle.launched_cwd, handle.environment
+            )
+            if found is not None:
+                self._bind_handle_transcript(handle, found)
+        status = agent.get("agent_status") or agent.get("status")
+        return str(status) if status else None
+
+    def prompt_delivery_lost(self, handle: LaunchHandle, prompt_path: Path) -> bool:
+        """Whether the agent is idle and this prompt demonstrably never landed.
+
+        True needs all three: the agent reports `idle`, no transcript record
+        names the prompt path, and the path is on no line of the pane. A turn
+        that started leaves at least one of those, and a missing or unreadable
+        observation is never a True.
+        """
+        try:
+            if self._agent_transcript_bound(handle) != "idle":
+                return False
+            if prompt_submission_marks(handle, prompt_path) > 0:
+                return False
+            return (
+                pane_lacks_offer(
+                    lambda *args, **kwargs: self._herdr(
+                        *args, env=handle.environment, **kwargs
+                    ),
+                    handle.pane_id,
+                    prompt_path,
+                )
+                is True
+            )
+        except Exception:
+            return False
+
+    def turn_activity(self, handle: LaunchHandle) -> Optional[Tuple[str, int]]:
+        """`(agent status, transcript bytes)`: what the envelope waiter reads.
+
+        `-1` bytes is "no transcript"; `None` is an unreadable agent. The pane
+        revision is deliberately absent: a status line repaints on its own, so
+        it would read as activity forever.
+        """
+        try:
+            status = self._agent_transcript_bound(handle)
+        except Exception:
+            return None
+        if status is None:
+            return None
+        size = -1
+        if handle.transcript_path is not None:
+            try:
+                size = Path(handle.transcript_path).stat().st_size
+            except OSError:
+                size = -1
+        return status, size
+
     def _runtime_submission_recorded(
         self, handle: LaunchHandle, prompt_path: Path
     ) -> Callable[[], bool]:
@@ -5407,6 +5576,9 @@ class HerdrLauncher:
                 composer_holds=self._composer_holds(
                     pane_id, spec.prompt_path, environment
                 ),
+                delivery_lost=lambda: self.prompt_delivery_lost(
+                    handle, spec.prompt_path
+                ),
             )
 
             # The pane's foreground group is meaningful only after submission.
@@ -5436,7 +5608,9 @@ class HerdrLauncher:
             if not isinstance(exc, Exception):
                 raise
             raise LaunchRefused(
-                LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+                LaunchRefusal.DISPATCH_NOT_CONSUMED
+                if isinstance(exc, DispatchNotConsumed)
+                else LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
                 "{0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
@@ -5574,7 +5748,9 @@ class HerdrLauncher:
             # declared refusal type rather than as a bare RuntimeError nobody
             # catches.
             raise LaunchRefused(
-                LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+                LaunchRefusal.DISPATCH_NOT_CONSUMED
+                if isinstance(exc, DispatchNotConsumed)
+                else LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
                 str(exc),
                 pane_created=True,
             ) from exc
@@ -5610,6 +5786,7 @@ class HerdrLauncher:
             composer_holds=self._composer_holds(
                 handle.pane_id, prompt, handle.environment
             ),
+            delivery_lost=lambda: self.prompt_delivery_lost(handle, prompt),
         )
 
 
