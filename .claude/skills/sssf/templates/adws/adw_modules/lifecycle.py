@@ -2210,6 +2210,79 @@ class ArtifactStore:
             self.conn.execute("ROLLBACK")
             raise
 
+    @serialized
+    def reopen_suite(
+        self, run_id: str, lane_id: str, artifact: st.LaneArtifact
+    ) -> ArtifactRecord:
+        """Send a merged tests lane back to WRITING_TESTS with a suite REVISE.
+
+        `artifact` is a TEST_REVIEW REVISE carrying `suite_reopen`: findings a
+        paired build lane's review attributed to the accepted suite, or a crash
+        the suite repeated on two candidates. It is recorded where a test
+        review is, so `_writing_tests` hands its findings to the tester exactly
+        as a test reviewer's REVISE. The lane's projection is untouched: the
+        contract the revised suite is reviewed against is the one it had.
+        """
+        now = now_iso()
+        self._begin()
+        try:
+            run = self._run(run_id)
+            projection = self._projection(run_id, run["plan_revision"], lane_id)
+            if self._lane_kind(run_id, lane_id) != st.LANE_KIND_TESTS:
+                raise st.IllegalStageEdge("suite reopen requires a tests lane")
+            if (
+                artifact.kind is not st.ArtifactKind.TEST_REVIEW
+                or artifact.verdict is not st.ReviewerVerdict.REVISE
+                or not artifact.payload.get("suite_reopen")
+            ):
+                raise st.CanonicalIdentityError("suite reopen requires TEST_REVIEW REVISE")
+            if artifact.plan_revision != run["plan_revision"]:
+                raise StaleStageInput("suite reopen plan_revision")
+            self._validate_projection_match(artifact, projection)
+            current = self.lane_stage(run_id, lane_id)
+            if current is not st.LaneStage.MERGED:
+                if current is st.LaneStage.WRITING_TESTS:
+                    record = self._insert_lane_artifact(
+                        run_id=run_id,
+                        lane_id=lane_id,
+                        artifact=artifact,
+                        completed_stage=st.LaneStage.REVIEWING_TESTS,
+                        now=now,
+                    )
+                    if record.replayed:
+                        self.conn.execute("COMMIT")
+                        return record
+                raise StageCasConflict(current.value)
+            record = self._insert_lane_artifact(
+                run_id=run_id,
+                lane_id=lane_id,
+                artifact=artifact,
+                completed_stage=st.LaneStage.REVIEWING_TESTS,
+                now=now,
+            )
+            self._cas_stage(
+                run_id,
+                lane_id,
+                st.LaneStage.MERGED,
+                st.LaneStage.WRITING_TESTS,
+                now,
+            )
+            self._audit(
+                run_id=run_id,
+                lane_id=lane_id,
+                from_stage=st.LaneStage.MERGED.value,
+                to_stage=st.LaneStage.WRITING_TESTS.value,
+                artifact_id=record.artifact_id,
+                reason="suite_reopen",
+                now=now,
+            )
+            self._touch_run(run_id, now)
+            self.conn.execute("COMMIT")
+            return record
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
     def _final_review_lanes(self, run: sqlite3.Row, integration_sha: str) -> list[dict]:
         rows = []
         for lane in self._active_lanes(run["run_id"], run["plan_revision"]):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -658,6 +659,39 @@ def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
 #: reverse. `maestro.config.yaml`'s `suite_timeout_s` overrides it.
 SUITE_TIMEOUT_S = 3600.0
 
+#: The typed reason a suite run that died by signal is reported under.
+SUITE_CRASHED = "SUITE_CRASHED"
+
+#: How many of the runner's last non-blank output lines a crash carries.
+CRASH_TAIL_LINES = 20
+
+
+def suite_crash_reason(returncode: int) -> str:
+    """`SUITE_CRASHED:<signal>` when `returncode` says a signal killed the run.
+
+    A process the runner spawned directly reports `-N`; one behind a shell or a
+    launcher such as `uv run` reports `128 + N`. `-1` is not a signal here: it is
+    `execute_cases`' own "could not run" sentinel, which carries its own output.
+    """
+    number = 0
+    if returncode < -1:
+        number = -returncode
+    elif 128 < returncode < 128 + 65:
+        number = returncode - 128
+    if not number:
+        return ""
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = "SIG{0}".format(number)
+    return "{0}:{1}".format(SUITE_CRASHED, name)
+
+
+def crash_tail(output: str) -> list[str]:
+    """The runner's last non-blank lines, verbatim, for a crashed run."""
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    return lines[-CRASH_TAIL_LINES:]
+
 
 def run_suite(
     tree: Path,
@@ -724,6 +758,22 @@ def run_suite(
     executed = (
         counts["passed"] + counts["failed"] + counts["errored"] + counts["skipped"]
     )
+    crashed = suite_crash_reason(returncode)
+    if crashed:
+        # The runner process was killed by a signal (maestro#330: SIGBUS in a
+        # suite's in-test server thread, exit 138). "0 executed" alone told
+        # neither builder nor reviewer that the harness crashed, so the typed
+        # reason and the runner's last lines travel with the counts.
+        return {
+            "counts": counts,
+            "crash_tail": crash_tail(output),
+            "crashed": crashed,
+            "executed": executed,
+            "min_cases": bound.min_cases,
+            "output": output,
+            "returncode": returncode,
+            "runner": bound.runner,
+        }
     if returncode == 0 and executed < 1:
         # A runner that exited 0 while the parser found no cases has produced a
         # measurement this code cannot read. It is not a pass.

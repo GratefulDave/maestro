@@ -617,7 +617,10 @@ def measure_candidate(
         dest, files, gate=gate, suite_timeout_s=suite_timeout_s
     )
     collection_broken = False
-    if refusal is not None or _collected_no_case(run):
+    crashed = str(run.get("crashed") or "")
+    # A run killed by a signal is already typed (`SUITE_CRASHED:<signal>`), so
+    # it is not the ambiguous "no case outcome" the base comparison settles.
+    if not crashed and (refusal is not None or _collected_no_case(run)):
         # "No case outcome" is ambiguous on its own: an undeclared dependency
         # and a candidate that broke an import both produce it, and under the
         # runner probe both arrive as the same refusal. The commit the builder
@@ -659,6 +662,10 @@ def measure_candidate(
         "passed": run["counts"]["passed"],
         "skipped": run["counts"]["skipped"],
     }
+    if crashed:
+        # Present only on a crash, so every other summary is byte-identical.
+        summary["crashed"] = crashed
+        summary["crash_tail"] = list(run.get("crash_tail") or ())
     min_cases = int(run.get("min_cases") or 1)
     runner_failed = bool(
         run["returncode"] != 0
@@ -927,7 +934,12 @@ def review_builder_output(
         "builder_base_sha": builder_base_sha,
         "candidate_ref": candidate_ref,
         "candidate_sha": candidate_sha,
-        "failure_output": list(failure_lines(str(run["output"]))) + probe_lines,
+        "failure_output": (
+            [str(run["crashed"]), *run.get("crash_tail", ())]
+            if run.get("crashed")
+            else list(failure_lines(str(run["output"])))
+        )
+        + probe_lines,
         "findings": [dict(item) for item in findings_out],
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
