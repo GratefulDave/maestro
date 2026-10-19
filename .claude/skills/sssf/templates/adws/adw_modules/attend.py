@@ -87,6 +87,11 @@ KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
 #: The Plan IR the live revision was projected from could not be located.
 PLAN_IR_UNRESOLVED = "ATTEND_PLAN_IR_UNRESOLVED"
 
+#: The directory attend keeps its planctl roots in is one planctl refuses to
+#: upload (it is, contains, or sits in the home directory or `~/.maestro`) or
+#: holds key material. Nothing attend can move fixes a configured path.
+PLANROOT_UNSAFE = "ATTEND_PLANROOT_UNSAFE"
+
 #: The operator agent's runtime-defect declaration was not the typed shape.
 DEFECT_INVALID = "ATTEND_RUNTIME_DEFECT_INVALID"
 
@@ -129,6 +134,7 @@ class AttendPolicy:
     reviewer_route: Mapping[str, str] = field(default_factory=dict)
     planctl: Optional[Path] = None
     plan_ir: Optional[Path] = None
+    planctl_root_dir: Optional[Path] = None
     validate_argv: Tuple[str, ...] = ()
     reviewer_id: str = ""
     reviewer_vendor: str = ""

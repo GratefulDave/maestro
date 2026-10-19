@@ -152,6 +152,7 @@ _ATTEND_FIELDS = frozenset(
         "reviewer_vendor",
         "planctl",
         "plan_ir",
+        "planctl_root_dir",
         "validate_argv",
     )
 )
@@ -386,6 +387,7 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
                 "reviewer_route": MappingProxyType({}),
                 "reviewer_vendor": None,
                 "planctl": None,
+                "planctl_root_dir": None,
                 "validate_argv": (),
             }
         )
@@ -452,6 +454,11 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
     plan_ir = _optional_config_string(value.get("plan_ir"), "attend.plan_ir")
     if plan_ir and not Path(plan_ir).is_absolute():
         raise _MaestroConfigurationError("attend.plan_ir must be absolute")
+    root_dir = _optional_config_string(
+        value.get("planctl_root_dir"), "attend.planctl_root_dir"
+    )
+    if root_dir and not Path(root_dir).is_absolute():
+        raise _MaestroConfigurationError("attend.planctl_root_dir must be absolute")
     return MappingProxyType(
         {
             "max_amendments_per_lane": per_lane,
@@ -463,6 +470,7 @@ def _canonical_attend(value: object) -> Mapping[str, Any]:
             "reviewer_vendor": reviewer_vendor,
             "planctl": Path(planctl) if planctl else None,
             "plan_ir": Path(plan_ir) if plan_ir else None,
+            "planctl_root_dir": Path(root_dir) if root_dir else None,
             "validate_argv": _config_argv(
                 value.get("validate_argv"), "attend.validate_argv"
             )
@@ -3919,6 +3927,7 @@ class _RunPreflight:
         plan_ir: Optional[Path] = None,
         plan_ir_current: Optional[Callable[[], Tuple[bool, str]]] = None,
         plan_ir_supply: Optional[Callable[[], str]] = None,
+        planroot_check: Optional[Callable[[], Tuple[bool, str]]] = None,
         runner: rp.Runner = rp.real_runner,
         which: Callable[[str], Optional[str]] = shutil.which,
         file_issue: Optional[Callable[[str, str], Mapping[str, str]]] = None,
@@ -3935,6 +3944,7 @@ class _RunPreflight:
         self.plan_ir = plan_ir
         self.plan_ir_current = plan_ir_current
         self.plan_ir_supply = plan_ir_supply
+        self.planroot_check = planroot_check
         self.runner = runner
         self.which = which
         self.repo = Path(target.target_repository_root)
@@ -4103,7 +4113,7 @@ class _RunPreflight:
             reason = "attend is disabled in this deployment"
             return [
                 rp.Check(item, lambda: (True, ""), skip=reason)
-                for item in ("attend:planctl", "attend:plan-ir", "aws:planctl-runner", "gh:auth", "gh:repo-permission")
+                for item in ("attend:planctl", "attend:planroot-dir", "attend:plan-ir", "aws:planctl-runner", "gh:auth", "gh:repo-permission")
             ]
         policy = _attend_policy(self.layout)
         checks = [
@@ -4111,6 +4121,19 @@ class _RunPreflight:
                 "attend:planctl", policy.planctl,
                 "set attend.planctl to the plan-contract validator; there is no "
                 "source the runtime can fetch it from",
+            ),
+            *(
+                [
+                    rp.Check(
+                        "attend:planroot-dir",
+                        self.planroot_check,
+                        "set attend.planctl_root_dir to a durable directory "
+                        "outside the home directory root, ~/.maestro and keys_dir: "
+                        "planctl refuses to upload a root there",
+                    )
+                ]
+                if self.planroot_check is not None
+                else []
             ),
             self._plan_ir_check(),
         ]
@@ -5083,6 +5106,7 @@ def _attend_policy(layout: Mapping[str, Any]) -> att.AttendPolicy:
         reviewer_route=reviewer_route,
         planctl=raw.get("planctl"),
         plan_ir=raw.get("plan_ir"),
+        planctl_root_dir=raw.get("planctl_root_dir"),
         validate_argv=tuple(raw.get("validate_argv") or ()),
         reviewer_id=_attend_reviewer_id(reviewer_route),
         reviewer_vendor=str(raw.get("reviewer_vendor") or ""),
@@ -5260,41 +5284,122 @@ def _attend_plan_ir(
     )
 
 
-def _attend_root(runtime: Any, run_id: str, revision: int) -> Path:
-    """The planctl root attend owns for one revision, under `runtime_state_root`.
+def _attend_planroot_dir(policy: att.AttendPolicy, runtime: Any) -> Path:
+    """The durable directory attend keeps its planctl roots in.
+
+    `attend.planctl_root_dir`, else a per-deployment directory in the user's
+    own state location. Never under `runtime_state_root`: planctl uploads a
+    revision's root to its mutation runner and refuses one that is the home
+    directory, contains it, or sits in `~/.maestro`, which holds the signing
+    keys. The root is durable (it outlives the scratch trees an operator
+    amends from) and uploadable, so what it holds is the IR, its render, the
+    findings and the sha256-verified pinned sources -- never a key.
+    """
+    if policy.planctl_root_dir is not None:
+        return Path(policy.planctl_root_dir)
+    name = Path(runtime.path).name
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        state = os.environ.get("XDG_STATE_HOME")
+        base = Path(state) if state and os.path.isabs(state) else Path.home() / ".local" / "state"
+    return base / "maestro" / name / "planroots"
+
+
+def _planroot_unsafe(root: Path, keys_dir: Optional[Path] = None) -> str:
+    """Why planctl would refuse to upload `root`, or "" when it would not.
+
+    The rule is planctl-ec2.sh `upload_root_is_unsafe`: the root is not the
+    home directory, does not contain it, and is not `~/.maestro` or inside
+    it. A root that is, contains or sits in `keys_dir`, or that holds a file
+    with the bytes of one of its files, is refused too.
+    """
+    home = Path(os.environ.get("HOME") or Path.home()).resolve()
+    resolved = Path(root).resolve()
+    maestro_home = home / ".maestro"
+    if resolved == home or home.is_relative_to(resolved):
+        return "{0} is, or contains, the home directory".format(root)
+    if resolved == maestro_home or resolved.is_relative_to(maestro_home):
+        return "{0} is inside {1}, which holds signing keys".format(root, maestro_home)
+    if keys_dir is None:
+        return ""
+    keys = Path(keys_dir).resolve()
+    if resolved == keys or resolved.is_relative_to(keys) or keys.is_relative_to(resolved):
+        return "{0} overlaps the keys directory {1}".format(root, keys)
+    if keys.is_dir() and resolved.is_dir():
+        secrets = {
+            hashlib.sha256(item.read_bytes()).hexdigest()
+            for item in keys.rglob("*")
+            if item.is_file()
+        }
+        for item in resolved.rglob("*"):
+            if item.is_file() and hashlib.sha256(item.read_bytes()).hexdigest() in secrets:
+                return "{0} holds a copy of a key from {1}".format(item, keys)
+    return ""
+
+
+def _attend_planroot_base(
+    policy: att.AttendPolicy, runtime: Any, layout: Mapping[str, Any]
+) -> Path:
+    """`_attend_planroot_dir`, refused PLANROOT_UNSAFE when planctl would refuse it."""
+    base = _attend_planroot_dir(policy, runtime)
+    keys = layout.get("keys_dir")
+    reason = _planroot_unsafe(base, Path(keys) if keys else None)
+    if reason:
+        raise att.AttendRefused(
+            att.PLANROOT_UNSAFE,
+            "{0}; set attend.planctl_root_dir to a directory outside the home "
+            "directory root, ~/.maestro and keys_dir".format(reason),
+        )
+    return base
+
+
+def _attend_planroot_check(
+    policy: att.AttendPolicy, runtime: Any, layout: Mapping[str, Any]
+) -> tuple[bool, str]:
+    """Preflight's reading of `_attend_planroot_base`: the typed reason, not a raise."""
+    try:
+        return True, str(_attend_planroot_base(policy, runtime, layout))
+    except att.AttendRefused as refused:
+        return False, "{0}: {1}".format(refused.code, refused.detail)
+
+
+def _attend_root(base: Path, run_id: str, revision: int) -> Path:
+    """The planctl root attend owns for one revision, under `base`.
 
     The revision's IR, everything planctl writes beside it, and a copy of
     every pinned source the IR cites live here, and attend passes this
-    directory as `--repo-root`. It is the directory the revision's pinned
-    plan artifact already lives in, so it is a function of the run and the
+    directory as `--repo-root`. It is a function of the run and the
     revision and never of where some earlier IR happened to be written: on
     run 2acd2f5f the r6 IR was written next to a hand amendment's r5 IR in
     `/tmp`, outside the `--repo-root` attend passed, and planctl refused it.
+    `base` is `_attend_planroot_base`, never `runtime_state_root`: planctl
+    refuses to upload a root inside `~/.maestro`.
     """
-    return _pinned_plan_artifact(runtime, run_id, revision).parent
+    return Path(base) / run_id / "r{0}".format(int(revision))
 
 
-def _attend_owned_ir(runtime: Any, run_id: str, revision: int) -> Path:
-    return _attend_root(runtime, run_id, revision) / "{0}.r{1}.ir.json".format(
+def _attend_owned_ir(base: Path, run_id: str, revision: int) -> Path:
+    return _attend_root(base, run_id, revision) / "{0}.r{1}.ir.json".format(
         run_id, int(revision)
     )
 
 
-def _attend_root_record(runtime: Any, run_id: str, revision: int) -> Path:
+def _attend_root_record(base: Path, run_id: str, revision: int) -> Path:
     """Which plan the owned IR is the IR of, by the pinned plan's sha256.
 
     Without it an IR a refused attempt left in the root would read as the
     revision's own once a hand amendment applied that revision number.
     """
-    return _attend_root(runtime, run_id, revision) / "{0}.r{1}.root.json".format(
+    return _attend_root(base, run_id, revision) / "{0}.r{1}.root.json".format(
         run_id, int(revision)
     )
 
 
-def _attend_record_root(runtime: Any, run_id: str, revision: int) -> None:
-    ir = _attend_owned_ir(runtime, run_id, revision)
+def _attend_record_root(runtime: Any, base: Path, run_id: str, revision: int) -> None:
+    ir = _attend_owned_ir(base, run_id, revision)
     pinned = _pinned_plan_artifact(runtime, run_id, revision)
-    _attend_root_record(runtime, run_id, revision).write_text(
+    _attend_root_record(base, run_id, revision).write_text(
         json.dumps(
             {
                 "plan_revision": int(revision),
@@ -5311,10 +5416,12 @@ def _attend_record_root(runtime: Any, run_id: str, revision: int) -> None:
     )
 
 
-def _attend_root_current(runtime: Any, run_id: str, revision: int) -> tuple[bool, str]:
+def _attend_root_current(
+    runtime: Any, base: Path, run_id: str, revision: int
+) -> tuple[bool, str]:
     """The owned IR exists and its record names the revision's pinned plan."""
-    ir = _attend_owned_ir(runtime, run_id, revision)
-    record_path = _attend_root_record(runtime, run_id, revision)
+    ir = _attend_owned_ir(base, run_id, revision)
+    record_path = _attend_root_record(base, run_id, revision)
     pinned = _pinned_plan_artifact(runtime, run_id, revision)
     if not ir.is_file() or not record_path.is_file():
         return False, "{0} is not recorded".format(ir)
@@ -5327,6 +5434,41 @@ def _attend_root_current(runtime: Any, run_id: str, revision: int) -> tuple[bool
         return False, "{0} changed after it was recorded".format(ir)
     json.loads(ir.read_bytes())
     return True, str(ir)
+
+
+def _attend_migrate_roots(runtime: Any, base: Path, run_id: str) -> list[Path]:
+    """Move roots an earlier release laid out under `runtime_state_root`.
+
+    Those roots sat in `runtime_state_root/plans/<run>/r<N>/` beside the
+    pinned plan, which is inside `~/.maestro`, so planctl refused to upload
+    them. Everything but the pinned plan moves to `base`, which keeps the
+    revision's own layout, and a moved record's `repo_root` follows it. A
+    file the destination already holds is left where it is.
+    """
+    old = Path(runtime.path) / "plans" / run_id
+    moved: list[Path] = []
+    if not old.is_dir():
+        return moved
+    for source in sorted(old.glob("r[0-9]*")):
+        if not source.is_dir():
+            continue
+        revision = source.name[1:]
+        destination = Path(base) / run_id / source.name
+        for item in sorted(source.rglob("*")):
+            if not item.is_file() or item.relative_to(source) == Path(_PLAN_ARTIFACT_NAME):
+                continue
+            target = destination / item.relative_to(source)
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(item), str(target))
+            moved.append(target)
+        record = destination / "{0}.r{1}.root.json".format(run_id, revision)
+        if record in moved:
+            data = json.loads(record.read_text(encoding="utf-8"))
+            data["repo_root"] = str(destination)
+            record.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return moved
 
 
 def _attend_copy_sources(
@@ -5398,6 +5540,7 @@ def _attend_copy_sources(
 def _attend_supply_root(
     policy: att.AttendPolicy,
     runtime: Any,
+    base: Path,
     store: ArtifactStore,
     repo: Path,
     run_id: str,
@@ -5405,18 +5548,28 @@ def _attend_supply_root(
 ) -> str:
     """Lay out the owned root of a revision attend did not write itself.
 
+    Roots an earlier release kept under `runtime_state_root` are moved to
+    `base` first (`_attend_migrate_roots`); a revision that leaves recorded
+    needs no more.
+
     The IR is found where `_attend_plan_ir` always looked -- beside the
     revision's recorded plan artifact, then `attend.plan_ir` -- and copied
     in with its sources, which are read from that IR's directory and its
     ancestors (planctl's root contains its IR) and then the run repository.
     """
+    moved = _attend_migrate_roots(runtime, base, run_id)
+    if moved:
+        if _attend_root_current(runtime, base, run_id, revision)[0]:
+            return "moved {0} files from runtime_state_root into {1}".format(
+                len(moved), _attend_root(base, run_id, revision)
+            )
     legacy = Path(plan_artifact_ref_for(store, run_id, revision)).resolve().parent
     found = _attend_plan_ir(policy, legacy, run_id, revision)
     data = found.read_bytes()
     document = json.loads(data)
     if not isinstance(document, dict):
         raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, "{0} is not an object".format(found))
-    owned = _attend_owned_ir(runtime, run_id, revision)
+    owned = _attend_owned_ir(base, run_id, revision)
     owned.parent.mkdir(parents=True, exist_ok=True)
     bases = [found.resolve().parent, *found.resolve().parent.parents, repo]
     missing = _attend_copy_sources(document, owned.parent, bases)
@@ -5428,7 +5581,7 @@ def _attend_supply_root(
             ),
         )
     owned.write_bytes(data)
-    _attend_record_root(runtime, run_id, revision)
+    _attend_record_root(runtime, base, run_id, revision)
     return "copied {0} and its sources into {1}".format(found, owned.parent)
 
 
@@ -5849,6 +6002,10 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     console = step_log.RunReporter(run_id, runtime.path)
     state: dict[str, Any] = {"passes": 0}
 
+    def plan_base() -> Path:
+        # Unvalidated: preflight reports an unsafe directory as a refused item.
+        return _attend_planroot_dir(policy, runtime)
+
     def build_scheduler(plan: st.CompiledPlan) -> tuple[Any, Any]:
         preflight = None
         if state["passes"]:
@@ -5861,11 +6018,16 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             preflight = _RunPreflight(
                 layout, runtime, store, run_id, target, console,
                 verb=verb, attend=True, local=bool(getattr(args, "local", False)),
-                plan_ir=_attend_owned_ir(runtime, run_id, revision),
-                plan_ir_current=lambda: _attend_root_current(runtime, run_id, revision),
-                plan_ir_supply=lambda: _attend_supply_root(
-                    policy, runtime, store, repo, run_id, revision
+                plan_ir=_attend_owned_ir(plan_base(), run_id, revision),
+                plan_ir_current=lambda: _attend_root_current(
+                    runtime, _attend_planroot_base(policy, runtime, layout),
+                    run_id, revision,
                 ),
+                plan_ir_supply=lambda: _attend_supply_root(
+                    policy, runtime, _attend_planroot_base(policy, runtime, layout),
+                    store, repo, run_id, revision,
+                ),
+                planroot_check=lambda: _attend_planroot_check(policy, runtime, layout),
             )
             preflight.run_wide()
             actor = preflight.actor_for(plan)
@@ -5913,7 +6075,10 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
         reviewer_findings: Sequence[Mapping[str, Any]],
         previous_revision: str,
     ) -> att.OperatorRequest:
-        current, detail = _attend_root_current(runtime, run_id, plan.plan_revision)
+        base = _attend_planroot_base(policy, runtime, layout)
+        current, detail = _attend_root_current(
+            runtime, base, run_id, plan.plan_revision
+        )
         if not current:
             raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, detail)
         return _attend_request(
@@ -5923,7 +6088,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             run_id,
             parked,
             plan,
-            _attend_owned_ir(runtime, run_id, plan.plan_revision),
+            _attend_owned_ir(base, run_id, plan.plan_revision),
             role_cwd_for(parked[0][0], "operator"),
             review_round,
             reviewer_findings,
@@ -5998,11 +6163,12 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     ) -> st.CompiledPlan:
         # Sources come from the root of the revision this one amends, which
         # preflight or this session's last apply recorded, then the repo.
+        base = _attend_planroot_base(policy, runtime, layout)
         plan, plan_out = _attend_project(
-            policy, layout, repo, _attend_root(runtime, run_id, revision), run_id,
+            policy, layout, repo, _attend_root(base, run_id, revision), run_id,
             revision_bytes, revision, review_findings,
             local=bool(getattr(args, "local", False)),
-            bases=(_attend_root(runtime, run_id, revision - 1), repo),
+            bases=(_attend_root(base, run_id, revision - 1), repo),
         )
         state["plan_path"] = plan_out
         return plan
@@ -6015,7 +6181,10 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             Path(state["plan_path"]),
             _pinned_plan_artifact(runtime, run_id, plan.plan_revision),
         )
-        _attend_record_root(runtime, run_id, plan.plan_revision)
+        _attend_record_root(
+            runtime, _attend_planroot_base(policy, runtime, layout),
+            run_id, plan.plan_revision,
+        )
         return record
 
     started = now_iso()
