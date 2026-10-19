@@ -46,10 +46,18 @@ attend:
   # planctl: /absolute/path/to/planctl.py
   # Absolute path to the Plan IR the run's current revision was projected
   # from. Preflight copies it, with its sources, into the revision's planctl
-  # root under runtime_state_root/plans/<run>/r<N>/, where every attended
+  # root under planctl_root_dir/<run>/r<N>/, where every attended
   # amendment writes its own. Absent refuses ATTEND_PLAN_IR_UNRESOLVED
   # rather than handing an agent a projected plan to edit as an IR.
   # plan_ir: /absolute/path/to/plan.ir.json
+  # Where attend keeps each revision's planctl root: durable, and uploaded by
+  # planctl, which refuses a root that is the home directory, contains it, or
+  # sits in ~/.maestro (signing keys). Absolute. Absent means
+  # ~/Library/Application Support/maestro/<deployment>/planroots on macOS,
+  # else $XDG_STATE_HOME (~/.local/state)/maestro/<deployment>/planroots.
+  # Roots an earlier release put under runtime_state_root/plans are moved
+  # here by the attend:plan-ir preflight step.
+  # planctl_root_dir: /absolute/path/to/planroots
 # Reviewer-authored probes: how many code reviews per lane (since its last
 # resume) may admit a new probe. 0 turns the feature off. Absent means 5.
 review:
