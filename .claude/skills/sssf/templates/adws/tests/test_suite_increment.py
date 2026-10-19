@@ -11,14 +11,12 @@ from __future__ import annotations
 import json
 import unittest
 
-from adw_modules import plan_compiler
 from adw_modules import scheduler_types as st
 from adw_modules import suite_increment as inc
 from tests.test_suite_reopen import (
     ReopenActor,
     SUITE_PATH,
     SuiteReopenTests,
-    _ASSERTS,
 )
 
 P = "tests/test_contract.py"
@@ -153,7 +151,13 @@ SUITE_TOUCHES_OTHER = SUITE_V1.replace("1 + 1 == 2", "2 + 2 == 4").replace(
 SUITE_FIXES_CITED = SUITE_V1.replace("is_file()", "exists()")
 
 
-class ReopenThroughTheScheduler(SuiteReopenTests):
+class ReopenThroughTheScheduler(unittest.TestCase):
+    # The reopen fixture, not its tests: inheriting the class would run all of
+    # them a second time.
+    setUp = SuiteReopenTests.setUp
+    _start = SuiteReopenTests._start
+    _compiled = SuiteReopenTests._compiled
+
     def _run(self, suites, name):
         actor = _Tester(
             self.repo, self.runtime.path / "worktrees",
