@@ -430,8 +430,10 @@ class AmendmentDoesNotResetAnUnnamedLaneTest(unittest.TestCase):
             item["lane_id"]: item["to_stage"]
             for item in record.payload.get("resets") or []
         }
-        self.assertEqual(resets.get("lane-t2"), st.LaneStage.TESTS_SEALED.value)
-        self.assertEqual(resets.get("lane-b2"), st.LaneStage.READY_TO_MERGE.value)
+        # Neither lane of the unnamed pair is affected: both stay MERGED, so
+        # nothing re-merges and no agent or suite runs for them.
+        self.assertEqual(resets.get("lane-t2"), st.LaneStage.MERGED.value)
+        self.assertEqual(resets.get("lane-b2"), st.LaneStage.MERGED.value)
         self.assertNotEqual(resets.get("lane-t2"), st.LaneStage.PLANNED.value)
         self.assertIsNot(
             self.store.lane_stage(run_id, "lane-t2"), st.LaneStage.PLANNED)

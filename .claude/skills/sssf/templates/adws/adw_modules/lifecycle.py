@@ -2588,9 +2588,19 @@ class ArtifactStore:
                 if old["spec_digest"] == new_lane.spec_digest:
                     raise AmendmentRefused("AMENDMENT_DOES_NOT_ADDRESS_REVIEW")
             computed: list[st.LaneReset] = []
-            prefix = st.amendment_retained_prefix(
-                amended_projection.lanes,
-                (lane_id for lane_id, is_changed in changed.items() if is_changed),
+            unaffected = st.amendment_unaffected_lanes(
+                {lane.lane_id: lane.needs for lane in amended_projection.lanes},
+                st.amendment_affected_roots(
+                    {
+                        lane_id: row["lane_projection_digest"]
+                        for lane_id, row in old_lanes.items()
+                    },
+                    {
+                        lane.lane_id: lane.lane_projection_digest
+                        for lane in amended_projection.lanes
+                    },
+                    artifact.payload.get("invalidated_inputs") or (),
+                ),
             )
             for lane_id, new_lane in new_lanes.items():
                 if lane_id not in old_lanes:
@@ -2613,7 +2623,7 @@ class ArtifactStore:
                     changed=changed[lane_id],
                     wait_reason=wait_reason,
                     lane_kind=new_lane.lane_kind,
-                    retained_prefix=lane_id in prefix,
+                    unaffected=lane_id in unaffected,
                 )
                 computed.append(st.LaneReset(lane_id, current, target))
             computed_sorted = tuple(sorted(computed, key=lambda item: item.lane_id))
@@ -2726,6 +2736,79 @@ class ArtifactStore:
             )
             self.conn.execute("COMMIT")
             return record
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def retain_unaffected_merges(self, run_id: str) -> tuple[str, ...]:
+        """Put back on MERGED the unaffected lanes an amendment reset.
+
+        An amendment applied before `amendment_unaffected_lanes` reset every
+        merged lane after the first changed lane in integration order, affected
+        or not, and left the scheduler to replay them -- through BUILDING for
+        an untyped lane. Read off the current revision's PLAN_AMENDMENT and
+        the two projections, a lane that amendment took off MERGED, that it
+        did not affect, and that has recorded nothing since, goes back to
+        MERGED with the merge it already has in the (never rewound)
+        integration ref. Called before the scheduler dispatches anything.
+        """
+        now = now_iso()
+        self._begin()
+        try:
+            run = self._run(run_id)
+            revision = run["plan_revision"]
+            amendment = self.conn.execute(
+                "SELECT amendment_artifact_id FROM plan_revisions "
+                "WHERE run_id=? AND plan_revision=?",
+                (run_id, revision),
+            ).fetchone()
+            payload = self._amendment_payload(run_id, revision)
+            if amendment is None or payload is None:
+                self.conn.execute("COMMIT")
+                return ()
+            old = self._active_lanes(run_id, int(payload["prior_plan_revision"]))
+            new = self._active_lanes(run_id, revision)
+            unaffected = st.amendment_unaffected_lanes(
+                {row["lane_id"]: self._needs(row) for row in new},
+                st.amendment_affected_roots(
+                    {row["lane_id"]: row["lane_projection_digest"] for row in old},
+                    {row["lane_id"]: row["lane_projection_digest"] for row in new},
+                    payload.get("invalidated_inputs") or (),
+                ),
+            )
+            restored = []
+            for reset in payload.get("resets") or ():
+                lane_id = reset["lane_id"]
+                to_stage = st.LaneStage(reset["to_stage"])
+                if (
+                    reset["from_stage"] != st.LaneStage.MERGED.value
+                    or to_stage is st.LaneStage.MERGED
+                    or lane_id not in unaffected
+                    or self.lane_stage(run_id, lane_id) is not to_stage
+                    or self._latest_lane_artifact(
+                        run_id, lane_id, plan_revision=revision
+                    )
+                    is not None
+                    or self._latest_lane_artifact(
+                        run_id, lane_id, st.ArtifactKind.INTEGRATION_MERGE
+                    )
+                    is None
+                ):
+                    continue
+                self._cas_stage(run_id, lane_id, to_stage, st.LaneStage.MERGED, now)
+                self._audit(
+                    run_id=run_id,
+                    lane_id=lane_id,
+                    from_stage=to_stage.value,
+                    to_stage=st.LaneStage.MERGED.value,
+                    artifact_id=amendment[0],
+                    reason="amendment_unaffected",
+                    now=now,
+                )
+                restored.append(lane_id)
+            self.conn.execute("COMMIT")
+            return tuple(sorted(restored))
         except Exception:
             self.conn.execute("ROLLBACK")
             raise

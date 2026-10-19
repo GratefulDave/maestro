@@ -2235,6 +2235,12 @@ class FactoryScheduler:
             self._resume_orphaned_integration_merge()
             self._maybe_correct_legacy_integration_base()
             ensure_run_integration_ref(self.target, self.store, self.run_id)
+            for lane_id in self.store.retain_unaffected_merges(self.run_id):
+                self._say(
+                    lane_id,
+                    "kept merged",
+                    "the amendment did not affect it; nothing replays",
+                )
             while True:
                 status = self.status()
                 if status is st.RunStatus.COMPLETE:
@@ -5278,6 +5284,7 @@ def amendment_resets(
     store: ArtifactStore,
     run_id: str,
     compiled: st.CompiledPlan,
+    invalidated_inputs: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[st.LaneReset, ...]:
     row = run_row(store, run_id)
     old = {lane.lane_id: lane for lane in store.active_projection(run_id)}
@@ -5288,7 +5295,14 @@ def amendment_resets(
         if lane.lane_id not in old
         or old[lane.lane_id].lane_projection_digest != lane.lane_projection_digest
     }
-    prefix = st.amendment_retained_prefix(compiled.lanes, changed_ids)
+    unaffected = st.amendment_unaffected_lanes(
+        {lane.lane_id: lane.needs for lane in compiled.lanes},
+        st.amendment_affected_roots(
+            {lane_id: lane.lane_projection_digest for lane_id, lane in old.items()},
+            {lane.lane_id: lane.lane_projection_digest for lane in compiled.lanes},
+            invalidated_inputs,
+        ),
+    )
     for lane in compiled.lanes:
         previous = old.get(lane.lane_id)
         if previous is None:
@@ -5308,7 +5322,7 @@ def amendment_resets(
             changed=changed,
             wait_reason=wait,
             lane_kind=lane.lane_kind,
-            retained_prefix=lane.lane_id in prefix,
+            unaffected=lane.lane_id in unaffected,
         )
         resets.append(st.LaneReset(lane.lane_id, current, target))
     del row
@@ -5365,7 +5379,7 @@ def apply_factory_amendment(
             store, target, run_id, runtime.path
         )
         tip = ensure_run_integration_ref(target, store, run_id)
-        resets = amendment_resets(store, run_id, compiled)
+        resets = amendment_resets(store, run_id, compiled, invalidated_inputs)
         payload = {
             "input_digest": "",
             "invalidated_inputs": list(invalidated_inputs),

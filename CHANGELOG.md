@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (weakening): an amendment keeps every MERGED lane it does not affect, not only the integration-order prefix
+
+- After #347 only the MERGED lanes ahead of the first changed lane in
+  integration order stayed MERGED. An unaffected lane after it was still reset
+  (`scheduler_types.amendment_reset_stage`): a typed one replayed its merge, an
+  untyped one went `TESTS_SEALED` -> `BUILDING`, i.e. a builder, a code
+  reviewer and a suite run for work nothing touched.
+- Affected is now decided from the ledger (`amendment_unaffected_lanes`,
+  `amendment_affected_roots`): a lane whose projection digest changed, a new
+  lane, a lane named by `invalidated_inputs`, and every lane whose `needs`
+  closure holds one of those. Every other MERGED lane stays MERGED in
+  `apply_factory_amendment` and `ArtifactStore.apply_amendment` alike.
+- Nothing is re-applied: the integration ref is append-only (never rewound by
+  an amendment), so an unaffected lane's merge is already in the head's
+  ancestry.
+- An amendment applied under the old rule is repaired when the scheduler
+  starts, before any dispatch: `ArtifactStore.retain_unaffected_merges`
+  returns such a lane to MERGED if it still sits at its reset stage with
+  nothing recorded since; otherwise the scheduler keeps it.
+- Affected lanes are unchanged.
+
 ### Changed — contract change (strengthening, new check): a suite is never sealed while it fails inside its own harness
 
 - A tests lane's draft could reach `TESTS_SEALED` while some of its cases failed

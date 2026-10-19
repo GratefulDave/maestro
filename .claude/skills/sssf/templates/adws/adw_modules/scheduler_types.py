@@ -1046,23 +1046,60 @@ def topological_integration_order(lanes: Sequence["LaneProjection"]) -> Tuple[st
     return tuple(ordered)
 
 
-def amendment_retained_prefix(
-    lanes: Sequence["LaneProjection"], changed_lane_ids: Iterable[str]
+def amendment_unaffected_lanes(
+    needs: Mapping[str, Sequence[str]], affected_roots: Iterable[str]
 ) -> frozenset[str]:
-    """Lanes that precede the first changed lane in integration order.
+    """Lanes an amendment does not affect, decided from the ledger alone.
 
-    An amendment replays the integration ref only from the first lane it
-    changes. A merged lane before that point has the same inputs, the same
-    merge and the same integration SHA after the amendment, so it has nothing
-    to replay.
+    A lane is affected when it is a root (its projection -- spec digest,
+    needs, declared outputs, lane kind -- changed, it is new, or the
+    amendment invalidated its inputs) or when any lane in its `needs`
+    closure is affected. Every other lane is unaffected.
+
+    The integration ref is append-only: an amendment never rewinds it
+    (`durable_integration_tip` walks one unbroken merge chain across every
+    revision). An unaffected merged lane's merge is therefore already in the
+    head's ancestry with the same bytes, and there is nothing to re-apply; it
+    stays MERGED wherever it sits in integration order. Only the integration
+    order prefix was kept before, so an unaffected lane after the first
+    changed lane was reset and replayed -- an untyped one through BUILDING,
+    i.e. a builder, a code reviewer and a suite run for work nothing touched.
     """
-    changed_ids = set(changed_lane_ids)
-    prefix: list[str] = []
-    for lane_id in topological_integration_order(lanes):
-        if lane_id in changed_ids:
-            break
-        prefix.append(lane_id)
-    return frozenset(prefix)
+    roots = set(affected_roots)
+    affected: dict[str, bool] = {}
+
+    def visit(lane_id: str, trail: frozenset[str]) -> bool:
+        if lane_id in affected:
+            return affected[lane_id]
+        if lane_id in trail:
+            raise CanonicalIdentityError("plan DAG is cyclic")
+        if lane_id not in needs:
+            raise CanonicalIdentityError("needs lane does not exist")
+        inner = trail | {lane_id}
+        hit = lane_id in roots
+        for dep in needs[lane_id]:
+            hit = visit(dep, inner) or hit
+        affected[lane_id] = hit
+        return hit
+
+    for lane_id in needs:
+        visit(lane_id, frozenset())
+    return frozenset(lane_id for lane_id, hit in affected.items() if not hit)
+
+
+def amendment_affected_roots(
+    old_digests: Mapping[str, str],
+    new_digests: Mapping[str, str],
+    invalidated_inputs: Iterable[Mapping[str, Any]] = (),
+) -> frozenset[str]:
+    """New lanes, lanes whose projection digest moved, and invalidated lanes."""
+    roots = {
+        lane_id
+        for lane_id, digest in new_digests.items()
+        if old_digests.get(lane_id) != digest
+    }
+    roots.update(str(entry["lane_id"]) for entry in invalidated_inputs)
+    return frozenset(roots)
 
 
 def amendment_reset_stage(
@@ -1071,7 +1108,7 @@ def amendment_reset_stage(
     changed: bool,
     wait_reason: Optional[WaitReason],
     lane_kind: Optional[str] = None,
-    retained_prefix: bool = False,
+    unaffected: bool = False,
 ) -> LaneStage:
     if wait_reason is WaitReason.AMENDMENT_REQUIRED:
         if not changed:
@@ -1083,9 +1120,10 @@ def amendment_reset_stage(
         return LaneStage.WAITING_FOR_USER
     if current in UNSTARTED_STAGES:
         return current
-    if retained_prefix and current is LaneStage.MERGED:
-        # Before the first changed lane in integration order nothing replays:
-        # the lane keeps its merge, its integration SHA and its reviews.
+    if unaffected and current is LaneStage.MERGED:
+        # Nothing it is built from changed and the integration ref is never
+        # rewound: the lane keeps its merge, its suite and its reviews, and no
+        # agent or suite runs for it (`amendment_unaffected_lanes`).
         return current
     kind = normalize_lane_kind(lane_kind)
     if kind == LANE_KIND_BUILD:
