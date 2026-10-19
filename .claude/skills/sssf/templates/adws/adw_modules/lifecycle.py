@@ -1234,12 +1234,18 @@ class ArtifactStore:
         self, run_id: str, lane_id: str
     ) -> sqlite3.Row | None:
         revision = self._run(run_id)["plan_revision"]
-        return self._latest_lane_artifact(
+        row = self._latest_lane_artifact(
             run_id,
             lane_id,
             st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
+        if row is None and self.lane_stage(run_id, lane_id) is st.LaneStage.MERGED:
+            # A merged lane an amendment retained keeps the suite it merged.
+            row = self._latest_lane_artifact(
+                run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
+            )
+        return row
 
 
     def _accepted_suite(self, run_id: str, lane_id: str) -> sqlite3.Row | None:
@@ -1273,6 +1279,11 @@ class ArtifactStore:
                     st.ArtifactKind.INTEGRATION_MERGE,
                     plan_revision=revision,
                 )
+                if row is None:
+                    # `dep` is MERGED above: a retained lane keeps its merge.
+                    row = self._latest_lane_artifact(
+                        run_id, dep, st.ArtifactKind.INTEGRATION_MERGE
+                    )
                 if row is None:
                     raise st.IllegalStageEdge(f"needs {dep} has no INTEGRATION_MERGE")
             receipts.append(row)
@@ -2577,6 +2588,10 @@ class ArtifactStore:
                 if old["spec_digest"] == new_lane.spec_digest:
                     raise AmendmentRefused("AMENDMENT_DOES_NOT_ADDRESS_REVIEW")
             computed: list[st.LaneReset] = []
+            prefix = st.amendment_retained_prefix(
+                amended_projection.lanes,
+                (lane_id for lane_id, is_changed in changed.items() if is_changed),
+            )
             for lane_id, new_lane in new_lanes.items():
                 if lane_id not in old_lanes:
                     computed.append(
@@ -2598,6 +2613,7 @@ class ArtifactStore:
                     changed=changed[lane_id],
                     wait_reason=wait_reason,
                     lane_kind=new_lane.lane_kind,
+                    retained_prefix=lane_id in prefix,
                 )
                 computed.append(st.LaneReset(lane_id, current, target))
             computed_sorted = tuple(sorted(computed, key=lambda item: item.lane_id))

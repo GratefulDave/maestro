@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Collection, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 CANONICAL_SCHEMA_VERSION = 1
@@ -1046,12 +1046,32 @@ def topological_integration_order(lanes: Sequence["LaneProjection"]) -> Tuple[st
     return tuple(ordered)
 
 
+def amendment_retained_prefix(
+    lanes: Sequence["LaneProjection"], changed_lane_ids: Iterable[str]
+) -> frozenset[str]:
+    """Lanes that precede the first changed lane in integration order.
+
+    An amendment replays the integration ref only from the first lane it
+    changes. A merged lane before that point has the same inputs, the same
+    merge and the same integration SHA after the amendment, so it has nothing
+    to replay.
+    """
+    changed_ids = set(changed_lane_ids)
+    prefix: list[str] = []
+    for lane_id in topological_integration_order(lanes):
+        if lane_id in changed_ids:
+            break
+        prefix.append(lane_id)
+    return frozenset(prefix)
+
+
 def amendment_reset_stage(
     current: LaneStage,
     *,
     changed: bool,
     wait_reason: Optional[WaitReason],
     lane_kind: Optional[str] = None,
+    retained_prefix: bool = False,
 ) -> LaneStage:
     if wait_reason is WaitReason.AMENDMENT_REQUIRED:
         if not changed:
@@ -1062,6 +1082,10 @@ def amendment_reset_stage(
     if wait_reason in RESUMABLE_WAIT_REASONS:
         return LaneStage.WAITING_FOR_USER
     if current in UNSTARTED_STAGES:
+        return current
+    if retained_prefix and current is LaneStage.MERGED:
+        # Before the first changed lane in integration order nothing replays:
+        # the lane keeps its merge, its integration SHA and its reviews.
         return current
     kind = normalize_lane_kind(lane_kind)
     if kind == LANE_KIND_BUILD:

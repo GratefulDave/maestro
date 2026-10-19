@@ -2550,13 +2550,19 @@ class FactoryScheduler:
 
     def _current_accepted_suite(self, lane_id: str) -> ArtifactRecord | None:
         revision = run_row(self.store, self.run_id)["plan_revision"]
-        return _latest(
+        suite = _latest(
             self.store,
             self.run_id,
             lane_id,
             st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
+        if suite is None and self.store.lane_stage(self.run_id, lane_id) is st.LaneStage.MERGED:
+            # A merged lane an amendment retained keeps the suite it merged.
+            suite = _latest(
+                self.store, self.run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
+            )
+        return suite
 
     def _accepted_suite_for(self, lane: st.LaneProjection) -> ArtifactRecord:
         """The accepted suite this lane is graded against.
@@ -2610,6 +2616,11 @@ class FactoryScheduler:
                 st.ArtifactKind.INTEGRATION_MERGE,
                 plan_revision=revision,
             )
+            if merge is None and self.store.lane_stage(self.run_id, dep) is st.LaneStage.MERGED:
+                # A merged lane an amendment retained keeps the merge it made.
+                merge = _latest(
+                    self.store, self.run_id, dep, st.ArtifactKind.INTEGRATION_MERGE
+                )
             if merge is None:
                 raise FactoryRefused(f"missing dependency merge {dep}")
             receipts.append(merge)
@@ -5001,6 +5012,13 @@ def amendment_resets(
     row = run_row(store, run_id)
     old = {lane.lane_id: lane for lane in store.active_projection(run_id)}
     resets = []
+    changed_ids = {
+        lane.lane_id
+        for lane in compiled.lanes
+        if lane.lane_id not in old
+        or old[lane.lane_id].lane_projection_digest != lane.lane_projection_digest
+    }
+    prefix = st.amendment_retained_prefix(compiled.lanes, changed_ids)
     for lane in compiled.lanes:
         previous = old.get(lane.lane_id)
         if previous is None:
@@ -5008,7 +5026,7 @@ def amendment_resets(
                 st.LaneReset(lane.lane_id, st.LaneStage.PLANNED, st.LaneStage.PLANNED)
             )
             continue
-        changed = previous.lane_projection_digest != lane.lane_projection_digest
+        changed = lane.lane_id in changed_ids
         current = store.lane_stage(run_id, lane.lane_id)
         wait = None
         if current is st.LaneStage.WAITING_FOR_USER:
@@ -5020,6 +5038,7 @@ def amendment_resets(
             changed=changed,
             wait_reason=wait,
             lane_kind=lane.lane_kind,
+            retained_prefix=lane.lane_id in prefix,
         )
         resets.append(st.LaneReset(lane.lane_id, current, target))
     del row
