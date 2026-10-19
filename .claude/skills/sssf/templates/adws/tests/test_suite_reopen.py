@@ -42,6 +42,8 @@ from tests.test_tests_lane_handoff import (
 )
 
 SUITE_PATH = "tests/public_contract.py"
+CASE_ID = SUITE_PATH + "::test_product_is_ready"
+CANDIDATE_MARK = "candidate defect carried forward"
 
 _ASSERTS = (
     "from pathlib import Path\n"
@@ -67,6 +69,9 @@ class ReopenActor(HandoffActor):
         self.calls: list[str] = []
         self.same_candidate = False
         self.versions: dict[str, int] = defaultdict(int)
+        self.build_contexts: list = []
+        self.review_contexts: list = []
+        self.suite_defects: list = []
 
     def write_tests(self, ctx):
         self.calls.append("write_tests")
@@ -93,22 +98,49 @@ class ReopenActor(HandoffActor):
 
     def build(self, ctx):
         self.calls.append("build")
-        return super().build(ctx)
+        self.build_contexts.append(ctx)
+        result = dict(super().build(ctx))
+        if self.suite_defects:
+            result["suite_defects"] = self.suite_defects
+        return result
 
     def review_code(self, ctx):
         self.calls.append("review_code")
+        self.review_contexts.append(ctx)
         self.review_code_lanes.append(ctx.lane.lane_id)
         answer = self.reviews.pop(0) if len(self.reviews) > 1 else self.reviews[0]
         if answer == "pass":
             return st.ReviewerVerdict.PASS, ()
         finding = _finding_for(ctx)
+        # Every failing case is ruled on by id, as the harness now requires.
+        ruled = tuple(
+            dict(finding, test_id=test_id) for test_id in ctx.failing_test_ids
+        )
         if answer == "suite":
             finding = dict(
                 finding,
                 attribution=st.FINDING_ATTRIBUTION_SUITE,
                 implementation_area=SUITE_PATH + ":4 the fixture reads the wrong file",
             )
-        return st.ReviewerVerdict.REVISE, (finding,)
+            ruled = tuple(dict(finding, test_id=t) for t in ctx.failing_test_ids)
+        if answer == "suite_by_id":
+            # Attributed by the failing case's id alone, beside a candidate
+            # finding that must still reach the next builder round.
+            candidate = dict(
+                _finding_for(ctx),
+                implementation_area="product.py:1 " + CANDIDATE_MARK,
+            )
+            suite = tuple(
+                dict(
+                    _finding_for(ctx),
+                    attribution=st.FINDING_ATTRIBUTION_SUITE,
+                    implementation_area="the fixture reads the wrong file",
+                    test_id=test_id,
+                )
+                for test_id in ctx.failing_test_ids
+            )
+            return st.ReviewerVerdict.REVISE, (candidate, *suite)
+        return st.ReviewerVerdict.REVISE, ruled or (finding,)
 
 
 def _reopens(store, run_id: str) -> list[dict]:
@@ -285,6 +317,68 @@ class SuiteReopenTests(unittest.TestCase):
             ["write_tests", "review_tests", "build", "review_code", "build", "review_code"],
         )
         self.assertNotIn("crashed", reviews[2]["public_result_summary"])
+
+    def test_failing_case_attributed_by_id_reopens_at_once_and_keeps_candidate_findings(
+        self,
+    ) -> None:
+        actor = ReopenActor(
+            self.repo, self.runtime.path / "worktrees", reviews=["suite_by_id", "pass"]
+        )
+        scheduler = self._start(self._compiled(), actor, "run-by-id")
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+
+        # The real runner's id for the failing case, recorded on the review.
+        reviews = _code_reviews(self.store, "run-by-id")
+        self.assertEqual(reviews[0]["failing_test_ids"], [CASE_ID])
+        self.assertEqual(actor.review_contexts[0].failing_test_ids, (CASE_ID,))
+        # No builder round between the attribution and the reopen.
+        self.assertEqual(
+            actor.calls,
+            [
+                "write_tests",
+                "review_tests",
+                "build",
+                "review_code",
+                "write_tests",
+                "review_tests",
+                "build",
+                "review_code",
+            ],
+        )
+        reopens = _reopens(self.store, "run-by-id")
+        self.assertEqual(len(reopens), 1)
+        handed = actor.tests_turns[1]["review"]["findings"]
+        self.assertEqual([item.get("test_id") for item in handed], [CASE_ID])
+        # The candidate finding from the same review reaches the next builder
+        # round, against the re-sealed suite.
+        rebuild = actor.build_contexts[1]
+        self.assertEqual(rebuild.entry_kind, st.BuildingEntryKind.CODE_REVISE)
+        carried = rebuild.artifacts["CODE_REVIEW"].payload["findings"]
+        self.assertTrue(
+            any(CANDIDATE_MARK in item["implementation_area"] for item in carried)
+        )
+        self.assertNotEqual(
+            rebuild.test_suite_digest, reviews[0]["test_suite_digest"]
+        )
+
+    def test_builder_suite_defect_claim_is_recorded_and_reaches_the_reviewer(self) -> None:
+        claim = {"test_id": CASE_ID, "reason": "the fixture reads the wrong file"}
+        actor = ReopenActor(
+            self.repo, self.runtime.path / "worktrees", reviews=["suite_by_id", "pass"]
+        )
+        actor.suite_defects = [claim]
+        scheduler = self._start(self._compiled(), actor, "run-claim")
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+
+        self.assertEqual(actor.review_contexts[0].suite_defect_claims, (claim,))
+        built = sch._latest(
+            self.store, "run-claim", "lane-build", st.ArtifactKind.BUILDER_OUTPUT
+        )
+        self.assertEqual(built.payload["suite_defects"], [claim])
+        self.assertEqual(
+            _code_reviews(self.store, "run-claim")[0]["suite_defect_claims"], [claim]
+        )
+        self.assertEqual(len(_reopens(self.store, "run-claim")), 1)
 
     # -- maestro#331: no regrant under attend -------------------------------
 

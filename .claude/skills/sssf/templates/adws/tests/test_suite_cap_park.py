@@ -14,7 +14,7 @@ import unittest
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
 from tests.test_suite_reopen import ReopenActor, SUITE_PATH, SuiteReopenTests
-from tests.test_tests_lane_handoff import _finding_for
+from tests.test_tests_lane_handoff import _finding_for, rule_on_failing
 
 
 class MixedActor(ReopenActor):
@@ -31,7 +31,7 @@ class MixedActor(ReopenActor):
             attribution=st.FINDING_ATTRIBUTION_SUITE,
             implementation_area=SUITE_PATH + ":4 the fixture reads the wrong file",
         )
-        return st.ReviewerVerdict.REVISE, (suite, _finding_for(ctx))
+        return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (suite, _finding_for(ctx)))
 
 
 class SuiteCapPark(unittest.TestCase):

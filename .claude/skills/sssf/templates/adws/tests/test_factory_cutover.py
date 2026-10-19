@@ -17,6 +17,7 @@ from adw_modules import git_publication as gitpub
 from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
+from tests.test_tests_lane_handoff import rule_on_failing
 from adw_modules.lifecycle import (
     AmendmentAlreadyApplied,
     AmendmentRefused,
@@ -184,7 +185,7 @@ class ScriptedActor:
         n = self.code_rounds[ctx.lane.lane_id]
         self.code_rounds[ctx.lane.lane_id] += 1
         if n == 0:
-            return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
+            return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (_finding_for(ctx),))
         return st.ReviewerVerdict.PASS, ()
 
     def review_integration(self, ctx, lanes, integration_sha):
@@ -740,7 +741,7 @@ class FactoryCutoverTests(unittest.TestCase):
                 n = self.code_rounds[ctx.lane.lane_id]
                 self.code_rounds[ctx.lane.lane_id] += 1
                 if ctx.lane.lane_id == "lane-b" and n == 0:
-                    return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
+                    return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (_finding_for(ctx),))
                 return st.ReviewerVerdict.PASS, ()
 
             def build(self, ctx):
@@ -1076,7 +1077,7 @@ class FactoryCutoverTests(unittest.TestCase):
                 n = self.code_rounds[ctx.lane.lane_id]
                 self.code_rounds[ctx.lane.lane_id] += 1
                 if ctx.lane.lane_id == "lane-a" and n == 0:
-                    return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
+                    return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (_finding_for(ctx),))
                 return st.ReviewerVerdict.PASS, ()
 
             def build(self, ctx: sch.LaneContext) -> dict:

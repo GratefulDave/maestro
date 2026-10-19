@@ -33,6 +33,20 @@ def _finding_for(ctx) -> dict:
     )
     return dict(FINDING, violated_requirement=clause)
 
+
+def rule_on_failing(ctx, findings) -> tuple:
+    """A fake code reviewer's REVISE that names every failing case by `test_id`.
+
+    The harness asks a REVISE back, then parks the lane, when a failing
+    accepted-suite case goes unnamed. The first finding is the template.
+    """
+    named = {item.get("test_id") for item in findings}
+    return tuple(findings) + tuple(
+        dict(findings[0], test_id=test_id)
+        for test_id in getattr(ctx, "failing_test_ids", ())
+        if test_id not in named
+    )
+
 SECRET = "secret-handoff-token"
 V2_PLAN = Path(
     "/Users/davidandrews/PycharmProjects/.worktrees/fdadb/integration"
@@ -233,7 +247,7 @@ class HandoffActor:
         n = self.code_rounds[ctx.lane.lane_id]
         self.code_rounds[ctx.lane.lane_id] += 1
         if n == 0:
-            return st.ReviewerVerdict.REVISE, (_finding_for(ctx),)
+            return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (_finding_for(ctx),))
         return st.ReviewerVerdict.PASS, ()
 
     def review_integration(self, ctx, lanes, integration_sha):

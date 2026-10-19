@@ -73,15 +73,23 @@ STANDARDS_MAX_SEVERITY = SEVERITY_WARNING
 # Keys a finding may carry beyond the four required ones. A present key is
 # preserved through normalization; an absent one is not invented, so a spec
 # finding submitted without them comes back with exactly REVISE_FINDING_KEYS.
-FINDING_OPTIONAL_KEYS = ("axis", "severity", "attribution")
+FINDING_OPTIONAL_KEYS = ("axis", "severity", "attribution", "test_id")
 
 # Whose defect a code-review finding names. `candidate` is the default and what
 # every finding meant before this key existed. `accepted_suite` says the
 # failure is in the accepted suite itself -- a fixture or harness defect the
 # builder cannot fix, because it may not edit a suite path. Such a finding
-# counts only when its `implementation_area` cites a suite path and line
-# (`<path>:<line>`); the scheduler then sends the suite back to its tests lane
-# (`FactoryScheduler._maybe_reopen_suite`) instead of to the builder.
+# counts when its `implementation_area` cites a suite path and line
+# (`<path>:<line>`), or when its `test_id` names a case the harness measured
+# failing or the builder claimed defective; the scheduler then sends the suite
+# back to its tests lane (`FactoryScheduler._reopen_suite`) instead of to the
+# builder.
+#
+# `test_id` is how a REVISE accounts for a measured failure: every case the
+# accepted suite failed against the candidate, and every case the builder
+# claimed defective (`suite_defects`), must be named by some finding's
+# `test_id`, exactly as the harness reported it. A review that leaves one
+# unnamed is asked back once, then parked `ReviewFailingTestUnattributed`.
 FINDING_ATTRIBUTION_CANDIDATE = "candidate"
 FINDING_ATTRIBUTION_SUITE = "accepted_suite"
 FINDING_ATTRIBUTIONS = (FINDING_ATTRIBUTION_CANDIDATE, FINDING_ATTRIBUTION_SUITE)
@@ -490,6 +498,11 @@ def require_revise_findings(
                     "finding attribution is not a known attribution"
                 )
             row["attribution"] = attribution
+        if "test_id" in keys:
+            test_id = finding["test_id"]
+            if not isinstance(test_id, str) or not test_id.strip():
+                raise CanonicalIdentityError("finding test_id is empty")
+            row["test_id"] = test_id
         if "code" in keys:
             code = finding["code"]
             if not isinstance(code, str) or code not in FINDING_CODES:
@@ -497,6 +510,29 @@ def require_revise_findings(
             row["code"] = code
         normalized.append(row)
     return tuple(normalized)
+
+
+def require_suite_defect_claims(raw: Any) -> Tuple[Mapping[str, str], ...]:
+    """A builder's `suite_defects`: `[{test_id, reason}]`, typed or refused.
+
+    The builder may not edit the accepted suite, so a case no correct
+    implementation can pass is something it can only report. Absent or empty
+    is no claim. Each claim reaches the code reviewer, who must rule on it by
+    `test_id` (see `FINDING_OPTIONAL_KEYS`).
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise CanonicalIdentityError("suite_defects is not a list")
+    claims = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {"test_id", "reason"}:
+            raise CanonicalIdentityError("suite_defects entry is not {test_id, reason}")
+        for key in ("test_id", "reason"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise CanonicalIdentityError(f"suite_defects {key} is empty")
+        claims.append({"reason": item["reason"], "test_id": item["test_id"]})
+    return tuple(claims)
 
 
 _REQUIREMENT_QUOTE_MARKS = frozenset("\"'`")

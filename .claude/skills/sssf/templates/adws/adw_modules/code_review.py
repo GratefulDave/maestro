@@ -13,6 +13,7 @@ measurement is always of the accepted cases and never of a rewrite.
 from __future__ import annotations
 
 import dataclasses
+import re
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -420,6 +421,32 @@ def failure_lines(
     return tuple(kept)
 
 
+#: pytest's `-vv` outcome line and its short-summary line, and vitest's FAIL
+#: header. Each names one failing case by the id the runner itself prints.
+_PYTEST_FAILED_CASE = re.compile(r"^(\S+::\S+) (?:FAILED|ERROR)\b")
+_PYTEST_SUMMARY_CASE = re.compile(r"^(?:FAILED|ERROR) (\S+::\S+)")
+_VITEST_FAILED_CASE = re.compile(r"^FAIL\s+(\S.*? > .*?)(?:\s+\d+(?:\.\d+)?m?s)?$")
+
+
+def failing_case_ids(output: str) -> tuple[str, ...]:
+    """Every case id the runner reported failing or erroring, in order, once.
+
+    The id is the runner's own: `path::name` for pytest, `path > ... > title`
+    for vitest. A code reviewer is handed these and must account for each by a
+    finding's `test_id`, so a failing case can no longer pass through a REVISE
+    that never mentions it.
+    """
+    seen: dict[str, None] = {}
+    for raw in output.splitlines():
+        line = rr._ANSI.sub("", raw).strip()
+        for pattern in (_PYTEST_FAILED_CASE, _PYTEST_SUMMARY_CASE, _VITEST_FAILED_CASE):
+            match = pattern.match(line)
+            if match:
+                seen.setdefault(match.group(1), None)
+                break
+    return tuple(seen)
+
+
 #: One line of framing, prepended to the findings the builder is handed when
 #: the suite was red. The failure lines come off the runner; the findings are
 #: a model's reading of a candidate, and twice in one session that reading was
@@ -562,6 +589,8 @@ class SuiteMeasurement:
     #: The materialized, provisioned review tree the suite ran in. Probes are
     #: written into and run from this same tree.
     tree: Path | None = None
+    #: The runner's own ids of every case that failed or errored.
+    failing_test_ids: tuple[str, ...] = ()
 
 
 def measure_candidate(
@@ -686,6 +715,7 @@ def measure_candidate(
         run=run,
         files=files,
         tree=tree,
+        failing_test_ids=() if crashed else failing_case_ids(str(run["output"])),
     )
 
 
@@ -841,6 +871,7 @@ def review_builder_output(
     suite_timeout_s: float | None = None,
     measurement: SuiteMeasurement | None = None,
     probe_measurement: ProbeMeasurement | None = None,
+    suite_defect_claims: Sequence[Mapping[str, str]] = (),
 ) -> st.LaneArtifact:
     """Bind a reviewer verdict to the measurement of one candidate.
 
@@ -960,6 +991,13 @@ def review_builder_output(
         "test_suite_digest": tb.suite_digest(files),
         "verdict": verdict.value,
     }
+    # Each only when there is something to record, so every other review is
+    # byte-identical. `_suite_reopen_plan` reads both: a finding attributed to
+    # the accepted suite by `test_id` counts only for an id named here.
+    if measurement.failing_test_ids:
+        payload["failing_test_ids"] = list(measurement.failing_test_ids)
+    if suite_defect_claims:
+        payload["suite_defect_claims"] = [dict(item) for item in suite_defect_claims]
     if standards:
         # Recorded, never dropped: the builder reads only `findings`, so
         # these reach no builder and cause no transition, but the review

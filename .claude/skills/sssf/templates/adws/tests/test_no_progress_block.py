@@ -13,7 +13,7 @@ from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
 from adw_modules.lifecycle import ArtifactStore
 from adw_modules.runtime_state import RuntimeStateRoot
-from tests.test_tests_lane_handoff import FINDING, HandoffActor, _git, _init_repo, _unified_plan_bytes
+from tests.test_tests_lane_handoff import FINDING, HandoffActor, _git, _init_repo, _unified_plan_bytes, rule_on_failing
 
 def _with_dependency_lane(plan_bytes):
     document = json.loads(plan_bytes)
@@ -117,7 +117,7 @@ class ContentActor(HandoffActor):
         return {"candidate_sha": _git(work, "rev-parse", "HEAD"), "changed": True}
 
     def review_code(self, ctx):
-        return st.ReviewerVerdict.REVISE, (FINDING,)
+        return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (FINDING,))
 
 
 class ReviewedContentTest(unittest.TestCase):
