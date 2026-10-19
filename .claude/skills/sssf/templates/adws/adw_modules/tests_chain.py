@@ -13,6 +13,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -593,11 +594,21 @@ def _assert_declared_python(
 
 
 def _suite_selectors(
-    gate: SimpleNamespace, files: Sequence[str], tree: Path
+    gate: SimpleNamespace,
+    files: Sequence[str],
+    tree: Path,
+    report: Path | None = None,
 ) -> tuple[str, ...]:
     argv, selectors = rc.substituted_gate_argv(gate.argv, files, tree)
     if gate.runner == "pytest":
-        return (
+        # The per-case JUnit report, written outside the tree under test. It
+        # is read only when the runner dies by signal: see `run_suite`.
+        reporting = (
+            ("-o", "junit_family=xunit2", "--junitxml={0}".format(report))
+            if report is not None
+            else ()
+        )
+        return reporting + (
             "--rootdir",
             ".",
             # Verbosity 2, not `-q`. Below it pytest truncates a dict
@@ -693,6 +704,41 @@ def crash_tail(output: str) -> list[str]:
     return lines[-CRASH_TAIL_LINES:]
 
 
+#: The non-blocking note a signal that arrived after the session finished is
+#: recorded under. The per-case results stand; the crash is reported beside them.
+SUITE_CRASHED_AFTER_COMPLETION = "SUITE_CRASHED_AFTER_COMPLETION"
+
+
+def completed_counts(report: Path) -> dict[str, int] | None:
+    """Per-case counts from a complete pytest JUnit report, else None.
+
+    pytest writes the report once, whole, in `pytest_sessionfinish`, after
+    every case has an outcome; a report that exists and is well formed is
+    therefore the session-finish record, and a signal that arrived after it
+    killed teardown, not a test. A missing, truncated or empty report is a
+    crash before completion and answers None.
+
+    The printed totals line is not required as well. Measured on the real
+    binary: a SIGSEGV in `pytest_unconfigure` leaves the report complete and
+    loses the totals line, which pytest had written to a block-buffered pipe
+    that the signal never flushed.
+    """
+    try:
+        states, _lines = rr.reduce_junit(Path(report).read_bytes())
+    except (OSError, ValueError):
+        return None
+    counts = {"passed": 0, "failed": 0, "errored": 0, "skipped": 0}
+    key = {
+        rr.PROBE_PASSED: "passed",
+        rr.PROBE_FAILED_STATE: "failed",
+        rr.PROBE_ERROR: "errored",
+        rr.PROBE_SKIPPED: "skipped",
+    }
+    for state in states.values():
+        counts[key[state]] += 1
+    return counts
+
+
 def run_suite(
     tree: Path,
     paths: Sequence[str],
@@ -731,20 +777,28 @@ def run_suite(
             "SUITE_RUNNER_UNUSABLE:{0}: {1}".format(bound.runner, detail)
         ) from extra
     _assert_declared_python(resolved, Path(tree), Path(tree), bound.cwd, files)
-    exec_gate = SimpleNamespace(
-        runner=bound.runner,
-        argv=_suite_selectors(bound, files, Path(tree)),
-        cwd=bound.cwd,
-        min_cases=bound.min_cases,
-    )
-    raw = rr.execute_cases(
-        resolved,
-        exec_gate,
-        tree,
-        timeout_s=timeout_s,
-    )
-    output = str(raw.get("output") or "")
-    returncode = int(raw.get("returncode") or 0)
+    with tempfile.TemporaryDirectory(prefix="maestro-suite-report-") as scratch:
+        report = Path(scratch) / "junit.xml"
+        exec_gate = SimpleNamespace(
+            runner=bound.runner,
+            argv=_suite_selectors(bound, files, Path(tree), report),
+            cwd=bound.cwd,
+            min_cases=bound.min_cases,
+        )
+        raw = rr.execute_cases(
+            resolved,
+            exec_gate,
+            tree,
+            timeout_s=timeout_s,
+        )
+        output = str(raw.get("output") or "")
+        returncode = int(raw.get("returncode") or 0)
+        crashed = suite_crash_reason(returncode)
+        completed = (
+            completed_counts(report)
+            if crashed and bound.runner == "pytest" and not raw.get("timed_out")
+            else None
+        )
     if raw.get("timed_out"):
         # A killed run prints no summary line, so parsing it would report zero
         # cases and read as a candidate that collects nothing. It measured
@@ -755,10 +809,29 @@ def run_suite(
             "Raise `suite_timeout_s`."
         )
     counts = _parse_suite_counts(bound.runner, output)
+    note: dict[str, Any] = {}
+    if completed is not None:
+        # The session finished -- pytest wrote a complete per-case report and
+        # printed its totals -- and only then did a signal kill the process
+        # (observed: `2 failed, 106 passed in 58.70s`, then SIGSEGV in CPython
+        # 3.14 interpreter teardown with torch and cv2 loaded, counted as a
+        # crash on every round). Every case has an outcome, so the per-case results are the
+        # measurement, and the exit status the signal left is not: it is
+        # replaced by the one those results imply. The crash travels beside
+        # them as a note that blocks nothing.
+        counts = completed
+        note = {
+            "crash_note": "{0}:{1}".format(
+                SUITE_CRASHED_AFTER_COMPLETION, crashed.split(":", 1)[1]
+            ),
+            "crash_tail": crash_tail(output),
+            "crash_returncode": returncode,
+        }
+        returncode = 1 if counts["failed"] or counts["errored"] else 0
+        crashed = ""
     executed = (
         counts["passed"] + counts["failed"] + counts["errored"] + counts["skipped"]
     )
-    crashed = suite_crash_reason(returncode)
     if crashed:
         # The runner process was killed by a signal (maestro#330: SIGBUS in a
         # suite's in-test server thread, exit 138). "0 executed" alone told
@@ -850,4 +923,5 @@ def run_suite(
         "output": output,
         "returncode": returncode,
         "runner": bound.runner,
+        **note,
     }
