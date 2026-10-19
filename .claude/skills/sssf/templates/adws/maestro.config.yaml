@@ -86,3 +86,8 @@ executables:
   herdr: herdr
   omp: omp
   claude: claude
+# A reused role session larger than this many tokens (estimated from its
+# transcript, or from the prompts and envelopes it exchanged) is replaced at
+# the next dispatch by a fresh one seeded with a compact handoff. 0 turns the
+# cap off. Absent means 150000.
+# role_session_max_tokens: 150000

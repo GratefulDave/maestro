@@ -32,6 +32,7 @@ from adw_modules import attend as att
 from adw_modules import git_publication as gitpub
 from adw_modules.handoff_budget import (
     OMP_CONTEXT_WINDOW_TOKENS,
+    estimate_tokens_for_bytes,
     route_publishes_a_window,
 )
 from adw_modules import code_review as cr
@@ -193,6 +194,20 @@ def _config_concurrency(value: object, label: str) -> int:
         return 1
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise _MaestroConfigurationError(label + " must be an integer >= 1")
+    return int(value)
+
+
+#: A reused role session whose transcript passes this many tokens is replaced
+#: by a fresh one seeded with a compact handoff. `0` turns the cap off.
+DEFAULT_ROLE_SESSION_MAX_TOKENS = 150_000
+
+
+def _config_role_session_max_tokens(value: object, label: str) -> int:
+    """`role_session_max_tokens`: the largest reused session. Absent keeps the default."""
+    if value is None:
+        return DEFAULT_ROLE_SESSION_MAX_TOKENS
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _MaestroConfigurationError(label + " must be an integer >= 0")
     return int(value)
 
 
@@ -536,6 +551,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["attend"] = _canonical_attend(loaded.get("attend"))
     loaded["concurrency"] = _config_concurrency(
         loaded.get("concurrency"), "concurrency"
+    )
+    loaded["role_session_max_tokens"] = _config_role_session_max_tokens(
+        loaded.get("role_session_max_tokens"), "role_session_max_tokens"
     )
     # One key, read where the tool reads it, so a deployment cannot be told two
     # different things about when a tests lane stops.
@@ -885,6 +903,8 @@ _PROBE_VIEW_KEYS = ("probe_id", "path", "requirement", "intent")
 class HerdrStageActor:
     """Persistent role panes. Envelope bytes are payload, not stage."""
 
+    role_session_max_tokens: int = DEFAULT_ROLE_SESSION_MAX_TOKENS
+
     def __init__(
         self,
         launcher: lch.LauncherAdapter,
@@ -895,7 +915,9 @@ class HerdrStageActor:
         operator_route: Mapping[str, str] | None = None,
         role_vendors: Mapping[str, str | None] | None = None,
         attend_reviewer_route: Mapping[str, str] | None = None,
+        role_session_max_tokens: int = DEFAULT_ROLE_SESSION_MAX_TOKENS,
     ) -> None:
+        self.role_session_max_tokens = int(role_session_max_tokens)
         self.launcher = launcher
         self.state_root = Path(state_root)
         self.worktrees = self.state_root / "worktrees"
@@ -1692,6 +1714,26 @@ class HerdrStageActor:
                         "claim a finding is fixed by resubmitting byte-identical "
                         "files."
                     )
+            paths = extra.get("accepted_suite_paths")
+            if paths:
+                instructions += (
+                    " The accepted suite is in this checkout at: {0}. Start "
+                    "from it and change only what revise_findings cite by "
+                    "path:line or node id"
+                ).format(", ".join(str(item) for item in paths))
+                if extra.get("spec_diff") is not None:
+                    instructions += (
+                        ", plus tests bound to the items spec_diff lists as "
+                        "added, removed or changed"
+                    )
+                instructions += (
+                    ". Do not remove, rewrite or reorder any other test or "
+                    "helper, and do not rewrite the suite: the harness "
+                    "compares your draft with the accepted suite per test and "
+                    "refuses SUITE_REDRAFT_OUT_OF_SCOPE for a changed or "
+                    "removed unit nothing names. Add a test only when a "
+                    "finding or a new or changed spec item requires it."
+                )
         elif role == "test-reviewer":
             instructions += (
                 " This checkout is the TEST_DRAFT candidate. Review only the "
@@ -1832,6 +1874,13 @@ class HerdrStageActor:
                 ).format(json.dumps(rejected[:300]))
         if role == "integration-reviewer":
             instructions += " PASS requires affected_lanes=[]. REVISE requires a nonempty affected_lanes subset."
+        if extra.get("session_handoff"):
+            instructions += (
+                " This is a fresh session replacing one that grew past its "
+                "size cap. session_handoff summarizes the earlier work; this "
+                "checkout holds its current state. Rely on those and on this "
+                "prompt, not on anything you assume was said before."
+            )
         body: dict[str, Any] = {
             "envelope_path": envelope_path,
             "envelope_schema": schema,
@@ -2518,6 +2567,11 @@ class HerdrStageActor:
                 if handle is not None:
                     self._retain_completed(handle, key)
                 return payload, handle, cwd
+        prompt_extra: Mapping[str, Any] = extra
+        handoff = self._cap_reused_session(ctx, role, key, stored, cwd, session, turn)
+        if handoff is not None:
+            stored = None
+            prompt_extra = {**extra, "session_handoff": handoff}
         if stored is not None:
             stored.turns = turn
             stored.run_id = ctx.run_id
@@ -2558,7 +2612,7 @@ class HerdrStageActor:
 
         def write_prompt(actual_cwd: Path) -> None:
             write_role_prompt(
-                prompt, self._prompt(ctx, role, envelope, actual_cwd, extra)
+                prompt, self._prompt(ctx, role, envelope, actual_cwd, prompt_extra)
             )
 
         def write_identity() -> None:
@@ -2666,6 +2720,108 @@ class HerdrStageActor:
         self._retain_completed(handle, key)
         return payload, handle, cwd_used
 
+    def _session_tokens(self, cwd: Path, session: Path, turns: int) -> int:
+        """Estimated size of one role session: the larger of its transcript and its traffic.
+
+        The transcript is whatever `*.jsonl` the route keeps in `session`; a
+        route that keeps none there is measured by the prompts sent and the
+        envelopes returned, which is what the agent has read and written.
+        """
+        def size(path: Path) -> int:
+            try:
+                return path.stat().st_size if path.is_file() else 0
+            except OSError:
+                return 0
+
+        transcript = sum(size(path) for path in session.glob("*.jsonl"))
+        traffic = sum(
+            size(lch.role_prompt_path(cwd, turn)) + size(lch.role_result_path(cwd, turn))
+            for turn in range(1, turns + 1)
+        )
+        return estimate_tokens_for_bytes(max(transcript, traffic))
+
+    def _cap_reused_session(
+        self,
+        ctx: LaneContext,
+        role: str,
+        key: tuple[str, str, str],
+        stored: _RoleSession | None,
+        cwd: Path,
+        session: Path,
+        turn: int,
+    ) -> Mapping[str, Any] | None:
+        """Retire a session that has grown past the cap; answer the handoff for its successor.
+
+        Reuse under the cap is unchanged (same lane, role and spec digest).
+        Past it the next dispatch starts a fresh session instead of piling
+        onto the old one: the pane is closed, the transcript moved aside
+        (kept, never deleted, and out of `-c`'s reach), and the new prompt
+        carries a compact handoff. `None` when nothing was retired.
+        """
+        cap = self.role_session_max_tokens
+        if cap <= 0 or turn <= 1:
+            return None
+        tokens = self._session_tokens(cwd, session, turn - 1)
+        if tokens <= cap:
+            return None
+        lane_id = ctx.lane.lane_id
+        self._say(
+            lane_id,
+            "{0} session over cap: fresh session".format(role),
+            "~{0} tokens against role_session_max_tokens {1}".format(tokens, cap),
+        )
+        cancel = getattr(self.launcher, "cancel", None)
+        if stored is not None and stored.handle is not None and cancel is not None:
+            try:
+                cancel(stored.handle, time.monotonic() + _SUPERSEDED_CLOSE_SECONDS)
+            except Exception as exc:
+                self._say(lane_id, "{0} session close refused".format(role), str(exc))
+        self._roles.pop(key, None)
+        transcripts = sorted(session.glob("*.jsonl"))
+        if transcripts:
+            aside = session / "superseded-{0}".format(time.time_ns())
+            aside.mkdir()
+            for transcript in transcripts:
+                os.replace(transcript, aside / transcript.name)
+        return self._session_handoff(ctx, cwd, turn - 1, tokens)
+
+    def _session_handoff(
+        self, ctx: LaneContext, cwd: Path, turns: int, tokens: int
+    ) -> dict[str, Any]:
+        """What a fresh session needs of the one it replaces: last answer, tree state, obligations."""
+        def trim(value: Any, depth: int = 0) -> Any:
+            if isinstance(value, str):
+                return value[:300]
+            if isinstance(value, Mapping) and depth < 3:
+                return {str(k): trim(v, depth + 1) for k, v in list(value.items())[:20]}
+            if isinstance(value, (list, tuple)) and depth < 3:
+                return [trim(v, depth + 1) for v in list(value)[:20]]
+            return value if isinstance(value, (int, float, bool)) or value is None else str(value)[:300]
+
+        handoff: dict[str, Any] = {
+            "reason": "ROLE_SESSION_OVER_CAP",
+            "prior_turns": turns,
+            "prior_tokens_estimate": tokens,
+            "open_obligations": [str(item)[:300] for item in ctx.lane.public_acceptance][:20],
+        }
+        try:
+            last = json.loads(lch.role_result_path(cwd, turns).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            last = None
+        if isinstance(last, Mapping):
+            files = last.get("test_files") or last.get("private_files")
+            summary = {k: v for k, v in last.items() if k not in ("test_files", "private_files")}
+            if isinstance(files, Mapping):
+                summary["test_files"] = sorted(str(path) for path in files)
+            handoff["last_answer"] = trim(summary)
+        try:
+            state = self._git(cwd, "status", "--short", check=False)
+        except FactoryRefused:
+            state = ""
+        if state:
+            handoff["tree_state"] = state.splitlines()[:40]
+        return handoff
+
     def _prepare(
         self, ctx: LaneContext, role: str, *, sha: str | None
     ) -> tuple[Path, Path | None]:
@@ -2719,10 +2875,18 @@ class HerdrStageActor:
 
         # Filled in below once the turn is known to be a review revise.
         revise_draft: list[tuple[str, tuple[str, ...]]] = []
+        # The accepted suite a redraft starts from, when the lane has one.
+        baseline = ctx.redraft_baseline or {}
+        baseline_files: Mapping[str, str] = baseline.get("suite_files") or {}
 
         def refresh(path: Path) -> None:
             if (path / ".git").exists():
                 self._refresh_git_checkout(path, sha)
+                for rel, text in baseline_files.items():
+                    target = _resolved_under(path, rel)
+                    if not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(text)
                 for draft_sha, draft_files in revise_draft:
                     self._restore_draft(path, draft_sha, draft_files)
 
@@ -2758,6 +2922,10 @@ class HerdrStageActor:
                     revise_draft.append((draft_sha, draft_files))
         if findings:
             extra["revise_findings"] = findings
+        if baseline_files:
+            extra["accepted_suite_paths"] = sorted(baseline_files)
+            if baseline.get("spec_diff") is not None:
+                extra["spec_diff"] = baseline["spec_diff"]
         invalidation = ctx.artifacts.get("TEST_INVALIDATION")
         if invalidation is not None:
             payload = getattr(invalidation, "payload", None) or {}
@@ -3559,6 +3727,9 @@ def _actor_for(
         operator_route=attend_route or None,
         attend_reviewer_route=reviewer_route or None,
         role_vendors=layout.get("role_vendors"),
+        role_session_max_tokens=_config_role_session_max_tokens(
+            layout.get("role_session_max_tokens"), "role_session_max_tokens"
+        ),
     )
 
 
