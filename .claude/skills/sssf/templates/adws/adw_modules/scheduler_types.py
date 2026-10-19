@@ -1083,7 +1083,12 @@ def amendment_reset_stage(
         # lane that had already passed. That is what stopped runs converging,
         # and it is the reason this returns the merge stage and not the build
         # stage.
-        if current is LaneStage.MERGED:
+        #
+        # A lane already at READY_TO_MERGE holds the same accepted inputs a
+        # merged one does -- that stage cannot be entered without them -- so
+        # it keeps them too. Sending it to BUILDING rebuilt an untouched lane
+        # once per amendment that landed between its PASS and its merge.
+        if current in (LaneStage.MERGED, LaneStage.READY_TO_MERGE):
             return LaneStage.READY_TO_MERGE
         if current in STARTED_IMPLEMENTATION_STAGES:
             return LaneStage.BUILDING

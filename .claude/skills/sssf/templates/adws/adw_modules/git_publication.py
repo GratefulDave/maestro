@@ -495,6 +495,25 @@ def measure_tree_delta(
     return parse_diff_tree(raw)
 
 
+def paths_unchanged(
+    binding: TargetBinding, before_sha: str, after_sha: str, paths: Collection[str]
+) -> bool:
+    """Whether every path holds the same blob, or the same absence, at both commits.
+
+    Read off the tree delta, so it compares content and never commit
+    identity: two commits with different SHAs and the same bytes at `paths`
+    answer True. A rename or deletion of a watched path is a change.
+    """
+    if before_sha == after_sha:
+        return True
+    watched = set(paths)
+    return not any(
+        path in watched
+        for entry in measure_tree_delta(binding, before_sha, after_sha)
+        for path in entry.represented_paths()
+    )
+
+
 def publication_touched_paths(
     binding: TargetBinding,
     *,
@@ -693,6 +712,7 @@ def decide_merge_action(
     candidate_sha: str,
     integration_head: str,
     base_head: str | None = None,
+    inputs_unchanged: bool = False,
 ) -> MergeDecision:
     """Which of the three READY_TO_MERGE edges this candidate takes.
 
@@ -702,18 +722,28 @@ def decide_merge_action(
     untyped lane builds on a commit one step above the head -- the head plus
     its own accepted suite (`FactoryScheduler._untyped_builder_base`) -- so
     its `base_head` is that commit's parent. Staleness is measured against the
-    head, not against the base: a zero-delta candidate whose head moved is
+    head, not against the base.
+
+    Staleness is a question about content, not commit identity. A zero-delta
+    candidate claims the base already satisfies its lane, and that claim
+    rests on the paths the lane and its needs own. `inputs_unchanged` is the
+    caller's measurement that every one of those paths holds the same blob
+    (or the same absence) at `base_head` and at the integration head
+    (`paths_unchanged`). An amendment re-merges every retained lane, so every
+    head SHA moves while those bytes stay put; comparing SHAs alone sent an
+    untouched zero-delta lane back to its builder on every amendment. A
+    zero-delta candidate whose head moved AND whose inputs changed is
     `BASE_INVALIDATION`, whatever its base was.
 
-    A zero-delta candidate that IS the integration head is revalidated,
-    creating no commit. A zero-delta candidate that is not -- the untyped
-    lane's, which is the head plus a suite -- is merged, because the
-    integration tree changes by exactly that suite and that is a merge with a
-    commit, not a revalidation that creates none.
+    A zero-delta candidate that IS its base head is revalidated on the
+    integration head, creating no commit. A zero-delta candidate that is not
+    -- the untyped lane's, which is the head plus a suite -- is merged,
+    because the integration tree changes by exactly that suite and that is a
+    merge with a commit, not a revalidation that creates none.
     """
     if base_head is None:
         base_head = builder_base_sha
-    if not changed and base_head != integration_head:
+    if not changed and base_head != integration_head and not inputs_unchanged:
         return MergeDecision(
             action="BASE_INVALIDATION",
             before_sha=integration_head,
@@ -727,7 +757,7 @@ def decide_merge_action(
                 "CANDIDATE_OUTPUT_OWNERSHIP_REFUSED",
                 "zero-delta candidate must equal its builder base",
             )
-        if candidate_sha != integration_head:
+        if candidate_sha != base_head:
             return MergeDecision(
                 action="MERGE",
                 before_sha=integration_head,
@@ -971,19 +1001,28 @@ def revalidate_zero_delta(
     builder_base_sha: str,
     candidate_ref: str,
     candidate_sha: str,
+    integration_head: str,
     input_digest: str,
 ) -> dict[str, Any]:
+    """Accept a zero-delta candidate on the integration head without a commit.
+
+    Anchored on the head, not on the candidate: after an amendment re-merges
+    the retained lanes the head is a new commit carrying the same bytes at
+    this lane's inputs (`decide_merge_action(inputs_unchanged=True)`), and
+    the merge chain (`durable_integration_tip`) requires a revalidation to
+    sit exactly at the tip.
+    """
     revalidate_binding(binding)
     git = binding.git()
-    tree = git.commit_tree_oid(candidate_sha)
+    tree = git.commit_tree_oid(integration_head)
     return integration_merge_payload(
         builder_output_artifact_id=builder_artifact_id,
         code_review_artifact_id=code_review_artifact_id,
         builder_base_sha=builder_base_sha,
         candidate_ref=candidate_ref,
         candidate_sha=candidate_sha,
-        before_sha=candidate_sha,
-        after_sha=candidate_sha,
+        before_sha=integration_head,
+        after_sha=integration_head,
         expected_tree_sha=tree,
         revalidated=True,
         input_digest=input_digest,

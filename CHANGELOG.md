@@ -6,6 +6,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (weakening): a zero-delta build lane whose inputs are byte-identical at the new integration head is revalidated, not rebuilt, after an amendment
+
+- A build lane's accepted candidate was zero-delta (`changed=false`,
+  `tree_delta=[]`). Three consecutive amendments left its spec untouched and
+  reset it MERGED -> READY_TO_MERGE as designed, but each replay re-merged
+  every retained lane, so the head SHA moved, and `decide_merge_action`
+  (`base_head != integration_head`) wrote `BASE_INVALIDATION` each time. The
+  lane went back to its builder three times and returned the same zero delta;
+  a second zero-delta lane did the same. Its declared outputs, and those of
+  every lane it needs, were byte-identical across all three invalidations.
+- Staleness is now measured by content. `decide_merge_action` takes
+  `inputs_unchanged`, which the scheduler computes with
+  `git_publication.paths_unchanged` over the lane's declared outputs and its
+  `needs` closure's (its accepted suite included) at the base head and the
+  integration head. Both `_ready_to_merge` and orphan-merge reconciliation
+  (`_explain_ahead_merge`) pass it. A real change on any of those paths still
+  invalidates; a changed candidate is unaffected.
+- `revalidate_zero_delta` is anchored on the integration head
+  (`before_sha == after_sha == head`), so a revalidation whose candidate is an
+  older base keeps the merge chain intact.
+- `amendment_reset_stage` keeps an unchanged build lane at READY_TO_MERGE
+  instead of sending it to BUILDING (an earlier amendment rebuilt both lanes
+  that way). Previously only MERGED was kept.
+- Weakening: a zero-delta lane no longer rebuilds when the head moved only on
+  paths outside its inputs. `tests/test_amendment_keeps_merged_builds.py`
+  previously asserted READY_TO_MERGE -> BUILDING.
+- Tests: `tests/test_zero_delta_replay.py` drives the real scheduler through
+  two amendments (no builder round, revalidated merge anchored on the head),
+  and the real `_zero_delta_inputs_unchanged` + `decide_merge_action` for a
+  changed own output, a changed suite path, an unrelated move, and a changed
+  candidate.
+
 ### Changed — contract change (weakening): a pytest suite killed by a signal after its JUnit report is complete is measured from the report
 
 - An accepted suite printed `2 failed, 106 passed in 58.70s` and then

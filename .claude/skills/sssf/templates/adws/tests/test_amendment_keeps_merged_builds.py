@@ -65,12 +65,23 @@ def test_a_changed_merged_build_lane_still_starts_over() -> None:
     [
         st.LaneStage.BUILDING,
         st.LaneStage.REVIEWING_CODE,
-        st.LaneStage.READY_TO_MERGE,
     ],
 )
 def test_a_build_lane_in_flight_is_unaffected(stage) -> None:
-    """Only the MERGED arm moved; a lane mid-implementation still rewinds."""
+    """A lane without an accepted candidate still rewinds to its builder."""
     assert _reset(stage, changed=False) is st.LaneStage.BUILDING
+
+
+def test_an_untouched_ready_to_merge_build_lane_keeps_its_build() -> None:
+    """READY_TO_MERGE already holds the PASS review a merged lane has.
+
+    An amendment that landed while two unchanged build lanes sat at
+    READY_TO_MERGE sent both to BUILDING, and both were rebuilt.
+    """
+    assert (
+        _reset(st.LaneStage.READY_TO_MERGE, changed=False)
+        is st.LaneStage.READY_TO_MERGE
+    )
 
 
 def test_an_untouched_merged_tests_lane_still_reseals() -> None:
