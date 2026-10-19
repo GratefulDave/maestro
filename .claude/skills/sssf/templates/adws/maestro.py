@@ -3060,15 +3060,23 @@ class HerdrStageActor:
         Code resolves the tree to the target repository's already-trusted
         project instead of stopping at a folder-trust prompt nobody is there
         to answer (a plain directory has no project entry). `--no-checkout`
-        leaves no product file in it. Whatever an earlier dispatch left --
-        `revisions/` named by ATTEND_REVIEW rows, a pre-worktree plain tree --
-        is moved aside and back, so every recorded path keeps its bytes.
+        leaves no product file in it.
+
+        Whatever an earlier dispatch left -- `revisions/` named by
+        ATTEND_REVIEW rows, a pre-worktree plain tree -- has its children
+        moved aside and back, so every recorded path keeps its bytes. The
+        directory itself is never renamed: a live agent's working directory
+        is that directory, and renaming it carried the agent's pane to the
+        temporary name, so the next launch refused BINDING_MISMATCH against
+        it. `git worktree add` takes the emptied directory as it stands.
         """
         if (cwd / ".git").exists():
             return
         held = cwd.parent / ".checkout-{0}".format(uuid.uuid4().hex)
-        if cwd.is_dir():
-            cwd.rename(held)
+        if cwd.is_dir() and any(cwd.iterdir()):
+            held.mkdir()
+            for child in cwd.iterdir():
+                child.rename(held / child.name)
         self._add_worktree(cwd, self._base_sha(ctx, "tester"), no_checkout=True)
         if held.is_dir():
             for child in held.iterdir():
@@ -3197,19 +3205,22 @@ class HerdrStageActor:
                 (inputs / "previous_revision.ir.json").resolve()
             )
         Path(request.revision_out_path).unlink(missing_ok=True)
-        payload, _handle, cwd_used = self._launch(
-            ctx,
-            "operator",
-            cwd,
-            extra,
-            prepare_cwd=lambda path: self._write_attend_tree(
-                path, request.lanes, files
-            ),
-            # A --no-checkout tree holds no project to install.
-            provision=False,
-        )
-        # Records the worktree, so removal is the lanes' `git worktree remove`.
-        self._bind_checkout(self._role_key(ctx, "operator"), attempt, cwd, cwd_used)
+        try:
+            payload, _handle, cwd_used = self._launch(
+                ctx,
+                "operator",
+                cwd,
+                extra,
+                prepare_cwd=lambda path: self._write_attend_tree(
+                    path, request.lanes, files
+                ),
+                # A --no-checkout tree holds no project to install.
+                provision=False,
+            )
+            # Records the worktree, so removal is the lanes' `git worktree remove`.
+            self._bind_checkout(self._role_key(ctx, "operator"), attempt, cwd, cwd_used)
+        finally:
+            self._close_attend_pane(ctx, "operator", cwd)
         return payload
 
     def attend_reviewer(
@@ -3256,21 +3267,52 @@ class HerdrStageActor:
             "revision_ir_path": str((inputs / "revision.ir.json").resolve()),
         }
         Path(request.findings_out_path).unlink(missing_ok=True)
-        payload, _handle, cwd_used = self._launch(
-            ctx,
-            _ATTEND_REVIEWER_ROLE,
-            cwd,
-            extra,
-            prepare_cwd=lambda path: self._write_attend_tree(
-                path, request.lanes, files
-            ),
-            # A --no-checkout tree holds no project to install.
-            provision=False,
-        )
-        self._bind_checkout(
-            self._role_key(ctx, _ATTEND_REVIEWER_ROLE), attempt, cwd, cwd_used
-        )
+        try:
+            payload, _handle, cwd_used = self._launch(
+                ctx,
+                _ATTEND_REVIEWER_ROLE,
+                cwd,
+                extra,
+                prepare_cwd=lambda path: self._write_attend_tree(
+                    path, request.lanes, files
+                ),
+                # A --no-checkout tree holds no project to install.
+                provision=False,
+            )
+            self._bind_checkout(
+                self._role_key(ctx, _ATTEND_REVIEWER_ROLE), attempt, cwd, cwd_used
+            )
+        finally:
+            self._close_attend_pane(ctx, _ATTEND_REVIEWER_ROLE, cwd)
         return payload
+
+    def _close_attend_pane(self, ctx: LaneContext, role: str, cwd: Path) -> None:
+        """Close the pane an attend dispatch launched, answered or failed.
+
+        An attend role answers one file per dispatch, so its pane holds
+        nothing a later dispatch needs, and one left open -- a `blocked` start
+        keeps its pane -- is what the next launch reconnects to. The role's
+        record keeps its tree for the run's own cleanup and drops only the
+        handle. Best effort, as `_release_superseded` is: a pane Herdr would
+        not close is reported, never a reason to fail the lane.
+        """
+        stored = self._roles.get(self._role_key(ctx, role))
+        if stored is not None:
+            stored.handle = None
+        close = getattr(self.launcher, "close_agent", None)
+        if close is None:
+            return
+        try:
+            close(
+                lch.role_session_token(ctx.run_id, ctx.lane.lane_id, role),
+                self._launch_environment(cwd),
+            )
+        except Exception as exc:
+            self._say(
+                ctx.lane.lane_id,
+                "{0} pane not closed".format(role),
+                "{0}: {1}".format(type(exc).__name__, exc),
+            )
 
     def publish(
         self,

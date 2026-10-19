@@ -27,6 +27,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unchanged.
 
 ### Fixed
+- **Attend launches no longer refuse `BINDING_MISMATCH` over a tree an
+  earlier dispatch left.** `_attend_checkout` converted a plain tree into a
+  worktree by renaming the directory aside, which carried a live agent's pane
+  to `.checkout-<id>`; the next launch reconnected to that agent and refused
+  `<...>/.checkout-<id>!=<...>/checkout`. The tree is now converted where it
+  stands (its children move aside and back, the directory never moves), an
+  attend agent bound to another tree is closed and replaced instead of
+  refused, and `attend_operator` / `attend_reviewer` close the pane they
+  launched in one `finally`, answered or failed, so a `blocked` start no
+  longer leaves a pane for the next dispatch.
 - **Attend agents' scratch trees are not provisioned.** `attend_operator` and
   `attend_reviewer` dispatch into a non-git tree that holds no project, but
   `_launch` ran the deployment's `provision_argv` there, so `uv sync --frozen`

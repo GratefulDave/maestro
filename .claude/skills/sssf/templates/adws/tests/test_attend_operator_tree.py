@@ -204,6 +204,8 @@ class ReviewerDispatch(unittest.TestCase):
             mock.patch.object(actor, "_attend_checkout", create=True),
             mock.patch.object(actor, "_bind_checkout", create=True),
             mock.patch.object(actor, "_role_key", create=True),
+            # The pane close is EachAttendDispatchClosesThePaneItLaunched's.
+            mock.patch.object(actor, "_close_attend_pane", create=True),
         ):
             payload = actor.attend_reviewer(SimpleNamespace(), request)
         self.assertEqual(payload["verdict"], "PASS")
