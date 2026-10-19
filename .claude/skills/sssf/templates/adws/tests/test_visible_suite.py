@@ -41,6 +41,7 @@ from adw_modules import test_binding as tb  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
 from adw_modules.lifecycle import ArtifactStore  # noqa: E402
 from adw_modules.runtime_state import RuntimeStateRoot  # noqa: E402
+from tests.test_tests_lane_handoff import rule_on_failing  # noqa: E402
 from adw_modules import launcher as lch  # noqa: E402
 from typing import cast  # noqa: E402
 from tests.test_actor_delegation_capability import (  # noqa: E402
@@ -215,7 +216,7 @@ class Actor:
         n = self.code_rounds[ctx.lane.lane_id]
         self.code_rounds[ctx.lane.lane_id] += 1
         if n == 0:
-            return st.ReviewerVerdict.REVISE, (FINDING,)
+            return st.ReviewerVerdict.REVISE, rule_on_failing(ctx, (FINDING,))
         return st.ReviewerVerdict.PASS, ()
 
     def review_integration(self, ctx, lanes, integration_sha):

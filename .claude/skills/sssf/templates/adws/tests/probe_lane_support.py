@@ -30,6 +30,7 @@ from tests.test_tests_lane_handoff import (
     _git,
     _init_repo,
     _unified_plan_bytes,
+    rule_on_failing,
 )
 
 REQUIREMENT = "a.txt is written"
@@ -134,7 +135,11 @@ class ProbeActor(HandoffActor):
             tuple(probes.Challenge(pid, "the probe is wrong") for pid in step.get("challenges", ())),
         )
         verdict = step.get("verdict", st.ReviewerVerdict.REVISE)
-        findings = (_finding_for(ctx),) if verdict is st.ReviewerVerdict.REVISE else ()
+        findings = (
+            rule_on_failing(ctx, (_finding_for(ctx),))
+            if verdict is st.ReviewerVerdict.REVISE
+            else ()
+        )
         return verdict, findings
 
     def take_probes(self, ctx):

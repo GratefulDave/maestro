@@ -1159,7 +1159,16 @@ class HerdrStageActor:
         if role == "tester":
             return {"test_files": {"<path>": "<utf-8 contents>"}}
         if role == "builder":
-            return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
+            return {
+                "candidate_sha": "<optional git sha>",
+                "changed": "<optional bool>",
+                "suite_defects": [
+                    {
+                        "test_id": "<optional: a failing case id, exactly as in failure_output>",
+                        "reason": "<why no implementation satisfying public_contract can pass it>",
+                    }
+                ],
+            }
         if role == "code-reviewer":
             # The optional keys ride inside the one example object; appended
             # as bare strings they re-create the flattening described above.
@@ -1170,6 +1179,9 @@ class HerdrStageActor:
             )
             example["attribution"] = "<optional: {0}>".format(
                 "|".join(st.FINDING_ATTRIBUTIONS)
+            )
+            example["test_id"] = (
+                "<optional: a failing_test_ids or suite_defect_claims id, exactly as given>"
             )
             envelope: dict[str, Any] = {
                 "verdict": "PASS|REVISE",
@@ -1799,7 +1811,13 @@ class HerdrStageActor:
                     "rename or copy any of those paths: a candidate whose delta "
                     "names one is refused before review (CANDIDATE_TEST_PATH_"
                     "REFUSED). The code reviewer grades against public_contract "
-                    "and the plan's acceptance criteria, not against the suite."
+                    "and the plan's acceptance criteria, not against the suite. "
+                    "If a failing case cannot be passed by any implementation "
+                    "that satisfies public_contract, do not shape the product "
+                    "to it: list it in suite_defects with its exact test_id and "
+                    "the reason. The code reviewer must rule on every claim, and "
+                    "a case it attributes to the accepted suite goes back to the "
+                    "tests lane. Omit suite_defects otherwise."
                 ).format(", ".join(str(item) for item in paths))
             surface = extra.get("bound_surface")
             if isinstance(surface, Mapping):
@@ -1849,7 +1867,7 @@ class HerdrStageActor:
                     "will be overridden. Read the failing cases in the suite "
                     "under test_paths, then read the candidate against "
                     "public_contract and declared_outputs and say WHICH code "
-                    "is wrong and HOW to fix it. Every finding must name a "
+                    "is wrong and HOW to fix it. Every candidate finding must name a "
                     "file in declared_outputs and the specific behavior that "
                     "is wrong -- a missing branch, an unhandled input, a "
                     "contract clause the code does not satisfy. Do not restate "
@@ -1861,6 +1879,40 @@ class HerdrStageActor:
                     counts.get("failed", 0),
                     counts.get("errored", 0),
                 )
+            failing = [str(item) for item in extra.get("failing_test_ids") or ()]
+            claims = [
+                item for item in extra.get("suite_defect_claims") or ()
+                if isinstance(item, Mapping)
+            ]
+            if failing or claims:
+                instructions += (
+                    " A REVISE must rule on every case in failing_test_ids and "
+                    "in suite_defect_claims: for each, give a finding whose "
+                    "test_id is that id exactly, with attribution candidate "
+                    "(the candidate is wrong; say how to fix it) or "
+                    "accepted_suite (no implementation satisfying "
+                    "public_contract can pass it; say why in observed_behavior). "
+                    "One finding per id. A case left unnamed is sent back once, "
+                    "and a second miss parks the lane."
+                )
+            if claims:
+                instructions += (
+                    " The builder claims these cases are defects in the accepted "
+                    "suite; rule on each against public_contract, not against "
+                    "the builder's word: {0}"
+                ).format(
+                    " | ".join(
+                        "{0}: {1}".format(item.get("test_id"), item.get("reason"))
+                        for item in claims
+                    )
+                )
+            unattributed = [str(item) for item in extra.get("unattributed_tests") or ()]
+            if unattributed:
+                instructions += (
+                    " Your previous REVISE did not rule on these cases: {0}. "
+                    "Re-review and give each one a finding whose test_id is that "
+                    "id exactly, attributed candidate or accepted_suite."
+                ).format(", ".join(unattributed))
             if extra.get("suite_findings_required") and not red:
                 instructions += (
                     " Your previous answer for this candidate was REVISE "
@@ -3164,7 +3216,7 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
-        _payload, _handle, cwd_used = self._launch(
+        payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
             cwd,
@@ -3177,7 +3229,11 @@ class HerdrStageActor:
         candidate_sha, changed = self._commit_declared(
             cwd_used, ctx.lane.declared_outputs, sha
         )
-        return {"candidate_sha": candidate_sha, "changed": changed}
+        result: dict[str, Any] = {"candidate_sha": candidate_sha, "changed": changed}
+        if isinstance(payload, Mapping) and payload.get("suite_defects"):
+            # Typed and ruled on by the scheduler, never read as prose here.
+            result["suite_defects"] = payload["suite_defects"]
+        return result
 
     def review_code(
         self, ctx: LaneContext
@@ -3195,6 +3251,14 @@ class HerdrStageActor:
             extra["suite_result_summary"] = dict(ctx.suite_result_summary)
         if ctx.suite_findings_required:
             extra["suite_findings_required"] = True
+        # Each only when present, so a green review dispatches byte-identical
+        # extra. The reviewer must name every id here in a finding's test_id.
+        if ctx.failing_test_ids:
+            extra["failing_test_ids"] = list(ctx.failing_test_ids)
+        if ctx.suite_defect_claims:
+            extra["suite_defect_claims"] = [dict(item) for item in ctx.suite_defect_claims]
+        if ctx.unattributed_tests:
+            extra["unattributed_tests"] = list(ctx.unattributed_tests)
         # Each key only when there is something to say, so a lane that has
         # never carried a probe dispatches byte-identical extra.
         existing = [

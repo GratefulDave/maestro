@@ -1263,6 +1263,14 @@ class LaneContext:
     #: `lane-wp3-reader-tests` refused REVIEW_FINDING_UNCITED on a finding the
     #: contract does state, reworded both times.
     rejected_citation: str = ""
+    #: The runner's ids of every accepted-suite case that failed against this
+    #: candidate, and the builder's `suite_defects` claims. A code reviewer must
+    #: name each failing id and each claimed id in some finding's `test_id`.
+    failing_test_ids: tuple[str, ...] = ()
+    suite_defect_claims: tuple[Mapping[str, str], ...] = ()
+    #: Set on the second ask, when the reviewer's REVISE left these failing or
+    #: claimed case ids unattributed.
+    unattributed_tests: tuple[str, ...] = ()
     #: The names the accepted suite binds to: module specifiers, the symbols
     #: imported from each, and the result-object keys the assertions read.
     #: An index into a suite the builder can also read in full; it was the
@@ -2068,6 +2076,19 @@ def _bind_reviewer_findings(
         contract_text=contract_text,
         harness_keys=HARNESS_VIOLATED_REQUIREMENTS,
     )
+
+
+def _unattributed_tests(
+    findings: Sequence[Mapping[str, Any]], required: Sequence[str]
+) -> tuple[str, ...]:
+    """The ids in `required` that no gating finding names by `test_id`."""
+    gating, _standards = st.partition_findings_by_axis(findings)
+    named = {
+        str(item.get("test_id") or "").strip()
+        for item in gating
+        if isinstance(item, Mapping)
+    }
+    return tuple(test_id for test_id in required if test_id not in named)
 
 
 def _cites_suite_line(area: str, suite_paths: Sequence[str]) -> bool:
@@ -3808,6 +3829,12 @@ class FactoryScheduler:
         self._say(lane_id, "builder returned a candidate")
         candidate_sha = extra["candidate_sha"]
         changed = bool(extra.get("changed", True))
+        try:
+            claims = st.require_suite_defect_claims(extra.get("suite_defects"))
+        except st.CanonicalIdentityError as exc:
+            self._park_lane_fault(
+                ctx, "BuilderSuiteDefectsMalformed", "{0}:{1}".format(lane_id, exc), exc
+            )
         admitted = gitpub.admit_candidate(
             self.target,
             run_id=self.run_id,
@@ -3840,6 +3867,15 @@ class FactoryScheduler:
             "test_suite_digest": ctx.test_suite_digest,
             "tree_delta": admitted.get("tree_delta") or [],
         }
+        if claims:
+            # The builder's typed report that a case cannot be passed by a
+            # correct implementation. The code reviewer must rule on each.
+            builder_payload["suite_defects"] = [dict(item) for item in claims]
+            self._say(
+                lane_id,
+                "builder claims accepted-suite defect(s)",
+                ", ".join(item["test_id"] for item in claims),
+            )
         artifact = rc.make_lane_artifact(
             kind=st.ArtifactKind.BUILDER_OUTPUT,
             request=_request(ctx),
@@ -3947,11 +3983,23 @@ class FactoryScheduler:
                 counts["errored"],
             ),
         )
+        claims = st.require_suite_defect_claims(builder.payload.get("suite_defects"))
         ctx = dataclasses.replace(
             ctx,
             suite_result_summary=dict(measurement.summary),
             existing_probes=probes.active_records(records, retired),
             probe_budget_left=budget_left,
+            failing_test_ids=measurement.failing_test_ids,
+            suite_defect_claims=claims,
+        )
+        # Every failing case and every claimed case must be ruled on, so a
+        # suite defect is actionable whether or not the reviewer happens to
+        # notice it (run 2acd2f5f: three candidate findings, none about the
+        # one failing case, so the builder was sent to game a hash).
+        required = tuple(
+            dict.fromkeys(
+                [*measurement.failing_test_ids, *(item["test_id"] for item in claims)]
+            )
         )
         taken: tuple[Any, ...] = ((), (), ())
 
@@ -4033,6 +4081,55 @@ class FactoryScheduler:
                     "{0}:{1}:{2}".format(lane_id, "code-reviewer", citation[:120]),
                     exc,
                 )
+        # A REVISE envelope rules on every case. A PASS over a red suite is
+        # the second-ask path above; the runner then settles it as REVISE.
+        missing = (
+            _unattributed_tests(findings, required)
+            if verdict is st.ReviewerVerdict.REVISE
+            else ()
+        )
+        if missing:
+            self._say(
+                lane_id,
+                "REVISE left failing or claimed cases unattributed, asking again",
+                ", ".join(missing),
+            )
+            verdict, findings = ask(
+                dataclasses.replace(ctx, unattributed_tests=missing)
+            )
+            self._say(
+                lane_id,
+                "code reviewer answered {0} on the second ask".format(verdict.value),
+                "{0} finding(s)".format(len(findings)),
+            )
+            try:
+                findings = _bind_reviewer_findings(
+                    findings,
+                    contract_text=_public_contract_text(product_contract),
+                )
+            except st.CanonicalIdentityError as exc:
+                citation = getattr(exc, "offending_requirement", "")
+                self._park_lane_fault(
+                    ctx,
+                    "ReviewFindingUncited",
+                    "{0}:{1}:{2}".format(
+                        lane_id,
+                        "code-reviewer",
+                        (citation if isinstance(citation, str) else "")[:120],
+                    ),
+                    exc,
+                )
+            if verdict is st.ReviewerVerdict.REVISE:
+                missing = _unattributed_tests(findings, required)
+            else:
+                missing = ()
+            if missing:
+                self._park_lane_fault(
+                    ctx,
+                    "ReviewFailingTestUnattributed",
+                    "{0}:{1}:{2}".format(lane_id, "code-reviewer", ", ".join(missing)[:300]),
+                    FactoryRefused("REVIEW_FAILING_TEST_UNATTRIBUTED"),
+                )
         probe_measurement = None
         if records or any(taken):
             probe_measurement, verdict, findings = self._probe_review(
@@ -4068,6 +4165,7 @@ class FactoryScheduler:
             suite_timeout_s=self._suite_timeout_s,
             measurement=measurement,
             probe_measurement=probe_measurement,
+            suite_defect_claims=claims,
         )
         _complete(
             self.store,
@@ -4732,12 +4830,26 @@ class FactoryScheduler:
         if latest.get("verdict") != st.ReviewerVerdict.REVISE.value:
             return None
         paths = self._own_test_paths(lane, suite)
+        # A suite finding counts when it cites a suite line, or when its
+        # `test_id` names a case this review measured failing or the builder
+        # claimed defective: either locates it in the accepted suite.
+        measured = {
+            *(str(item) for item in latest.get("failing_test_ids") or ()),
+            *(
+                str(item.get("test_id"))
+                for item in latest.get("suite_defect_claims") or ()
+                if isinstance(item, Mapping)
+            ),
+        }
         attributed = [
             dict(item)
             for item in latest.get("findings") or ()
             if isinstance(item, Mapping)
             and item.get("attribution") == st.FINDING_ATTRIBUTION_SUITE
-            and _cites_suite_line(str(item.get("implementation_area") or ""), paths)
+            and (
+                _cites_suite_line(str(item.get("implementation_area") or ""), paths)
+                or str(item.get("test_id") or "") in measured
+            )
         ]
         plan: dict[str, Any] | None = None
         if attributed:
