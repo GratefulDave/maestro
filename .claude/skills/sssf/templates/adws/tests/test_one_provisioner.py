@@ -144,12 +144,14 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
                 scheduler.rr, "collect_cases", return_value=("src/a.test.ts > a",)
             ) as collect,
         ):
-            ids, outcomes = self.factory._collect_draft(
+            ids, outcomes, harness = self.factory._collect_draft(
                 ctx, gate, {"src/a.test.ts": "it()"}
             )
         self.assertEqual(ids, ("src/a.test.ts > a",))
         # No declared cases on this gate, so no red-at-parent outcomes are run.
         self.assertEqual(outcomes, {})
+        # The harness probe is a pytest plugin; a vitest draft is not probed.
+        self.assertIsNone(harness)
         self.assertEqual(
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7)]
         )

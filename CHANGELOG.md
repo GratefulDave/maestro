@@ -6,6 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening, new check): a suite is never sealed while it fails inside its own harness
+
+- A tests lane's draft could reach `TESTS_SEALED` while some of its cases failed
+  in the suite's own code: an embedded example input missing a key the harness
+  read (`inp["files"]`, `inp["minimum"]`), raising `KeyError` before any
+  production code ran. The builder cannot edit the suite, so such a case is red
+  whatever it writes; the test reviewer passed it across rounds and it was found
+  only after builder rounds.
+- The draft gate (`FactoryScheduler._measure_draft_gate`) now runs a pytest
+  draft once more at the parent commit with a measurement plugin
+  (`adw_modules/harness_probe_plugin.py`, loaded by
+  `runner_resolution.execute_harness_probe` from outside the tree). A failure
+  whose innermost project frame is a draft file, whose exception is
+  `KeyError`/`TypeError`/`AttributeError`/`NameError`, and that entered no
+  production frame first is a `SUITE_HARNESS_DEFECT` REVISE citing file:line
+  and the exception, before the test reviewer is asked. `NotImplementedError`,
+  production-raised failures, a missing module attribute and a call-site
+  signature refusal for a callable the draft does not define stay the expected
+  red. vitest drafts are not probed.
+- A draft literal that copies a contract `decided_by` example (same answer,
+  agreeing shared input values) with an input key dropped or added is a
+  `SUITE_EXAMPLE_MISMATCH` REVISE naming the missing/extra keys.
+- No existing check changed; both are additional REVISE reasons on the same
+  path as `gate.min_cases` and `gate.declared_cases`.
+
 ### Changed — contract change (weakening): a zero-delta build lane whose inputs are byte-identical at the new integration head is revalidated, not rebuilt, after an amendment
 
 - A build lane's accepted candidate was zero-delta (`changed=false`,

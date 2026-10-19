@@ -7,6 +7,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1716,6 +1717,249 @@ def _red_at_parent_findings(
     )
 
 
+#: The exception classes a harness raises on its own data: a key its embedded
+#: input lacks, a call or attribute on the wrong shape, a name it never bound.
+#: NotImplementedError is a production stub's expected red and never qualifies.
+_HARNESS_EXCEPTIONS = frozenset({"KeyError", "TypeError", "AttributeError", "NameError"})
+
+#: CPython's call-site signature refusal. It is raised in the CALLER's frame
+#: before the callee runs, so a harness calling a production callable whose
+#: signature this lane changes looks exactly like a harness defect. It counts
+#: only when the callable it names is defined in the draft itself.
+_SIGNATURE_TYPE_ERROR = re.compile(
+    r"^(?P<name>[\w.<>]+)\(\) (?:got an unexpected keyword argument|missing \d+ "
+    r"required|takes \d+|takes from|takes no|got multiple values)"
+)
+
+
+def _defined_in_draft(qualname: str, files: Mapping[str, str]) -> bool:
+    parts = [part for part in qualname.split(".") if part and part != "__init__"]
+    if not parts:
+        return False
+    pattern = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+{0}\b".format(re.escape(parts[-1])), re.M)
+    return any(pattern.search(text) for text in files.values())
+
+
+def _harness_defects(
+    rows: Sequence[Mapping[str, Any]], files: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Each parent failure the draft's own code raised, as `file:line: nodeid: exc`.
+
+    A row qualifies only when all of these hold, each read off the probe's
+    measurement and none off failure prose: no production frame was entered
+    before the failure; the innermost project frame is one of the draft's
+    files; the exception is one of `_HARNESS_EXCEPTIONS` and not a
+    NotImplementedError; and it is not one of the two shapes a missing
+    production surface takes at the parent from inside a test frame -- an
+    attribute missing on a module, or a call-site signature refusal for a
+    callable the draft does not define. Everything else is the expected red.
+    """
+    draft = {rc.normalize_repo_path(path) for path in files}
+    found: list[str] = []
+    for row in rows:
+        mro = set(row.get("exception") or ())
+        if not (mro & _HARNESS_EXCEPTIONS) or "NotImplementedError" in mro:
+            continue
+        if row.get("production_entered") or row.get("attribute_of_module"):
+            continue
+        where = str(row.get("file") or "")
+        if where not in draft:
+            continue
+        message = str(row.get("message") or "")
+        signature = _SIGNATURE_TYPE_ERROR.match(message)
+        if signature and not _defined_in_draft(signature.group("name"), files):
+            continue
+        found.append(
+            "{0}:{1}: {2} ({3}): {4}: {5}".format(
+                where,
+                row.get("line"),
+                row.get("nodeid"),
+                row.get("phase"),
+                (row.get("exception") or ["?"])[0],
+                message,
+            )
+        )
+    return tuple(found)
+
+
+def _suite_harness_findings(defects: Sequence[str]) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "SUITE_HARNESS_DEFECT: run against the parent commit, these "
+                    "cases failed inside the draft's own test code before any "
+                    "production code ran: {0}".format("; ".join(defects))
+                ),
+                "required_behavior": (
+                    "a case may be red at the parent only because the lane's "
+                    "production code does not exist or does not behave yet. A "
+                    "failure raised by the suite's own fixtures, helpers or "
+                    "embedded inputs is red whatever the builder writes, and the "
+                    "builder cannot edit the suite. Fix each named line so the "
+                    "case reaches the production call it is about"
+                ),
+                "violated_requirement": "SUITE_HARNESS_DEFECT",
+            },
+        )
+    )
+
+
+_DECIDED_BY = " [decided by: "
+_CLAIM_ID = re.compile(r"^(\S+) \(")
+
+
+def _contract_examples(
+    contract: Mapping[str, Any] | None,
+) -> tuple[tuple[str, int, Mapping[str, Any]], ...]:
+    """`(label, index, example)` for every decided_by example the tester was handed.
+
+    Read back from the acceptance text exactly as `AcceptanceCriterion.public_text`
+    rendered it -- the bytes the tester actually received -- so the comparison
+    is against what the suite could have copied, not a second projection.
+    """
+    if not isinstance(contract, Mapping):
+        return ()
+    found: list[tuple[str, int, Mapping[str, Any]]] = []
+    for position, text in enumerate(contract.get("acceptance_criteria") or ()):
+        text = str(text)
+        at = text.rfind(_DECIDED_BY)
+        if at < 0 or not text.endswith("]"):
+            continue
+        try:
+            examples = json.loads(text[at + len(_DECIDED_BY) : -1])
+        except ValueError:
+            continue
+        claim = _CLAIM_ID.match(text)
+        label = claim.group(1) if claim else "acceptance[{0}]".format(position)
+        for index, example in enumerate(examples if isinstance(examples, list) else ()):
+            if isinstance(example, Mapping) and isinstance(example.get("input"), Mapping):
+                found.append((label, index, example))
+    return tuple(found)
+
+
+def _as_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+def _embedded_examples(files: Mapping[str, str]) -> list[tuple[str, int, Mapping[str, Any]]]:
+    """Worked-example literals in the draft: `{"input": {...}, "expect"|"refuses": ...}`.
+
+    Python dict literals that `ast.literal_eval` accepts, and every object in a
+    `.json` draft file. A computed input is not a literal and is not read.
+    """
+    found: list[tuple[str, int, Mapping[str, Any]]] = []
+
+    def keep(path: str, line: int, value: Any) -> None:
+        if (
+            isinstance(value, Mapping)
+            and isinstance(value.get("input"), Mapping)
+            and ("expect" in value) != ("refuses" in value)
+        ):
+            try:
+                found.append((path, line, _as_json(value)))
+            except (TypeError, ValueError):
+                pass
+
+    for path, text in sorted(files.items()):
+        if path.endswith(".py"):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict):
+                    try:
+                        keep(path, node.lineno, ast.literal_eval(node))
+                    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                        continue
+        elif path.endswith(".json"):
+            try:
+                stack = [json.loads(text)]
+            except ValueError:
+                continue
+            while stack:
+                value = stack.pop()
+                if isinstance(value, Mapping):
+                    keep(path, 0, value)
+                    stack.extend(value.values())
+                elif isinstance(value, list):
+                    stack.extend(value)
+    return found
+
+
+def _example_mismatches(
+    contract: Sequence[tuple[str, int, Mapping[str, Any]]], files: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Embedded examples copied from a contract example with input keys changed.
+
+    An embedded example is a copy of contract example C when it states the same
+    answer (`expect` or `refuses`, equal), every input key the two share has an
+    equal value, they share at least one, and one input's key set contains the
+    other's. It is a mismatch when no contract example with that answer has
+    exactly its key set. An example the contract does not state -- a different
+    answer, or a conflicting shared value -- is the tester's own case and is not
+    compared.
+    """
+    if not contract:
+        return ()
+    stated = [(label, index, _as_json(example)) for label, index, example in contract]
+    problems: list[str] = []
+    for path, line, embedded in _embedded_examples(files):
+        answer = "expect" if "expect" in embedded else "refuses"
+        mine = embedded["input"]
+        same_answer = [
+            item for item in stated
+            if answer in item[2] and item[2][answer] == embedded[answer]
+        ]
+        if any(set(item[2]["input"]) == set(mine) for item in same_answer):
+            continue
+        for label, index, example in same_answer:
+            theirs = example["input"]
+            shared = set(theirs) & set(mine)
+            if not shared or any(theirs[key] != mine[key] for key in shared):
+                continue
+            if not (set(theirs) <= set(mine) or set(mine) <= set(theirs)):
+                continue
+            missing = sorted(set(theirs) - set(mine))
+            extra = sorted(set(mine) - set(theirs))
+            problems.append(
+                "{0}{1}: embeds {2} decided_by[{3}] with input keys{4}{5}".format(
+                    path,
+                    ":{0}".format(line) if line else "",
+                    label,
+                    index,
+                    " missing " + ", ".join(missing) if missing else "",
+                    " extra " + ", ".join(extra) if extra else "",
+                )
+            )
+            break
+    return tuple(problems)
+
+
+def _suite_example_findings(problems: Sequence[str]) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "tests",
+                "observed_behavior": (
+                    "SUITE_EXAMPLE_MISMATCH: the draft embeds a contract worked "
+                    "example with a different input than the contract states: "
+                    "{0}".format("; ".join(problems))
+                ),
+                "required_behavior": (
+                    "a case that cites a decided_by example must use that "
+                    "example's input exactly as the contract states it -- every "
+                    "input key the contract gives, and no other. Copy the input "
+                    "from the acceptance criterion verbatim"
+                ),
+                "violated_requirement": "SUITE_EXAMPLE_MISMATCH",
+            },
+        )
+    )
+
+
 def _red_at_parent_unreadable_findings(detail: str) -> tuple[dict[str, str], ...]:
     return st.require_revise_findings(
         (
@@ -1762,6 +2006,8 @@ HARNESS_VIOLATED_REQUIREMENTS = frozenset(
         "gate.required_cases",
         "gate.min_cases",
         "gate.declared_cases",
+        "SUITE_HARNESS_DEFECT",
+        "SUITE_EXAMPLE_MISMATCH",
         cr._RUNNER_REVISE["violated_requirement"],
         cr._COLLECTION_REVISE["violated_requirement"],
         cr._UNGATED_REVISE["violated_requirement"],
@@ -2945,7 +3191,7 @@ class FactoryScheduler:
             return None, None
         files = self._draft_files(draft)
         try:
-            collected, outcomes = self._collect_draft(ctx, gate, files)
+            collected, outcomes, harness = self._collect_draft(ctx, gate, files)
         except ParentOutcomesRefused as refused:
             return _red_at_parent_unreadable_findings(str(refused)), None
         except DraftCollectionRefused as refused:
@@ -2960,7 +3206,23 @@ class FactoryScheduler:
             return _draft_required_cases_findings(missing), len(collected)
         if len(collected) < gate.min_cases:
             return _draft_min_cases_findings(len(collected), gate.min_cases), len(collected)
-        # Last, because it is the only check that ran the cases: a draft that
+        # A worked example the suite copied from the contract with an input key
+        # dropped or added tests a different input than the one the contract
+        # decides, and the builder cannot change the suite to say so.
+        mismatches = _example_mismatches(_contract_examples(ctx.public_contract), files)
+        if mismatches:
+            return _suite_example_findings(mismatches), len(collected)
+        # A case that fails inside the draft's own harness, before any
+        # production frame ran, is red whatever the builder writes. Sealing it
+        # seals a suite that can never go green. Before the declared-outcome
+        # comparison, because a harness defect is the more precise answer to a
+        # case that is "red for a reason this plan does not claim".
+        if harness is None and gate.runner in rr.HARNESS_PROBE_RUNNERS:
+            self._say(ctx.lane.lane_id, "harness probe unreadable; not measured")
+        defects = _harness_defects(harness or (), files)
+        if defects:
+            return _suite_harness_findings(defects), len(collected)
+        # Last of the checks that ran the cases: a draft that
         # does not collect, or is short of its floor, has nothing to adjudicate
         # against the parent and would be told two things at once.
         divergent = _red_at_parent_divergences(
@@ -3100,7 +3362,9 @@ class FactoryScheduler:
         ctx: LaneContext,
         gate: SimpleNamespace,
         files: Mapping[str, str],
-    ) -> tuple[tuple[str, ...], Mapping[str, bool]]:
+    ) -> tuple[
+        tuple[str, ...], Mapping[str, bool], Optional[Sequence[Mapping[str, Any]]]
+    ]:
         run_repo = Path(self.target.target_repository_root)
         base = self._integration_head()
         dest = tm.scratch_tree_path(
@@ -3152,7 +3416,13 @@ class FactoryScheduler:
             outcomes: Mapping[str, bool] = {}
             if getattr(gate, "declared_cases", ()):
                 outcomes = rr.execute_case_outcomes(resolved, measured, dest)
-            return tuple(ids), outcomes
+            # Same tree, same reason: the harness probe asks which of the
+            # draft's failures at the parent were raised by the draft itself,
+            # and the parent is this tree.
+            harness = rr.execute_harness_probe(
+                resolved, measured, dest, tuple(files), self.runtime.path
+            )
+            return tuple(ids), outcomes, harness
         except (
             rr.CollectFailed,
             rr.RunnerUnusable,

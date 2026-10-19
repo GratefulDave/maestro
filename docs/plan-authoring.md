@@ -727,6 +727,24 @@ property, which should have held at the parent, was red there because its assert
 shipped module the lane did not own with a key that module does not recognise. The suite read
 `executed=6 passed=5 failed=1` on three consecutive candidates and the lane parked `NO_PROGRESS`.
 
+### What the draft gate refuses without a plan field: harness defects and copied examples
+
+Two draft checks need nothing declared. Both are `REVISE` findings against the tester, recorded
+before the test reviewer is asked.
+
+- **`SUITE_HARNESS_DEFECT`** (pytest gates). The draft runs once at the parent commit with a
+  measurement plugin loaded from outside the tree. A failing case is a harness defect when its
+  innermost project frame is one of the draft's files, its exception is `KeyError`, `TypeError`,
+  `AttributeError` or `NameError`, and no production frame (a project `.py` file that is neither a
+  draft file nor a `conftest.py`) was entered before it failed. A `NotImplementedError`, a failure
+  raised inside production, a missing attribute on a module, and a call-site signature refusal for
+  a callable the draft does not define are the expected red and pass. A vitest gate is not probed.
+- **`SUITE_EXAMPLE_MISMATCH`**. Where a draft embeds a `decided_by` worked example as a literal
+  (`{"input": {...}, "expect": ...}` or `refuses`, in a Python dict literal or a `.json` draft
+  file), its input must carry exactly the contract example's keys. A literal is read as a copy of
+  a contract example when it states the same answer, agrees on every shared input value, and one
+  key set contains the other. A computed input is not read.
+
 ### Historical verifier commands, and `test_strength`, which is not historical
 
 **`test_strength` is still required, today, on every tests-lane verifier.** Ingress raises

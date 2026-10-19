@@ -1120,6 +1120,76 @@ def execute_case_outcomes(
     return outcomes
 
 
+#: The runners `execute_harness_probe` can attribute a failure's frames for.
+#: pytest only: the probe is a pytest plugin. A vitest draft is not probed.
+HARNESS_PROBE_RUNNERS = frozenset({"pytest"})
+
+_HARNESS_PLUGIN = Path(__file__).with_name("harness_probe_plugin.py")
+_HARNESS_PLUGIN_MODULE = "maestro_harness_probe"
+
+
+def execute_harness_probe(
+    resolved: ResolvedRunner,
+    gate: Any,
+    tree: Path,
+    draft_paths: Sequence[str],
+    scratch_root: Path,
+    *,
+    timeout_s: float = EXECUTE_TIMEOUT_S,
+) -> Optional[List[Dict[str, Any]]]:
+    """Run the gate's cases once with the harness probe plugin loaded.
+
+    Returns one row per case that failed in setup or call (see
+    `harness_probe_plugin`), or None when this run cannot be read: an
+    unsupported runner, or a plugin that never loaded. The plugin and its
+    report live in a directory allocated outside `tree`, so the measurement
+    never writes into its subject.
+    """
+    if resolved.runner not in HARNESS_PROBE_RUNNERS:
+        return None
+    tree = Path(tree).resolve()
+    base = Path(scratch_root).resolve() / "harness-probe"
+    if base == tree or tree in base.parents:
+        raise ValueError("the harness probe must be written outside the tree under test")
+    base.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="harness-", dir=str(base)))
+    try:
+        shutil.copyfile(_HARNESS_PLUGIN, work / (_HARNESS_PLUGIN_MODULE + ".py"))
+        report = work / "report.jsonl"
+        argv = (
+            "-p", _HARNESS_PLUGIN_MODULE, "-p", "no:cacheprovider",
+            "-o", "addopts=", "--tb=no", "-q",
+        ) + tuple(getattr(gate, "argv", ()) or ())
+        probe = _OutcomeGate(argv=argv, cwd=str(getattr(gate, "cwd", None) or "."))
+        execute_cases(
+            resolved, probe, tree, timeout_s=timeout_s,
+            env={
+                "PYTHONPATH": str(work),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "MAESTRO_HARNESS_TREE": str(tree),
+                "MAESTRO_HARNESS_DRAFT": json.dumps(sorted(draft_paths)),
+                "MAESTRO_HARNESS_REPORT": str(report),
+            },
+        )
+        try:
+            lines = report.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        rows = []
+        for line in lines:
+            try:
+                rows.append(dict(json.loads(line)))
+            except (ValueError, TypeError):
+                # A run killed at its deadline can leave a torn last line;
+                # every complete row before it is still a measurement.
+                continue
+        if not any(row.get("loaded") for row in rows):
+            return None
+        return [row for row in rows if not row.get("loaded")]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 
 # -- probe execution ---------------------------------------------------------
 #
