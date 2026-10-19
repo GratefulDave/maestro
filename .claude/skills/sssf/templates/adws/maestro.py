@@ -199,7 +199,7 @@ def _config_concurrency(value: object, label: str) -> int:
 
 #: A reused role session whose transcript passes this many tokens is replaced
 #: by a fresh one seeded with a compact handoff. `0` turns the cap off.
-DEFAULT_ROLE_SESSION_MAX_TOKENS = 150_000
+DEFAULT_ROLE_SESSION_MAX_TOKENS = 1_000_000
 
 
 def _config_role_session_max_tokens(value: object, label: str) -> int:
