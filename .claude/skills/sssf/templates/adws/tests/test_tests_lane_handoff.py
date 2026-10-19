@@ -946,9 +946,11 @@ class TestsLaneHandoffTests(unittest.TestCase):
             runtime=self.runtime,
             target=target,
         )
+        # lane-tests precedes the first changed lane: it keeps its merge and
+        # its rev-1 suite, which the changed build lane still reads.
         self.assertEqual(
             self.store.lane_stage("run-reseal", "lane-tests"),
-            st.LaneStage.TESTS_SEALED,
+            st.LaneStage.MERGED,
         )
         self.assertEqual(
             self.store.lane_stage("run-reseal", "lane-build"),
@@ -962,7 +964,9 @@ class TestsLaneHandoffTests(unittest.TestCase):
             target,
             compiled=amended,
         )
-        self.assertIsNone(scheduler._current_accepted_suite("lane-tests"))
+        retained = scheduler._current_accepted_suite("lane-tests")
+        self.assertIsNotNone(retained)
+        self.assertEqual(retained.plan_revision, 1)
         resume = HandoffActor(self.repo, self.runtime.path / "worktrees")
         scheduler = sch.FactoryScheduler(
             self.store,
@@ -990,10 +994,10 @@ class TestsLaneHandoffTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertEqual([row[0] for row in seals], [1, 2])
+        self.assertEqual([row[0] for row in seals], [1])
         current = scheduler._current_accepted_suite("lane-tests")
         self.assertIsNotNone(current)
-        self.assertEqual(current.plan_revision, 2)
+        self.assertEqual(current.plan_revision, 1)
         builders = list(
             self.store.conn.execute(
                 "SELECT plan_revision, payload_json FROM lane_artifacts "

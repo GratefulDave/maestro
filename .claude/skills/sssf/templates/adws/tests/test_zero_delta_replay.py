@@ -192,33 +192,19 @@ class ZeroDeltaReplayTests(unittest.TestCase):
         new = {lane.lane_id: lane.lane_projection_digest for lane in third.lanes}
         self.assertEqual(old["lane-build"], new["lane-build"])
         self.assertNotEqual(old["lane-x"], new["lane-x"])
+        kinds_before = _kinds(self.store, "lane-build")
         self._amend(third)
-        self.assertEqual(
-            self.store.lane_stage(RUN, "lane-build"), st.LaneStage.READY_TO_MERGE
-        )
-        with self.assertRaises(RuntimeError):
-            self._scheduler(third).run()
-
-        # The tests lane re-merged, so the head SHA moved...
-        self.assertNotEqual(sch.durable_integration_tip(self.store, RUN), head_before)
-        # ...and lane-build merged again without a builder round.
-        self.assertEqual(self.actor.build_lanes.count("lane-build"), builds)
-        self.assertIn("lane-x", self.actor.build_lanes[-1:])
+        # lane-build precedes the first changed lane (lane-x): it stays MERGED
+        # with its merge, so nothing re-merges and nothing is rebuilt.
         self.assertEqual(
             self.store.lane_stage(RUN, "lane-build"), st.LaneStage.MERGED
         )
-        at_three = [kind for kind, rev in _kinds(self.store, "lane-build") if rev == 3]
-        self.assertEqual(at_three, [st.ArtifactKind.INTEGRATION_MERGE.value])
-        merge = sch._latest(
-            self.store, RUN, "lane-build", st.ArtifactKind.INTEGRATION_MERGE
-        )
-        assert merge is not None
-        self.assertIs(merge.payload["revalidated"], True)
-        # Anchored on the head it was revalidated against, not on its own
-        # candidate: `durable_integration_tip` walks the chain and refuses
-        # "revalidation not anchored" otherwise, and the ref agrees with it.
-        self.assertEqual(merge.payload["before_sha"], merge.payload["after_sha"])
-        self.assertNotEqual(merge.payload["candidate_sha"], merge.payload["after_sha"])
+        with self.assertRaises(RuntimeError):
+            self._scheduler(third).run()
+        self.assertNotEqual(sch.durable_integration_tip(self.store, RUN), head_before)
+        self.assertEqual(self.actor.build_lanes.count("lane-build"), builds)
+        self.assertIn("lane-x", self.actor.build_lanes[-1:])
+        self.assertEqual(_kinds(self.store, "lane-build"), kinds_before)
         self.assertEqual(
             sch.durable_integration_tip(self.store, RUN),
             _git(self.repo, "rev-parse", st.integration_ref(RUN)),

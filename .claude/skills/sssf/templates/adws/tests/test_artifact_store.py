@@ -1492,6 +1492,63 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(self.store.ready_lane_ids(RUN_ID), ("A",))
         del merge_a
 
+    def _amend(self, amended, resets, stamp, integration):
+        self.store.apply_amendment(
+            RUN_ID,
+            1,
+            amended,
+            self._amendment_artifact(
+                amended, resets, stamp, integration_head=integration
+            ),
+            resets,
+        )
+
+    def _lane_artifact_ids(self, lane_id: str) -> list[str]:
+        return [
+            row[0]
+            for row in self.store.conn.execute(
+                "SELECT artifact_id FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+                "ORDER BY sequence",
+                (RUN_ID, lane_id),
+            )
+        ]
+
+    def test_amendment_touching_last_lane_keeps_earlier_lanes_merged(self) -> None:
+        integration = self._merge_both()
+        tip_before = self.store.integration_merge_payloads(RUN_ID)
+        artifacts_a = self._lane_artifact_ids("A")
+        changed_b = make_lane(
+            "B", needs=("A",), outputs=("b.py",), spec=digest_label("spec:B:v2")
+        )
+        amended = make_plan(self.lane_a, changed_b, revision=2, stamp="last")
+        resets = (
+            st.LaneReset("A", st.LaneStage.MERGED, st.LaneStage.MERGED),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.PLANNED),
+        )
+        self._amend(amended, resets, "last", integration)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "A"), st.LaneStage.MERGED)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "B"), st.LaneStage.PLANNED)
+        self.assertEqual(self._lane_artifact_ids("A"), artifacts_a)
+        self.assertEqual(self.store.integration_merge_payloads(RUN_ID)[0], tip_before[0])
+
+    def test_amendment_touching_first_lane_replays_the_lanes_after_it(self) -> None:
+        integration = self._merge_both()
+        changed_a = make_lane("A", spec=digest_label("spec:A:v2"))
+        amended = make_plan(changed_a, self.lane_b, revision=2, stamp="first")
+        keeps_a = (
+            st.LaneReset("A", st.LaneStage.MERGED, st.LaneStage.MERGED),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.TESTS_SEALED),
+        )
+        with self.assertRaises(AmendmentRefused):
+            self._amend(amended, keeps_a, "first-bad", integration)
+        resets = (
+            st.LaneReset("A", st.LaneStage.MERGED, st.LaneStage.PLANNED),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.TESTS_SEALED),
+        )
+        self._amend(amended, resets, "first", integration)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "A"), st.LaneStage.PLANNED)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "B"), st.LaneStage.TESTS_SEALED)
+
     def test_stale_stage_input_when_revision_not_retained(self) -> None:
         self._to_sealed(self.lane_a)
         digest_before = self.store.lane_stage(RUN_ID, "A")
