@@ -403,22 +403,39 @@ class ARestartDispatchReuseTest(unittest.TestCase):
 
             self._assert_second_dispatch(bench, context)
 
-    def test_invalid_or_missing_envelope_dispatches_turn_two(self) -> None:
-        for invalid_envelope in (True, False):
-            with self.subTest(invalid_envelope=invalid_envelope):
-                with tempfile.TemporaryDirectory() as tmp:
-                    bench = _Bench(tmp)
-                    context, _identity = self._first_dispatch(bench)
-                    envelope = self._envelope_path(bench, 1)
-                    if invalid_envelope:
-                        envelope.write_text(
-                            json.dumps({"verdict": "UNDECIDED"}), encoding="utf-8"
-                        )
-                    else:
-                        envelope.unlink()
-                    bench.restart()
+    def test_invalid_envelope_dispatches_turn_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, _identity = self._first_dispatch(bench)
+            self._envelope_path(bench, 1).write_text(
+                json.dumps({"verdict": "UNDECIDED"}), encoding="utf-8"
+            )
+            bench.restart()
 
-                    self._assert_second_dispatch(bench, context)
+            self._assert_second_dispatch(bench, context)
+
+    def test_an_unanswered_identical_turn_is_asked_again_as_the_same_turn(
+        self,
+    ) -> None:
+        # Run 2acd2f5f: turn 3 had no envelope at resume and turn 4 was
+        # allocated for the byte-identical dispatch, so an answer the agent
+        # wrote for turn 3 landed on a path nobody awaited.
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = _Bench(tmp)
+            context, _identity = self._first_dispatch(bench)
+            self._envelope_path(bench, 1).unlink()
+            bench.restart()
+
+            verdict, findings = bench.actor.review_tests(context)
+
+            self.assertIs(verdict, ReviewerVerdict.PASS)
+            self.assertEqual(list(findings), [])
+            self.assertEqual(bench.launcher.launches, 2)
+            self.assertTrue(self._envelope_path(bench, 1).is_file())
+            self.assertFalse(self._envelope_path(bench, 2).exists())
+            self.assertFalse(
+                lch.role_prompt_path(self._envelope_path(bench, 1).parents[2], 2).exists()
+            )
 
 
 class ATesterEnvelopeHarvestSurvivesRestart(unittest.TestCase):
