@@ -58,7 +58,7 @@ Implementation: `adw_modules/run_preflight.py` (the check engine and the checks)
 | `route-receipt:<route>` | `route_receipts.<route>` verifies against the route verify keys and admits the route | when the file is absent: `route_admission.admit_routes` captures it, signed with `keys_dir/route.seed` (read, never created) | unconfigured, no route seed, capture fails, or an existing receipt is invalid (an existing file is never overwritten) |
 | `key:reviewer-hmac` | `keys_dir/reviewer-hmac.key` readable | never | absent (human) |
 | `attend:planctl` | `attend.planctl` exists and is readable | none: no source the runtime can fetch it from | absent or unset |
-| `attend:plan-ir` | the revision's Plan IR (`run attend`'s own copy, else `attend.plan_ir`) exists and parses as JSON | none | absent or unparsable |
+| `attend:plan-ir` | the revision's Plan IR is in attend's planctl root `runtime_state_root/plans/<run>/r<N>/`, parses as JSON, and its `<run>.r<N>.root.json` record names the revision's pinned plan by sha256 | copies the IR found beside the revision's recorded plan artifact (else `attend.plan_ir`), wherever it lives (a hand amendment in `/tmp` included), with every pinned source whose bytes match the IR's sha256, read from the IR's directory and its ancestors, then the run repository | no IR found, unparsable, or a required source no copy matches |
 | `aws:planctl-runner` | `aws sts get-caller-identity --profile planctl-runner` exits 0 | never | expired or missing credentials (human); skipped under `run attend --local` |
 | `gh:auth` | `gh auth status` exits 0 | never | not logged in (human) |
 | `gh:repo-permission` | `gh repo view --json viewerPermission` is TRIAGE, WRITE, MAINTAIN or ADMIN | never | lower (human: grant access) |

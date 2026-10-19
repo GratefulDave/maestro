@@ -559,7 +559,10 @@ def _planctl_fixture(binary: Path, tmp: Path, run_id: str, revision: int) -> tup
     different receipt, so the case fails unless Maestro sets it. The
     fixture's one link points at its own rendered page beside it; a plan's
     links point at repository files, so the link is re-aimed at one, which
-    has nothing to do with Maestro's paths.
+    has nothing to do with Maestro's paths. Its source sits above its own
+    directory (`../schemas/`); a plan cites repository paths, which attend
+    copies into the planctl root it owns, so the source is re-pathed into
+    the repository.
     """
     import shutil
 
@@ -568,10 +571,15 @@ def _planctl_fixture(binary: Path, tmp: Path, run_id: str, revision: int) -> tup
     repo = tmp / "repo"
     (repo / "docs").mkdir(parents=True)
     (repo / "docs" / "target.md").write_text("target\n", encoding="utf-8")
-    (tmp / "schemas").mkdir()
-    shutil.copy(skill / "schemas" / "plan-ir-v1.schema.json", tmp / "schemas")
+    (repo / "schemas").mkdir()
+    shutil.copy(skill / "schemas" / "plan-ir-v1.schema.json", repo / "schemas")
     ir = json.loads((skill / "fixtures" / "valid-plan-ir.json").read_text())
-    ir["links"][0]["href"] = "../repo/docs/target.md"
+    schema = "schemas/plan-ir-v1.schema.json"
+    ir["source_artifacts"][0]["path"] = schema
+    for fixture in ir.get("fixtures") or ():
+        fixture["path"] = schema
+    ir["links"][0]["source_path"] = schema
+    ir["links"][0]["href"] = "../docs/target.md"
     ir["links"][0]["canonical_target"] = "docs/target.md"
     authored = tmp / "out" / "r{0}.ir.json".format(revision)
     authored.parent.mkdir()
