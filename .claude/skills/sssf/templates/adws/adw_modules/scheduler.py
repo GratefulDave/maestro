@@ -33,6 +33,7 @@ from . import scheduler_types as st
 from . import tests_chain as tc
 from . import tree_materialize as tm
 from .lifecycle import (
+    AmendmentAlreadyApplied,
     AmendmentRefused,
     ArtifactRecord,
     ArtifactStore,
@@ -5036,6 +5037,16 @@ def apply_factory_amendment(
     invalidated_inputs: Sequence[Mapping[str, Any]] = (),
 ) -> ArtifactRecord:
     row = run_row(store, run_id)
+    applied = store.conn.execute(
+        "SELECT plan_revision FROM plan_revisions WHERE run_id=? AND plan_digest=?",
+        (run_id, compiled.plan_digest),
+    ).fetchone()
+    if applied is not None:
+        raise AmendmentAlreadyApplied(
+            "plan digest {0} is already revision {1}".format(
+                compiled.plan_digest, applied["plan_revision"]
+            )
+        )
     runtime.revalidate(row["runtime_state_fingerprint"])
     gitpub.revalidate_binding(target)
     locks = OrderedLocks(runtime, row["target_worktree_git_dir"])

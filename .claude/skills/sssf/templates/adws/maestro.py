@@ -51,6 +51,7 @@ from adw_modules import step_log
 from adw_modules import tests_chain as tchain
 from adw_modules import tree_materialize as tm
 from adw_modules.lifecycle import (
+    AmendmentAlreadyApplied,
     ArtifactStore,
     LedgerSchemaUnsupported,
     RunAlreadyExists,
@@ -599,6 +600,9 @@ def _project_identity(target: gitpub.TargetBinding) -> str:
 #: Matches the launcher's own post-launch cancel budget; the lane never waits
 #: on this, because a refusal here is reported rather than raised.
 _SUPERSEDED_CLOSE_SECONDS = 5.0
+
+#: The file in a role's `session` dir naming the turn its live session began at.
+_SESSION_EPOCH_FILE = "session-epoch"
 
 
 class _RoleSession:
@@ -2689,6 +2693,7 @@ class HerdrStageActor:
 
         def session_replaced(reason: str, detail: str) -> None:
             self._say(lane_id, "{0}: fresh {1} session".format(reason, role), detail)
+            self._start_session_epoch(session, turn)
 
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
@@ -2746,12 +2751,32 @@ class HerdrStageActor:
         self._retain_completed(handle, key)
         return payload, handle, cwd_used
 
-    def _session_tokens(self, cwd: Path, session: Path, turns: int) -> int:
-        """Estimated size of one role session: the larger of its transcript and its traffic.
+    @staticmethod
+    def _session_epoch(session: Path) -> int:
+        """First turn of the live session; `1` when it has never been replaced."""
+        try:
+            return max(1, int((session / _SESSION_EPOCH_FILE).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return 1
 
-        The transcript is whatever `*.jsonl` the route keeps in `session`; a
+    @staticmethod
+    def _start_session_epoch(session: Path, turn: int) -> None:
+        """Record that a fresh session begins at `turn`: earlier turns no longer count."""
+        try:
+            (session / _SESSION_EPOCH_FILE).write_text(str(turn), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _session_tokens(self, cwd: Path, session: Path, turns: int) -> tuple[int, int]:
+        """Size of the live role session: (estimated tokens, largest single prompt tokens).
+
+        The tokens are the larger of its transcript and its traffic. The
+        transcript is whatever `*.jsonl` the route keeps in `session` (a
+        replaced session's is moved to `superseded-*`, out of the glob); a
         route that keeps none there is measured by the prompts sent and the
         envelopes returned, which is what the agent has read and written.
+        Traffic counts only the turns since the last replacement, because
+        the turn files outlive the session that read them.
         """
         def size(path: Path) -> int:
             try:
@@ -2760,11 +2785,16 @@ class HerdrStageActor:
                 return 0
 
         transcript = sum(size(path) for path in session.glob("*.jsonl"))
+        live = range(self._session_epoch(session), turns + 1)
         traffic = sum(
             size(lch.role_prompt_path(cwd, turn)) + size(lch.role_result_path(cwd, turn))
-            for turn in range(1, turns + 1)
+            for turn in live
         )
-        return estimate_tokens_for_bytes(max(transcript, traffic))
+        largest = max((size(lch.role_prompt_path(cwd, turn)) for turn in live), default=0)
+        return (
+            estimate_tokens_for_bytes(max(transcript, traffic)),
+            estimate_tokens_for_bytes(largest),
+        )
 
     def _cap_reused_session(
         self,
@@ -2787,8 +2817,11 @@ class HerdrStageActor:
         cap = self.role_session_max_tokens
         if cap <= 0 or turn <= 1:
             return None
-        tokens = self._session_tokens(cwd, session, turn - 1)
-        if tokens <= cap:
+        tokens, prompt_tokens = self._session_tokens(cwd, session, turn - 1)
+        # A session holding one prompt larger than half the cap would be over
+        # it again on every dispatch; replacing it cannot help, so the cap
+        # yields to twice the biggest prompt.
+        if tokens <= max(cap, 2 * prompt_tokens):
             return None
         lane_id = ctx.lane.lane_id
         self._say(
@@ -2803,6 +2836,7 @@ class HerdrStageActor:
             except Exception as exc:
                 self._say(lane_id, "{0} session close refused".format(role), str(exc))
         self._roles.pop(key, None)
+        self._start_session_epoch(session, turn)
         transcripts = sorted(session.glob("*.jsonl"))
         if transcripts:
             aside = session / "superseded-{0}".format(time.time_ns())
@@ -4861,13 +4895,37 @@ def _run_amend(args: argparse.Namespace) -> int:
                 revision=row["plan_revision"] + 1,
                 ref=str(Path(args.plan).resolve()),
             )
-            apply_factory_amendment(
-                store,
-                run_id,
-                compiled,
-                runtime=runtime,
-                target=target,
-            )
+            try:
+                apply_factory_amendment(
+                    store,
+                    run_id,
+                    compiled,
+                    runtime=runtime,
+                    target=target,
+                )
+            except AmendmentAlreadyApplied as already:
+                gitpub.revalidate_binding(target)
+                current = FactoryScheduler(
+                    store,
+                    run_id,
+                    _actor_for(runtime, layout, target, run_id, _previous),
+                    runtime,
+                    target,
+                    compiled=_previous,
+                    max_probe_rounds=_max_probe_rounds(layout),
+                ).status()
+                print(
+                    json.dumps(
+                        {
+                            "detail": str(already),
+                            "outcome": "AMENDMENT_ALREADY_APPLIED",
+                            "run_id": run_id,
+                            "status": current.value,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
             _pin_plan_artifact(
                 Path(args.plan),
                 _pinned_plan_artifact(runtime, run_id, row["plan_revision"] + 1),

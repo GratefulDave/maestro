@@ -63,7 +63,7 @@ class MaxProbeRoundsConfigTest(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "FactoryScheduler"
         ]
-        self.assertEqual(len(sites), 5)
+        self.assertEqual(len(sites), 6)
         for node in sites:
             keywords = {item.arg: item.value for item in node.keywords}
             self.assertIn("max_probe_rounds", keywords, "line {0}".format(node.lineno))
