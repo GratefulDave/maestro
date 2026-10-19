@@ -3827,6 +3827,8 @@ class _RunPreflight:
         attend: bool,
         local: bool = False,
         plan_ir: Optional[Path] = None,
+        plan_ir_current: Optional[Callable[[], Tuple[bool, str]]] = None,
+        plan_ir_supply: Optional[Callable[[], str]] = None,
         runner: rp.Runner = rp.real_runner,
         which: Callable[[str], Optional[str]] = shutil.which,
         file_issue: Optional[Callable[[str, str], Mapping[str, str]]] = None,
@@ -3841,6 +3843,8 @@ class _RunPreflight:
         self.attend = attend
         self.local = local
         self.plan_ir = plan_ir
+        self.plan_ir_current = plan_ir_current
+        self.plan_ir_supply = plan_ir_supply
         self.runner = runner
         self.which = which
         self.repo = Path(target.target_repository_root)
@@ -4018,11 +4022,7 @@ class _RunPreflight:
                 "set attend.planctl to the plan-contract validator; there is no "
                 "source the runtime can fetch it from",
             ),
-            rp.readable_file_check(
-                "attend:plan-ir", self.plan_ir,
-                "set attend.plan_ir to the Plan IR this revision was projected from",
-                parse=json.loads,
-            ),
+            self._plan_ir_check(),
         ]
         if self.local:
             checks.append(
@@ -4053,6 +4053,21 @@ class _RunPreflight:
             )
         )
         return checks
+
+    def _plan_ir_check(self) -> rp.Check:
+        """The revision's IR, in the planctl root attend owns, recorded.
+
+        Supplied when absent: an IR attend did not write (`attend.plan_ir`,
+        or a hand amendment's, which may sit in `/tmp`) is copied with its
+        sources into the revision's root under `runtime_state_root`.
+        """
+        remedy = "set attend.plan_ir to the Plan IR this revision was projected from"
+        check = rp.readable_file_check("attend:plan-ir", self.plan_ir, remedy, parse=json.loads)
+        if self.plan_ir_current is None:
+            return check
+        return rp.Check(
+            "attend:plan-ir", self.plan_ir_current, remedy, provision=self.plan_ir_supply
+        )
 
     def run_wide(self) -> None:
         provisioning.set_tree_packages(())
@@ -5010,7 +5025,8 @@ def _run_planctl(
     Exit 1 is planctl's verdict about the revision (`ATTEND_REVISION_REFUSED`).
     Any other failure -- an interpreter that cannot start, a signal, the
     interpreter's own exit 2 for a script it cannot open, planctl's exit 3
-    for its own harness (remote runner, uncaught crash) -- said nothing about
+    for its own harness (remote runner, uncaught crash, a `--repo-root` that
+    does not contain the IR) -- said nothing about
     the revision and is `ATTEND_PLANCTL_FAILED`, which attend contains.
     """
     environment = dict(os.environ)
@@ -5128,6 +5144,178 @@ def _attend_plan_ir(
         "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
         "({2})".format(revision, written, policy.plan_ir or "unset"),
     )
+
+
+def _attend_root(runtime: Any, run_id: str, revision: int) -> Path:
+    """The planctl root attend owns for one revision, under `runtime_state_root`.
+
+    The revision's IR, everything planctl writes beside it, and a copy of
+    every pinned source the IR cites live here, and attend passes this
+    directory as `--repo-root`. It is the directory the revision's pinned
+    plan artifact already lives in, so it is a function of the run and the
+    revision and never of where some earlier IR happened to be written: on
+    run 2acd2f5f the r6 IR was written next to a hand amendment's r5 IR in
+    `/tmp`, outside the `--repo-root` attend passed, and planctl refused it.
+    """
+    return _pinned_plan_artifact(runtime, run_id, revision).parent
+
+
+def _attend_owned_ir(runtime: Any, run_id: str, revision: int) -> Path:
+    return _attend_root(runtime, run_id, revision) / "{0}.r{1}.ir.json".format(
+        run_id, int(revision)
+    )
+
+
+def _attend_root_record(runtime: Any, run_id: str, revision: int) -> Path:
+    """Which plan the owned IR is the IR of, by the pinned plan's sha256.
+
+    Without it an IR a refused attempt left in the root would read as the
+    revision's own once a hand amendment applied that revision number.
+    """
+    return _attend_root(runtime, run_id, revision) / "{0}.r{1}.root.json".format(
+        run_id, int(revision)
+    )
+
+
+def _attend_record_root(runtime: Any, run_id: str, revision: int) -> None:
+    ir = _attend_owned_ir(runtime, run_id, revision)
+    pinned = _pinned_plan_artifact(runtime, run_id, revision)
+    _attend_root_record(runtime, run_id, revision).write_text(
+        json.dumps(
+            {
+                "plan_revision": int(revision),
+                "repo_root": str(ir.parent),
+                "ir": ir.name,
+                "ir_sha256": hashlib.sha256(ir.read_bytes()).hexdigest(),
+                "plan_sha256": hashlib.sha256(pinned.read_bytes()).hexdigest(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _attend_root_current(runtime: Any, run_id: str, revision: int) -> tuple[bool, str]:
+    """The owned IR exists and its record names the revision's pinned plan."""
+    ir = _attend_owned_ir(runtime, run_id, revision)
+    record_path = _attend_root_record(runtime, run_id, revision)
+    pinned = _pinned_plan_artifact(runtime, run_id, revision)
+    if not ir.is_file() or not record_path.is_file():
+        return False, "{0} is not recorded".format(ir)
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    if not pinned.is_file() or record.get("plan_sha256") != hashlib.sha256(
+        pinned.read_bytes()
+    ).hexdigest():
+        return False, "{0} records another plan than {1}".format(record_path, pinned)
+    if record.get("ir_sha256") != hashlib.sha256(ir.read_bytes()).hexdigest():
+        return False, "{0} changed after it was recorded".format(ir)
+    json.loads(ir.read_bytes())
+    return True, str(ir)
+
+
+def _attend_copy_sources(
+    document: Mapping[str, Any], root: Path, bases: Sequence[Path]
+) -> list[str]:
+    """Copy the IR's pinned sources and link targets into `root`.
+
+    A source is taken from the first base whose bytes match the sha256 the
+    IR declares, so a base is somewhere to find bytes and never an authority
+    over them. An absolute path is read by planctl where it is and copied
+    nowhere. Returns the required sources no base holds; planctl names
+    them itself when the caller lets it run.
+    """
+    resolved_root = root.resolve()
+
+    def destination(raw: Any) -> Optional[Path]:
+        if not isinstance(raw, str) or not raw or os.path.isabs(raw):
+            return None
+        target = (root / raw).resolve()
+        if not target.is_relative_to(resolved_root):
+            raise att.AttendRefused(
+                att.PLANCTL_FAILED,
+                "source path {0} escapes the planctl root {1} attend lays "
+                "out".format(raw, root),
+            )
+        return target
+
+    def place(target: Path, data: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        scratch = target.with_name(target.name + ".tmp")
+        scratch.write_bytes(data)
+        scratch.replace(target)
+
+    missing = []
+    for source in document.get("source_artifacts") or ():
+        if not isinstance(source, Mapping):
+            continue
+        raw = source.get("path")
+        target = destination(raw)
+        if target is None:
+            continue
+        for base in bases:
+            candidate = Path(base) / raw
+            if not candidate.is_file():
+                continue
+            data = candidate.read_bytes()
+            if hashlib.sha256(data).hexdigest() == source.get("sha256"):
+                if candidate.resolve() != target:
+                    place(target, data)
+                break
+        else:
+            if source.get("required"):
+                missing.append(str(raw))
+    for link in document.get("links") or ():
+        if not isinstance(link, Mapping):
+            continue
+        raw = link.get("canonical_target")
+        target = destination(raw)
+        if target is None or target.is_file():
+            continue
+        for base in bases:
+            candidate = Path(base) / raw
+            if candidate.is_file():
+                place(target, candidate.read_bytes())
+                break
+    return missing
+
+
+def _attend_supply_root(
+    policy: att.AttendPolicy,
+    runtime: Any,
+    store: ArtifactStore,
+    repo: Path,
+    run_id: str,
+    revision: int,
+) -> str:
+    """Lay out the owned root of a revision attend did not write itself.
+
+    The IR is found where `_attend_plan_ir` always looked -- beside the
+    revision's recorded plan artifact, then `attend.plan_ir` -- and copied
+    in with its sources, which are read from that IR's directory and its
+    ancestors (planctl's root contains its IR) and then the run repository.
+    """
+    legacy = Path(plan_artifact_ref_for(store, run_id, revision)).resolve().parent
+    found = _attend_plan_ir(policy, legacy, run_id, revision)
+    data = found.read_bytes()
+    document = json.loads(data)
+    if not isinstance(document, dict):
+        raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, "{0} is not an object".format(found))
+    owned = _attend_owned_ir(runtime, run_id, revision)
+    owned.parent.mkdir(parents=True, exist_ok=True)
+    bases = [found.resolve().parent, *found.resolve().parent.parents, repo]
+    missing = _attend_copy_sources(document, owned.parent, bases)
+    if missing:
+        raise att.AttendRefused(
+            att.PLAN_IR_UNRESOLVED,
+            "no copy of required sources {0} with the sha256 {1} declares".format(
+                ", ".join(missing), found
+            ),
+        )
+    owned.write_bytes(data)
+    _attend_record_root(runtime, run_id, revision)
+    return "copied {0} and its sources into {1}".format(found, owned.parent)
 
 
 def _attend_final_review(
@@ -5398,15 +5586,18 @@ def _attend_project(
     revision: int,
     review_findings: Sequence[Any],
     local: bool = False,
+    bases: Optional[Sequence[Path]] = None,
 ) -> tuple[st.CompiledPlan, Path]:
     """Validate, approve, project and compile one reviewed revision.
 
     The same four steps the human ran by hand on an earlier run, in the same
     order and against the same binary. `revision_bytes` are exactly the bytes
-    the reviewer passed. They are written under the plans directory first
-    because `planctl --repo-root` refuses an IR outside the root it is told
-    to resolve sources against, and because a revision that is applied has
-    to survive the operator agent's scratch tree.
+    the reviewer passed. They are written into `plans_dir`, the revision's
+    own planctl root (`_attend_root`), with the sources they cite copied in
+    from `bases` (default: the run repository), and `plans_dir` is the
+    `--repo-root` every planctl step is given: planctl refuses an IR outside
+    its root, and a revision that is applied has to survive the operator
+    agent's scratch tree.
 
     `approval.receipt_path` is where planctl requires the receipt to be
     written, relative to the IR. Where Maestro writes the receipt is
@@ -5449,8 +5640,9 @@ def _attend_project(
     if not isinstance(approval, dict):
         approval = {}
     document["approval"] = {**approval, "receipt_path": receipt.name}
+    _attend_copy_sources(document, plans_dir, (repo,) if bases is None else bases)
     ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    root = ["--repo-root", str(repo)]
+    root = ["--repo-root", str(plans_dir)]
     _write_review_findings(binary, ir, findings, policy, review_findings)
     _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
@@ -5540,8 +5732,6 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     )
     session_id = uuid.uuid4().hex
     repo = Path(row["target_repository_root"])
-    plans_dir = Path(plan_artifact_ref_for(store, run_id, row["plan_revision"]))
-    plans_dir = plans_dir.resolve().parent
     console = step_log.RunReporter(run_id, runtime.path)
     state: dict[str, Any] = {"passes": 0}
 
@@ -5553,16 +5743,15 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             # Once per invocation, before the first dispatch: a later pass
             # runs after an amendment this session applied, in the same
             # environment the first pass already proved.
-            try:
-                plan_ir: Optional[Path] = _attend_plan_ir(
-                    policy, plans_dir, run_id, plan.plan_revision
-                )
-            except att.AttendRefused:
-                plan_ir = None
+            revision = plan.plan_revision
             preflight = _RunPreflight(
                 layout, runtime, store, run_id, target, console,
                 verb=verb, attend=True, local=bool(getattr(args, "local", False)),
-                plan_ir=plan_ir,
+                plan_ir=_attend_owned_ir(runtime, run_id, revision),
+                plan_ir_current=lambda: _attend_root_current(runtime, run_id, revision),
+                plan_ir_supply=lambda: _attend_supply_root(
+                    policy, runtime, store, repo, run_id, revision
+                ),
             )
             preflight.run_wide()
             actor = preflight.actor_for(plan)
@@ -5610,6 +5799,9 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
         reviewer_findings: Sequence[Mapping[str, Any]],
         previous_revision: str,
     ) -> att.OperatorRequest:
+        current, detail = _attend_root_current(runtime, run_id, plan.plan_revision)
+        if not current:
+            raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, detail)
         return _attend_request(
             store,
             runtime,
@@ -5617,7 +5809,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             run_id,
             parked,
             plan,
-            _attend_plan_ir(policy, plans_dir, run_id, plan.plan_revision),
+            _attend_owned_ir(runtime, run_id, plan.plan_revision),
             role_cwd_for(parked[0][0], "operator"),
             review_round,
             reviewer_findings,
@@ -5690,9 +5882,13 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
     def project(
         revision_bytes: bytes, revision: int, review_findings: list
     ) -> st.CompiledPlan:
+        # Sources come from the root of the revision this one amends, which
+        # preflight or this session's last apply recorded, then the repo.
         plan, plan_out = _attend_project(
-            policy, layout, repo, plans_dir, run_id, revision_bytes, revision,
-            review_findings, local=bool(getattr(args, "local", False)),
+            policy, layout, repo, _attend_root(runtime, run_id, revision), run_id,
+            revision_bytes, revision, review_findings,
+            local=bool(getattr(args, "local", False)),
+            bases=(_attend_root(runtime, run_id, revision - 1), repo),
         )
         state["plan_path"] = plan_out
         return plan
@@ -5705,6 +5901,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
             Path(state["plan_path"]),
             _pinned_plan_artifact(runtime, run_id, plan.plan_revision),
         )
+        _attend_record_root(runtime, run_id, plan.plan_revision)
         return record
 
     started = now_iso()
@@ -5755,7 +5952,8 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
                     file_issue=lambda title, body: _attend_file_issue(
                         repo, title, body
                     ),
-                    deviations_path=plans_dir / "{0}.deviations.md".format(run_id),
+                    deviations_path=runtime.path / "plans" / run_id
+                    / "{0}.deviations.md".format(run_id),
                     say=console.step,
                 )
                 status = outcome.status
