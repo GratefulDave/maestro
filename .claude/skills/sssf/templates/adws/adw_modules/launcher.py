@@ -2556,6 +2556,9 @@ def prompt_submission_marks(
     turn's record the instant a new prompt was offered -- the same stale-proof
     failure the pane revision has, one artifact over.  Callers snapshot the
     count before offering and require it to rise.
+
+    Counted over the transcript's whole family (`transcript_family`), because
+    the file Herdr names is not always the one the agent is writing.
     """
     transcript = handle.transcript_path
     if transcript is None:
@@ -2564,16 +2567,20 @@ def prompt_submission_marks(
     if chunk_size < len(marker):
         chunk_size = len(marker)
     total = 0
-    overlap = b""
     try:
-        with Path(transcript).open("rb") as source:
-            while True:
-                chunk = source.read(chunk_size)
-                if not chunk:
-                    return total
-                window = overlap + chunk
-                total += window.count(marker)
-                overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+        for path in transcript_family(Path(transcript)):
+            overlap = b""
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(chunk_size)
+                    if not chunk:
+                        break
+                    window = overlap + chunk
+                    total += window.count(marker)
+                    overlap = (
+                        window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+                    )
+        return total
     except OSError as exc:
         # The count so far is a floor, not the count. Callers comparing counts
         # must know the scan aborted — see `_rising_submission_record`, where
@@ -2582,6 +2589,31 @@ def prompt_submission_marks(
         if on_error is not None:
             on_error(exc)
         return total
+
+
+def transcript_family(transcript: Path) -> List[Path]:
+    """The reported transcript first, then every other `*.jsonl` beside it.
+
+    An agent can start a new session file in the same directory while Herdr
+    keeps reporting the first one. Run 2acd2f5f: an omp code reviewer wrote
+    turns 3 and 4 into `…21-27-01….jsonl` while `agent get` still named
+    `…20-00-08….jsonl`, last written an hour earlier. Every count over the
+    reported file stayed 0, so each offer read as unproven, the idle agent
+    read as never having received its prompt, and a prompt it had answered
+    -- envelope written -- was sent three times and refused
+    `DISPATCH_NOT_CONSUMED`. The directory is the role's own session
+    directory (or, for Claude, its own checkout's project directory), so a
+    sibling file is this agent's, and a replaced session is moved out of it.
+    """
+    try:
+        siblings = sorted(
+            path
+            for path in transcript.parent.glob("*.jsonl")
+            if path != transcript and path.is_file()
+        )
+    except OSError:
+        siblings = []
+    return [transcript, *siblings]
 
 
 def _rising_submission_record(
@@ -5188,7 +5220,15 @@ class HerdrLauncher:
         names the prompt path, and the path is on no line of the pane. A turn
         that started leaves at least one of those, and a missing or unreadable
         observation is never a True.
+
+        An envelope at this dispatch's own path outranks all three: it is the
+        turn's answer, so the prompt reached the agent. A re-sent prompt the
+        agent answers by pointing at the result it already wrote is consumed,
+        and the waiter harvests that result.
         """
+        envelope = handle.envelope_path
+        if envelope is not None and Path(envelope).is_file():
+            return False
         try:
             if self._agent_transcript_bound(handle) != "idle":
                 return False
@@ -5223,7 +5263,10 @@ class HerdrLauncher:
         size = -1
         if handle.transcript_path is not None:
             try:
-                size = Path(handle.transcript_path).stat().st_size
+                size = sum(
+                    path.stat().st_size
+                    for path in transcript_family(Path(handle.transcript_path))
+                )
             except OSError:
                 size = -1
         return status, size
@@ -5744,6 +5787,12 @@ class HerdrLauncher:
         try:
             self._submit_resubmission(handle, prompt, timeout_s)
         except (PromptNotSubmitted, PromptSubmissionUnobservable) as exc:
+            # The turn's own envelope outranks the submission proof, exactly
+            # as it does in `launch`: an answer written while the proof was
+            # still being read is a consumed prompt.
+            if handle.envelope_path is not None and Path(handle.envelope_path).is_file():
+                self._clear_quiescence(handle.correlation_token)
+                return handle
             # A failed correction submission must leave through the lane's
             # declared refusal type rather than as a bare RuntimeError nobody
             # catches.

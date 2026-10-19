@@ -2652,13 +2652,21 @@ class HerdrStageActor:
         def identity_path_for(identity_turn: int) -> Path:
             return session / "identity-{}.json".format(identity_turn)
 
-        def harvested_payload(identity_turn: int) -> Mapping[str, Any] | None:
+        def same_dispatch(identity_turn: int) -> bool:
             try:
                 persisted_identity = json.loads(
                     _read_regular_text_under(
                         session, identity_path_for(identity_turn)
                     )
                 )
+            except (FactoryRefused, OSError, UnicodeError, ValueError):
+                return False
+            return persisted_identity == dispatch_identity
+
+        def harvested_payload(identity_turn: int) -> Mapping[str, Any] | None:
+            if not same_dispatch(identity_turn):
+                return None
+            try:
                 payload = json.loads(
                     _read_regular_text_under(
                         cwd, lch.role_result_path(cwd, identity_turn)
@@ -2666,7 +2674,7 @@ class HerdrStageActor:
                 )
             except (FactoryRefused, OSError, UnicodeError, ValueError):
                 return None
-            if persisted_identity != dispatch_identity or not isinstance(payload, dict):
+            if not isinstance(payload, dict):
                 return None
             if not self._payload_ok(role, payload):
                 return None
@@ -2710,6 +2718,19 @@ class HerdrStageActor:
                 if handle is not None:
                     self._retain_completed(handle, key)
                 return payload, handle, cwd
+            # The same dispatch, sent and not yet answered: it is still that
+            # turn, so it is asked again under that turn's number. Run
+            # 2acd2f5f resumed a code reviewer whose turn 3 had no envelope
+            # and allocated turn 4 with byte-identical identity; an agent that
+            # finishes turn 3 after a resume writes `envelope-3`, which a
+            # waiter on `envelope-4` never reads. Re-sending prompt 3 puts any
+            # answer -- the one in flight, or a reply pointing at it -- on the
+            # path being awaited.
+            if (
+                not lch.role_result_path(cwd, highest_existing_turn).exists()
+                and same_dispatch(highest_existing_turn)
+            ):
+                turn = highest_existing_turn
         prompt_extra: Mapping[str, Any] = extra
         handoff = self._cap_reused_session(ctx, role, key, stored, cwd, session, turn)
         if handoff is not None:

@@ -45,6 +45,9 @@ class _Herdr:
         self.screen = '/remote-control is active\n> Try "fix lint errors"\n'
         self.landed = False
         self.sends = 0
+        # A fast turn: the agent answers and is `idle` again, and its pane
+        # shows the mention without the path, before the proof is read.
+        self.answers_at_once = False
 
     def __call__(self, *args: Any, **kwargs: Any) -> dict:
         del kwargs
@@ -58,8 +61,11 @@ class _Herdr:
                 self.screen = "> " + str(args[3]) + "\n"
         elif verb in (("pane", "send-keys"), ("agent", "send-keys")):
             if args[3] == "enter" and self.landed and self.status == "idle":
-                self.status = "working"
-                self.screen = "> @{0}\n  working\n".format(self.prompt)
+                if self.answers_at_once:
+                    self.screen = "> \n"
+                else:
+                    self.status = "working"
+                    self.screen = "> @{0}\n  working\n".format(self.prompt)
                 with self.transcript.open("a", encoding="utf-8") as out:
                     out.write(
                         json.dumps({"type": "user", "text": "@{0}".format(self.prompt)})
@@ -172,6 +178,71 @@ class DeliveryProofTests(unittest.TestCase):
                 launcher.resubmit(pane.handle, pane.prompt)
         self.assertIs(ctx.exception.refusal, lch.LaunchRefusal.DISPATCH_NOT_CONSUMED)
         self.assertTrue(ctx.exception.pane_created)
+
+
+class AnsweredDispatchTests(unittest.TestCase):
+    """Run 2acd2f5f, lane-spend-build code reviewer (omp).
+
+    The agent wrote turns 3 and 4 into a second session file in its session
+    directory while Herdr kept naming the first. Each prompt-4 send landed --
+    the agent wrote `envelope-4.json`, then answered the re-sends with "This
+    exact prompt and candidate were already reviewed" -- and the dispatch was
+    refused `DISPATCH_NOT_CONSUMED ... after 3 sends`.
+    """
+
+    def _rotated(self, drop: int) -> _Pane:
+        pane = _Pane(drop)
+        self.addCleanup(pane.close)
+        # Herdr's record still names the first file; the agent writes here.
+        pane.herdr.transcript = pane.transcript.with_name("rotated.jsonl")
+        pane.herdr.transcript.write_text('{"type": "session"}\n', encoding="utf-8")
+        # omp renders a mention without the path, so the pane never shows it.
+        pane.herdr.screen = "> \n"
+        pane.herdr.answers_at_once = True
+        return pane
+
+    def test_a_prompt_recorded_in_a_rotated_transcript_is_consumed_once(self) -> None:
+        pane = self._rotated(drop=0)
+        pane.submit()
+        self.assertEqual(pane.herdr.sends, 1)
+
+    def test_a_dispatch_whose_envelope_exists_is_never_called_lost(self) -> None:
+        pane = self._rotated(drop=99)
+        envelope = Path(pane.handle.launched_cwd) / "results" / "envelope-4.json"
+        envelope.parent.mkdir(parents=True)
+        envelope.write_text('{"verdict": "REVISE", "findings": []}', encoding="utf-8")
+        object.__setattr__(pane.handle, "envelope_path", envelope)
+        self.assertFalse(pane.launcher.prompt_delivery_lost(pane.handle, pane.prompt))
+        # A send the agent answers only by pointing at that envelope: consumed.
+        pane.submit()
+        self.assertEqual(pane.herdr.sends, 1)
+
+    def test_a_resubmission_whose_envelope_appeared_is_returned(self) -> None:
+        pane = self._rotated(drop=0)
+        envelope = Path(pane.handle.launched_cwd) / "results" / "envelope-4.json"
+        envelope.parent.mkdir(parents=True)
+        envelope.write_text('{"verdict": "PASS", "findings": []}', encoding="utf-8")
+        launcher = pane.launcher
+        launcher._clear_quiescence = lambda _t: None  # type: ignore[method-assign]
+        with mock.patch.object(
+            launcher, "_verified_handle_binding", lambda _h: None
+        ), mock.patch.object(
+            lch, "wait_for_interactive_agent", lambda *_a, **_k: None
+        ), mock.patch.object(
+            launcher,
+            "_submit_resubmission",
+            side_effect=lch.DispatchNotConsumed("DISPATCH_NOT_CONSUMED:x"),
+        ):
+            handle = launcher.resubmit(
+                pane.handle, pane.prompt, envelope_path=envelope
+            )
+        self.assertIs(handle, pane.handle)
+
+    def test_a_dropped_prompt_with_a_rotated_transcript_is_still_refused(self) -> None:
+        pane = self._rotated(drop=99)
+        with self.assertRaises(lch.DispatchNotConsumed):
+            pane.submit()
+        self.assertEqual(pane.herdr.sends, lch.PROMPT_RESENDS + 1)
 
 
 class IdleWaitBoundTests(unittest.TestCase):
