@@ -925,6 +925,44 @@ def _base_head(
     return parents[0]
 
 
+def _zero_delta_inputs_unchanged(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    lane: st.LaneProjection,
+    producer: ArtifactRecord,
+    base_head: str,
+    integration_head: str,
+) -> bool:
+    """Whether a zero-delta candidate's inputs hold the same bytes at the head.
+
+    The inputs are the lane's declared outputs and those of every lane in its
+    `needs` closure -- its own code, its accepted suite (a typed build lane's
+    tests lane owns it), and every module that code builds on. Compared at
+    `base_head` and the integration head by content, never by SHA: an
+    amendment re-merges every retained lane, which moves the head's SHA and
+    leaves those bytes where they were. A changed candidate, or one whose
+    head has not moved, does not ask the question.
+    """
+    if bool(producer.payload.get("changed", True)) or base_head == integration_head:
+        return False
+    lanes = {item.lane_id: item for item in store.active_projection(run_id)}
+    paths = set(lane.declared_outputs)
+    pending = list(lane.needs)
+    seen: set[str] = set()
+    while pending:
+        dep = pending.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        needed = lanes.get(dep)
+        if needed is None:
+            return False
+        paths.update(needed.declared_outputs)
+        pending.extend(needed.needs)
+    return gitpub.paths_unchanged(target, base_head, integration_head, paths)
+
+
 ACCEPTED_TESTS_COMMIT_MESSAGE = b"maestro accepted tests\n"
 
 
@@ -976,12 +1014,16 @@ def _explain_ahead_merge(
     if builder is None or review is None:
         return None
     try:
+        base_head = _base_head(target, lane, builder.payload["builder_base_sha"])
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=ledger_tip,
-            base_head=_base_head(target, lane, builder.payload["builder_base_sha"]),
+            base_head=base_head,
+            inputs_unchanged=_zero_delta_inputs_unchanged(
+                store, target, run_id, lane, builder, base_head, ledger_tip
+            ),
         )
     except (gitpub.GitPublicationRefused, FactoryRefused):
         return None
@@ -4560,12 +4602,16 @@ class FactoryScheduler:
         if builder is None or review is None:
             raise FactoryRefused("missing READY_TO_MERGE inputs")
         head = self._integration_head()
+        base_head = _base_head(self.target, lane, builder.payload["builder_base_sha"])
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=head,
-            base_head=_base_head(self.target, lane, builder.payload["builder_base_sha"]),
+            base_head=base_head,
+            inputs_unchanged=_zero_delta_inputs_unchanged(
+                self.store, self.target, self.run_id, lane, builder, base_head, head
+            ),
         )
         if decision.action == "BASE_INVALIDATION":
             digest = st.base_invalidation_input_digest(
@@ -4645,6 +4691,7 @@ class FactoryScheduler:
                 builder_base_sha=builder.payload["builder_base_sha"],
                 candidate_ref=builder.payload["candidate_ref"],
                 candidate_sha=builder.payload["candidate_sha"],
+                integration_head=head,
                 input_digest=digest,
             )
         else:

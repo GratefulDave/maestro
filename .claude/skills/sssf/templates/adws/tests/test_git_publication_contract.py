@@ -495,6 +495,7 @@ class GitPublicationContract(unittest.TestCase):
             builder_base_sha=self.base,
             candidate_ref="refs/maestro/candidates/run1/laneA/" + self.digest,
             candidate_sha=self.base,
+            integration_head=self.base,
             input_digest=self.digest,
         )
         self.assertTrue(payload["revalidated"])

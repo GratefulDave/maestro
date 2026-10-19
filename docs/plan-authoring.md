@@ -583,8 +583,9 @@ returns the lane to `BUILDING` from the accepted suite, the findings and the fai
 
 Two consequences for authoring. First, write the instruction so it reads correctly a second time,
 against a tree that already contains a partial answer. Second, if a sibling lane has merged, a
-zero-delta or stale-base candidate is handled by `BASE_INVALIDATION` back to `BUILDING` from the
-new integration HEAD — not by salvaging a dirty worktree.
+zero-delta candidate whose declared inputs changed under it is handled by `BASE_INVALIDATION`
+back to `BUILDING` from the new integration HEAD — not by salvaging a dirty worktree. One whose
+inputs are byte-identical at the new HEAD is revalidated there and does not rebuild.
 
 Process death restarts the current incomplete stage from its last immutable artifact. `run resume`
 does not adopt a live session.
