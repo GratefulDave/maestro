@@ -2346,8 +2346,22 @@ class OwnershipMatrixTest(unittest.TestCase):
 
     # -- stable agent ------------------------------------------------------------
 
-    def test_idle_and_working_agents_are_adopted_blocked_and_unknown_refuse(self) -> None:
-        for status, adopted in (("idle", True), ("working", True), ("done", True), ("blocked", False), ("unknown", False)):
+    def test_working_agent_from_a_dead_launcher_is_replaced_not_adopted(self) -> None:
+        # Its turn belongs to a scheduler that no longer exists; resubmitting
+        # into it waits on, or interrupts, work nothing will read.
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            tester = run.spec(TESTS_LANE, "tester")
+            first = _launch(run.launcher(), run.herdr, tester)
+            run.herdr.set_agent_status(first.agent_name, "working")
+            mark = len(run.herdr.calls)
+            again = _launch(run.launcher(), run.herdr, tester)
+            self.assertNotEqual(again.pane_id, first.pane_id)
+            self.assertIn(first.pane_id, run.herdr.closed_panes)
+            self.assertEqual(len(_calls_after(run.herdr, mark, START)), 1)
+
+    def test_idle_and_done_agents_are_adopted_blocked_and_unknown_refuse(self) -> None:
+        for status, adopted in (("idle", True), ("done", True), ("blocked", False), ("unknown", False)):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 run = _RunFixture(tmp)
                 tester = run.spec(TESTS_LANE, "tester")
