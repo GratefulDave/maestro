@@ -20,6 +20,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from types import SimpleNamespace
+from unittest import mock
 
 import maestro
 from adw_modules import launcher as lch
@@ -31,7 +32,9 @@ from tests.test_herdr_workspace_topology import (
     TESTS_LANE,
     _RunFixture,
     _checkout,
+    _drive,
     _launch,
+    _launch_patches,
     _launcher,
     _place,
     _spec,
@@ -39,6 +42,9 @@ from tests.test_herdr_workspace_topology import (
 
 OLD = "a" * 64
 NEW = "b" * 64
+
+#: Captured before any test patches it: `_launch_patches` stubs the wait.
+_REAL_READINESS_WAIT = lch.wait_for_interactive_agent
 
 
 def _role_spec(
@@ -336,6 +342,62 @@ class OrphanedTurnTest(unittest.TestCase):
         self.assertIn(original.pane_id, run.herdr.closed_panes)
         self.assertNotEqual(relaunched.pane_id, original.pane_id)
         self.assertEqual(self.replaced, [lch.SESSION_TURN_ORPHANED])
+
+
+class BusyRetainedSessionTest(unittest.TestCase):
+    """A retained session still busy at the next dispatch is replaced.
+
+    A Claude tester declared its draft; minutes later a background-task
+    notification woke it into a turn of its own, and the next dispatch's
+    readiness wait refused PROMPT_SUBMISSION_REFUSED:AGENT_INTERACTIVE_READY_
+    TIMEOUT, parking a healthy lane LANE_FAULT. That turn has no reader.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.replaced: list = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def relaunch(self, launcher: lch.HerdrLauncher, spec: lch.LaunchSpec) -> lch.LaunchHandle:
+        """The next dispatch, under the real readiness wait."""
+        with _launch_patches(), mock.patch.object(
+            lch, "wait_for_interactive_agent", _REAL_READINESS_WAIT
+        ):
+            return _drive(launcher, spec)
+
+    def run_spec(self, run: _RunFixture, role: str) -> lch.LaunchSpec:
+        lane = TESTS_LANE if role in ("tester", "test-reviewer") else BUILD_LANE
+        return replace(
+            run.spec(lane, role),
+            on_session_replaced=lambda reason, detail: self.replaced.append(reason),
+        )
+
+    def test_a_busy_retained_session_is_replaced_not_refused(self) -> None:
+        for role in ("tester", "test-reviewer", "builder", "code-reviewer", "operator"):
+            with self.subTest(role):
+                self.replaced.clear()
+                run = _RunFixture(tempfile.mkdtemp(dir=self.tmp.name))
+                launcher = run.launcher()
+                spec = self.run_spec(run, role)
+                original = _launch(launcher, run.herdr, spec)
+                run.herdr.set_agent_status(original.agent_name, "working")
+                relaunched = self.relaunch(launcher, spec)
+                self.assertIn(original.pane_id, run.herdr.closed_panes)
+                self.assertNotEqual(relaunched.pane_id, original.pane_id)
+                self.assertEqual(self.replaced, [lch.SESSION_BUSY])
+
+    def test_a_settled_retained_session_is_reused(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        launcher = run.launcher()
+        spec = self.run_spec(run, "tester")
+        original = _launch(launcher, run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "idle")
+        again = self.relaunch(launcher, spec)
+        self.assertEqual(again.pane_id, original.pane_id)
+        self.assertNotIn(original.pane_id, run.herdr.closed_panes)
+        self.assertEqual(self.replaced, [])
 
 
 class OmpSessionDirTest(unittest.TestCase):

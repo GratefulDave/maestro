@@ -924,6 +924,11 @@ SESSION_UNRECORDED = "SESSION_UNRECORDED"
 #: dispatched. Nothing in this process will read that turn, and a prompt
 #: resubmitted into it waits on, or interrupts, work nobody owns.
 SESSION_TURN_ORPHANED = "SESSION_TURN_ORPHANED"
+#: A retained agent whose dispatched turn already declared is still not
+#: interactive at the next dispatch's bounded readiness wait -- it started a
+#: turn of its own (a background-task notification wakes Claude Code into
+#: one). Nothing will read that turn either.
+SESSION_BUSY = "SESSION_BUSY"
 #: The file in an omp `session_dir` recording whose session it holds.
 SESSION_IDENTITY_FILE = "maestro-session.json"
 
@@ -3976,6 +3981,35 @@ class HerdrLauncher:
         )
         if reason in (SESSION_LANE_MISMATCH, SESSION_ROLE_MISMATCH):
             self._refuse_live_pane("{0}:{1}".format(reason, detail))
+        self._replace_session(spec, handle, reason, detail)
+        return True
+
+    def _busy_session_replaced(self, spec: LaunchSpec, handle: LaunchHandle) -> bool:
+        """Close an adopted session that stays busy past the readiness wait.
+
+        Every adopted session's dispatched turn has already declared, so a
+        turn still running at the end of the bounded wait is one nobody will
+        read. Refusing here parked the lane `LANE_FAULT` on a healthy agent;
+        the session is replaced exactly as a superseded one is, and the
+        caller starts the role fresh.
+        """
+        try:
+            wait_for_interactive_agent(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=handle.environment, **kwargs
+                ),
+                handle.agent_name,
+            )
+        except AgentNotInteractive as exc:
+            self._replace_session(
+                spec, handle, SESSION_BUSY, "pane {0}: {1}".format(handle.pane_id, exc)
+            )
+            return True
+        return False
+
+    def _replace_session(
+        self, spec: LaunchSpec, handle: LaunchHandle, reason: str, detail: str
+    ) -> None:
         try:
             self.cancel(handle, time.monotonic() + 5.0)
         except Exception as exc:
@@ -3989,7 +4023,6 @@ class HerdrLauncher:
         self._discard_role_handle(spec, handle)
         if spec.on_session_replaced is not None:
             spec.on_session_replaced(reason, detail)
-        return True
 
     def _validated_existing_role_handle(
         self, spec: LaunchSpec, environment: Mapping[str, str]
@@ -5395,9 +5428,14 @@ class HerdrLauncher:
         # raised before herdr is called *at all*. Resolving the parent first
         # would make one herdr call before that refusal and falsify it.
         pane_env_flags(environment)
-        def resubmit_adopted(adopted: LaunchHandle) -> LaunchHandle:
+        def resubmit_adopted(adopted: LaunchHandle) -> Optional[LaunchHandle]:
+            # `None`: the adopted session stayed busy and was closed; the
+            # caller starts the role fresh. Binding first: only a session
+            # proven to be this one may be closed.
+            self._verified_handle_binding(adopted)
+            if self._busy_session_replaced(spec, adopted):
+                return None
             if spec.prepare_adopted_cwd is not None:
-                self._verified_handle_binding(adopted)
                 spec.prepare_adopted_cwd(adopted.launched_cwd)
                 # The callback may rewrite the prompt with the adopted CWD.
                 prepare_route_prompt(spec)
@@ -5413,7 +5451,9 @@ class HerdrLauncher:
         if existing is None:
             existing = self._reconnect_live_agent(spec, environment)
         if existing is not None:
-            return resubmit_adopted(existing)
+            adopted = resubmit_adopted(existing)
+            if adopted is not None:
+                return adopted
         # Placement: the operator's (or Maestro-created) parent Space, a
         # linked lane child under it, a lazy role pane inside the child.
         pane_id, layout, reused_role_pane = self._acquire_pane(
@@ -5427,7 +5467,13 @@ class HerdrLauncher:
             # be refused `agent_pane_busy` and reap the live pane.
             existing = self._reconnect_live_agent(spec, environment)
             if existing is not None:
-                return resubmit_adopted(existing)
+                adopted = resubmit_adopted(existing)
+                if adopted is not None:
+                    return adopted
+                # The busy session's pane is closed; place a fresh one.
+                pane_id, layout, reused_role_pane = self._acquire_pane(
+                    spec, worktree, environment
+                )
         with layout.lock:
             pane_is_in_layout = pane_id in layout.panes
             placement_tab_id = layout.tab_id
