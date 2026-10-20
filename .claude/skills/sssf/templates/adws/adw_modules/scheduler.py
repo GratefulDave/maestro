@@ -290,6 +290,33 @@ def _base_invalidation_priors(
     )
 
 
+def _revise_prior(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    revise: Optional[ArtifactRecord],
+) -> Optional[ArtifactRecord]:
+    """The BUILDER_OUTPUT a CODE_REVIEW REVISE judged, read off the review.
+
+    The review names its candidate in `input_artifact_ids`. A lane carried
+    across an amendment in a resumable wait re-reviews the candidate it built
+    under the previous plan revision, so its REVISE is stamped with the new
+    revision and its BUILDER_OUTPUT with the old one; the newest BUILDER_OUTPUT
+    at the review's revision is nothing, and the lane refused CODE_REVISE
+    missing prior artifacts with both artifacts present.
+    """
+    if revise is None:
+        return None
+    named = [
+        artifact
+        for artifact_id in revise.payload.get("input_artifact_ids") or ()
+        if (artifact := _lane_artifact_by_id(store, run_id, lane_id, artifact_id))
+        is not None
+        and artifact.kind is st.ArtifactKind.BUILDER_OUTPUT
+    ]
+    return named[0] if len(named) == 1 else None
+
+
 def _substantive_blob(repo: Path, path: str, oid: str) -> str:
     """Conservative syntax equality; unknown or invalid files stay exact."""
     suffix = Path(path).suffix
@@ -871,14 +898,20 @@ def _merge_producers(
     """
     if lane.lane_kind == st.LANE_KIND_TESTS:
         revision = run_row(store, run_id)["plan_revision"]
+        suite = _latest(
+            store,
+            run_id,
+            lane.lane_id,
+            st.ArtifactKind.ACCEPTED_TEST_SUITE,
+            plan_revision=revision,
+        )
+        if suite is None and store.lane_stage(run_id, lane.lane_id) in st.SUITE_HOLDING_STAGES:
+            # Carried across an amendment, not reset: the suite it sealed.
+            suite = _latest(
+                store, run_id, lane.lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
+            )
         return (
-            _latest(
-                store,
-                run_id,
-                lane.lane_id,
-                st.ArtifactKind.ACCEPTED_TEST_SUITE,
-                plan_revision=revision,
-            ),
+            suite,
             _latest(
                 store,
                 run_id,
@@ -2619,13 +2652,7 @@ class FactoryScheduler:
             code_review = st.NO_CODE_REVIEW
             base_invalidation = st.NO_BASE_INVALIDATION
             if entry is st.BuildingEntryKind.CODE_REVISE:
-                prior = _latest(
-                    self.store,
-                    self.run_id,
-                    lane_id,
-                    st.ArtifactKind.BUILDER_OUTPUT,
-                    plan_revision=revision,
-                )
+                prior = _revise_prior(self.store, self.run_id, lane_id, revise)
                 if prior is None or revise is None:
                     raise FactoryRefused("CODE_REVISE missing prior artifacts")
                 prior_builder = prior.artifact_id
@@ -2830,8 +2857,9 @@ class FactoryScheduler:
             st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
-        if suite is None and self.store.lane_stage(self.run_id, lane_id) is st.LaneStage.MERGED:
-            # A merged lane an amendment retained keeps the suite it merged.
+        if suite is None and self.store.lane_stage(self.run_id, lane_id) in st.SUITE_HOLDING_STAGES:
+            # A lane an amendment carried rather than reset keeps the suite
+            # it sealed (`st.SUITE_HOLDING_STAGES`).
             suite = _latest(
                 self.store, self.run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
             )
@@ -3745,13 +3773,7 @@ class FactoryScheduler:
         code_review = st.NO_CODE_REVIEW
         base_invalidation = st.NO_BASE_INVALIDATION
         if entry is st.BuildingEntryKind.CODE_REVISE:
-            prior = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.BUILDER_OUTPUT,
-                plan_revision=revision,
-            )
+            prior = _revise_prior(self.store, self.run_id, lane_id, revise)
             if prior is None or revise is None:
                 raise FactoryRefused("CODE_REVISE missing prior artifacts")
             prior_builder = prior.artifact_id
