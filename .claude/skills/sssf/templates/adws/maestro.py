@@ -4333,8 +4333,12 @@ class _RunPreflight:
         Supplied when absent: an IR attend did not write (`attend.plan_ir`,
         or a hand amendment's, which may sit in `/tmp`) is copied with its
         sources into the revision's root under `runtime_state_root`.
+        The IR is the one the revision's plan names (`_attend_plan_ir`).
         """
-        remedy = "set attend.plan_ir to the Plan IR this revision was projected from"
+        remedy = (
+            "project the plan with plan_author_cli.py so it names its IR, or set "
+            "attend.plan_ir to the IR whose sha256 the plan's receipt names"
+        )
         check = rp.readable_file_check("attend:plan-ir", self.plan_ir, remedy, parse=json.loads)
         if self.plan_ir_current is None:
             return check
@@ -5431,27 +5435,106 @@ def _attend_suite_files(
     )
 
 
+def _plan_source_ir(pinned: Path) -> tuple[Optional[str], Optional[str]]:
+    """The IR a pinned plan was projected from: `(sha256, recorded path)`.
+
+    The sha256 is the signed receipt's `ir_sha256`; the path is
+    `approval.source_ir.path`, which plans projected before it existed lack.
+    Both are None for a plan with no approval (a scripted `run amend`).
+    """
+    try:
+        document = json.loads(Path(pinned).read_bytes())
+    except (OSError, ValueError):
+        return None, None
+    approval = document.get("approval") if isinstance(document, dict) else None
+    if not isinstance(approval, Mapping):
+        return None, None
+    receipt = approval.get("receipt")
+    expected = receipt.get("ir_sha256") if isinstance(receipt, Mapping) else None
+    source = approval.get("source_ir")
+    recorded = source.get("path") if isinstance(source, Mapping) else None
+    return (
+        expected if isinstance(expected, str) else None,
+        recorded if isinstance(recorded, str) and recorded else None,
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _attend_configured_ir_conflict(
+    policy: att.AttendPolicy, pinned: Path, revision: int
+) -> str:
+    """Why `attend.plan_ir` names another IR than this revision's, else "".
+
+    The pinned plan's receipt names its IR by sha256; a configured path to
+    different bytes is a run-scoped input read from deployment config.
+    """
+    expected, _ = _plan_source_ir(pinned)
+    configured = policy.plan_ir
+    if expected is None or configured is None or not configured.is_file():
+        return ""
+    found = _file_sha256(configured)
+    if found == expected:
+        return ""
+    return (
+        "attend.plan_ir {0} has sha256 {1}; revision {2} was projected from "
+        "the IR with sha256 {3}".format(configured, found, revision, expected)
+    )
+
+
 def _attend_plan_ir(
-    policy: att.AttendPolicy, plans_dir: Path, run_id: str, revision: int
+    policy: att.AttendPolicy,
+    plans_dir: Path,
+    run_id: str,
+    revision: int,
+    pinned: Optional[Path] = None,
+    repo: Optional[Path] = None,
 ) -> Path:
     """The Plan IR the live revision was projected from.
 
-    Two places, in order: the copy `run attend` itself wrote for a revision it
-    applied, and the deployment's configured `attend.plan_ir` for the revision
-    a human authored. Neither present is a refusal rather than a fallback --
-    the pinned plan artifact is a *projection* of an IR, and handing it to an
-    agent asked to edit an IR would produce a revision the ingress cannot read
-    and a refusal three steps later that names none of this.
+    An approved plan names its IR by the receipt's sha256, and a plan the
+    projection authored also names its path (`approval.source_ir`). Places,
+    in order: the copy `run attend` itself wrote for a revision it applied,
+    the plan's recorded path under the run repository, then `attend.plan_ir`
+    -- each taken only when its bytes are that sha256. `attend.plan_ir`
+    naming other bytes refuses `ATTEND_PLAN_IR_MISMATCH`: it never stands in
+    for the run's own IR. A plan with no receipt keeps the unverified order.
+    None found is a refusal rather than a fallback -- the pinned plan
+    artifact is a *projection* of an IR, and handing it to an agent asked to
+    edit an IR would produce a revision the ingress cannot read.
     """
     written = plans_dir / "{0}.r{1}.ir.json".format(run_id, revision)
-    if written.is_file():
-        return written
-    if policy.plan_ir is not None and policy.plan_ir.is_file():
-        return policy.plan_ir
+    expected, recorded = _plan_source_ir(pinned) if pinned is not None else (None, None)
+    if expected is None:
+        if written.is_file():
+            return written
+        if policy.plan_ir is not None and policy.plan_ir.is_file():
+            return policy.plan_ir
+        raise att.AttendRefused(
+            att.PLAN_IR_UNRESOLVED,
+            "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
+            "({2})".format(revision, written, policy.plan_ir or "unset"),
+        )
+    conflict = _attend_configured_ir_conflict(policy, pinned, revision)
+    if conflict:
+        raise att.AttendRefused(att.PLAN_IR_MISMATCH, conflict)
+    candidates = [written]
+    if recorded is not None:
+        candidates.append(Path(repo or ".") / recorded)
+    if policy.plan_ir is not None:
+        candidates.append(policy.plan_ir)
+    for candidate in candidates:
+        if candidate.is_file() and _file_sha256(candidate) == expected:
+            return candidate
     raise att.AttendRefused(
         att.PLAN_IR_UNRESOLVED,
-        "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
-        "({2})".format(revision, written, policy.plan_ir or "unset"),
+        "no Plan IR with sha256 {0} (revision {1}'s receipt): looked at {2}; "
+        "re-project the plan with plan_author_cli.py so it records its IR, "
+        "or set attend.plan_ir to that IR".format(
+            expected, revision, ", ".join(str(c) for c in candidates)
+        ),
     )
 
 
@@ -5588,7 +5671,11 @@ def _attend_record_root(runtime: Any, base: Path, run_id: str, revision: int) ->
 
 
 def _attend_root_current(
-    runtime: Any, base: Path, run_id: str, revision: int
+    runtime: Any,
+    base: Path,
+    run_id: str,
+    revision: int,
+    policy: Optional[att.AttendPolicy] = None,
 ) -> tuple[bool, str]:
     """The owned IR exists and its record names the revision's pinned plan."""
     ir = _attend_owned_ir(base, run_id, revision)
@@ -5603,6 +5690,15 @@ def _attend_root_current(
         return False, "{0} records another plan than {1}".format(record_path, pinned)
     if record.get("ir_sha256") != hashlib.sha256(ir.read_bytes()).hexdigest():
         return False, "{0} changed after it was recorded".format(ir)
+    expected, _ = _plan_source_ir(pinned)
+    if expected is not None and record.get("ir_sha256") != expected:
+        return False, "{0} holds the IR with sha256 {1}; {2} was projected from {3}".format(
+            ir, record.get("ir_sha256"), pinned, expected
+        )
+    if policy is not None:
+        conflict = _attend_configured_ir_conflict(policy, pinned, revision)
+        if conflict:
+            return False, conflict
     json.loads(ir.read_bytes())
     return True, str(ir)
 
@@ -5708,6 +5804,26 @@ def _attend_copy_sources(
     return missing
 
 
+def _attend_clear_foreign_root(
+    base: Path, run_id: str, revision: int, ir_sha256: str
+) -> None:
+    """Empty a revision's root recorded for another IR before re-laying it.
+
+    A root an earlier release supplied from a deployment-wide `attend.plan_ir`
+    holds that IR's sources too; laying the run's own IR over it would leave
+    them beside it, for planctl to upload and an agent to read.
+    """
+    record_path = _attend_root_record(base, run_id, revision)
+    if not record_path.is_file():
+        return
+    try:
+        recorded = json.loads(record_path.read_text(encoding="utf-8")).get("ir_sha256")
+    except ValueError:
+        recorded = None
+    if recorded != ir_sha256:
+        shutil.rmtree(_attend_root(base, run_id, revision))
+
+
 def _attend_supply_root(
     policy: att.AttendPolicy,
     runtime: Any,
@@ -5730,17 +5846,21 @@ def _attend_supply_root(
     """
     moved = _attend_migrate_roots(runtime, base, run_id)
     if moved:
-        if _attend_root_current(runtime, base, run_id, revision)[0]:
+        if _attend_root_current(runtime, base, run_id, revision, policy)[0]:
             return "moved {0} files from runtime_state_root into {1}".format(
                 len(moved), _attend_root(base, run_id, revision)
             )
     legacy = Path(plan_artifact_ref_for(store, run_id, revision)).resolve().parent
-    found = _attend_plan_ir(policy, legacy, run_id, revision)
+    found = _attend_plan_ir(
+        policy, legacy, run_id, revision,
+        pinned=_pinned_plan_artifact(runtime, run_id, revision), repo=repo,
+    )
     data = found.read_bytes()
     document = json.loads(data)
     if not isinstance(document, dict):
         raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, "{0} is not an object".format(found))
     owned = _attend_owned_ir(base, run_id, revision)
+    _attend_clear_foreign_root(base, run_id, revision, _file_sha256(found))
     owned.parent.mkdir(parents=True, exist_ok=True)
     bases = [found.resolve().parent, *found.resolve().parent.parents, repo]
     missing = _attend_copy_sources(document, owned.parent, bases)
@@ -6193,7 +6313,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
                 plan_ir=_attend_owned_ir(plan_base(), run_id, revision),
                 plan_ir_current=lambda: _attend_root_current(
                     runtime, _attend_planroot_base(policy, runtime, layout),
-                    run_id, revision,
+                    run_id, revision, policy,
                 ),
                 plan_ir_supply=lambda: _attend_supply_root(
                     policy, runtime, _attend_planroot_base(policy, runtime, layout),

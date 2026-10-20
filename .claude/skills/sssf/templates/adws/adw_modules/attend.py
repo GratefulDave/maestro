@@ -86,6 +86,9 @@ PLANCTL_FAILED = "ATTEND_PLANCTL_FAILED"
 KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
 #: The Plan IR the live revision was projected from could not be located.
 PLAN_IR_UNRESOLVED = "ATTEND_PLAN_IR_UNRESOLVED"
+#: `attend.plan_ir` names bytes other than the IR the revision's own plan
+#: was projected from (the receipt's `ir_sha256`). Config never substitutes.
+PLAN_IR_MISMATCH = "ATTEND_PLAN_IR_MISMATCH"
 
 #: The directory attend keeps its planctl roots in is one planctl refuses to
 #: upload (it is, contains, or sits in the home directory or `~/.maestro`) or

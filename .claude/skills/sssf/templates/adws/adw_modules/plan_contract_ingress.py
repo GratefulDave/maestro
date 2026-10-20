@@ -1495,6 +1495,16 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     return {"schema_version": SCHEMA_VERSION, "lanes": projected_lanes}
 
 
+def _source_ir(ir_path: Path, repo: Path, ir_bytes: bytes) -> dict:
+    """The projected IR's identity: repo-relative path when inside `repo`."""
+    resolved = Path(ir_path).resolve()
+    try:
+        path = str(resolved.relative_to(Path(repo).resolve()))
+    except ValueError:
+        path = str(resolved)
+    return {"path": path, "sha256": hashlib.sha256(ir_bytes).hexdigest()}
+
+
 def project_canonical_plan(
         ir_path: Path, receipt_path: Path, repo: Path,
         rendered_path: Optional[Path] = None, *,
@@ -1515,7 +1525,8 @@ def project_canonical_plan(
     digest = plan_compiler.compile_plan(plan_author.author_plan(draft)).plan_digest
     approved = dict(
         draft,
-        approval=plan_approval.approval_record(digest, receipt, reviewer_key),
+        approval=plan_approval.approval_record(
+            digest, receipt, reviewer_key, source_ir=_source_ir(ir_path, repo, ir_bytes)),
     )
     stored = plan_author.author_plan(approved)
     if plan_compiler.compile_plan(stored).plan_digest != digest:

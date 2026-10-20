@@ -150,8 +150,10 @@ def evaluate(checks: Iterable[Check], say: Callable[[str, str, str], None]) -> T
                 added = check.provision()
             except Exception as exc:  # the refusal's detail, not a crash
                 added = ""
-                detail = "{0}; provisioning failed: {1}: {2}".format(
-                    detail, type(exc).__name__, exc
+                code = getattr(exc, "code", None)
+                detail = "{0}; provisioning failed: {1}: {2}{3}".format(
+                    detail, type(exc).__name__,
+                    "{0}: ".format(code) if isinstance(code, str) else "", exc,
                 )
             else:
                 present, after = _verified(check.verify)

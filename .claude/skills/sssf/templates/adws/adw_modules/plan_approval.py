@@ -183,9 +183,18 @@ def verify_receipt(
 
 
 def approval_record(
-    plan_digest: str, receipt: Mapping[str, Any], key: bytes
+    plan_digest: str,
+    receipt: Mapping[str, Any],
+    key: bytes,
+    source_ir: Optional[Mapping[str, Any]] = None,
 ) -> dict:
-    """What the trusted projection writes into the plan it authored."""
+    """What the trusted projection writes into the plan it authored.
+
+    `source_ir` names the IR the plan was projected from -- its path, relative
+    to the projection's `--repo` when inside it, and its sha256 -- and is
+    signed with the rest, so `run attend` amends the run's own IR and never
+    one a deployment config points at.
+    """
     record = {
         "schema_version": APPROVAL_VERSION,
         "plan_digest": plan_digest,
@@ -193,6 +202,8 @@ def approval_record(
         "signature_algorithm": SIGNATURE_ALGORITHM,
         "reviewer_key_id": key_id(key),
     }
+    if source_ir is not None:
+        record["source_ir"] = dict(source_ir)
     record["signature"] = signature(record, key)
     return record
 
