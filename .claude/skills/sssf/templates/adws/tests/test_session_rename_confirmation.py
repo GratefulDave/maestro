@@ -189,6 +189,38 @@ def _handle(pane_id: str, cwd: Path) -> lch.LaunchHandle:
     )
 
 
+#: `herdr pane read w2B0:p3 --source recent-unwrapped`, from the omp pane that
+#: refused run a70e25b9's cleanup: omp badges the title with its role before
+#: the name, so the name does not follow the sentence directly.
+BADGED_SESSION_NAME = (
+    "chinese_deep_fake-44716b4d36aaa5100e17a725eae58337add2f1e51f8975b93c4dc89855ed1803"
+    "-a70e-lane-wp4-corpus-tests-tester-reviewer"
+)
+BADGED_PANE_TEXT = (
+    'Session renamed to "\U0001f9ea TESTS:\n'
+    "chinese_deep_fake-44716b4d36aaa5100e17a725eae58337add2f1e51f8975b93c4dc89855ed1\n"
+    '803-a70e-lane-wp4-corpus-tests-tester-reviewer".\n'
+)
+
+
+class TheBadgedConfirmationIsAccepted(unittest.TestCase):
+    def test_role_badge_before_the_name(self) -> None:
+        self.assertTrue(
+            lch.session_rename_confirmed(BADGED_PANE_TEXT, BADGED_SESSION_NAME)
+        )
+
+    def test_a_different_name_is_not_confirmed(self) -> None:
+        self.assertFalse(
+            lch.session_rename_confirmed(
+                BADGED_PANE_TEXT, BADGED_SESSION_NAME + "-other"
+            )
+        )
+
+    def test_the_name_far_from_the_sentence_is_not_confirmed(self) -> None:
+        text = "Session renamed to" + "x" * 80 + BADGED_SESSION_NAME
+        self.assertFalse(lch.session_rename_confirmed(text, BADGED_SESSION_NAME))
+
+
 class TheRenameIsConfirmedByReadingThePane(unittest.TestCase):
     """`_confirm_session_rename` against a fake whose composer wraps."""
 

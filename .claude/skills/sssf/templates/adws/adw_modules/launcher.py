@@ -1368,7 +1368,17 @@ def session_rename_confirmed(text: str, session_name: str) -> bool:
     rename had worked; the sentence was on screen for the whole 60s wait.
     Punctuation is the composer's, so `_unchromed` drops it too.
     """
-    return _unchromed(session_rename_confirmation(session_name)) in _unchromed(text)
+    sentence = _unchromed(session_rename_confirmation(session_name))
+    anchor = _unchromed("Session renamed to")
+    name = sentence[len(anchor):]
+    haystack = _unchromed(text)
+    start = haystack.find(anchor)
+    while start != -1:
+        after = start + len(anchor)
+        if name in haystack[after : after + len(name) + SESSION_RENAME_DECORATION_MAX]:
+            return True
+        start = haystack.find(anchor, start + 1)
+    return False
 
 
 def git_primary_workdir(repo: Path) -> Path:
@@ -2863,6 +2873,14 @@ AGENT_START_BUSY_POLL_S = 0.5
 #: How often COMPLETE cleanup re-reads a pane while waiting for the composer
 #: to print its rename confirmation. The window is the caller's `timeout_s`.
 SESSION_RENAME_POLL_S = 0.5
+
+#: Most characters, once whitespace and punctuation are removed, a composer may
+#: print between `Session renamed to` and the name it was given. omp prefixes
+#: the title with a role badge -- `Session renamed to "\U0001f9ea TESTS:` and
+#: then the name -- so the name is not adjacent to the sentence. The name embeds
+#: a 64-hex repository fingerprint, so finding it right after the anchor is not
+#: ambiguous.
+SESSION_RENAME_DECORATION_MAX = 32
 
 
 def _start_agent_when_free(
@@ -6347,9 +6365,11 @@ class HerdrLauncher:
 
         The parent Space is never closed: it is the operator's own Space when
         one was open on the repository, and even a Maestro-created one is
-        shared by every run on that repository. Cancel is not this path. A
-        rename that is not confirmed leaves every affected pane and lane
-        workspace open.
+        shared by every run on that repository. Cancel is not this path. The
+        rename is cosmetic: a pane that is not idle, is not interactive, or
+        does not confirm it never keeps its lane workspace open, because this
+        runs only after the run published. Only a handle that is not this
+        launcher's own (`BINDING_MISMATCH`) stops the cleanup.
         """
         ordered: List[LaunchHandle] = []
         seen: set[str] = set()
@@ -6365,28 +6385,17 @@ class HerdrLauncher:
                 continue
             try:
                 self.wait_for_idle(handle, timeout_s=timeout_s)
+                name = self._session_name(handle, project_identity)
+                self._confirm_session_rename(handle, name, timeout_s)
             except HerdrCallError as exc:
                 if exc.code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND, AGENT_NOT_FOUND):
                     self._cleaned_absent.add(handle.pane_id)
                     continue
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                    pane_created=True,
-                ) from exc
-            except LaunchRefused:
-                raise
-            except AgentNotInteractive as exc:
-                # Same outcome as any other unconfirmed rename, said in the
-                # type this path already declares. Untyped, it escaped every
-                # caller and ended the run at cleanup.
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                    pane_created=True,
-                ) from exc
-            name = self._session_name(handle, project_identity)
-            self._confirm_session_rename(handle, name, timeout_s)
+            except LaunchRefused as exc:
+                if exc.refusal is LaunchRefusal.BINDING_MISMATCH:
+                    raise
+            except Exception:
+                pass
             confirmed.append(handle)
         children: List[str] = []
         environments: Dict[str, Mapping[str, str]] = {}
@@ -6555,12 +6564,6 @@ class FakeLauncher:
             if self._handles.get(handle.correlation_token) is not handle:
                 raise LaunchRefused(
                     LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
-                )
-            if self.agent_status(handle) not in (None, "idle"):
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    handle.correlation_token,
-                    pane_created=True,
                 )
             self._states[handle.correlation_token] = PollResult(
                 PollState.GONE, detail="RUN_COMPLETE"
