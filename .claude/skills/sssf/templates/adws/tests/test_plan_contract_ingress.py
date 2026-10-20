@@ -156,6 +156,33 @@ class IngressProjectionTests(unittest.TestCase):
             self._lane(draft, "lane-b")["spec"], self._lane(without, "lane-b")["spec"]
         )
 
+    def test_optional_source_projects_and_keeps_its_flag(self) -> None:
+        """planctl accepts required: false; ingress carries it, never refuses it."""
+        from adw_modules import plan_canonical
+        from adw_modules.plan_compiler import compile_plan
+
+        ir = copy.deepcopy(self.ir)
+        optional_id = ir["source_artifacts"][0]["source_id"]
+        ir["source_artifacts"][0]["required"] = False
+        draft = self._project(ir)
+        carried = [
+            source for lane in draft["lanes"]
+            for source in lane["spec"]["sources"]
+            if source["source_id"] == optional_id
+        ]
+        self.assertTrue(carried)
+        self.assertTrue(all(source["required"] is False for source in carried))
+        compile_plan(plan_canonical.canonicalize(draft))
+        self.assertNotEqual(draft, self._project())
+
+    def test_source_required_must_still_be_boolean(self) -> None:
+        ir = copy.deepcopy(self.ir)
+        ir["source_artifacts"][0]["required"] = "no"
+        with self.assertRaises(self.ingress.IngressError) as caught:
+            self._project(ir)
+        self.assertIn("UNMAPPABLE_SOURCES", str(caught.exception))
+        self.assertIn(".required", str(caught.exception))
+
     def test_requires_must_be_a_lane_mapping(self) -> None:
         ir = copy.deepcopy(self.ir)
         ir["extensions"]["maestro"]["requires"] = ["lane-b"]
