@@ -295,8 +295,12 @@ def _revise_prior(
     run_id: str,
     lane_id: str,
     revise: Optional[ArtifactRecord],
+    kind: st.ArtifactKind = st.ArtifactKind.BUILDER_OUTPUT,
 ) -> Optional[ArtifactRecord]:
     """The BUILDER_OUTPUT a CODE_REVIEW REVISE judged, read off the review.
+
+    Or, with `kind=TEST_DRAFT`, the draft a TEST_REVIEW REVISE judged: the
+    same question about the other producing stage.
 
     The review names its candidate in `input_artifact_ids`. A lane carried
     across an amendment in a resumable wait re-reviews the candidate it built
@@ -312,7 +316,7 @@ def _revise_prior(
         for artifact_id in revise.payload.get("input_artifact_ids") or ()
         if (artifact := _lane_artifact_by_id(store, run_id, lane_id, artifact_id))
         is not None
-        and artifact.kind is st.ArtifactKind.BUILDER_OUTPUT
+        and artifact.kind is kind
     ]
     return named[0] if len(named) == 1 else None
 
@@ -3035,6 +3039,15 @@ class FactoryScheduler:
         artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
         if review is not None:
             artifacts["TEST_REVIEW"] = review
+            # The draft under revision. Without it the tester's checkout is
+            # the integration head and nothing else, so every revise turn
+            # rebuilt the draft from scratch and dropped the last round's
+            # fixes (run 2acd2f5f, lane-device-tests, turns 13 and 14).
+            draft = _revise_prior(
+                self.store, self.run_id, lane_id, review, st.ArtifactKind.TEST_DRAFT
+            )
+            if draft is not None:
+                artifacts["TEST_DRAFT"] = draft
         contract = rc.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
@@ -3809,6 +3822,11 @@ class FactoryScheduler:
         }
         if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
             artifacts["CODE_REVIEW"] = revise
+        if entry is not st.BuildingEntryKind.INITIAL:
+            # The candidate under revision, for a builder whose checkout no
+            # longer holds it (an amendment closes the run's panes and
+            # removes their trees).
+            artifacts["BUILDER_OUTPUT"] = prior
         records, retired, _receipts, probe_commit = self._accumulated_probes(lane_id)
         active_probes = probes.active_records(records, retired)
         ctx = LaneContext(

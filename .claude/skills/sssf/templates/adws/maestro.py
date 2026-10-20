@@ -2173,6 +2173,7 @@ class HerdrStageActor:
 
         The index stays at the refreshed head, so the restored files read as
         the role's uncommitted output exactly as if it had just written them.
+        A path absent at `draft_sha` was deleted there, and is deleted here.
         """
         present = tuple(
             line
@@ -2181,6 +2182,10 @@ class HerdrStageActor:
             ).splitlines()
             if line
         )
+        for rel in set(files) - set(present):
+            target = _resolved_under(checkout, str(Path(rel).parent)) / Path(rel).name
+            if target.is_file() or target.is_symlink():
+                target.unlink()
         if not present:
             return
         self._git(checkout, "checkout", draft_sha, "--", *present)
@@ -2407,6 +2412,22 @@ class HerdrStageActor:
         limit = int(getattr(self, "dispatch_idle_timeout_s", 0) or 0)
         last_seen: object = None
         quiet_since = 0.0
+
+        def transcript_bytes() -> object:
+            if activity is None:
+                return None
+            try:
+                seen = activity(handle)
+            except Exception:
+                return None
+            return seen[1] if seen is not None else None
+
+        def envelope_text() -> object:
+            try:
+                return _read_regular_text_under(bound, envelope)
+            except (OSError, UnicodeError, ValueError):
+                return None
+
         while True:
             try:
                 raw = _read_regular_text_under(bound, envelope)
@@ -2421,10 +2442,32 @@ class HerdrStageActor:
             if isinstance(payload, dict) and self._payload_ok(role, payload):
                 wait = getattr(self.launcher, "wait_for_idle", None)
                 if wait is not None:
+                    before = transcript_bytes()
                     try:
                         wait(handle)
+                    except lch.AgentNotInteractive as exc:
+                        # An envelope is not the end of a turn. On run
+                        # 2acd2f5f the tester declared, kept editing for a
+                        # minute, and rewrote its envelope six seconds after
+                        # this wait gave up, so the recorded draft missed its
+                        # last edit. A transcript that grew, or an envelope
+                        # that changed, during the wait is an agent still
+                        # working: wait again. One that did neither is a slow
+                        # composer over finished work, and the declaration
+                        # stands.
+                        if transcript_bytes() != before or envelope_text() != raw:
+                            self._say(
+                                lane_id or "-",
+                                "{0} still working after declaring".format(role),
+                                str(exc),
+                            )
+                            continue
+                        self._say(
+                            lane_id or "-",
+                            "{0} completion could not be confirmed".format(role),
+                            str(exc),
+                        )
                     except (
-                        lch.AgentNotInteractive,
                         lch.HerdrCallError,
                         lch.LaunchRefused,
                     ) as exc:
@@ -2437,6 +2480,12 @@ class HerdrStageActor:
                             "{0} completion could not be confirmed".format(role),
                             str(exc),
                         )
+                    else:
+                        # Idle now, and the envelope read above predates the
+                        # wait: a turn that rewrote it while finishing is
+                        # declared by the rewrite. Read it again.
+                        if envelope_text() != raw:
+                            continue
                 return payload
             # ── nothing but the envelope ends this wait ─────────────────────
             #
@@ -3243,14 +3292,34 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
+        # A CODE_REVISE or BASE_INVALIDATION turn edits the prior candidate.
+        # A checkout that survived holds it committed on the base; a fresh one
+        # is the bare base, so lay the candidate's delta back down, uncommitted.
+        prior = getattr(ctx.artifacts.get("BUILDER_OUTPUT"), "payload", None) or {}
+        prior_sha = str(prior.get("candidate_sha") or "")
+        prior_files = tuple(sorted({
+            path
+            for entry in prior.get("tree_delta") or ()
+            if isinstance(entry, Mapping)
+            for path in (entry.get("old_path"), entry.get("new_path"))
+            if path
+        }))
+
+        def refresh(path: Path) -> None:
+            self._refresh_builder_checkout(path, ctx.lane.declared_outputs, sha)
+            if (
+                prior_sha
+                and prior_files
+                and self._git(path, "rev-parse", "HEAD") == sha
+            ):
+                self._restore_draft(path, prior_sha, prior_files)
+
         payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
             cwd,
             extra,
-            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_builder_checkout(
-                path, ctx.lane.declared_outputs, sha
-            )),
+            prepare_cwd=self._with_fixtures(ctx, refresh),
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         candidate_sha, changed = self._commit_declared(
