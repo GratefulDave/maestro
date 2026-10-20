@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path, weakening): a retained session still busy at the next dispatch is replaced, not refused
+
+- A Claude tester declared its draft; a background-task notification later
+  woke it into a turn of its own (10m17s). The next dispatch adopted the
+  in-process role handle, `resubmit`'s bounded readiness wait
+  (`wait_for_interactive_agent`, 180s) timed out on `working`, and the lane
+  parked `LANE_FAULT` as
+  `PROMPT_SUBMISSION_REFUSED:AGENT_INTERACTIVE_READY_TIMEOUT:<agent>:pane_retained`.
+  The agent was healthy and became idle minutes later.
+- `HerdrLauncher.launch` now runs the readiness wait on an adopted session
+  before re-materializing its tree (`_busy_session_replaced`). If the wait
+  times out, the session is closed as `SESSION_BUSY` through the same
+  close/refuse/steps-line path a superseded or orphaned session uses
+  (`_replace_session`), and the role starts fresh. A settled session is reused
+  as before. Binding is verified before the wait, so a mismatched pane still
+  refuses `BINDING_MISMATCH` and is never closed.
+- Removed: the `PROMPT_SUBMISSION_REFUSED` refusal for this case on both
+  adoption call sites in `launch`. `resubmit` called directly keeps its
+  refusal.
+
 ### Changed — contract change (weakening): an amendment keeps every MERGED lane it does not affect, not only the integration-order prefix
 
 - After #347 only the MERGED lanes ahead of the first changed lane in
