@@ -1029,6 +1029,28 @@ class ArtifactStore:
             (run_id, lane_id, artifact_id),
         ).fetchone()
 
+    def _revise_prior(
+        self, run_id: str, lane_id: str, review: Optional[sqlite3.Row]
+    ) -> Optional[sqlite3.Row]:
+        """The BUILDER_OUTPUT a CODE_REVIEW REVISE names in `input_artifact_ids`.
+
+        The candidate the review judged, not the newest BUILDER_OUTPUT. The
+        scheduler resolves it the same way (`scheduler._revise_prior`), so a
+        lane carried across an amendment reconstructs the digest it wrote.
+        """
+        if review is None:
+            return None
+        named = [
+            row
+            for artifact_id in _loads(review["payload_json"]).get("input_artifact_ids")
+            or ()
+            if (row := self._lane_artifact_by_id(run_id, lane_id, artifact_id))
+            is not None
+            and st.stored_artifact_kind(row["artifact_kind"], run_id=run_id)
+            is st.ArtifactKind.BUILDER_OUTPUT
+        ]
+        return named[0] if len(named) == 1 else None
+
     def _latest_lane_artifact(
         self,
         run_id: str,
@@ -1240,8 +1262,9 @@ class ArtifactStore:
             st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
-        if row is None and self.lane_stage(run_id, lane_id) is st.LaneStage.MERGED:
-            # A merged lane an amendment retained keeps the suite it merged.
+        if row is None and self.lane_stage(run_id, lane_id) in st.SUITE_HOLDING_STAGES:
+            # A lane an amendment carried rather than reset keeps the suite
+            # it sealed (`st.SUITE_HOLDING_STAGES`).
             row = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
             )
@@ -1490,15 +1513,13 @@ class ArtifactStore:
             code_review = st.NO_CODE_REVIEW
             base_invalidation = st.NO_BASE_INVALIDATION
         elif entry is st.BuildingEntryKind.CODE_REVISE:
-            prior = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
-            )
             review = self._latest_lane_artifact(
                 run_id,
                 lane_id,
                 st.ArtifactKind.CODE_REVIEW,
                 verdict=st.ReviewerVerdict.REVISE,
             )
+            prior = self._revise_prior(run_id, lane_id, review)
             if prior is None or review is None:
                 raise StaleStageInput("CODE_REVISE missing prior artifacts")
             prior_builder = prior["artifact_id"]
