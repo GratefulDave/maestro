@@ -1356,8 +1356,10 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             source.get("path"), "UNMAPPABLE_SOURCES",
             "{}.path".format(source_id))
         _require_relative(path, source_id)
-        required = source.get("required")
-        if required is not True:
+        # The schema permits required: false (an optional pinned source).
+        # It rides spec.sources verbatim, so the flag stays in the spec digest
+        # and consumers (maestro._attend_copy_sources) skip it when absent.
+        if not isinstance(source.get("required"), bool):
             raise IngressError(
                 "UNMAPPABLE_SOURCES:{}.required".format(source_id))
         digest = _require_text(
