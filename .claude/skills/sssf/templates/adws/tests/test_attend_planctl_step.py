@@ -101,6 +101,16 @@ class PlanctlExitStatus(unittest.TestCase):
         path.write_text("import os, signal, sys\n" + body + "\n", encoding="utf-8")
         return path
 
+    def test_stderr_is_persisted_on_success_and_on_failure(self) -> None:
+        log = self.tmp / "x.planctl-review.log"
+        ok = self._binary("sys.stderr.write('phase ami 4s\\n')")
+        maestro._run_planctl(ok, ["review", "x.ir.json"], log=log)
+        self.assertEqual(log.read_text(encoding="utf-8"), "phase ami 4s\n")
+        bad = self._binary("sys.stderr.write('phase mutate 9s\\n'); sys.exit(1)")
+        with self.assertRaises(att.AttendRefused):
+            maestro._run_planctl(bad, ["review", "x.ir.json"], log=log)
+        self.assertEqual(log.read_text(encoding="utf-8"), "phase mutate 9s\n")
+
     def _code(self, binary: Path) -> str:
         with self.assertRaises(att.AttendRefused) as caught:
             maestro._run_planctl(binary, ["review", "x.ir.json"])
