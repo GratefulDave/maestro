@@ -29,7 +29,9 @@ from tests.test_herdr_workspace_topology import (
     PROJECT,
     RUN_HASH,
     TESTS_LANE,
+    _RunFixture,
     _checkout,
+    _launch,
     _launcher,
     _place,
     _spec,
@@ -234,6 +236,106 @@ class LiveSessionReuseTest(unittest.TestCase):
             raised.exception.detail,
         )
         self.assertEqual(self.replaced, [])
+
+
+class OrphanedTurnTest(unittest.TestCase):
+    """A dead scheduler's still-running turn is never dispatched into.
+
+    A resume adopted a code reviewer whose previous scheduler had been killed
+    mid-turn and resubmitted into it. A turn still `working` either holds the
+    readiness wait until it refuses and parks the lane, or is interrupted by
+    the offer with whatever its composer held. Either way a killed scheduler
+    stranded a lane; the adopted session is replaced instead.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.herdr = FakeHerdr()
+        self.herdr.add_workspace(PROJECT, self.root)
+        self.label = lch.workspace_label_for(PROJECT, RUN_HASH)
+        self.replaced: list = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def launcher(self) -> lch.HerdrLauncher:
+        launcher = _launcher(self.label)
+        launcher._herdr = self.herdr  # type: ignore[method-assign]
+        return launcher
+
+    def test_restart_reconnect_replaces_a_working_session(self) -> None:
+        for role, lane in (
+            ("tester", TESTS_LANE),
+            ("builder", BUILD_LANE),
+            ("code-reviewer", BUILD_LANE),
+            ("operator", BUILD_LANE),
+            ("attend-reviewer", BUILD_LANE),
+        ):
+            with self.subTest(role):
+                self.replaced.clear()
+                tree = _checkout(self.root, role)
+                spec = _role_spec(
+                    tree, lane=lane, role=role, digest=OLD, replaced=self.replaced
+                )
+                old, _, _ = _place(self.launcher(), self.herdr, spec, status="working")
+                second = self.launcher()
+                second._bind_run_identity(spec)
+                self.assertIsNone(
+                    second._reconnect_live_agent(spec, dict(spec.environment))
+                )
+                self.assertIn(old.pane_id, self.herdr.closed_panes)
+                self.assertEqual(self.replaced, [lch.SESSION_TURN_ORPHANED])
+
+    def test_restart_reconnect_reuses_a_settled_session(self) -> None:
+        for status in ("idle", "done"):
+            with self.subTest(status):
+                self.replaced.clear()
+                self.herdr = FakeHerdr()
+                self.herdr.add_workspace(PROJECT, self.root)
+                tree = _checkout(self.root, "tester-" + status)
+                spec = _role_spec(
+                    tree, lane=TESTS_LANE, role="tester", digest=OLD,
+                    replaced=self.replaced,
+                )
+                old, _, _ = _place(self.launcher(), self.herdr, spec, status=status)
+                second = self.launcher()
+                second._bind_run_identity(spec)
+                adopted = second._reconnect_live_agent(spec, dict(spec.environment))
+                self.assertIsNotNone(adopted)
+                assert adopted is not None
+                self.assertEqual(adopted.pane_id, old.pane_id)
+                self.assertNotIn(old.pane_id, self.herdr.closed_panes)
+                self.assertEqual(self.replaced, [])
+
+    def test_this_process_own_working_turn_is_not_orphaned(self) -> None:
+        tree = _checkout(self.root, "tester")
+        spec = _role_spec(
+            tree, lane=TESTS_LANE, role="tester", digest=OLD, replaced=self.replaced
+        )
+        launcher = self.launcher()
+        old, _, _ = _place(launcher, self.herdr, spec, status="working")
+        adopted = launcher._reconnect_live_agent(spec, dict(spec.environment))
+        self.assertIsNotNone(adopted)
+        self.assertNotIn(old.pane_id, self.herdr.closed_panes)
+        self.assertEqual(self.replaced, [])
+
+    def test_restore_leaves_a_working_session_for_the_launch_to_replace(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        spec = replace(
+            run.spec(TESTS_LANE, "tester"),
+            spec_digest=OLD,
+            on_session_replaced=lambda reason, detail: self.replaced.append(reason),
+        )
+        original = _launch(run.launcher(), run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "working")
+        fresh = run.launcher()
+        fresh.restore_layout(spec)
+        self.assertNotIn(spec.correlation_token, fresh._handles)
+        relaunched = _launch(fresh, run.herdr, spec)
+        self.assertIn(original.pane_id, run.herdr.closed_panes)
+        self.assertNotEqual(relaunched.pane_id, original.pane_id)
+        self.assertEqual(self.replaced, [lch.SESSION_TURN_ORPHANED])
 
 
 class OmpSessionDirTest(unittest.TestCase):

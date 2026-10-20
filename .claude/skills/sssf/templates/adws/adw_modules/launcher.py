@@ -920,6 +920,10 @@ SESSION_ROLE_MISMATCH = "SESSION_ROLE_MISMATCH"
 SESSION_SPEC_DIGEST_CHANGED = "SESSION_SPEC_DIGEST_CHANGED"
 #: Nothing records whose session it is, so nothing proves it is this one.
 SESSION_UNRECORDED = "SESSION_UNRECORDED"
+#: A restart-adopted agent is still `working` on a turn its dead scheduler
+#: dispatched. Nothing in this process will read that turn, and a prompt
+#: resubmitted into it waits on, or interrupts, work nobody owns.
+SESSION_TURN_ORPHANED = "SESSION_TURN_ORPHANED"
 #: The file in an omp `session_dir` recording whose session it holds.
 SESSION_IDENTITY_FILE = "maestro-session.json"
 
@@ -3919,8 +3923,14 @@ class HerdrLauncher:
         spec: LaunchSpec,
         handle: LaunchHandle,
         pane: Mapping[str, object],
+        *,
+        orphaned: bool = False,
     ) -> bool:
         """Close `handle`'s session if it may not serve `spec`; say if it did.
+
+        `orphaned` is the restart-adoption path's statement that the proven
+        session is mid-turn for a scheduler that no longer exists; it is
+        closed as `SESSION_TURN_ORPHANED` exactly as a superseded one is.
 
         Both reuse paths -- the in-process role handle and an agent adopted
         by its stable name after a restart -- call this once the pane is
@@ -3937,6 +3947,8 @@ class HerdrLauncher:
         """
         recorded = _pane_session_record(pane)
         reason = session_reuse_refusal(spec, recorded)
+        if reason is None and orphaned:
+            reason = SESSION_TURN_ORPHANED
         if reason is None:
             return False
         detail = "pane {0}: recorded {1}, wanted {2}".format(
@@ -4115,11 +4127,14 @@ class HerdrLauncher:
             )
             name = _agent_name(spec.correlation_token)
             agent = self._fetch_agent(name, environment)
-            # A session recorded for another spec digest is left for the
-            # next launch, whose reconnect closes and replaces it.
-            if agent is not None and session_reuse_refusal(
-                spec, _pane_session_record(pane)
-            ) is None:
+            # A session recorded for another spec digest, or one still
+            # `working` on a turn the dead scheduler dispatched, is left for
+            # the next launch, whose reconnect closes and replaces it.
+            if (
+                agent is not None
+                and _agent_status_of(agent) != "working"
+                and session_reuse_refusal(spec, _pane_session_record(pane)) is None
+            ):
                 if str(agent.get("pane_id") or "") != pane_id:
                     self._refuse_live_pane("RESTORED_AGENT_PANE_MISMATCH")
                 self._handle_from_live_agent(spec, name, agent, pane, environment)
@@ -4555,6 +4570,13 @@ class HerdrLauncher:
             != METADATA_SCRATCH_REDIRECT
         ):
             return None
+        # No handle in this process means the agent was started by a
+        # scheduler that has since died. If it is still `working`, that turn
+        # has no reader: resubmitting waits on it until the readiness wait
+        # refuses and the lane parks, or interrupts it into a composer that
+        # still holds whatever it held. Replace the session instead.
+        with self._handles_lock:
+            owned = spec.correlation_token in self._handles
         if self._refused_session_replaced(
             spec,
             LaunchHandle(
@@ -4565,6 +4587,7 @@ class HerdrLauncher:
                 environment=environment,
             ),
             pane,
+            orphaned=status == "working" and not owned,
         ):
             return None
         return self._handle_from_live_agent(spec, stable_name, agent, pane, environment)
