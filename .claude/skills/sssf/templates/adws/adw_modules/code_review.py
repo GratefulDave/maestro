@@ -13,6 +13,9 @@ measurement is always of the accepted cases and never of a rewrite.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -229,6 +232,62 @@ def _review_tree(
         tree = tm.materialize_commit(repo, sha, dest, state_root=state_root)
     prov.provision_tree(tree, provision_argv, provision_timeout_s)
     return tree
+
+
+def _suite_run_path(
+    state_root: Path,
+    request: rc.LaneRequest,
+    candidate_sha: str,
+    files: Mapping[str, str],
+    gate: object,
+    provision_argv: Sequence[str],
+    suite_timeout_s: float | None,
+) -> Path:
+    """Where a finished measurement of exactly these inputs is kept.
+
+    A scheduler interrupted mid-suite pauses the lane, and the worker that was
+    running the suite finishes anyway (its late completion is refused by the
+    ledger). The next session measures the same candidate again, 10-17 minutes
+    for a result that already existed. Everything the measurement depends on is
+    in the key, so a different candidate, suite, gate or provisioning never
+    reads it.
+    """
+    key = hashlib.sha256(
+        json.dumps(
+            [
+                request.input_digest,
+                candidate_sha,
+                sorted(files.items()),
+                repr(gate),
+                list(provision_argv),
+                suite_timeout_s,
+            ],
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return Path(state_root) / "suite-measurements" / (key + ".json")
+
+
+def _load_suite_run(path: Path) -> Mapping[str, object] | None:
+    try:
+        run = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return run if isinstance(run, dict) and "counts" in run else None
+
+
+def _store_suite_run(path: Path, run: Mapping[str, object]) -> None:
+    """Keep a finished measurement; a crashed run is not one."""
+    if run.get("crashed") or run.get("crash_note"):
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".{0}.tmp".format(os.getpid()))
+        temp.write_text(json.dumps(run, sort_keys=True), encoding="utf-8")
+        os.replace(temp, path)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 _NO_RUN = {
@@ -642,9 +701,17 @@ def measure_candidate(
         state_root=state_root,
     )
     tb.verify_suite(files, dest)
-    run, refusal = _run_suite(
-        dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+    kept = _suite_run_path(
+        state_root, request, candidate_sha, files, gate, provision_argv,
+        suite_timeout_s,
     )
+    run, refusal = _load_suite_run(kept), None
+    if run is None:
+        run, refusal = _run_suite(
+            dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+        )
+        if refusal is None:
+            _store_suite_run(kept, run)
     collection_broken = False
     crashed = str(run.get("crashed") or "")
     # A run killed by a signal is already typed (`SUITE_CRASHED:<signal>`), so
