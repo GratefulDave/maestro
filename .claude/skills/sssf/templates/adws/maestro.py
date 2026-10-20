@@ -2400,7 +2400,9 @@ class HerdrStageActor:
         self, handle: object, envelope: Path, role: str, lane_id: str = ""
     ) -> Mapping[str, Any]:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
+        started = time.monotonic()
         waited = 0.0
+        next_beat = 30.0
         activity = getattr(self.launcher, "turn_activity", None)
         limit = int(getattr(self, "dispatch_idle_timeout_s", 0) or 0)
         last_seen: object = None
@@ -2473,10 +2475,14 @@ class HerdrStageActor:
             # it. The refusal is the typed launch failure every caller already
             # contains (a lane parks LANE_FAULT; attend retries once).
             time.sleep(0.1)
-            waited += 0.1
+            # Wall time, not a count of sleeps: each pass also reads the
+            # envelope and calls herdr, so summing 0.1s ticks ran 2.7x slow
+            # on run 2acd2f5f and a 600s bound took 2030s.
+            waited = time.monotonic() - started
             # A silent minute is indistinguishable from a hung agent. Say the
             # wait is still a wait, at a cadence that does not flood a terminal.
-            if waited % 30 < 0.1:
+            if waited >= next_beat:
+                next_beat = waited - waited % 30 + 30
                 self._say(
                     lane_id or "-",
                     "waiting on {0}".format(role),
@@ -5238,7 +5244,11 @@ _PLANCTL_VERDICT_EXIT = 1
 
 
 def _run_planctl(
-    binary: Path, argv: Sequence[str], *, key: Optional[str] = None
+    binary: Path,
+    argv: Sequence[str],
+    *,
+    key: Optional[str] = None,
+    log: Optional[Path] = None,
 ) -> str:
     """One planctl subcommand, refused by exit status and nothing else.
 
@@ -5271,6 +5281,13 @@ def _run_planctl(
                 argv[0], type(exc).__name__, exc
             ),
         ) from exc
+    if log is not None:
+        # planctl prints its phase timings on stderr; success used to drop
+        # them, so a 15-32 minute review could not be broken into phases.
+        try:
+            log.write_text(result.stderr or "", encoding="utf-8")
+        except OSError:
+            pass
     if result.returncode == 0:
         return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
@@ -6016,6 +6033,7 @@ def _attend_project(
             *(["--local"] if local else []),
         ],
         key=key,
+        log=plans_dir / (stem + ".planctl-review.log"),
     )
     _run_planctl(
         binary,

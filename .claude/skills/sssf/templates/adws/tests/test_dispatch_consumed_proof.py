@@ -246,13 +246,22 @@ class AnsweredDispatchTests(unittest.TestCase):
 
 
 class IdleWaitBoundTests(unittest.TestCase):
-    def _wait(self, pane: _Pane, limit: int) -> Any:
+    def _wait(self, pane: _Pane, limit: int, tick: float = 0.1) -> Any:
+        self.clock = 1000.0
+
+        def sleep(_s: float) -> None:
+            # What a pass really costs: the sleep plus the envelope read and
+            # the herdr calls around it. `tick` > 0.1 is a slow pass.
+            self.clock += tick
+
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
         actor.launcher = pane.launcher
         actor.step = None
         actor.dispatch_idle_timeout_s = limit
         envelope = Path(pane.handle.launched_cwd) / "results" / "envelope-1.json"
-        with mock.patch.object(maestro.time, "sleep", lambda _s: None):
+        with mock.patch.object(maestro.time, "sleep", sleep), mock.patch.object(
+            maestro.time, "monotonic", lambda: self.clock
+        ):
             return actor._await_envelope(pane.handle, envelope, "operator", "lane-a")
 
     def test_an_idle_agent_with_no_envelope_ends_the_wait_typed(self) -> None:
@@ -262,6 +271,17 @@ class IdleWaitBoundTests(unittest.TestCase):
             self._wait(pane, 120)
         self.assertTrue(ctx.exception.detail.startswith("DISPATCH_NOT_CONSUMED:operator"))
         self.assertTrue(ctx.exception.pane_created)
+
+    def test_the_bound_is_wall_time_when_each_pass_is_slower_than_its_sleep(self) -> None:
+        # Run 2acd2f5f: a 600s bound took 2030s because the loop summed its
+        # 0.1s sleeps. Here every pass costs 0.3s of wall time; a 120s bound
+        # must end within one extra 30s sample of 120s after the first quiet sample,
+        # not at 3x that.
+        pane = _Pane(drop=99)
+        self.addCleanup(pane.close)
+        with self.assertRaises(LaunchFailed):
+            self._wait(pane, 120, tick=0.3)
+        self.assertLessEqual(self.clock - 1000.0, 30 + 120 + 30 + 1)
 
     def test_transcript_growth_restarts_the_bound(self) -> None:
         pane = _Pane(drop=99)
