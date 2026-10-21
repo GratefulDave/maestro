@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -1841,6 +1842,43 @@ def composer_holds_offer(
         return None
     marker = str(Path(prompt_path).resolve())
     return any(marker in line for line in lines[-COMPOSER_TAIL_LINES:])
+
+
+#: What `turn_activity` reports for an `idle` agent whose pane footer still
+#: lists a background shell or monitor it started. Herdr says `idle` the moment
+#: the turn ends, but Claude Code re-invokes the agent when that job fires, so
+#: the agent is working and the dispatch idle bound must not count the time.
+BACKGROUND_TASK_STATUS = "background"
+
+_BACKGROUND_TASK_FOOTER = re.compile(
+    r"\b[1-9]\d* (?:shells?|monitors?|background (?:tasks?|jobs?))\b"
+)
+
+
+def pane_background_tasks(
+    herdr_call: Callable[..., dict], pane_id: str
+) -> Optional[bool]:
+    """Whether the pane footer lists a live background shell or monitor.
+
+    Reads the tail of the pane the way `pane_lacks_offer` does. `None` means
+    the pane could not be read, which is a missing observation and never a
+    "no".
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        return None
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return any(
+        _BACKGROUND_TASK_FOOTER.search(line)
+        for line in lines[-COMPOSER_TAIL_LINES:]
+    )
 
 
 def pane_revision(
@@ -5334,6 +5372,18 @@ class HerdrLauncher:
             return None
         if status is None:
             return None
+        if status == "idle":
+            try:
+                background = pane_background_tasks(
+                    lambda *args, **kwargs: self._herdr(
+                        *args, env=handle.environment, **kwargs
+                    ),
+                    handle.pane_id,
+                )
+            except Exception:
+                background = None
+            if background:
+                status = BACKGROUND_TASK_STATUS
         size = -1
         if handle.transcript_path is not None:
             try:

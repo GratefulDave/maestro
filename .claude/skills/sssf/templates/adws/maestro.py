@@ -205,7 +205,8 @@ DEFAULT_ROLE_SESSION_MAX_TOKENS = 1_000_000
 
 
 #: Seconds a dispatched agent may sit `idle` with no envelope and a transcript
-#: that does not grow before the dispatch is refused `DISPATCH_NOT_CONSUMED`.
+#: that does not grow, and no background shell or monitor of its own, before
+#: the dispatch is refused `DISPATCH_NOT_CONSUMED`.
 #: `0` turns the bound off.
 DEFAULT_DISPATCH_IDLE_TIMEOUT_S = 600
 
@@ -1534,6 +1535,7 @@ class HerdrStageActor:
             "- Use enabled profile and repository capabilities only for this role's task.\n"
             "- Native Read, Write, Edit, Bash, skills, and MCP remain available.\n"
             "- Delegation is allowed: split disjoint work across subagents to save context (Claude: `/team`; omp: its own subagents). Subagents obey this contract; you own the envelope.\n"
+            "- Run tests and waits in the foreground. Never end a turn while a background shell or monitor you started is still running: the harness reads an ended turn as finished work, and an idle agent with no envelope is refused.\n"
             "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
             "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
             "- Write only what this role permits, then write the requested UTF-8 JSON envelope to its `.part` sibling and rename it into place, and stop.\n\n"
@@ -2422,6 +2424,15 @@ class HerdrStageActor:
                 return None
             return seen[1] if seen is not None else None
 
+        def background_live() -> bool:
+            if activity is None:
+                return False
+            try:
+                seen = activity(handle)
+            except Exception:
+                return False
+            return seen is not None and seen[0] == lch.BACKGROUND_TASK_STATUS
+
         def envelope_text() -> object:
             try:
                 return _read_regular_text_under(bound, envelope)
@@ -2455,7 +2466,11 @@ class HerdrStageActor:
                         # working: wait again. One that did neither is a slow
                         # composer over finished work, and the declaration
                         # stands.
-                        if transcript_bytes() != before or envelope_text() != raw:
+                        if (
+                            transcript_bytes() != before
+                            or envelope_text() != raw
+                            or background_live()
+                        ):
                             self._say(
                                 lane_id or "-",
                                 "{0} still working after declaring".format(role),
