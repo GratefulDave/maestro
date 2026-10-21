@@ -573,6 +573,14 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["provision_timeout_s"] = _config_timeout(
         loaded.get("provision_timeout_s"), "provision_timeout_s"
     )
+    try:
+        loaded["suite_requirements"] = provisioning.parse_suite_requirements(
+            loaded.get("suite_requirements")
+        )
+    except ValueError as exc:
+        raise _MaestroConfigurationError(str(exc)) from exc
+    # Every remote suite job this process dispatches carries them.
+    provisioning.set_suite_requirements(loaded["suite_requirements"])
     loaded["suite_timeout_s"] = _config_timeout(
         loaded.get("suite_timeout_s"), "suite_timeout_s", None
     )
@@ -4456,7 +4464,7 @@ class _RunPreflight:
                     rp.Check(
                         "runners",
                         lambda: (scheduler._assert_runners_usable() or True, "every runner the plan names resolves"),
-                        "fix provision_argv so the runner loads; the runner tree is kept for inspection",
+                        "fix provision_argv so the runner loads, or the named suite_requirements entry so it installs on the spot fleet",
                     )
                 ],
                 self.say,

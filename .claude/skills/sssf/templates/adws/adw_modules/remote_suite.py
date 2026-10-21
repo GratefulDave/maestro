@@ -88,6 +88,7 @@ def call(
         "argv": [str(item) for item in provision_argv if str(item)],
         "timeout_s": provision_timeout_s,
         "packages": list(prov.tree_packages()),
+        "requirements": [dict(item) for item in prov.suite_requirements()],
     }
     budget = float(timeout_s or 0) + float(provision_timeout_s or prov.PROVISION_TIMEOUT_S)
     outcome = _EXECUTOR(op, Path(tree), rj.encode(dict(args)), provision, budget)
