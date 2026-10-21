@@ -46,7 +46,7 @@ class SuiteMeasurementSurvivesInterrupt(unittest.TestCase):
     def _measure(self, runs: list, *, digest: str = "d1", sha: str = SHA, gate=GATE):
         calls = []
 
-        def run_suite(tree, files, *, gate, suite_timeout_s=None):
+        def run_suite(tree, files, *, gate, suite_timeout_s=None, **_provisioning):
             calls.append(1)
             return runs.pop(0)
 

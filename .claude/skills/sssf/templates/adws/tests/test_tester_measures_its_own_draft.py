@@ -53,15 +53,16 @@ class TesterMustEnumerateItsOwnDraft(unittest.TestCase):
                 self.assertIn("Before you return the envelope", text)
                 self.assertIn("enumerate your own draft", text)
 
-    def test_both_collect_invocations_are_spelled_out(self) -> None:
-        # The tester is not handed the gate's argv, so a contract that says
-        # "run the gate's collect" without saying what that is asks it to
-        # guess. These are `runner_resolution.COLLECT_ARGS` verbatim.
+    def test_the_collect_is_the_remote_command_never_a_local_runner(self) -> None:
+        # The tester is not handed the gate's argv; it is handed one command
+        # that runs the gate's own collect on the spot fleet. A local
+        # `--collect-only` imports every test module on the operator's host.
         for kind in self.LANE_KINDS:
             with self.subTest(lane_kind=kind):
                 text = _contract(kind)
-                self.assertIn("list --run", text)
-                self.assertIn("--collect-only -q -o addopts=", text)
+                self.assertIn("remote test command", text)
+                self.assertIn("`--collect`", text)
+                self.assertNotIn("--collect-only -q -o addopts=", text)
 
     def test_a_static_scan_is_named_and_refused(self) -> None:
         for kind in self.LANE_KINDS:

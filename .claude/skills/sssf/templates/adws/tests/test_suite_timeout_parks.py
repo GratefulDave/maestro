@@ -200,6 +200,10 @@ class TheBudgetIsADeploymentKey(unittest.TestCase):
             if not isinstance(node, ast.Call):
                 continue
             names = {kw.arg for kw in node.keywords}
+            # Remote runs that are not the suite (preflight probe, draft
+            # collection, probes) carry their own bound, not the suite's.
+            if ast.unparse(node.func) in ("rs.call", "cr.measure_probes"):
+                continue
             if "provision_timeout_s" in names and any(
                 isinstance(kw.value, ast.Attribute)
                 and kw.value.attr == "_provision_timeout_s"

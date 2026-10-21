@@ -250,9 +250,10 @@ class AProvisioningGapIsRefusedAtRoundOne(_FactoryFixture):
         message = str(caught.exception)
         self.assertIn("ERR_MODULE_NOT_FOUND", message)
         self.assertIn("vitest", message)
-        # The measured tree is kept and named, and nothing repaired it.
-        self.assertIn(str(self.tree), message)
-        self.assertFalse((self.tree / "node_modules").exists())
+        # Named by the commit it was measured at on the spot fleet; the local
+        # tree was never where it ran, so it is not kept.
+        self.assertIn("measured on the spot fleet at", message)
+        self.assertFalse(self.tree.exists())
 
     def test_the_same_tree_passes_when_provisioning_installs_the_runner(self) -> None:
         self.factory._provision_argv = (
