@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): a transient GitHub failure on the spot fleet is retried, and a spot-fleet refusal parks its lane instead of ending the run
+
+- One `gh run view` poll answered `net/http: TLS handshake timeout`; `_gh`
+  refused `REMOTE_SUITE_REFUSED:RUN_UNREADABLE` on that first answer, the
+  refusal left the lane worker, and `_advance_ready` re-raised it, so every
+  lane in the run stopped.
+- `remote_suite` retries a `gh` call or `git push` whose output reads as a
+  transit failure (TLS or i/o timeout, reset or refused connection, HTTP 5xx,
+  429 or rate limit) after 5, 10, 20, 40 and 80 seconds. Any other failure,
+  and a transient one past the last retry, refuses exactly as before.
+- `_advance` parks a `RemoteSuiteRefused` as that lane's `LANE_FAULT`, the
+  same lane-scoped treatment as `LaunchFailed`; independent lanes keep
+  advancing. Git, harness, runtime and ledger-integrity errors stay run-level.
+
 ### Changed — contract change (strengthening, new path): a suite's host tools and devices are declared, installed and proven on the spot fleet before any lane runs
 
 - The run preflight proved only that the runner loads. Suites that call
