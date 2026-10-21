@@ -27,6 +27,7 @@ from . import git_publication as gitpub
 from . import plan_model
 from . import probes
 from . import provisioning as prov
+from . import remote_suite as rs
 from . import review_contract as rc
 from . import suite_increment as inc
 from . import runner_resolution as rr
@@ -1595,18 +1596,7 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     )
 
 
-def _collect_gate(
-    gate: SimpleNamespace, files: Mapping[str, str], tree: Path
-) -> SimpleNamespace:
-    argv, _selectors = rc.substituted_gate_argv(gate.argv, files, tree)
-    return SimpleNamespace(
-        runner=gate.runner,
-        argv=argv,
-        cwd=gate.cwd,
-        min_cases=gate.min_cases,
-        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
-        declared_cases=tuple(getattr(gate, "declared_cases", ()) or ()),
-    )
+_collect_gate = tc.collect_gate
 
 
 def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
@@ -3375,53 +3365,34 @@ class FactoryScheduler:
                 self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
             )
             tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
-            keep = False
             try:
-                self._say("", "checking {0} is usable in {1}".format(runner, cwd))
-                # The one provisioner every actor and measurement tree crosses,
-                # with nothing bridged in afterwards: this probe speaks for the
-                # tester, reviewer and builder trees only if it runs in exactly
-                # what `provision_argv` installs.
-                prov.provision_tree(
-                    dest, self._provision_argv, self._provision_timeout_s
-                )
-                rr.resolve(
-                    runner,
+                self._say("", "checking {0} is usable in {1} on the spot fleet".format(runner, cwd))
+                # Provisioned and probed where every lane's suite will run: the
+                # remote job runs `provision_argv`, then the whole-tree probe.
+                # Empty paths on purpose: this preflight runs before any
+                # candidate exists, so the whole tree genuinely is its question.
+                rs.call(
+                    "resolve",
                     dest,
-                    cwd,
-                    # Empty on purpose, and now stated rather than defaulted:
-                    # this preflight runs before any candidate exists, so the
-                    # whole tree genuinely is its question.
-                    (),
+                    {"runner": runner, "cwd": cwd, "paths": []},
+                    provision_argv=self._provision_argv,
+                    provision_timeout_s=self._provision_timeout_s,
+                    timeout_s=rr.PROBE_TIMEOUT_S,
                 )
             except (rr.RunnerUnusable, prov.ReviewProvisioningError) as extra:
                 # Provisioning belongs to this refusal, not above it. The
                 # preflight's own sentence is "the environment every lane will
                 # run in is usable", and a `provision_argv` that fails is that
                 # sentence coming out false -- one whose answer is the
-                # deployment's command, which no agent can act on either. It
-                # escaped here as an untyped crash, so the one run verb both
-                # paths cross reported a stack trace for the case it exists to
-                # name.
-                #
-                # The tree stays. A refusal about an environment is answered by
-                # opening that environment, and this one used to be deleted on
-                # the way out -- so the cheapest possible diagnosis, running the
-                # probe by hand where it failed, cost a full rebuild of the
-                # environment from the deployment's own `provision_argv` before
-                # it could start. `scratch_worktree_path` randomizes the name,
-                # so a kept tree can never be one a later call is refused for
-                # adopting.
-                keep = True
+                # deployment's command, which no agent can act on either.
                 detail = getattr(extra, "detail", None) or str(extra)
                 unusable.append(
-                    "{0} in {1}: {2}; measured in {3}, which is kept".format(
-                        runner, cwd, detail, dest
+                    "{0} in {1}: {2}; measured on the spot fleet at {3}".format(
+                        runner, cwd, detail, base
                     )
                 )
             finally:
-                if not keep:
-                    _remove_collect_tree(dest)
+                _remove_collect_tree(dest)
         if unusable:
             raise RunnerPreflightRefused("; ".join(unusable))
 
@@ -3440,57 +3411,29 @@ class FactoryScheduler:
             "draft-collect-{0}".format(ctx.lane.lane_id),
         )
         tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
-        keep = False
         try:
-            # Provision before probing, with nothing bridged in from the
-            # product checkout, so a dependency the deployment's
-            # `provision_argv` does not install is missing here exactly as it
-            # is missing in the tester's tree.
-            prov.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
-            # Resolve BEFORE the draft is written, because `resolve`'s probe is
-            # a whole-tree `--collect-only` and would otherwise be measuring the
-            # draft it is supposed to be measuring the environment for. FDAdb
-            # run 2489c772 paid for that ordering: `lane-wp4-release-tests`
-            # drafted `services/device-substrates/tests/release/
-            # test_release_artifact.py`, the repository already carried
-            # `services/label-batch/tests/observations/test_release_artifact.py`
-            # from a merged lane, neither directory has an `__init__.py`, so
-            # pytest derived the same module name twice and interrupted
-            # collection with `import file mismatch` at exit 2. That is a name
-            # the tester chose and can change in one line -- and it was
-            # reported as `RUNNER_PREFLIGHT_REFUSED`, which ends the whole run,
-            # because a probe run after `write_files` cannot tell an unusable
-            # interpreter from a draft that will not collect.
-            resolved = rr.resolve(
-                gate.runner,
+            # One remote job, on the spot fleet: provision, resolve the runner
+            # BEFORE the draft is written, write it, collect, run the parent
+            # outcomes and the harness probe -- all in the one tree, which IS
+            # the parent commit. Resolution precedes the write because the
+            # probe is a whole-tree collect and would otherwise measure the
+            # draft (FDAdb run 2489c772, `import file mismatch` at exit 2,
+            # reported as `RUNNER_PREFLIGHT_REFUSED`). See `remote_job._op_draft`.
+            measured = rs.call(
+                "draft",
                 dest,
-                gate.cwd,
-                # Empty on purpose. This probe deliberately runs BEFORE
-                # `write_files`, so the draft's paths do not exist yet and
-                # naming them makes pytest exit 4, `file or directory not
-                # found` -- an unusable-interpreter refusal for a draft that
-                # was never written. The question here is only whether the
-                # environment is usable.
-                (),
+                {"gate": gate, "files": dict(files)},
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
+                timeout_s=rr.PROBE_TIMEOUT_S
+                + rr.COLLECT_TIMEOUT_S
+                + 2 * rr.EXECUTE_TIMEOUT_S,
             )
-            rc.write_files(dest, files)
-            measured = _collect_gate(gate, files, Path(dest))
-            ids = rr.collect_cases(resolved, measured, dest)
-            # The tree this collected in IS the parent commit -- `base` is the
-            # integration head with only the draft's files written on top --
-            # so the red-at-parent measurement belongs here and nowhere else. A second tree would provision twice and, worse, would let
-            # the two measurements disagree about which commit they were made
-            # against.
-            outcomes: Mapping[str, bool] = {}
-            if getattr(gate, "declared_cases", ()):
-                outcomes = rr.execute_case_outcomes(resolved, measured, dest)
-            # Same tree, same reason: the harness probe asks which of the
-            # draft's failures at the parent were raised by the draft itself,
-            # and the parent is this tree.
-            harness = rr.execute_harness_probe(
-                resolved, measured, dest, tuple(files), self.runtime.path
+            return (
+                tuple(measured["ids"]),
+                measured["outcomes"],
+                measured["harness"],
             )
-            return tuple(ids), outcomes, harness
         except (
             rr.CollectFailed,
             rr.RunnerUnusable,
@@ -3508,19 +3451,14 @@ class FactoryScheduler:
                 # the answer changed mid-run, which is the same fault
                 # discovered later.
                 #
-                # And the same fault keeps the same evidence: this refusal ends
-                # the run and is read by an operator, so the tree it was
-                # measured in stays, named beside the detail.
-                keep = True
                 raise RunnerPreflightRefused(
-                    "{0}; measured in {1}, which is kept".format(detail, dest)
+                    "{0}; measured on the spot fleet at {1}".format(detail, base)
                 ) from extra
             if isinstance(extra, rr.CaseOutcomesUnreadable):
                 raise ParentOutcomesRefused(detail) from extra
             raise DraftCollectionRefused(detail) from extra
         finally:
-            if not keep:
-                _remove_collect_tree(dest)
+            _remove_collect_tree(dest)
 
 
 
@@ -4510,9 +4448,20 @@ class FactoryScheduler:
                     survivors.append(sub)
             if not survivors:
                 return rejected
+            paths = [sub.path for sub in survivors]
             try:
-                resolved = rr.resolve(
-                    runner, tree, ".", paths=[sub.path for sub in survivors]
+                executions = rs.call(
+                    "probes",
+                    tree,
+                    {
+                        "runner": runner,
+                        "peers": paths,
+                        "paths": paths,
+                        "timeout_s": rr.EXECUTE_TIMEOUT_S,
+                    },
+                    provision_argv=self._provision_argv,
+                    provision_timeout_s=self._provision_timeout_s,
+                    timeout_s=rr.PROBE_TIMEOUT_S + rr.EXECUTE_TIMEOUT_S * len(paths),
                 )
             except rr.RunnerUnusable as exc:
                 for sub in survivors:
@@ -4521,7 +4470,7 @@ class FactoryScheduler:
                 return rejected
             pending: list[dict[str, Any]] = []
             for sub in survivors:
-                execution = probes.run_probe(resolved, tree, sub.path, scratch)
+                execution = executions[sub.path]
                 kind = probes.classify_admission(execution)
                 lines = tuple(cr.failure_lines(execution.output))
                 if kind == probes.ADMISSION_FAILING:
@@ -4638,6 +4587,8 @@ class FactoryScheduler:
                 retired=retired,
                 receipts=receipts,
                 scratch_root=scratch,
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
             )
             items = []
             for challenge in challenges:
@@ -4711,6 +4662,8 @@ class FactoryScheduler:
             receipts=receipts,
             submissions=tuple(outcomes[key] for key in sorted(outcomes)),
             scratch_root=scratch,
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
         )
         if active:
             commit, ref = probes.pin_sources(

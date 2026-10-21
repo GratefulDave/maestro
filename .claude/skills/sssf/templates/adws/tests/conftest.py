@@ -44,3 +44,22 @@ def _isolated_from_the_invoking_herdr():
         yield
     finally:
         os.environ.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def _suites_run_in_process():
+    """Measure against the local tree, through the remote result codec.
+
+    Production dispatches every test process to the GitHub Actions spot fleet
+    (`remote_suite.github`). The suite itself runs on that fleet already, so a
+    call site under test executes `remote_job` in-process instead.
+    `tests/test_remote_suite.py` drives the production executor with `gh` and
+    `git push` faked at the subprocess boundary.
+    """
+    from adw_modules import remote_suite
+
+    previous = remote_suite.use_executor(remote_suite.in_process)
+    try:
+        yield
+    finally:
+        remote_suite.use_executor(previous)

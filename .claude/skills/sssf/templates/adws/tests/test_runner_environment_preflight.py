@@ -86,16 +86,18 @@ class RealResolverPreflight(unittest.TestCase):
         self.assertIn("--collect-only", self.marker.read_text())
         self.assertFalse(self.tree.exists())
 
-    def test_real_probe_refusal_keeps_measured_tree_and_reports_runner_output(self) -> None:
+    def test_real_probe_refusal_reports_runner_output_and_where_it_ran(self) -> None:
+        # The probe runs on the spot fleet, so the local tree it was named
+        # after is not where it was measured and is not kept.
         self._runner(4)
 
         with self.assertRaises(RunnerPreflightRefused) as caught:
             self.factory._assert_runners_usable()
 
         self.assertIn("--collect-only", self.marker.read_text())
-        self.assertTrue(self.tree.is_dir())
+        self.assertFalse(self.tree.exists())
         self.assertIn("preflight dependency unavailable", str(caught.exception))
-        self.assertIn(str(self.tree), str(caught.exception))
+        self.assertIn("measured on the spot fleet at", str(caught.exception))
 
 
 if __name__ == "__main__":

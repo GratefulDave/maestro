@@ -16,6 +16,7 @@ gone and only the materialization survives, under a name that says what it is.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -26,6 +27,11 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .runtime_state import paths_overlap
+
+
+#: Written into a materialized tree's own `.git`: the repository and commit
+#: the tree was extracted from.
+SOURCE_RECORD = "maestro-source.json"
 
 
 class MaterializeError(RuntimeError):
@@ -280,6 +286,11 @@ def _extract_commit(repo: Path, sha: str, dest: Path) -> Path:
     if (dest / ".git").exists():
         raise MaterializeError("materialized tree carried a .git directory")
     _commit_materialized_tree(dest.resolve())
+    # The commit this tree holds, for `remote_suite`: a suite measured on this
+    # tree runs on the spot fleet against that commit, never against this copy.
+    (dest / ".git" / SOURCE_RECORD).write_text(
+        json.dumps({"repo": str(Path(repo).resolve()), "sha": sha}), encoding="utf-8"
+    )
     return dest.resolve()
 
 
