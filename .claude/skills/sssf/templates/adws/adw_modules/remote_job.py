@@ -230,6 +230,12 @@ def run_op(op: str, subject: Path, args: Mapping[str, Any], provision: Mapping[s
     if packages:
         prov.set_tree_packages(packages)
     prov.provision_tree(subject, argv, provision.get("timeout_s"))
+    # The host tools and devices the suites reach, proven where they run. The
+    # run preflight's `resolve` crosses this too, so a missing one refuses the
+    # run before any lane is dispatched instead of failing a candidate's suite.
+    prov.ensure_suite_requirements(
+        subject, provision.get("requirements") or (), provision.get("timeout_s")
+    )
     return OPS[op](Path(subject), decode(dict(args)))
 
 

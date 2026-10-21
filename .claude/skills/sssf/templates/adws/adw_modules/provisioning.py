@@ -166,3 +166,102 @@ def install_tree_packages(
         raise ReviewProvisioningError(
             argv, result.returncode, (result.stderr or "")[-400:]
         )
+
+
+class SuiteRequirementMissing(ReviewProvisioningError):
+    """A host tool or device the deployment says its suites reach is absent.
+
+    Raised on the spot runner, after its `install` ran (when it has one) and
+    the probe still failed. A `ReviewProvisioningError`, so the run preflight
+    refuses `RUNNER_PREFLIGHT_REFUSED` naming it before any lane is dispatched,
+    and a suite job that meets it mid-run is the environment failing, never a
+    candidate's tests. Unchecked, a missing `ffmpeg` was scored as errored
+    cases against the builder and sent back to the tester as findings.
+    """
+
+    code = "SUITE_REQUIREMENT_MISSING"
+
+    def __init__(self, name: str, argv: Sequence[str], returncode: int | None, detail: str = "") -> None:
+        self.name = name
+        self.argv = tuple(str(item) for item in argv)
+        self.returncode = returncode
+        self.detail = "{0} {1}: {2}".format(self.code, name, detail)
+        SuiteEnvironmentError.__init__(
+            self, "{0}:{1}:{2}:{3}:{4}".format(self.code, name, " ".join(self.argv), returncode, detail)
+        )
+
+
+#: `maestro.config.yaml`'s `suite_requirements`, set once per process by the
+#: config loader and carried in every remote suite job, like `_TREE_PACKAGES`.
+_SUITE_REQUIREMENTS: tuple[dict, ...] = ()
+
+
+def parse_suite_requirements(value: object) -> tuple[dict, ...]:
+    """`[{name, probe: argv, install?: argv}]`. Raises `ValueError` naming the bad entry."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("suite_requirements must be a list")
+    parsed = []
+    for index, entry in enumerate(value):
+        label = "suite_requirements[{0}]".format(index)
+        if not isinstance(entry, dict) or set(entry) - {"name", "probe", "install"}:
+            raise ValueError(label + " must be a mapping of name, probe and optional install")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(label + ".name must be a non-empty string")
+        item = {"name": name.strip()}
+        for key in ("probe", "install"):
+            argv = entry.get(key)
+            if argv is None and key == "install":
+                continue
+            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
+                raise ValueError("{0}.{1} must be a non-empty argv list of strings".format(label, key))
+            item[key] = list(argv)
+        parsed.append(item)
+    return tuple(parsed)
+
+
+def set_suite_requirements(requirements: Sequence[dict]) -> None:
+    global _SUITE_REQUIREMENTS
+    _SUITE_REQUIREMENTS = tuple(dict(item) for item in requirements)
+
+
+def suite_requirements() -> tuple[dict, ...]:
+    return _SUITE_REQUIREMENTS
+
+
+def ensure_suite_requirements(
+    dest: Path, requirements: Sequence[dict], timeout_s: float | None = None
+) -> None:
+    """Probe each requirement in the provisioned tree; install once if it has a way.
+
+    Runs on the spot runner only (`remote_job.run_op`), after `provision_tree`,
+    so a device probe can import the tree's own packages. Never on this host:
+    an install command here is the deployment's runner image, not the
+    operator's machine.
+    """
+    bound = PROVISION_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    env = te.tree_environment(Path(dest))
+
+    def attempt(argv: Sequence[str]) -> tuple[int | None, str]:
+        try:
+            result = run_harness_process(argv, cwd=Path(dest), env=env, timeout=bound)
+        except OSError as exc:
+            return None, str(exc)
+        return result.returncode, (result.stderr or result.stdout or "")[-400:]
+
+    for item in requirements:
+        name, probe = str(item["name"]), tuple(str(a) for a in item["probe"])
+        code, detail = attempt(probe)
+        if code == 0:
+            continue
+        install = tuple(str(a) for a in item.get("install") or ())
+        if not install:
+            raise SuiteRequirementMissing(name, probe, code, "probe failed and no install is declared: " + detail)
+        code, detail = attempt(install)
+        if code != 0:
+            raise SuiteRequirementMissing(name, install, code, "install failed: " + detail)
+        code, detail = attempt(probe)
+        if code != 0:
+            raise SuiteRequirementMissing(name, probe, code, "probe failed after install: " + detail)

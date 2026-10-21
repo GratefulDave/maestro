@@ -13,9 +13,9 @@ the runner's output. Exit status is the runner's.
     uv run --script adws/tools/remote_tests.py --tree . -- tests/test_x.py
     uv run --script adws/tools/remote_tests.py --tree . --collect -- src/a.test.ts
 
-Provisioning is the deployment's own `provision_argv` from the
-`maestro.config.yaml` beside this runtime, the same command every measurement
-tree is provisioned with.
+Provisioning is the deployment's own `provision_argv` and `suite_requirements`
+from the `maestro.config.yaml` beside this runtime, the same ones every
+measurement tree is provisioned with.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ _RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 if str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 
+from adw_modules import provisioning as prov  # noqa: E402
 from adw_modules import remote_suite as rs  # noqa: E402
 from adw_modules import runner_resolution as rr  # noqa: E402
 from adw_modules import tests_chain as tc  # noqa: E402
@@ -39,6 +40,8 @@ def _provisioning() -> tuple[list[str], float | None]:
     path = _RUNTIME_ROOT / "maestro.config.yaml"
     loaded = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
     loaded = loaded or {}
+    # The agent's own run gets the same host tools the review's run does.
+    prov.set_suite_requirements(prov.parse_suite_requirements(loaded.get("suite_requirements")))
     argv = [str(item) for item in loaded.get("provision_argv") or ()]
     timeout = loaded.get("provision_timeout_s")
     return argv, None if timeout is None else float(timeout)

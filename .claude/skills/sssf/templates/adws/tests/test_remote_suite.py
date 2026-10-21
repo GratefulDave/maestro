@@ -24,6 +24,7 @@ from unittest import mock
 
 import maestro
 from adw_modules import code_review as cr
+from adw_modules import provisioning as prov
 from adw_modules import remote_job as rj
 from adw_modules import remote_suite as rs
 from adw_modules import review_contract as rc
@@ -197,6 +198,23 @@ class RemoteSuiteTest(unittest.TestCase):
         with self.assertRaises(rs.RemoteSuiteRefused) as caught:
             cr._run_suite(self.tree, SUITE, gate=None, suite_timeout_s=120)
         self.assertIn("NOT_GITHUB", str(caught.exception))
+
+
+    def test_a_missing_suite_requirement_refuses_typed_from_the_fleet(self) -> None:
+        # The declared requirement travels in the job and is probed on the
+        # runner; its failure is the environment's, typed, and no suite runs.
+        requirement = {"name": "ffmpeg", "probe": ["/bin/sh", "-c", "echo no ffmpeg >&2; exit 127"]}
+        prov.set_suite_requirements([requirement])
+        self.addCleanup(prov.set_suite_requirements, ())
+        fake = self._fake()
+        run, refusal = cr._run_suite(self.tree, SUITE, gate=None, suite_timeout_s=120)
+        self.assertIsInstance(refusal, prov.SuiteRequirementMissing)
+        self.assertEqual(refusal.name, "ffmpeg")
+        self.assertIn("SUITE_REQUIREMENT_MISSING ffmpeg", refusal.detail)
+        self.assertIn("no ffmpeg", str(refusal))
+        self.assertEqual(run["executed"], 0)
+        job = json.loads(_git(self.repo, "show", "{0}:job.json".format(fake.refs[fake.inputs["job_ref"]])))
+        self.assertEqual(job["provision"]["requirements"], [requirement])
 
 
 class CodecTest(unittest.TestCase):

@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening, new path): a suite's host tools and devices are declared, installed and proven on the spot fleet before any lane runs
+
+- The run preflight proved only that the runner loads. Suites that call
+  `ffmpeg`, `ffprobe` or `just` by subprocess, or that need an Apple MPS
+  device, reached the spot runner without them, and the missing tool was
+  scored as errored cases against the builder and sent to the tester as
+  findings.
+- `maestro.config.yaml` gains `suite_requirements: [{name, probe, install?}]`.
+  Every remote suite job, the run start/resume preflight included, runs each
+  probe in the provisioned tree on the runner, runs `install` once on failure,
+  and probes again. Still failing refuses `SUITE_REQUIREMENT_MISSING` naming
+  the entry, which the preflight reports as `RUNNER_PREFLIGHT_REFUSED`.
+- A device the runner cannot have is declared with no `install`, so the run is
+  refused until the plan stops needing it. Nothing is skipped and nothing runs
+  locally. `tools/remote_tests.py` carries the same requirements.
+
 ### Changed — contract change (strengthening, new path): a dispatch that never reached its agent is delivered again, not parked for the operator
 
 - Run 646181870aef parked two lanes `DISPATCH_NOT_CONSUMED` on prompts a
