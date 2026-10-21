@@ -5474,12 +5474,26 @@ class HerdrLauncher:
         turn's answer, so the prompt reached the agent. A re-sent prompt the
         agent answers by pointing at the result it already wrote is consumed,
         and the waiter harvests that result.
+
+        A transcript that does not exist yet is a missing observation, not a
+        transcript without the record. A fresh omp session accepts its first
+        prompt, runs a pre-turn memory recall, and only then writes its session
+        file and renders the prompt; measured on omp 18.12.5 that was 62s after
+        Enter, with Herdr reporting `idle` and the path on no pane line the
+        whole time. Run 646181870aef's code reviewer was sent its prompt three
+        times in that window, refused `DISPATCH_NOT_CONSUMED`, and cancelled
+        holding the prompt it had accepted.
         """
         envelope = handle.envelope_path
         if envelope is not None and Path(envelope).is_file():
             return False
         try:
             if self._agent_transcript_bound(handle) != "idle":
+                return False
+            transcript = handle.transcript_path
+            if transcript is None or not any(
+                path.is_file() for path in transcript_family(Path(transcript))
+            ):
                 return False
             if _offer_marks_now(handle, prompt_path) > 0:
                 return False

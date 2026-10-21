@@ -245,6 +245,71 @@ class AnsweredDispatchTests(unittest.TestCase):
         self.assertEqual(pane.herdr.sends, lch.PROMPT_RESENDS + 1)
 
 
+class _FreshOmp(_Herdr):
+    """A fresh omp session between accepting its first prompt and recording it.
+
+    Measured on omp 18.12.5: Enter clears the composer, a pre-turn memory
+    recall runs for about a minute, and only then is the session file written
+    and the prompt rendered. Herdr names the session path the whole time and
+    reports `idle`.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> dict:
+        verb = tuple(args[:2])
+        if verb == ("pane", "send-text"):
+            self.sends += 1
+            self.screen = "> " + str(args[3]) + "\n"
+            return {}
+        if verb in (("pane", "send-keys"), ("agent", "send-keys")):
+            if args[3] == "enter":
+                self.screen = "> \n"
+            return {}
+        if verb == ("agent", "get"):
+            return {
+                "result": {
+                    "agent": {
+                        "agent_status": self.status,
+                        "agent_session": {
+                            "kind": "path",
+                            "source": "herdr:omp",
+                            "value": str(self.transcript),
+                        },
+                    }
+                }
+            }
+        return super().__call__(*args, **kwargs)
+
+
+class UnwrittenTranscriptTests(unittest.TestCase):
+    """Run 646181870aef, lane-wp3-report-build code reviewer (omp).
+
+    A fresh code-reviewer session was sent its prompt three times while it ran
+    its pre-turn recall, refused `DISPATCH_NOT_CONSUMED ... after 3 sends`, and
+    cancelled. Its session directory held no transcript at all.
+    """
+
+    def test_a_first_prompt_omp_has_not_recorded_yet_is_sent_once(self) -> None:
+        pane = _Pane(drop=0)
+        self.addCleanup(pane.close)
+        session_dir = Path(pane.handle.launched_cwd) / "code-reviewer-session"
+        session_dir.mkdir()
+        session = session_dir / "2026-10-21T07-06-30-000Z_omp.jsonl"
+        pane.herdr = _FreshOmp(pane.prompt, session, drop=0)
+        pane.launcher = _launcher(pane.herdr)
+        object.__setattr__(pane.handle, "transcript_path", None)
+        pane.submit()
+        self.assertEqual(pane.herdr.sends, 1)
+        # The launcher bound the path Herdr names; omp has not written it.
+        self.assertEqual(pane.handle.transcript_path, session)
+        self.assertFalse(session.exists())
+
+    def test_an_unbound_transcript_is_never_called_lost(self) -> None:
+        pane = _Pane(drop=0)
+        self.addCleanup(pane.close)
+        object.__setattr__(pane.handle, "transcript_path", None)
+        self.assertFalse(pane.launcher.prompt_delivery_lost(pane.handle, pane.prompt))
+
+
 class IdleWaitBoundTests(unittest.TestCase):
     def _wait(self, pane: _Pane, limit: int, tick: float = 0.1) -> Any:
         self.clock = 1000.0
