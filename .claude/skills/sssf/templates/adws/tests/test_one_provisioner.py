@@ -176,21 +176,15 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7.0)]
         )
 
-    def test_the_review_tree(self) -> None:
+    def test_the_review_tree_is_not_provisioned_on_this_host(self) -> None:
+        # Its suite runs on the spot fleet, and `remote_job.execute` provisions
+        # the subject there. Installing here would be multi-GB of local work
+        # for a tree no test process runs in.
         dest = self.root / "review"
         with mock.patch.object(cr.tm, "materialize_commit", return_value=dest) as materialize:
-            cr._review_tree(
-                self.root / "repo",
-                "a" * 40,
-                dest,
-                ("provisioner", "--install"),
-                7,
-                state_root=self.root,
-            )
+            cr._review_tree(self.root / "repo", "a" * 40, dest, state_root=self.root)
         materialize.assert_called_once()
-        self.assertEqual(
-            self.recorder.calls, [(dest, ("provisioner", "--install"), 7)]
-        )
+        self.assertEqual(self.recorder.calls, [])
 
     def test_the_harness_has_no_bridge_left_to_reach_for(self) -> None:
         for name in ("prepare_collect_tree", "COLLECT_RUNTIME_DIRS"):

@@ -632,6 +632,21 @@ def _suite_selectors(
         ) + selectors
     return argv
 
+def collect_gate(
+    gate: SimpleNamespace, files: Mapping[str, str], tree: Path
+) -> SimpleNamespace:
+    """The gate a draft is collected and measured under, with paths substituted."""
+    argv, _selectors = rc.substituted_gate_argv(gate.argv, files, tree)
+    return SimpleNamespace(
+        runner=gate.runner,
+        argv=argv,
+        cwd=gate.cwd,
+        min_cases=gate.min_cases,
+        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
+        declared_cases=tuple(getattr(gate, "declared_cases", ()) or ()),
+    )
+
+
 def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
     counts = {"passed": 0, "failed": 0, "errored": 0, "skipped": 0}
     if runner == "pytest":

@@ -887,6 +887,12 @@ TEST_CRAFT_REVIEWER_QUESTION = (
 )
 
 
+#: The agents' test command (`tools/remote_tests.py`): it runs a checkout's
+#: tests on the GitHub Actions spot fleet. Agents are told to use it and never
+#: to start a test runner on this machine.
+REMOTE_TESTS_TOOL = Path(__file__).resolve().parent / "tools" / "remote_tests.py"
+
+
 def _clear_precreated_role_cwd(dest: Path) -> bool:
     """Empty a precreated role cwd without replacing its process-bound inode."""
     if not _precreated_role_cwd(dest):
@@ -1277,13 +1283,13 @@ class HerdrStageActor:
 
     _TESTER_COLLECT_RULE = (
         "Before you return the envelope, enumerate your own draft with the "
-        "gate's own runner and see the listing. vitest: "
-        "`<vitest binary> list --run [--config <gate config>] <your files>`; "
-        "pytest: `<pytest binary> --collect-only -q -o addopts= <your files>`. "
-        "The harness runs exactly that and will not accept a draft it cannot "
+        "gate's own runner and see the listing: run the remote test command "
+        "your turn instructions name, with `--collect`, over your files. It "
+        "runs the gate's runner on the spot fleet, never on this machine. The "
+        "harness runs exactly that and will not accept a draft it cannot "
         "enumerate. A listing that appears and then does not exit is fine -- "
         "some configs hold the runner open, and the harness reads what was "
-        "printed; kill it once you have seen your case ids. Nothing printed at "
+        "printed. Nothing printed at "
         "all means no module finished loading, which is your defect to fix, "
         "not the harness's. Counting `it(`, `test(`, or `def test_` with grep, "
         "or any other static scan of the file, is NOT this measurement and "
@@ -1716,6 +1722,19 @@ class HerdrStageActor:
             spec.pop("gate", None)
         return spec
 
+    @staticmethod
+    def _remote_tests_instruction(cwd: Path) -> str:
+        """Every role's rule: no test process starts on this machine."""
+        return (
+            " Never run pytest, vitest, or any other test runner or test "
+            "collection on this machine -- not the suite, not one case, not "
+            "`--collect-only`, not `vitest list`: test processes run only on "
+            "the GitHub Actions spot fleet. To run or list tests, run "
+            "`uv run --script {0} --tree {1} [--collect] -- <test files>`. It "
+            "tests this checkout as it stands, uncommitted files included, and "
+            "prints the runner's output; its exit status is the runner's."
+        ).format(REMOTE_TESTS_TOOL, cwd.resolve())
+
     def _prompt(
         self,
         ctx: LaneContext,
@@ -1742,6 +1761,7 @@ class HerdrStageActor:
             "finished; never write into {0} directly, because a reader polling "
             "it reads a partial file as a failed turn. Schema: {1}. CWD: {2}."
         ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
+        instructions += self._remote_tests_instruction(cwd)
 
         if acceptance:
             instructions += self._acceptance_instruction(str(mode))
