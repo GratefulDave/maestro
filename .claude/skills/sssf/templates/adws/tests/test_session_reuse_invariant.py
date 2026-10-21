@@ -399,6 +399,42 @@ class BusyRetainedSessionTest(unittest.TestCase):
         self.assertNotIn(original.pane_id, run.herdr.closed_panes)
         self.assertEqual(self.replaced, [])
 
+    def test_a_retained_session_that_never_took_the_prompt_is_replaced(self) -> None:
+        # Run 646181870aef: a resubmission into a retained session that never
+        # receives the prompt was refused DISPATCH_NOT_CONSUMED and parked the
+        # lane LANE_FAULT. A fresh session is one more delivery.
+        refused = lch.LaunchRefused(
+            lch.LaunchRefusal.DISPATCH_NOT_CONSUMED, "never landed", pane_created=True
+        )
+        for role in ("tester", "test-reviewer", "builder", "code-reviewer", "operator"):
+            with self.subTest(role):
+                self.replaced.clear()
+                run = _RunFixture(tempfile.mkdtemp(dir=self.tmp.name))
+                launcher = run.launcher()
+                spec = self.run_spec(run, role)
+                original = _launch(launcher, run.herdr, spec)
+                run.herdr.set_agent_status(original.agent_name, "idle")
+                with mock.patch.object(launcher, "resubmit", side_effect=refused):
+                    relaunched = self.relaunch(launcher, spec)
+                self.assertIn(original.pane_id, run.herdr.closed_panes)
+                self.assertNotEqual(relaunched.pane_id, original.pane_id)
+                self.assertEqual(self.replaced, [lch.SESSION_NOT_CONSUMED])
+
+    def test_a_retained_session_refused_otherwise_still_refuses(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        launcher = run.launcher()
+        spec = self.run_spec(run, "tester")
+        original = _launch(launcher, run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "idle")
+        refused = lch.LaunchRefused(
+            lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED, "x", pane_created=True
+        )
+        with mock.patch.object(launcher, "resubmit", side_effect=refused):
+            with self.assertRaises(lch.LaunchRefused):
+                self.relaunch(launcher, spec)
+        self.assertNotIn(original.pane_id, run.herdr.closed_panes)
+        self.assertEqual(self.replaced, [])
+
 
 class OmpSessionDirTest(unittest.TestCase):
     def setUp(self) -> None:

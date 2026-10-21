@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening, new path): a dispatch that never reached its agent is delivered again, not parked for the operator
+
+- Run 646181870aef parked two lanes `DISPATCH_NOT_CONSUMED` on prompts a
+  fresh agent never received.
+- `prompt_delivery_lost` and the unbound-transcript submission proof counted
+  every record of the prompt path over the transcript family. After a
+  scheduler restart the path is `prompt-1.json` again, and Claude keeps the
+  replaced session's transcript (33 records of it) beside the new one, so the
+  lost offer read as delivered and was never re-sent. Both now count from a
+  per-file snapshot taken just before the offer (`marks_since_offer`,
+  `LaunchHandle.offer_marks`).
+- Herdr reports Claude `--remote-control` ready about 30s before its TUI
+  draws (measured: ready at 6s, drawn at 34-47s). A fresh launch now holds
+  the first prompt while the pane still ends at the agent's launch line
+  (`wait_for_agent_drawn`, 180s, `AGENT_NEVER_DRAWN`).
+- The envelope wait's idle bound resubmits a provably lost prompt once
+  (`DISPATCH_REDELIVERIES`) before refusing.
+- A retained session refused `DISPATCH_NOT_CONSUMED` on resubmission is
+  replaced (`SESSION_NOT_CONSUMED`) and the role starts fresh.
+
 ### Changed — contract change (new path, weakening): a retained session still busy at the next dispatch is replaced, not refused
 
 - A Claude tester declared its draft; a background-task notification later
