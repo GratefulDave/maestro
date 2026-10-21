@@ -210,6 +210,10 @@ DEFAULT_ROLE_SESSION_MAX_TOKENS = 1_000_000
 #: `0` turns the bound off.
 DEFAULT_DISPATCH_IDLE_TIMEOUT_S = 600
 
+#: How many times a dispatch whose prompt provably never reached the agent is
+#: delivered again when the idle bound expires, before it is refused.
+DISPATCH_REDELIVERIES = 1
+
 
 def _config_dispatch_idle_timeout_s(value: object, label: str) -> int:
     """`dispatch_idle_timeout_s`: the idle bound on a dispatch. Absent keeps the default."""
@@ -2424,7 +2428,12 @@ class HerdrStageActor:
             pass
 
     def _await_envelope(
-        self, handle: object, envelope: Path, role: str, lane_id: str = ""
+        self,
+        handle: object,
+        envelope: Path,
+        role: str,
+        lane_id: str = "",
+        prompt: Optional[Path] = None,
     ) -> Mapping[str, Any]:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
         started = time.monotonic()
@@ -2434,6 +2443,16 @@ class HerdrStageActor:
         limit = int(getattr(self, "dispatch_idle_timeout_s", 0) or 0)
         last_seen: object = None
         quiet_since = 0.0
+        redeliveries = 0
+
+        def delivery_lost() -> bool:
+            lost = getattr(self.launcher, "prompt_delivery_lost", None)
+            if prompt is None or lost is None:
+                return False
+            try:
+                return bool(lost(handle, prompt))
+            except Exception:
+                return False
 
         def transcript_bytes() -> object:
             if activity is None:
@@ -2583,6 +2602,30 @@ class HerdrStageActor:
                     quiet_since = waited
                     continue
                 if waited - quiet_since >= limit:
+                    # Run 646181870aef: a fresh tester sat at an empty
+                    # composer for 629s and the lane parked for the operator.
+                    # A dispatch that provably never reached the agent is
+                    # delivered again, a bounded number of times, first.
+                    if redeliveries < DISPATCH_REDELIVERIES and delivery_lost():
+                        redeliveries += 1
+                        self._say(
+                            lane_id or "-",
+                            "{0} never received its prompt, delivering again".format(
+                                role
+                            ),
+                            "redelivery {0} of {1}".format(
+                                redeliveries, DISPATCH_REDELIVERIES
+                            ),
+                        )
+                        try:
+                            self.launcher.resubmit(
+                                handle, prompt, envelope_path=envelope
+                            )
+                        except lch.LaunchRefused as exc:
+                            raise self._launch_failed(exc) from exc
+                        last_seen = None
+                        quiet_since = waited
+                        continue
                     raise LaunchFailed(
                         "DISPATCH_NOT_CONSUMED:{0} idle {1}s with no envelope "
                         "and no transcript activity".format(
@@ -2967,7 +3010,7 @@ class HerdrStageActor:
             "dispatched {0}".format(role),
             "{0} {1}".format(route["route"], route.get("model") or route.get("profile") or ""),
         )
-        payload = self._await_envelope(handle, envelope, role, lane_id)
+        payload = self._await_envelope(handle, envelope, role, lane_id, prompt=prompt)
         self._say(lane_id, "{0} replied".format(role), "turn {0}".format(turn))
         bound = _RoleSession(handle, cwd_used, attempt, None, ctx.run_id)
         bound.turns = turn

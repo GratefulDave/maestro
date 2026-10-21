@@ -462,7 +462,7 @@ class InvokingWorkspaceTest(unittest.TestCase):
                 cwd = _checkout(Path(tmp), "tester")
                 envelopes = []
 
-                def reply(handle, envelope, role, lane):
+                def reply(handle, envelope, role, lane, prompt=None):
                     envelopes.append(envelope)
                     envelope.write_text("{}", encoding="utf-8")
                     return {}

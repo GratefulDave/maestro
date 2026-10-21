@@ -782,6 +782,11 @@ class LaunchHandle:
     child_workspace_id: str = ""
     pane_role: str = ""
     lane_label: str = ""
+    #: Records of the offer this handle is waiting on, counted from just
+    #: before it was sent (`marks_since_offer`). `None` before any offer.
+    offer_marks: Optional[Callable[[], int]] = field(
+        default=None, compare=False, repr=False
+    )
 
 
     def __post_init__(self) -> None:
@@ -930,6 +935,9 @@ SESSION_TURN_ORPHANED = "SESSION_TURN_ORPHANED"
 #: turn of its own (a background-task notification wakes Claude Code into
 #: one). Nothing will read that turn either.
 SESSION_BUSY = "SESSION_BUSY"
+#: A retained agent never received the prompt resubmitted into it, after
+#: every bounded send. A fresh session is the one remaining delivery.
+SESSION_NOT_CONSUMED = "SESSION_NOT_CONSUMED"
 #: The file in an omp `session_dir` recording whose session it holds.
 SESSION_IDENTITY_FILE = "maestro-session.json"
 
@@ -2620,23 +2628,11 @@ def prompt_submission_marks(
     transcript = handle.transcript_path
     if transcript is None:
         return 0
-    marker = ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
-    if chunk_size < len(marker):
-        chunk_size = len(marker)
+    marker = _prompt_marker(prompt_path)
     total = 0
     try:
         for path in transcript_family(Path(transcript)):
-            overlap = b""
-            with path.open("rb") as source:
-                while True:
-                    chunk = source.read(chunk_size)
-                    if not chunk:
-                        break
-                    window = overlap + chunk
-                    total += window.count(marker)
-                    overlap = (
-                        window[-(len(marker) - 1) :] if len(marker) > 1 else b""
-                    )
+            total += _file_marks(path, marker, chunk_size)
         return total
     except OSError as exc:
         # The count so far is a floor, not the count. Callers comparing counts
@@ -2646,6 +2642,88 @@ def prompt_submission_marks(
         if on_error is not None:
             on_error(exc)
         return total
+
+
+def _prompt_marker(prompt_path: Path) -> bytes:
+    return ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
+
+
+def _file_marks(path: Path, marker: bytes, chunk_size: int = 64 * 1024) -> int:
+    chunk_size = max(chunk_size, len(marker))
+    total = 0
+    overlap = b""
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            window = overlap + chunk
+            total += window.count(marker)
+            overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+    return total
+
+
+#: A family file last written this close before the offer may still be the
+#: one the offer is recorded in, on a filesystem with coarse mtimes.
+OFFER_MTIME_SLACK_S = 2.0
+
+
+def _family_marks(
+    handle: LaunchHandle, marker: bytes
+) -> Dict[Path, Tuple[int, float]]:
+    if handle.transcript_path is None:
+        return {}
+    marks: Dict[Path, Tuple[int, float]] = {}
+    for path in transcript_family(Path(handle.transcript_path)):
+        try:
+            mtime = path.stat().st_mtime
+            marks[path] = (_file_marks(path, marker), mtime)
+        except FileNotFoundError:
+            continue
+    return marks
+
+
+def marks_since_offer(handle: LaunchHandle, prompt_path: Path) -> Callable[[], int]:
+    """Count the records of THIS offer of `prompt_path`, taken from now.
+
+    `prompt_submission_marks` is a total, and a prompt path is reused: a
+    scheduler restart resets the turn counter, so a fresh session is handed
+    `prompt-1.json` again, and Claude leaves the replaced session's
+    transcript beside the new one in the checkout's project directory. Run
+    646181870aef, lane-wp3-reproduce-tests: the dead session named
+    `prompt-1.json` 33 times, so a prompt that never reached the fresh
+    session read as delivered, nothing re-sent it, and the lane parked
+    `DISPATCH_NOT_CONSUMED` for the operator 629s later.
+
+    Snapshot per file before the offer and count only what rises. A file
+    first seen later (a transcript bound after the offer, a rotated session
+    file) counts in full only when it was written since the offer; one last
+    written before it cannot hold this offer's record.
+    """
+    marker = _prompt_marker(prompt_path)
+    offered_at = time.time()
+    try:
+        baseline = _family_marks(handle, marker)
+    except OSError:
+        baseline = {}
+
+    def since() -> int:
+        total = 0
+        for path, (count, mtime) in _family_marks(handle, marker).items():
+            if path in baseline:
+                total += max(0, count - baseline[path][0])
+            elif mtime >= offered_at - OFFER_MTIME_SLACK_S:
+                total += count
+        return total
+
+    return since
+
+
+def _offer_marks_now(handle: LaunchHandle, prompt_path: Path) -> int:
+    """This offer's records when the handle carries an offer, else the total."""
+    if handle.offer_marks is not None:
+        return handle.offer_marks()
+    return prompt_submission_marks(handle, prompt_path)
 
 
 def transcript_family(transcript: Path) -> List[Path]:
@@ -2790,6 +2868,65 @@ def wait_for_interactive_agent(
         return
     raise refusal()
 
+
+
+#: How long a started agent may take to draw over its own launch line before
+#: the first prompt is sent anyway. Measured 2026-10-21: Claude Code with
+#: `--remote-control` drew its TUI 34-47s after start, while `herdr agent
+#: start` had returned ready, `idle`, `interactive_ready: true`, at 6s.
+AGENT_DRAW_TIMEOUT_S = 180.0
+
+
+def pane_shows_launch_line(
+    herdr_call: Callable[..., dict], pane_id: str, route: str, last_arg: str
+) -> bool:
+    """Whether the pane's last line is still the shell line that started the agent.
+
+    True only on a legible screen whose last non-blank line names the route
+    and its final argument: nothing has drawn over the command yet, so a
+    prompt sent now lands on no composer. An unreadable or empty screen is
+    never a True.
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        return False
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return route in lines[-1] and last_arg in lines[-1]
+
+
+def wait_for_agent_drawn(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    route: str,
+    last_arg: str,
+    timeout_s: float = AGENT_DRAW_TIMEOUT_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Hold the first prompt until the agent has drawn over its launch line.
+
+    Herdr's readiness is not this. Run 646181870aef: a code reviewer's pane
+    still showed only `claude … --remote-control` when its prompt was sent
+    three times and refused `DISPATCH_NOT_CONSUMED`, and a tester's sends were
+    swallowed by the TUI that drew after them, leaving an empty composer.
+    Refuses `AgentNotInteractive` when the agent never draws.
+    """
+    deadline = monotonic() + max(0.0, timeout_s)
+    while pane_shows_launch_line(herdr_call, pane_id, route, last_arg):
+        if monotonic() >= deadline:
+            raise AgentNotInteractive(
+                "AGENT_NEVER_DRAWN:{0} still shows its launch line after {1}s".format(
+                    pane_id, int(timeout_s)
+                )
+            )
+        sleep(0.5)
 
 
 def wait_for_agent_transcript(
@@ -5344,7 +5481,7 @@ class HerdrLauncher:
         try:
             if self._agent_transcript_bound(handle) != "idle":
                 return False
-            if prompt_submission_marks(handle, prompt_path) > 0:
+            if _offer_marks_now(handle, prompt_path) > 0:
                 return False
             return (
                 pane_lacks_offer(
@@ -5428,7 +5565,7 @@ class HerdrLauncher:
                     self._bind_handle_transcript(handle, found)
             if handle.transcript_path is None:
                 return False
-            return prompt_submission_marks(handle, prompt_path) > 0
+            return _offer_marks_now(handle, prompt_path) > 0
 
         return recorded
 
@@ -5479,9 +5616,10 @@ class HerdrLauncher:
         # would make one herdr call before that refusal and falsify it.
         pane_env_flags(environment)
         def resubmit_adopted(adopted: LaunchHandle) -> Optional[LaunchHandle]:
-            # `None`: the adopted session stayed busy and was closed; the
-            # caller starts the role fresh. Binding first: only a session
-            # proven to be this one may be closed.
+            # `None`: the adopted session stayed busy, or never received the
+            # prompt, and was closed; the caller starts the role fresh.
+            # Binding first: only a session proven to be this one may be
+            # closed.
             self._verified_handle_binding(adopted)
             if self._busy_session_replaced(spec, adopted):
                 return None
@@ -5490,12 +5628,27 @@ class HerdrLauncher:
                 # The callback may rewrite the prompt with the adopted CWD.
                 prepare_route_prompt(spec)
                 preflight_launch_prompt(spec)
-            return self.resubmit(
-                adopted,
-                spec.prompt_path,
-                route=spec.route,
-                envelope_path=spec.envelope_path,
-            )
+            try:
+                return self.resubmit(
+                    adopted,
+                    spec.prompt_path,
+                    route=spec.route,
+                    envelope_path=spec.envelope_path,
+                )
+            except LaunchRefused as exc:
+                # The retained session never received the prompt after every
+                # bounded send. Replaced exactly as a busy one is (#369): the
+                # caller starts the role fresh, which is one more delivery,
+                # not a lane fault.
+                if exc.refusal is not LaunchRefusal.DISPATCH_NOT_CONSUMED:
+                    raise
+                self._replace_session(
+                    spec,
+                    adopted,
+                    SESSION_NOT_CONSUMED,
+                    "pane {0}: {1}".format(adopted.pane_id, exc.detail),
+                )
+                return None
 
         existing = self._validated_existing_role_handle(spec, environment)
         if existing is None:
@@ -5714,6 +5867,12 @@ class HerdrLauncher:
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 name,
             )
+            wait_for_agent_drawn(
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id,
+                spec.route,
+                route_argv[-1],
+            )
             # The trailing space is load-bearing, not cosmetic. `@` opens the
             # composer's file-path completion popup in both omp and Claude
             # Code, and while that popup is open it consumes Enter to accept a
@@ -5732,6 +5891,9 @@ class HerdrLauncher:
             # before or after offering is a circular refusal. Discover it
             # through the proof predicate while the submission loop runs;
             # missing stays unproven False.
+            object.__setattr__(
+                handle, "offer_marks", marks_since_offer(handle, spec.prompt_path)
+            )
             submission_recorded = self._runtime_submission_recorded(
                 handle, spec.prompt_path
             )
@@ -5952,6 +6114,7 @@ class HerdrLauncher:
     def _submit_resubmission(
         self, handle: LaunchHandle, prompt: Path, timeout_s: float
     ) -> None:
+        object.__setattr__(handle, "offer_marks", marks_since_offer(handle, prompt))
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
