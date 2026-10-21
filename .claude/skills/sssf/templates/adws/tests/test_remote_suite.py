@@ -165,8 +165,19 @@ class RemoteSuiteTest(unittest.TestCase):
         patcher = mock.patch.object(rs.subprocess, "run", fake)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # `time` is one module: the in-process job's own sub-second polling
+        # sleeps go through this patch too. Those still sleep; only the
+        # scheduler-scale waits (backoff, poll) are recorded and skipped.
         self.slept: list[float] = []
-        sleeper = mock.patch.object(rs.time, "sleep", self.slept.append)
+        real_sleep = rs.time.sleep
+
+        def sleep(delay: float) -> None:
+            if delay >= 1.0:
+                self.slept.append(delay)
+            else:
+                real_sleep(delay)
+
+        sleeper = mock.patch.object(rs.time, "sleep", sleep)
         sleeper.start()
         self.addCleanup(sleeper.stop)
         return fake
