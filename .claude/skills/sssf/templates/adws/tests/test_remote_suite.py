@@ -36,6 +36,9 @@ from tests import probe_actor_bench as pb
 ADWS = Path(__file__).resolve().parents[1]
 _REAL_RUN = subprocess.run
 SUITE = {"tests/test_one.py": "def test_one():\n    assert 1 + 1 == 2\n"}
+#: What `gh` printed when one poll ended a whole run.
+TLS_TIMEOUT = ('failed to get run: Get "https://api.github.com/repos/acme/widgets/actions/runs/7'
+               '?exclude_pull_requests=true": net/http: TLS handshake timeout')
 
 
 def _git(repo: Path, *argv: str) -> str:
@@ -55,11 +58,15 @@ def _extract(repo: Path, sha: str, dest: Path) -> None:
 class FakeGitHub:
     """`gh` and `git push`, answering as GitHub and the spot runner would."""
 
-    def __init__(self, repo: Path, scratch: Path, *, dispatch_rc: int = 0, download_rc: int = 0) -> None:
+    def __init__(self, repo: Path, scratch: Path, *, dispatch_rc: int = 0, download_rc: int = 0,
+                 view_failures: int = 0, push_failures: int = 0) -> None:
         self.repo = repo
         self.scratch = scratch
         self.dispatch_rc = dispatch_rc
         self.download_rc = download_rc
+        #: Polls of `gh run view` / subject pushes that fail in transit first.
+        self.view_failures = view_failures
+        self.push_failures = push_failures
         self.calls: list[list[str]] = []
         self.refs: dict[str, str] = {}
         self.deleted: list[str] = []
@@ -82,6 +89,10 @@ class FakeGitHub:
         if "--delete" in tail:
             self.deleted.extend(item for item in tail if item.startswith("refs/"))
             return self._done(argv)
+        if self.push_failures:
+            self.push_failures -= 1
+            return self._done(argv, 128, err="fatal: unable to access 'https://github.com/acme/widgets.git/': "
+                                             "Connection reset by peer")
         for spec in tail:
             if ":" in spec and not spec.startswith("http"):
                 sha, ref = spec.split(":", 1)
@@ -103,6 +114,9 @@ class FakeGitHub:
             rows = [{"databaseId": 7, "displayTitle": title, "url": "https://github.com/acme/widgets/actions/runs/7"}]
             return self._done(argv, out=json.dumps(rows))
         if verb == ["run", "view"]:
+            if self.view_failures:
+                self.view_failures -= 1
+                return self._done(argv, 1, err=TLS_TIMEOUT)
             return self._done(argv, out=json.dumps({"status": "completed", "conclusion": "success"}))
         if verb == ["run", "download"]:
             if self.download_rc:
@@ -151,7 +165,43 @@ class RemoteSuiteTest(unittest.TestCase):
         patcher = mock.patch.object(rs.subprocess, "run", fake)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # `time` is one module: the in-process job's own sub-second polling
+        # sleeps go through this patch too. Those still sleep; only the
+        # scheduler-scale waits (backoff, poll) are recorded and skipped.
+        self.slept: list[float] = []
+        real_sleep = rs.time.sleep
+
+        def sleep(delay: float) -> None:
+            if delay >= 1.0:
+                self.slept.append(delay)
+            else:
+                real_sleep(delay)
+
+        sleeper = mock.patch.object(rs.time, "sleep", sleep)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
         return fake
+
+    def test_a_transient_poll_failure_is_retried_and_the_run_is_read(self) -> None:
+        fake = self._fake(view_failures=2, push_failures=1)
+        run, refusal = cr._run_suite(self.tree, SUITE, gate=None, suite_timeout_s=120)
+        self.assertIsNone(refusal)
+        self.assertEqual(run["counts"]["passed"], 1)
+        views = [call for call in fake.calls if call[:3] == ["gh", "run", "view"]]
+        self.assertEqual(len(views), 3)
+        self.assertEqual(self.slept, [rs.TRANSIENT_BACKOFF_S[0]] + list(rs.TRANSIENT_BACKOFF_S[:2]))
+
+    def test_a_transient_failure_beyond_the_bound_refuses_typed(self) -> None:
+        fake = self._fake(view_failures=len(rs.TRANSIENT_BACKOFF_S) + 1)
+        with self.assertRaises(rs.RemoteSuiteRefused) as caught:
+            cr._run_suite(self.tree, SUITE, gate=None, suite_timeout_s=120)
+        self.assertEqual(caught.exception.reason, "RUN_UNREADABLE")
+        self.assertIn("TLS handshake timeout", str(caught.exception))
+        views = [call for call in fake.calls if call[:3] == ["gh", "run", "view"]]
+        self.assertEqual(len(views), len(rs.TRANSIENT_BACKOFF_S) + 1)
+        self.assertEqual(self.slept, list(rs.TRANSIENT_BACKOFF_S))
+        self.assertFalse([call for call in fake.calls if any("pytest" in item for item in call)])
+        self.assertEqual(len(fake.deleted), 2)
 
     def test_a_call_site_measures_on_the_fleet_and_deletes_its_refs(self) -> None:
         fake = self._fake()
@@ -178,6 +228,8 @@ class RemoteSuiteTest(unittest.TestCase):
         with self.assertRaises(rs.RemoteSuiteRefused) as caught:
             cr._run_suite(self.tree, SUITE, gate=None, suite_timeout_s=120)
         self.assertIn("DISPATCH_FAILED", str(caught.exception))
+        # Not a transient failure: refused on the first answer, never retried.
+        self.assertEqual(self.slept, [])
         self.assertIn(".github/workflows/maestro-suite.yml", str(caught.exception))
         self.assertFalse(
             [call for call in fake.calls if any("pytest" in item for item in call)],

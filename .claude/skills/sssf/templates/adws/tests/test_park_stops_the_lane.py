@@ -29,6 +29,7 @@ from adw_modules import git_helper
 from adw_modules import git_publication as gitpub
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
+from adw_modules import remote_suite as rs
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
 from adw_modules.lifecycle import ArtifactStore
@@ -123,6 +124,7 @@ FAULT_RUN_ID = "run-lane-fault"
 FAULTED_LANE = "lane-faulted"
 INDEPENDENT_LANE = "lane-independent"
 DEPENDENT_LANE = "lane-dependent"
+ORIGIN = "https://github.com/acme/widgets.git"
 
 
 def _fault_plan() -> bytes:
@@ -197,6 +199,21 @@ class _RuntimeFailingActor(_PassingActor):
     def write_tests(self, ctx: sch.LaneContext) -> dict:
         if ctx.lane.lane_id == FAULTED_LANE:
             raise RuntimeError("not an agent transport failure")
+        return super().write_tests(ctx)
+
+
+class _SpotFleetUnreachableActor(_PassingActor):
+    """Measures the faulted lane through the production executor, offline.
+
+    `remote_suite.github` runs for real; only its network calls are faked, at
+    `subprocess.run`, and every one of them times out in transit.
+    """
+
+    tree: Path
+
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        if ctx.lane.lane_id == FAULTED_LANE:
+            rs.github("draft", self.tree, {}, {}, 60.0)
         return super().write_tests(ctx)
 
 
@@ -297,6 +314,48 @@ class LaneFaultScopingTest(unittest.TestCase):
             steps,
         )
         self.assertEqual(self.store.ready_lane_ids(FAULT_RUN_ID), ())
+
+    def test_an_unreachable_spot_fleet_parks_its_lane_while_an_independent_lane_merges(
+        self,
+    ) -> None:
+        real_run = subprocess.run
+
+        def offline(argv: object, *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            words = [str(item) for item in argv] if isinstance(argv, (list, tuple)) else []
+            if words[:1] == ["gh"] or (
+                words[:1] == ["git"] and "push" in words and ORIGIN in words
+            ):
+                return subprocess.CompletedProcess(words, 128, "", "net/http: TLS handshake timeout")
+            return real_run(argv, *args, **kwargs)  # type: ignore[call-overload]
+
+        cutover._git(self.repo, "remote", "add", "origin", ORIGIN)
+        actor = _SpotFleetUnreachableActor(self.repo, self.runtime.path / "worktrees")
+        actor.tree = self.repo
+        with mock.patch.object(rs.subprocess, "run", offline), mock.patch.object(
+            rs.time, "sleep", lambda _s: None
+        ):
+            status = self.scheduler(actor, concurrency=2).run()
+
+        self.assertIs(status, st.RunStatus.WAITING)
+        self.assertEqual(
+            {
+                lane: self.store.lane_stage(FAULT_RUN_ID, lane)
+                for lane in (FAULTED_LANE, INDEPENDENT_LANE, DEPENDENT_LANE)
+            },
+            {
+                FAULTED_LANE: st.LaneStage.WAITING_FOR_USER,
+                INDEPENDENT_LANE: st.LaneStage.MERGED,
+                DEPENDENT_LANE: st.LaneStage.PLANNED,
+            },
+        )
+        wait = sch._latest(
+            self.store, FAULT_RUN_ID, FAULTED_LANE, st.ArtifactKind.USER_WAIT
+        )
+        assert wait is not None
+        self.assertEqual(wait.payload["wait_reason"], st.WaitReason.LANE_FAULT.value)
+        self.assertEqual(wait.payload["fault"]["exception_type"], "RemoteSuiteRefused")
+        self.assertIn("PUSH_FAILED", wait.payload["fault"]["message"])
+        self.assertIn("TLS handshake timeout", wait.payload["fault"]["message"])
 
     def test_quiescence_error_from_a_role_dispatch_is_run_level(self) -> None:
         self._assert_run_level_exception(

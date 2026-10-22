@@ -2738,9 +2738,10 @@ class FactoryScheduler:
         try:
             return call(*args)
         # `HerdrStageActor._launch` translates an agent-launch refusal to this
-        # boundary type.  It is the entire lane-scoped transport allowlist:
-        # harness, git, preparation, and generic runtime errors remain fatal
-        # even if they arise while a role method is executing.
+        # boundary type.  With `_advance`'s `RemoteSuiteRefused` it is the
+        # entire lane-scoped transport allowlist: harness, git, preparation,
+        # and generic runtime errors remain fatal even if they arise while a
+        # role method is executing.
         except LaunchFailed as exc:
             detail = exc.detail + (":pane_retained" if exc.pane_created else "")
             self._park_lane_fault(ctx, type(exc).__name__, detail, exc)
@@ -2749,27 +2750,32 @@ class FactoryScheduler:
         self, ctx: LaneContext, fault_type: str, detail: str, cause: BaseException
     ) -> NoReturn:
         """Park one lane as LANE_FAULT for the operator; the run keeps going."""
+        self._pause_lane_fault(ctx.lane.lane_id, ctx.stage, fault_type, detail)
+        raise _ActorFaultParked from cause
+
+    def _pause_lane_fault(
+        self, lane_id: str, stage: st.LaneStage, fault_type: str, detail: str
+    ) -> None:
         with self._inflight_lock:
-            inflight = self._inflight.get(ctx.lane.lane_id)
-        if inflight is not None and inflight[1] is ctx.stage:
+            inflight = self._inflight.get(lane_id)
+        if inflight is not None and inflight[1] is stage:
             _, _, digest, observed = inflight
         else:
-            digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
+            digest, observed = self._pause_input(lane_id, stage)
         self.store.pause_lane(
             self.run_id,
-            ctx.lane.lane_id,
-            ctx.stage,
+            lane_id,
+            stage,
             digest,
             observed=observed,
             reason=st.WaitReason.LANE_FAULT,
             fault=st.LaneFault(fault_type, detail),
         )
         self._say(
-            ctx.lane.lane_id,
+            lane_id,
             "lane fault, blocking for the operator",
             detail,
         )
-        raise _ActorFaultParked from cause
 
 
     def _advance(self, lane_id: str) -> None:
@@ -2809,6 +2815,13 @@ class FactoryScheduler:
                 )
         except _ActorFaultParked:
             return
+        except rs.RemoteSuiteRefused as exc:
+            # The spot fleet could not run or report this lane's suite, after
+            # `remote_suite` already retried any transient failure. Like
+            # `LaunchFailed` it is transport for one lane: that lane parks and
+            # every independent lane keeps advancing. It used to leave the
+            # worker and end the run.
+            self._pause_lane_fault(lane_id, stage, type(exc).__name__, str(exc))
         finally:
             with self._inflight_lock:
                 self._inflight.pop(lane_id, None)

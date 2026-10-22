@@ -20,7 +20,11 @@ raised, is decoded here and returned or raised at the call site.
 
 There is no local fallback. A run that cannot be pushed, dispatched, found,
 finished or read refuses `REMOTE_SUITE_REFUSED:<reason>`; nothing then runs on
-this host instead. The only other executor is `in_process`, which the test
+this host instead. A `gh` or `git push` that fails the way a network or the
+GitHub API fails transiently (a TLS handshake timeout, a reset connection, an
+HTTP 5xx, a 429 or secondary rate limit) is retried with bounded backoff first;
+the refusal is raised for any other failure, and for a transient one that
+outlasts the bound. The only other executor is `in_process`, which the test
 suite installs (`tests/conftest.py`) and production never does.
 """
 
@@ -57,6 +61,19 @@ QUEUE_ALLOWANCE_S = 1800.0
 POLL_S = 20.0
 #: An overlay is the call site's handful of written files, never a tree.
 OVERLAY_MAX_BYTES = 20 * 1024 * 1024
+#: Seconds slept before each retry of a transiently failed `gh` / `git push`.
+#: Its length is the bound: one try, then one retry per entry, then the refusal.
+TRANSIENT_BACKOFF_S = (5.0, 10.0, 20.0, 40.0, 80.0)
+#: stderr of a `gh` or `git push` that failed in transit, not on its merits,
+#: e.g. `failed to get run: Get "https://api.github.com/...": net/http: TLS
+#: handshake timeout`, which once ended a whole run from one poll.
+_TRANSIENT = re.compile(
+    r"tls handshake timeout|i/o timeout|timed? ?out|connection (?:reset|refused|closed)"
+    r"|broken pipe|unexpected eof|\beof\b|could not resolve host|temporary failure in name resolution"
+    r"|no such host|remote end hung up|rpc failed|http 5\d\d|http 429|\b50[0234]\b"
+    r"|rate limit|bad gateway|service unavailable|gateway time-?out|internal server error",
+    re.IGNORECASE,
+)
 
 
 class RemoteSuiteRefused(st.KernelError):
@@ -133,7 +150,7 @@ def github(
     job_sha = _job_commit(source, request, job, overlay)
     refs = ("{0}/{1}/subject".format(REF_PREFIX, request), "{0}/{1}/job".format(REF_PREFIX, request))
     _git(source, "push", "--quiet", url, "{0}:{1}".format(sha, refs[0]),
-         "{0}:{1}".format(job_sha, refs[1]), reason="PUSH_FAILED")
+         "{0}:{1}".format(job_sha, refs[1]), reason="PUSH_FAILED", network=True)
     try:
         minutes = int(math.ceil((budget_s + QUEUE_ALLOWANCE_S) / 60.0))
         _gh("workflow", "run", WORKFLOW, "-R", slug,
@@ -279,8 +296,8 @@ def _await_run(slug: str, run_id: str, run_url: str, budget_s: float) -> None:
 
 def _download_result(slug: str, run_id: str, run_url: str, request: str) -> Mapping[str, Any]:
     with tempfile.TemporaryDirectory(prefix="maestro-remote-result-") as scratch:
-        proc = _run(["gh", "run", "download", run_id, "-R", slug, "-n",
-                     "maestro-suite-{0}".format(request), "-D", scratch])
+        proc = _network(["gh", "run", "download", run_id, "-R", slug, "-n",
+                         "maestro-suite-{0}".format(request), "-D", scratch])
         result = Path(scratch) / "result.json"
         if proc.returncode != 0 or not result.is_file():
             raise RemoteSuiteRefused(
@@ -311,9 +328,29 @@ def _run(
         return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
 
 
+def _network(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    """`_run` for a call that crosses the network, retried while it fails in transit.
+
+    A failure whose stderr is not transient returns at once, so a real refusal
+    (no workflow, no artifact, auth) is exactly as fast as before. A dispatch
+    retried after a 5xx can, at worst, start a second run with the same title;
+    `_find_run` reads the first, and the refs the other needs are deleted when
+    this call returns.
+    """
+    proc = _run(argv)
+    for delay in TRANSIENT_BACKOFF_S:
+        if proc.returncode == 0 or not _TRANSIENT.search(proc.stderr or proc.stdout or ""):
+            return proc
+        time.sleep(delay)
+        proc = _run(argv)
+    return proc
+
+
 def _git(repo: Path, *argv: str, reason: str, stdin: Optional[str] = None,
-         env: Optional[Mapping[str, str]] = None, strip: bool = True) -> str:
-    proc = _run(["git", "-C", str(repo), *argv], stdin=stdin, env=env)
+         env: Optional[Mapping[str, str]] = None, strip: bool = True,
+         network: bool = False) -> str:
+    command = ["git", "-C", str(repo), *argv]
+    proc = _network(command) if network else _run(command, stdin=stdin, env=env)
     if proc.returncode != 0:
         raise RemoteSuiteRefused(
             reason, "git {0} in {1} exited {2}: {3}".format(
@@ -323,7 +360,7 @@ def _git(repo: Path, *argv: str, reason: str, stdin: Optional[str] = None,
 
 
 def _gh(*argv: str, reason: str, remedy: str = "") -> str:
-    proc = _run(["gh", *argv])
+    proc = _network(["gh", *argv])
     if proc.returncode != 0:
         detail = "gh {0} {1} exited {2}: {3}".format(
             argv[0], argv[1], proc.returncode, (proc.stderr or proc.stdout or "").strip()[-400:])
