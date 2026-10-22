@@ -1490,7 +1490,8 @@ class HerdrStageActor:
                 "any lane outside allowed_lane_ids is refused whole, and no "
                 "lane gets anything.\n"
                 "When `reviewer_findings_path` is given, the reviewer said "
-                "REVISE to your previous revision (`previous_revision_path`): "
+                "REVISE to your previous revision (`previous_revision_path`), "
+                "or planctl refused it and its error is the finding: "
                 "fix every located finding in it.\n"
                 "When `envelope_error` is given, your previous envelope was "
                 "refused with exactly that error: return a corrected envelope "
@@ -5478,8 +5479,15 @@ def _run_planctl(
     if result.returncode == 0:
         return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
+    # planctl prints every warning before its error, and the detail is
+    # bounded, so in planctl's order 18 warnings truncated the one line that
+    # said why the revision was refused. Non-warning lines come first.
+    lines = detail.strip().splitlines()
+    ordered = [line for line in lines if not line.startswith("warning:")] + [
+        line for line in lines if line.startswith("warning:")
+    ]
     message = "planctl {0} exited {1}: {2}".format(
-        argv[0], result.returncode, detail.strip()[:2000]
+        argv[0], result.returncode, "\n".join(ordered)[:2000]
     )
     if "review.remote_runner" in detail:
         # planctl runs its mutation pass on EC2 by default. Maestro never
@@ -6290,6 +6298,74 @@ def _write_review_findings(
     )
 
 
+def _attend_render(
+    policy: att.AttendPolicy,
+    repo: Path,
+    plans_dir: Path,
+    run_id: str,
+    revision_bytes: bytes,
+    revision: int,
+    bases: Optional[Sequence[Path]] = None,
+) -> tuple[Path, Path]:
+    """Lay one revision out in `plans_dir` and render it: `(ir, rendered)`.
+
+    planctl's mechanical validation of the revision, and the first step of
+    `_attend_project`. Attend also runs it on every authored revision before
+    its reviewer is dispatched (`_attend_check_revision`), so a revision
+    planctl refuses goes back to its author as that round's finding instead
+    of reaching a reviewer whose PASS the projection would then refuse.
+    """
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    stem = "{0}.r{1}".format(run_id, revision)
+    ir = plans_dir / (stem + ".ir.json")
+    rendered = plans_dir / (stem + ".html")
+    receipt = plans_dir / (stem + ".receipt.json")
+    if rendered.exists():
+        rendered.unlink()
+    try:
+        document = json.loads(revision_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise att.AttendRefused(
+            att.REVISION_REFUSED, "revision IR is not JSON: {0}".format(exc)
+        ) from exc
+    if not isinstance(document, dict):
+        raise att.AttendRefused(att.REVISION_REFUSED, "revision IR is not an object")
+    approval = document.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+    document["approval"] = {**approval, "receipt_path": receipt.name}
+    _attend_copy_sources(document, plans_dir, (repo,) if bases is None else bases)
+    ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _run_planctl(
+        _planctl_binary(policy),
+        ["render", str(ir), "--out", str(rendered), "--repo-root", str(plans_dir)],
+    )
+    return ir, rendered
+
+
+def _attend_check_revision(
+    policy: att.AttendPolicy,
+    repo: Path,
+    base: Path,
+    run_id: str,
+    revision_bytes: bytes,
+    revision: int,
+) -> None:
+    """`_attend_render` in a scratch root, before the reviewer reads a revision.
+
+    The scratch root is emptied first, so no source an earlier round laid out
+    is read for this one, and it is never the revision's own root. Sources
+    come from where `_attend_project` takes them.
+    """
+    scratch = Path(base) / run_id / "r{0}.check".format(int(revision))
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    _attend_render(
+        policy, repo, scratch, run_id, revision_bytes, revision,
+        bases=(_attend_root(base, run_id, revision - 1), repo),
+    )
+
+
 def _attend_project(
     policy: att.AttendPolicy,
     layout: Mapping[str, Any],
@@ -6332,33 +6408,18 @@ def _attend_project(
         )
     binary = _planctl_binary(policy)
     key = _reviewer_hmac_key(layout)
-    plans_dir.mkdir(parents=True, exist_ok=True)
     stem = "{0}.r{1}".format(run_id, revision)
-    ir = plans_dir / (stem + ".ir.json")
-    rendered = plans_dir / (stem + ".html")
     receipt = plans_dir / (stem + ".receipt.json")
     plan_out = plans_dir / (stem + ".plan.json")
     findings = plans_dir / (stem + ".review-findings.json")
-    for stale in (rendered, receipt, plan_out, findings):
+    for stale in (receipt, plan_out, findings):
         if stale.exists():
             stale.unlink()
-    try:
-        document = json.loads(revision_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise att.AttendRefused(
-            att.REVISION_REFUSED, "revision IR is not JSON: {0}".format(exc)
-        ) from exc
-    if not isinstance(document, dict):
-        raise att.AttendRefused(att.REVISION_REFUSED, "revision IR is not an object")
-    approval = document.get("approval")
-    if not isinstance(approval, dict):
-        approval = {}
-    document["approval"] = {**approval, "receipt_path": receipt.name}
-    _attend_copy_sources(document, plans_dir, (repo,) if bases is None else bases)
-    ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    ir, rendered = _attend_render(
+        policy, repo, plans_dir, run_id, revision_bytes, revision, bases
+    )
     root = ["--repo-root", str(plans_dir)]
     _write_review_findings(binary, ir, findings, policy, review_findings)
-    _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
         binary,
         [
@@ -6551,6 +6612,13 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
         review_round: int,
         revision_sha256: str,
     ) -> att.ReviewRequest:
+        # A revision planctl refuses never reaches the reviewer: the refusal
+        # goes back to the author as this round's finding.
+        _attend_check_revision(
+            policy, repo, _attend_planroot_base(policy, runtime, layout), run_id,
+            att.reviewed_bytes(revision, revision_sha256),
+            request.next_plan_revision,
+        )
         return _attend_review_request(
             policy,
             request,
