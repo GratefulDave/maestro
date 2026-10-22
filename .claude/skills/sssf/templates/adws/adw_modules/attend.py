@@ -171,6 +171,18 @@ class LaneEvidence:
     #: The `USER_WAIT` fault (`exception_type`, `message`) of a `LANE_FAULT`
     #: park, empty for every other reason.
     fault: Mapping[str, Any] = field(default_factory=dict)
+    #: The integration head the scheduler builds this lane on, and the
+    #: declared outputs of every lane it builds on (`merged_source_lane_ids`)
+    #: as that head holds them: the same bytes the builder's checkout has.
+    #: Without them the author cannot name a merged callable the review
+    #: demands, and the reviewer cannot check that it did.
+    integration_head: str = ""
+    merged_source: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def merged_source_sha256(self) -> str:
+        """Binds the head and every merged byte; a changed head changes it."""
+        return merged_source_digest(self.integration_head, self.merged_source)
 
 
 @dataclass(frozen=True)
@@ -353,6 +365,39 @@ def paired_lane_ids(
             if lane.lane_kind == st.LANE_KIND_BUILD and lane_id in lane.needs:
                 allowed.add(lane.lane_id)
     return tuple(sorted(allowed))
+
+
+def merged_source_lane_ids(
+    lanes: Sequence[st.LaneProjection], lane_id: str
+) -> Tuple[str, ...]:
+    """Every lane the parked lane and its pair build on, transitively.
+
+    Their declared outputs are on the integration head before either end of
+    the pair starts, so they are what the builder's checkout already holds
+    beside the suite. The pair itself is excluded: the tests end's outputs
+    are the accepted suite, already in `suite_files`.
+    """
+    by_id = {lane.lane_id: lane for lane in lanes}
+    pair = set(paired_lane_ids(lanes, lane_id))
+    seen: set = set()
+    pending = [need for member in pair if member in by_id for need in by_id[member].needs]
+    while pending:
+        need = pending.pop()
+        if need in seen or need in pair or need not in by_id:
+            continue
+        seen.add(need)
+        pending.extend(by_id[need].needs)
+    return tuple(sorted(seen))
+
+
+def merged_source_digest(head: str, files: Mapping[str, str]) -> str:
+    """sha256 over the integration head and every merged file, path-ordered."""
+    canonical = json.dumps(
+        {"integration_head": head, "files": sorted(files.items())},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return sha256_hex(canonical.encode("utf-8"))
 
 
 def batch_scope(
@@ -1364,6 +1409,7 @@ def _attend_batch(
         if failed is not None:
             return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
         verdict, located = require_review_verdict(answer)
+        merged = {lane.lane_id: lane.merged_source_sha256 for lane in request.lanes}
         store.record_attend_review(
             run_id,
             session_id=session_id,
@@ -1377,7 +1423,11 @@ def _attend_batch(
                 "revision_ref": str(written),
                 "revision_sha256": digest,
                 "lanes": [
-                    {"lane_id": lane_id, "wait_reason": reason}
+                    {
+                        "lane_id": lane_id,
+                        "wait_reason": reason,
+                        "merged_source_sha256": merged.get(lane_id, ""),
+                    }
                     for lane_id, reason in parked
                 ],
             },

@@ -1475,6 +1475,12 @@ class HerdrStageActor:
                 "the suite asserts, as a contract clause in your own words, is "
                 "exactly what you are here to do; pasting the test file into "
                 "the contract is not.\n"
+                "Every lane a parked lane builds on is already merged, and its "
+                "declared outputs, as the integration head the builder starts "
+                "from holds them, are under `merged/<lane_id>/` "
+                "(`merged_source_dir`, at `integration_head`). When a review "
+                "demands the contract name a merged callable, module or "
+                "report schema, read it there and name it exactly as it is.\n"
                 "Write the revision IR at the path the per-turn JSON names, "
                 "and nowhere else. Do not edit the current IR in place. Do not "
                 "run any `maestro` verb, any git command, or `planctl` -- an "
@@ -1501,7 +1507,13 @@ class HerdrStageActor:
                 "and you do not edit it. Read the revision against the "
                 "current IR it revises, the planctl question surface of the "
                 "revision, the author's rationales, and each parked lane's "
-                "evidence under `lanes/<lane_id>/` and `suite/<lane_id>/`.\n"
+                "evidence under `lanes/<lane_id>/` and `suite/<lane_id>/`, "
+                "and the merged source it builds on under "
+                "`merged/<lane_id>/`: the integration head's bytes for every "
+                "lane it depends on, the same the builder starts from. That "
+                "merged source is a permitted review input; check every "
+                "merged callable, module or schema the revision names "
+                "against it and cite it in your findings.\n"
                 "Return REVISE when the revision does not close each parked "
                 "lane's gap, weakens a check, verdict or error path, reaches "
                 "a lane outside allowed_lane_ids, or leaves a two-"
@@ -1967,8 +1979,9 @@ class HerdrStageActor:
         elif role == "operator":
             instructions += (
                 " Read current_ir_path and, for every lane in parked_lanes, "
-                "its accepted suite under suite/<lane_id>/ and its gate "
-                "table, reviews and final review under lanes/<lane_id>/. "
+                "its accepted suite under suite/<lane_id>/, its gate "
+                "table, reviews and final review under lanes/<lane_id>/, "
+                "and the merged source it builds on under merged/<lane_id>/. "
                 "Write one revised IR answering every parked lane at "
                 "revision_out_path and return that exact path plus one "
                 "rationale per parked lane, except a LANE_FAULT lane you "
@@ -1986,7 +1999,9 @@ class HerdrStageActor:
             instructions += (
                 " Read current_ir_path, revision_ir_path, question_surface_path, "
                 "rationales_path, and for every lane in parked_lanes its "
-                "evidence under lanes/<lane_id>/ and suite/<lane_id>/. "
+                "evidence under lanes/<lane_id>/ and suite/<lane_id>/ and "
+                "the merged source under merged/<lane_id>/, which you may "
+                "cite. "
                 + att.TWO_IMPLEMENTATIONS_QUESTION
                 + " Then return verdict PASS or REVISE; REVISE carries at "
                 "least one finding with location, defect and required_change."
@@ -3614,6 +3629,8 @@ class HerdrStageActor:
     #: to their CWD.
     _OPERATOR_INPUTS = "inputs"
     _OPERATOR_SUITE = "suite"
+    #: The integration head's bytes for every lane a parked lane builds on.
+    _OPERATOR_MERGED = "merged"
     _OPERATOR_OUT = "revisions"
     _ATTEND_REVIEWER = _ATTEND_REVIEWER_ROLE
 
@@ -3665,7 +3682,8 @@ class HerdrStageActor:
         """
         inputs = cwd / self._OPERATOR_INPUTS
         suite = cwd / self._OPERATOR_SUITE
-        for directory in (inputs, suite):
+        merged = cwd / self._OPERATOR_MERGED
+        for directory in (inputs, suite, merged):
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
@@ -3700,11 +3718,15 @@ class HerdrStageActor:
                 json.dumps(st.json_ready(lane.final_review), indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            lane_suite = _resolved_under(suite, lane.lane_id)
-            for relative, text in sorted(lane.suite_files.items()):
-                destination = _resolved_under(lane_suite, relative)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text(text, encoding="utf-8")
+            for root, files_of in (
+                (suite, lane.suite_files),
+                (merged, lane.merged_source),
+            ):
+                lane_root = _resolved_under(root, lane.lane_id)
+                for relative, text in sorted(files_of.items()):
+                    destination = _resolved_under(lane_root, relative)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(text, encoding="utf-8")
         lch.scratch_environment(cwd)
 
     def _attend_lanes_extra(
@@ -3719,6 +3741,12 @@ class HerdrStageActor:
                 ),
                 "suite_dir": str((cwd / self._OPERATOR_SUITE / lane.lane_id).resolve()),
                 "suite_files": sorted(lane.suite_files),
+                "integration_head": lane.integration_head,
+                "merged_source_dir": str(
+                    (cwd / self._OPERATOR_MERGED / lane.lane_id).resolve()
+                ),
+                "merged_source_files": sorted(lane.merged_source),
+                "merged_source_sha256": lane.merged_source_sha256,
             }
             for lane in lanes
         ]
@@ -5521,6 +5549,36 @@ def _attend_suite_files(
     )
 
 
+def _attend_merged_source(
+    repo: Path, head: str, paths: Sequence[str]
+) -> dict[str, str]:
+    """`paths` as the integration head `head` holds them, file by file.
+
+    A declared output may be a directory; every blob under it is read. Read
+    from the run repository's object database, never a working tree, so the
+    bytes are the head's and nothing else's. A blob that is not UTF-8 text is
+    left out: the agents read source, and the digest binds what they read.
+    """
+    if not head or not paths:
+        return {}
+    listing = tm._git(
+        Path(repo), "ls-tree", "-r", "-z", head, "--", *paths, text=False
+    ).stdout
+    files: dict[str, str] = {}
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        meta, _tab, raw_path = entry.partition(b"\t")
+        _mode, kind, blob = meta.decode("ascii").split()
+        if kind != "blob":
+            continue
+        try:
+            files[raw_path.decode("utf-8")] = tm.cat_blob(Path(repo), blob).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return dict(sorted(files.items()))
+
+
 def _plan_source_ir(pinned: Path) -> tuple[Optional[str], Optional[str]]:
     """The IR a pinned plan was projected from: `(sha256, recorded path)`.
 
@@ -6017,6 +6075,16 @@ def _attend_lane_evidence(
     wait = store.latest_lane_artifact_payload(
         run_id, lane_id, st.ArtifactKind.USER_WAIT
     )
+    # The head the scheduler builds on, so the bytes are the builder's.
+    head = durable_integration_tip(store, run_id)
+    by_id = {item.lane_id: item for item in compiled.lanes}
+    paths = sorted(
+        {
+            path
+            for need in att.merged_source_lane_ids(compiled.lanes, lane_id)
+            for path in by_id[need].declared_outputs
+        }
+    )
     return att.LaneEvidence(
         lane_id=lane_id,
         wait_reason=wait_reason,
@@ -6034,6 +6102,8 @@ def _attend_lane_evidence(
         suite_files=_attend_suite_files(store, repo, run_id, lane),
         final_review=_attend_final_review(store, run_id, wait),
         fault=dict((wait or {}).get("fault") or {}),
+        integration_head=head,
+        merged_source=_attend_merged_source(repo, head, paths),
     )
 
 
