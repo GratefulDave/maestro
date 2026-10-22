@@ -1333,6 +1333,30 @@ def _contain(
     return compiled
 
 
+def _refused_finding(
+    refused: AttendRefused,
+    lane_id: str,
+    review_round: int,
+    say: Callable[[str, str], None],
+) -> Tuple[Mapping[str, str], ...]:
+    """A planctl refusal of the revision, as the located finding its author fixes."""
+    say(
+        lane_id,
+        "review round {0}: planctl refused the revision, returned to the "
+        "author: {1}".format(review_round, (refused.detail.splitlines() or [""])[0]),
+    )
+    return (
+        {
+            "location": "revision IR (planctl)",
+            "defect": refused.detail,
+            "required_change": (
+                "change the revision so planctl accepts it; the defect is "
+                "planctl's own output, its error lines first"
+            ),
+        },
+    )
+
+
 def _attend_batch(
     *,
     store: Any,
@@ -1357,6 +1381,9 @@ def _attend_batch(
 
     Each round's revision has its own path, and the reviewer judges the
     bytes whose sha256 the round records; only those bytes are projected.
+    planctl's verdict on a revision (`REVISION_REFUSED`), before its review
+    or in the projection after a PASS, is that round's finding for the
+    author; only a projection refused in the last round still refuses.
     `compiled` itself is returned when every lane in the batch was declared
     a runtime defect, so nothing was revised.
     """
@@ -1393,12 +1420,21 @@ def _attend_batch(
         lane_ids = answer.lane_ids
         written, rationales = answer.revision, answer.rationales
         digest = sha256_hex(written.read_bytes())
-        review_request, failed = _twice(
-            lambda: review_request_for(
-                request, written, rationales, review_round, digest
-            ),
-            lane_ids[0], PLANCTL_FAILED, say, untyped=False,
-        )
+        try:
+            review_request, failed = _twice(
+                lambda: review_request_for(
+                    request, written, rationales, review_round, digest
+                ),
+                lane_ids[0], PLANCTL_FAILED, say, untyped=False,
+            )
+        except AttendRefused as exc:
+            if exc.code != REVISION_REFUSED:
+                raise
+            # planctl's verdict about the revision: the author's to fix, and
+            # no reviewer reads a revision planctl already refused.
+            reviewer_findings = _refused_finding(exc, lane_ids[0], review_round, say)
+            previous = str(written)
+            continue
         if failed is not None:
             return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
         if review_request.revision_sha256 != digest:
@@ -1435,6 +1471,20 @@ def _attend_batch(
         say(lane_ids[0], "review round {0}: {1}".format(review_round, verdict))
         if verdict == st.ReviewerVerdict.PASS.value:
             findings = require_review_findings(Path(review_request.findings_out_path))
+            data = reviewed_bytes(written, digest)
+            try:
+                revised, failed = _twice(
+                    lambda: project(data, request.next_plan_revision, findings),
+                    lane_ids[0], PLANCTL_FAILED, say, untyped=False,
+                )
+            except AttendRefused as exc:
+                if exc.code != REVISION_REFUSED or review_round == policy.max_review_rounds:
+                    raise
+                reviewer_findings = _refused_finding(exc, lane_ids[0], review_round, say)
+                previous = str(written)
+                continue
+            if failed is not None:
+                return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
             passed = (request, written, digest, rationales, findings, verdict)
             break
         reviewer_findings = located
@@ -1442,14 +1492,6 @@ def _attend_batch(
     if passed is None:
         return None
     request, written, digest, rationales, findings, verdict = passed
-    revised, failed = _twice(
-        lambda: project(
-            reviewed_bytes(written, digest), request.next_plan_revision, findings
-        ),
-        lane_ids[0], PLANCTL_FAILED, say, untyped=False,
-    )
-    if failed is not None:
-        return _contain(store, run_id, parked, failed, file_issue, escalated, say, compiled)
     changed = require_amendment_scope(compiled.lanes, revised.lanes, allowed)
     record = apply_amendment(revised)
     amendment = _payload_of(

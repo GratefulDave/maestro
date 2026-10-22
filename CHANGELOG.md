@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): a revision planctl refuses goes back to the attend author instead of ending the session
+
+- An attend reviewer passed a revision in round 3; `planctl render` then exited
+  1 on `verifier.source_coverage` and the session ended
+  `ATTEND_REVISION_REFUSED`. Render ran only after review, and its refusal
+  ended the verb, so the author never saw the error. The logged detail was
+  cut at 2000 characters after 18 warnings and never reached the error line.
+- Each authored revision is rendered in a scratch root
+  (`_attend_check_revision`) before the reviewer is dispatched. An exit-1
+  refusal there, or in the projection after a `PASS`, is that round's located
+  finding for the author, and the next round proceeds. A projection refused
+  in the last round still refuses; other planctl exits stay
+  `ATTEND_PLANCTL_FAILED`.
+- `_run_planctl` puts non-`warning:` lines before warnings in its refusal
+  detail.
+
 ### Changed — contract change (strengthening, new path): the attend author and reviewer read the merged source the parked lane builds on
 
 - A tests lane parked `NO_PROGRESS` because its review demanded the contract
