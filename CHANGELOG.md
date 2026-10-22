@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (strengthening, new path): the attend author and reviewer read the merged source the parked lane builds on
+
+- A tests lane parked `NO_PROGRESS` because its review demanded the contract
+  name the merged producer callables and their report schemas. The builder's
+  checkout held them; the attend author and reviewer were handed only the
+  lane's contract, reviews, gate table and suite. Three review rounds ended
+  `REVIEW_UNRESOLVED`, the reviewer naming the author's missing merged source
+  each time.
+- `_attend_lane_evidence` now reads, from the run's durable integration head,
+  the declared outputs of every lane the parked lane and its pair transitively
+  need (`attend.merged_source_lane_ids`). Both attend trees carry them under
+  `merged/<lane_id>/`; `parked_lanes` names `integration_head`,
+  `merged_source_dir`, `merged_source_files` and `merged_source_sha256`.
+- Both role contracts name the directory; the attend reviewer's names it a
+  permitted review input it may cite.
+- Each `ATTEND_REVIEW` lane entry records `merged_source_sha256`, binding the
+  head and every merged byte the round read.
+
 ### Changed — contract change (new path): a transient GitHub failure on the spot fleet is retried, and a spot-fleet refusal parks its lane instead of ending the run
 
 - One `gh run view` poll answered `net/http: TLS handshake timeout`; `_gh`
