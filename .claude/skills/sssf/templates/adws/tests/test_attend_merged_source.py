@@ -60,6 +60,7 @@ LANES = (
 class _Repo:
     def __init__(self, root: Path) -> None:
         self.root = root
+        root.mkdir(parents=True)
         self._git("init", "-q")
         self._git("config", "user.email", "t@example.com")
         self._git("config", "user.name", "t")
