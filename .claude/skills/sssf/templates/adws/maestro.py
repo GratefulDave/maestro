@@ -5284,6 +5284,11 @@ def _run_planctl(
             "\nhint: EC2 could not run the mutation pass; rerun with "
             "`maestro run attend --local` to run it on this machine"
         )
+    if att.NO_SPOT_CAPACITY in detail and att.NO_SPOT_CAPACITY not in message:
+        # The launcher says it last, past the cut; attend waits it out by it.
+        message += "\n" + [
+            line for line in detail.splitlines() if att.NO_SPOT_CAPACITY in line
+        ][-1].strip()
     if result.returncode != _PLANCTL_VERDICT_EXIT:
         raise att.AttendRefused(att.PLANCTL_FAILED, message)
     raise att.AttendRefused(att.REVISION_REFUSED, message)

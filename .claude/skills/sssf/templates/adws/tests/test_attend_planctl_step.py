@@ -120,6 +120,19 @@ class PlanctlExitStatus(unittest.TestCase):
         self.assertEqual(caught.exception.code, att.PLANCTL_FAILED)
         self.assertIn("spot capacity", caught.exception.detail)
 
+    def test_no_spot_capacity_survives_the_cut_of_a_long_output(self) -> None:
+        binary = self._binary(
+            'print("launch attempt\\n" * 400); '
+            'print("error: no spot capacity for: c7a.24xlarge", file=sys.stderr); '
+            "sys.exit(3)"
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._run_planctl(binary, ["review", "x.ir.json"])
+        self.assertEqual(caught.exception.code, att.PLANCTL_FAILED)
+        self.assertIn(
+            "error: no spot capacity for: c7a.24xlarge", caught.exception.detail
+        )
+
     def test_a_planctl_killed_by_a_signal_is_a_planctl_failure(self) -> None:
         binary = self._binary("os.kill(os.getpid(), signal.SIGKILL)")
         self.assertEqual(self._code(binary), att.PLANCTL_FAILED)
