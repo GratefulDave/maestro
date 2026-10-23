@@ -821,6 +821,61 @@ class AttendLoop(unittest.TestCase):
         self.assertEqual(len(harness.applied), 1)
         self.assertEqual(outcome.escalated, ())
 
+    def test_a_spot_capacity_failure_is_waited_out_and_the_amendment_lands(
+        self,
+    ) -> None:
+        slept: list[float] = []
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.PLANCTL_FAILED,
+                "planctl review exited 3: error: no spot capacity for: c7a.24xlarge",
+            ),
+            crash_times=att.CAPACITY_RETRIES,
+        )
+        outcome = harness.attend(sleep=slept.append)
+        self.assertEqual(slept, [att.CAPACITY_DELAY_SECONDS] * att.CAPACITY_RETRIES)
+        self.assertEqual(len(harness.dispatched), 1)
+        self.assertEqual(len(harness.projected), att.CAPACITY_RETRIES + 1)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.escalated, ())
+
+    def test_a_spot_capacity_failure_past_its_bound_holds_its_lanes(self) -> None:
+        slept: list[float] = []
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.PLANCTL_FAILED,
+                "planctl review exited 3: error: no spot capacity for: c7a.24xlarge",
+            ),
+        )
+        outcome = harness.attend(sleep=slept.append)
+        self.assertEqual(len(slept), att.CAPACITY_RETRIES)
+        self.assertEqual(len(harness.projected), att.CAPACITY_RETRIES + 1)
+        self.assertEqual(harness.applied, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_WAIT_NOT_ATTENDABLE)
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a-build"])
+        self.assertEqual(outcome.escalated[0].fault["exception_type"], att.PLANCTL_FAILED)
+
+    def test_a_planctl_failure_without_spot_capacity_is_not_waited_out(self) -> None:
+        slept: list[float] = []
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.PLANCTL_FAILED, "planctl review exited 3: review.remote_runner"
+            ),
+        )
+        outcome = harness.attend(sleep=slept.append)
+        self.assertEqual(slept, [])
+        self.assertEqual(len(harness.projected), 2)
+        self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a-build"])
+
     def test_a_planctl_verdict_after_pass_goes_back_to_the_author_each_round(
         self,
     ) -> None:

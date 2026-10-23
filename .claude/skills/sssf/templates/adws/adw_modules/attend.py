@@ -38,11 +38,18 @@ Attend's own agents are contained the same way. An author or reviewer that
 cannot be launched, crashes, or times out is retried once; a second failure
 holds the batch's lanes as a runtime defect, with the same deduplicated issue,
 instead of ending the run. A refusal about the revision is not contained.
+
+A planctl step that failed only because EC2 had no spot capacity for its
+mutation pass is not a defect either: nothing is wrong with the harness, the
+capacity is just not there yet. It is retried after `CAPACITY_DELAY_SECONDS`,
+up to `CAPACITY_RETRIES` times, with the reviewed revision kept; only once
+that bound is spent is the batch contained as above.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
@@ -82,6 +89,13 @@ PLANCTL_UNRESOLVED = "ATTEND_PLANCTL_UNRESOLVED"
 #: remote mutation runner could not run -- so it said nothing about the
 #: revision. Decided by planctl's exit status, never by its output.
 PLANCTL_FAILED = "ATTEND_PLANCTL_FAILED"
+#: The words planctl's EC2 launcher ends on when no spot type in any zone had
+#: capacity. A `PLANCTL_FAILED` carrying them is waited out, not contained.
+NO_SPOT_CAPACITY = "no spot capacity"
+#: How many times one planctl step waits out a capacity failure.
+CAPACITY_RETRIES = 3
+#: How long attend waits before retrying a capacity failure.
+CAPACITY_DELAY_SECONDS = 300.0
 #: No reviewer key was resolvable, so no receipt can be minted.
 KEY_UNRESOLVED = "ATTEND_REVIEWER_KEY_UNRESOLVED"
 #: The Plan IR the live revision was projected from could not be located.
@@ -1107,6 +1121,7 @@ def attend_run(
     file_issue: Optional[Callable[[str, str], Mapping[str, str]]] = None,
     deviations_path: Optional[Path] = None,
     say: Callable[[str, str], None] = lambda lane, message: None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> AttendOutcome:
     """Run the factory, and amend every attendable park instead of stopping.
 
@@ -1128,7 +1143,8 @@ def attend_run(
     previous_revision)` and `review_request_for(request, revision,
     rationales, review_round, revision_sha256)` assemble the two agents'
     inputs; `project(revision_bytes, plan_revision, findings)` signs,
-    projects and compiles exactly the bytes the reviewer passed.
+    projects and compiles exactly the bytes the reviewer passed. `sleep` is
+    how a planctl step waits out a spot capacity failure.
     """
     if not policy.enabled:
         raise AttendRefused(DISABLED, "attend.max_amendments_per_lane is not set")
@@ -1191,6 +1207,7 @@ def attend_run(
                 applied=applied,
                 escalated=escalated,
                 say=say,
+                sleep=sleep,
             )
         finally:
             _write_deviations(store, run_id, deviations_path)
@@ -1286,15 +1303,20 @@ def _twice(
     say: Callable[[str, str], None],
     *,
     untyped: bool,
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> Tuple[Any, Optional[AttendRefused]]:
-    """`call`, retried once on `code`. `(answer, None)` or `(None, failure)`.
+    """Retry `code` failures; `(answer, None)` or `(None, failure)`.
 
     Only a refusal typed `code` is retried. `untyped` also counts any other
     exception as `code`: true for an agent, whose crash has no type of its
-    own, false for a planctl step, which types its own failure.
+    own, false for a planctl step, which types its own failure. Given
+    `sleep`, a refusal naming `NO_SPOT_CAPACITY` is instead waited out up to
+    `CAPACITY_RETRIES` times and, once those are spent, is the failure.
     """
     failure: Optional[AttendRefused] = None
-    for attempt in (1, 2):
+    waits = 0
+    attempt = 0
+    while True:
         try:
             return call(), None
         except AttendRefused as exc:
@@ -1305,9 +1327,23 @@ def _twice(
             if not untyped:
                 raise
             failure = AttendRefused(code, "{0}: {1}".format(type(exc).__name__, exc))
-        if attempt == 1:
-            say(lane_id, "{0}, retrying once: {1}".format(code, failure.detail))
-    return None, failure
+        if sleep is not None and NO_SPOT_CAPACITY in failure.detail:
+            if waits >= CAPACITY_RETRIES:
+                return None, failure
+            waits += 1
+            say(
+                lane_id,
+                "{0}, no spot capacity, retry {1}/{2} in {3:.0f}s: {4}".format(
+                    code, waits, CAPACITY_RETRIES, CAPACITY_DELAY_SECONDS,
+                    failure.detail,
+                ),
+            )
+            sleep(CAPACITY_DELAY_SECONDS)
+            continue
+        attempt += 1
+        if attempt == 2:
+            return None, failure
+        say(lane_id, "{0}, retrying once: {1}".format(code, failure.detail))
 
 
 def _contain(
@@ -1320,13 +1356,13 @@ def _contain(
     say: Callable[[str, str], None],
     compiled: st.CompiledPlan,
 ) -> st.CompiledPlan:
-    """Attend failed twice: hold the batch's lanes as a runtime defect, not the run.
+    """Hold a batch's lanes as a runtime defect after attend exhausts retries.
 
     The same path a declared defect takes -- one deduplicated issue per lane,
     the lane held for the session -- so every other lane keeps running and
     only `PAUSE` stops the run. Nothing was revised, so `compiled` returns.
     """
-    detail = "{0} twice: {1}".format(failure.code, failure.detail)
+    detail = "{0} retries exhausted: {1}".format(failure.code, failure.detail)
     defects = tuple((lane_id, detail) for lane_id, _reason in parked)
     fault = {"exception_type": failure.code, "message": failure.detail}
     _escalate(store, run_id, defects, file_issue, escalated, say, fault=fault)
@@ -1376,6 +1412,7 @@ def _attend_batch(
     applied: list,
     say: Callable[[str, str], None],
     escalated: Optional[list] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Optional[st.CompiledPlan]:
     """One batch: author, review rounds, sign, apply. None when unresolved.
 
@@ -1425,7 +1462,7 @@ def _attend_batch(
                 lambda: review_request_for(
                     request, written, rationales, review_round, digest
                 ),
-                lane_ids[0], PLANCTL_FAILED, say, untyped=False,
+                lane_ids[0], PLANCTL_FAILED, say, untyped=False, sleep=sleep,
             )
         except AttendRefused as exc:
             if exc.code != REVISION_REFUSED:
@@ -1475,7 +1512,7 @@ def _attend_batch(
             try:
                 revised, failed = _twice(
                     lambda: project(data, request.next_plan_revision, findings),
-                    lane_ids[0], PLANCTL_FAILED, say, untyped=False,
+                    lane_ids[0], PLANCTL_FAILED, say, untyped=False, sleep=sleep,
                 )
             except AttendRefused as exc:
                 if exc.code != REVISION_REFUSED or review_round == policy.max_review_rounds:
@@ -1492,6 +1529,7 @@ def _attend_batch(
     if passed is None:
         return None
     request, written, digest, rationales, findings, verdict = passed
+
     changed = require_amendment_scope(compiled.lanes, revised.lanes, allowed)
     record = apply_amendment(revised)
     amendment = _payload_of(
