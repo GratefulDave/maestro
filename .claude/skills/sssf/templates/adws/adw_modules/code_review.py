@@ -13,12 +13,16 @@ measurement is always of the accepted cases and never of a rewrite.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from . import probes
 from . import provisioning as prov
+from . import remote_suite as rs
 from . import review_contract as rc
 from . import runner_resolution as rr
 from . import scheduler_types as st
@@ -101,20 +105,15 @@ def run_integration_gate(
     dest = Path(scratch_root) / "integration-gate-{0}-{1}".format(
         lane_id, input_digest[:12]
     )
-    _review_tree(
-        integration_repo,
-        integration_sha,
-        dest,
-        provision_argv,
-        provision_timeout_s,
-        state_root=state_root,
-    )
+    _review_tree(integration_repo, integration_sha, dest, state_root=state_root)
     # `failed` here is read by `FactoryScheduler._failed_run_gates`, which
     # stands between a merged surface and both the final review and
     # publication. A gate that measured bytes nobody accepted is a
     # publication decision made on a forgery, so the tree is verified first.
     tb.verify_suite(files, dest)
-    run = tc.run_suite(dest, tuple(files), gate=gate, timeout_s=suite_timeout_s)
+    run = _remote_suite(
+        dest, files, gate, suite_timeout_s, provision_argv, provision_timeout_s
+    )
     min_cases = int(run.get("min_cases") or 1)
     counts = run["counts"]
     failed = bool(
@@ -207,28 +206,97 @@ def _collected_no_case(run: Mapping[str, object]) -> bool:
 
 # `ReviewProvisioningError` and `provision_tree` live in `provisioning`, the one
 # provisioner every factory tree crosses. Re-exported here for existing imports;
-# the call below goes through the module so one patch of `prov.provision_tree`
+# `remote_job.execute` calls it through the module so one patch of `prov.provision_tree`
 # observes every site.
 ReviewProvisioningError = prov.ReviewProvisioningError
 provision_tree = prov.provision_tree
 
 
-def _review_tree(
-    repo: Path,
-    sha: str,
-    dest: Path,
-    provision_argv: Sequence[str] = (),
-    provision_timeout_s: float | None = None,
-    *,
-    state_root: Path,
-) -> Path:
+def _review_tree(repo: Path, sha: str, dest: Path, *, state_root: Path) -> Path:
+    """The commit under review, unprovisioned: its suite runs remotely.
+
+    Provisioning happens where the suite runs (`remote_job.execute`), on the
+    spot fleet, so nothing is installed into this tree on the scheduler host.
+    """
     dest = Path(dest)
     if dest.exists() and dest.is_dir() and any(dest.iterdir()):
-        tree = tm.refresh_materialized_commit(repo, sha, dest, state_root=state_root)
-    else:
-        tree = tm.materialize_commit(repo, sha, dest, state_root=state_root)
-    prov.provision_tree(tree, provision_argv, provision_timeout_s)
-    return tree
+        return tm.refresh_materialized_commit(repo, sha, dest, state_root=state_root)
+    return tm.materialize_commit(repo, sha, dest, state_root=state_root)
+
+
+def _remote_suite(
+    tree: Path,
+    files: Mapping[str, str],
+    gate: Mapping[str, object] | object | None,
+    suite_timeout_s: float | None,
+    provision_argv: Sequence[str],
+    provision_timeout_s: float | None,
+) -> Mapping[str, object]:
+    """`tests_chain.run_suite` against `tree`, run on the spot fleet."""
+    return rs.call(
+        "suite",
+        tree,
+        {"paths": list(files), "gate": gate, "timeout_s": suite_timeout_s},
+        provision_argv=provision_argv,
+        provision_timeout_s=provision_timeout_s,
+        timeout_s=tc.SUITE_TIMEOUT_S if suite_timeout_s is None else suite_timeout_s,
+    )
+
+
+def _suite_run_path(
+    state_root: Path,
+    request: rc.LaneRequest,
+    candidate_sha: str,
+    files: Mapping[str, str],
+    gate: object,
+    provision_argv: Sequence[str],
+    suite_timeout_s: float | None,
+) -> Path:
+    """Where a finished measurement of exactly these inputs is kept.
+
+    A scheduler interrupted mid-suite pauses the lane, and the worker that was
+    running the suite finishes anyway (its late completion is refused by the
+    ledger). The next session measures the same candidate again, 10-17 minutes
+    for a result that already existed. Everything the measurement depends on is
+    in the key, so a different candidate, suite, gate or provisioning never
+    reads it.
+    """
+    key = hashlib.sha256(
+        json.dumps(
+            [
+                request.input_digest,
+                candidate_sha,
+                sorted(files.items()),
+                repr(gate),
+                list(provision_argv),
+                suite_timeout_s,
+            ],
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return Path(state_root) / "suite-measurements" / (key + ".json")
+
+
+def _load_suite_run(path: Path) -> Mapping[str, object] | None:
+    try:
+        run = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return run if isinstance(run, dict) and "counts" in run else None
+
+
+def _store_suite_run(path: Path, run: Mapping[str, object]) -> None:
+    """Keep a finished measurement; a crashed run is not one."""
+    if run.get("crashed") or run.get("crash_note"):
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".{0}.tmp".format(os.getpid()))
+        temp.write_text(json.dumps(run, sort_keys=True), encoding="utf-8")
+        os.replace(temp, path)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 _NO_RUN = {
@@ -247,6 +315,8 @@ def _run_suite(
     *,
     gate: Mapping[str, object] | object | None,
     suite_timeout_s: float | None = None,
+    provision_argv: Sequence[str] = (),
+    provision_timeout_s: float | None = None,
 ) -> tuple[Mapping[str, object], rc.ReviewContractError | None]:
     """Run the suite, treating an environment refusal as a measurement.
 
@@ -260,7 +330,9 @@ def _run_suite(
     """
     try:
         return (
-            tc.run_suite(tree, tuple(files), gate=gate, timeout_s=suite_timeout_s),
+            _remote_suite(
+                tree, files, gate, suite_timeout_s, provision_argv, provision_timeout_s
+            ),
             None,
         )
     except rc.SuiteTimeoutError:
@@ -301,17 +373,15 @@ def _collect_at_base(
         lane_id, input_digest[:12]
     )
     try:
-        _review_tree(
-            candidate_repo,
-            builder_base_sha,
-            base_dest,
-            provision_argv,
-            provision_timeout_s,
-            state_root=state_root,
-        )
+        _review_tree(candidate_repo, builder_base_sha, base_dest, state_root=state_root)
         tb.verify_suite(files, base_dest)
         run, refusal = _run_suite(
-            base_dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+            base_dest,
+            files,
+            gate=gate,
+            suite_timeout_s=suite_timeout_s,
+            provision_argv=provision_argv,
+            provision_timeout_s=provision_timeout_s,
         )
     except (tm.TreeContainmentRefused, tb.TestSuiteTampered, rc.SuiteTimeoutError):
         # Neither is a fact about the base commit, and both must escape the
@@ -633,18 +703,24 @@ def measure_candidate(
     dest = Path(scratch_root) / "review-{0}-{1}".format(
         request.lane_id, request.input_digest[:12]
     )
-    tree = _review_tree(
-        candidate_repo,
-        candidate_sha,
-        dest,
-        provision_argv,
-        provision_timeout_s,
-        state_root=state_root,
-    )
+    tree = _review_tree(candidate_repo, candidate_sha, dest, state_root=state_root)
     tb.verify_suite(files, dest)
-    run, refusal = _run_suite(
-        dest, files, gate=gate, suite_timeout_s=suite_timeout_s
+    kept = _suite_run_path(
+        state_root, request, candidate_sha, files, gate, provision_argv,
+        suite_timeout_s,
     )
+    run, refusal = _load_suite_run(kept), None
+    if run is None:
+        run, refusal = _run_suite(
+            dest,
+            files,
+            gate=gate,
+            suite_timeout_s=suite_timeout_s,
+            provision_argv=provision_argv,
+            provision_timeout_s=provision_timeout_s,
+        )
+        if refusal is None:
+            _store_suite_run(kept, run)
     collection_broken = False
     crashed = str(run.get("crashed") or "")
     # A run killed by a signal is already typed (`SUITE_CRASHED:<signal>`), so
@@ -762,6 +838,8 @@ def measure_probes(
     commit: str = "",
     ref: str = "",
     timeout_s: float = rr.EXECUTE_TIMEOUT_S,
+    provision_argv: Sequence[str] = (),
+    provision_timeout_s: float | None = None,
 ) -> ProbeMeasurement:
     """Execute every ACTIVE probe once against the review tree.
 
@@ -775,30 +853,43 @@ def measure_probes(
     probes.validate_receipts(records, retired, receipts)
     status: dict[str, str] = {}
     evidence: dict[str, tuple[str, ...]] = {}
-    resolved: dict[str, rr.ResolvedRunner | str] = {}
     active = probes.active_records(records, retired)
+    # One remote run per runner: it resolves the runner over every active probe
+    # of that runner, then executes each once, on the spot fleet.
+    by_runner: dict[str, list[str]] = {}
+    for record in active:
+        runner = tc._file_runner(str(record["path"]))
+        if runner is not None:
+            by_runner.setdefault(runner, []).append(str(record["path"]))
+    executions: dict[str, rr.ProbeExecution | str] = {}
+    for runner, paths in by_runner.items():
+        try:
+            executions.update(
+                rs.call(
+                    "probes",
+                    Path(tree),
+                    {"runner": runner, "peers": paths, "paths": paths, "timeout_s": timeout_s},
+                    provision_argv=provision_argv,
+                    provision_timeout_s=provision_timeout_s,
+                    timeout_s=rr.PROBE_TIMEOUT_S + timeout_s * len(paths),
+                )
+            )
+        except rr.RunnerUnusable as extra:
+            reason = "runner unusable: {0}".format(
+                getattr(extra, "detail", "") or extra
+            )[:300]
+            executions.update({path: reason for path in paths})
+    del scratch_root  # scratch is allocated where the probes run
     for record in active:
         pid = str(record["probe_id"])
         path = str(record["path"])
-        runner = tc._file_runner(path)
-        if runner is None:
+        if tc._file_runner(path) is None:
             status[pid], evidence[pid] = probes.STATUS_OPEN, ("probe names no runner",)
             continue
-        if runner not in resolved:
-            peers = [str(r["path"]) for r in active if tc._file_runner(str(r["path"])) == runner]
-            try:
-                resolved[runner] = rr.resolve(runner, Path(tree), ".", paths=peers)
-            except rr.RunnerUnusable as extra:
-                resolved[runner] = "runner unusable: {0}".format(
-                    getattr(extra, "detail", "") or extra
-                )[:300]
-        runner_or_reason = resolved[runner]
-        if isinstance(runner_or_reason, str):
-            status[pid], evidence[pid] = probes.STATUS_OPEN, (runner_or_reason,)
+        execution = executions[path]
+        if isinstance(execution, str):
+            status[pid], evidence[pid] = probes.STATUS_OPEN, (execution,)
             continue
-        execution = probes.run_probe(
-            runner_or_reason, Path(tree), path, Path(scratch_root), timeout_s
-        )
         frozen = [str(item) for item in record["case_ids"]]
         if probes.discharge(execution, frozen):
             status[pid], evidence[pid] = probes.STATUS_DISCHARGED, ()

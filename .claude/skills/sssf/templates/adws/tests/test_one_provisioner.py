@@ -176,21 +176,15 @@ class EverySiteCallsTheOneProvisioner(_FactoryFixture):
             self.recorder.calls, [(self.tree, ("provisioner", "--install"), 7.0)]
         )
 
-    def test_the_review_tree(self) -> None:
+    def test_the_review_tree_is_not_provisioned_on_this_host(self) -> None:
+        # Its suite runs on the spot fleet, and `remote_job.execute` provisions
+        # the subject there. Installing here would be multi-GB of local work
+        # for a tree no test process runs in.
         dest = self.root / "review"
         with mock.patch.object(cr.tm, "materialize_commit", return_value=dest) as materialize:
-            cr._review_tree(
-                self.root / "repo",
-                "a" * 40,
-                dest,
-                ("provisioner", "--install"),
-                7,
-                state_root=self.root,
-            )
+            cr._review_tree(self.root / "repo", "a" * 40, dest, state_root=self.root)
         materialize.assert_called_once()
-        self.assertEqual(
-            self.recorder.calls, [(dest, ("provisioner", "--install"), 7)]
-        )
+        self.assertEqual(self.recorder.calls, [])
 
     def test_the_harness_has_no_bridge_left_to_reach_for(self) -> None:
         for name in ("prepare_collect_tree", "COLLECT_RUNTIME_DIRS"):
@@ -256,9 +250,10 @@ class AProvisioningGapIsRefusedAtRoundOne(_FactoryFixture):
         message = str(caught.exception)
         self.assertIn("ERR_MODULE_NOT_FOUND", message)
         self.assertIn("vitest", message)
-        # The measured tree is kept and named, and nothing repaired it.
-        self.assertIn(str(self.tree), message)
-        self.assertFalse((self.tree / "node_modules").exists())
+        # Named by the commit it was measured at on the spot fleet; the local
+        # tree was never where it ran, so it is not kept.
+        self.assertIn("measured on the spot fleet at", message)
+        self.assertFalse(self.tree.exists())
 
     def test_the_same_tree_passes_when_provisioning_installs_the_runner(self) -> None:
         self.factory._provision_argv = (

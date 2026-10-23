@@ -253,14 +253,16 @@ class AttendLaunchesThroughRealHerdr(unittest.TestCase):
             builder_base_sha=self.head,
         )
 
-    def _await_ready(self, handle: Any, envelope: Path, role: str, lane_id: str):
+    def _await_ready(
+        self, handle: Any, envelope: Path, role: str, lane_id: str, prompt: Any = None
+    ):
         """Stand in for the envelope wait: prove the agent ready, then stop.
 
         Ready is Herdr's own record: the stable agent exists, is not
         `blocked` (a trust or permission prompt), and its pane is bound to
         the tree the dispatch prepared.
         """
-        del envelope
+        del envelope, prompt
         deadline = time.monotonic() + _READY_S
         status = ""
         while time.monotonic() < deadline:

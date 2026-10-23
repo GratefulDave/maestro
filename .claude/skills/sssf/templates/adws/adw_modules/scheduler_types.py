@@ -291,6 +291,15 @@ STARTED_IMPLEMENTATION_STAGES: Tuple[LaneStage, ...] = (
     LaneStage.REVIEWING_CODE,
     LaneStage.READY_TO_MERGE,
 )
+# Stages a suite-owning lane (tests or untyped) reaches only after sealing its
+# accepted suite. `amendment_reset_stage` sends every such lane it resets to
+# TESTS_SEALED or earlier, where it seals again under the new revision, so a
+# lane found here with no suite at the live revision was carried across the
+# amendment (unaffected and MERGED, or in a resumable wait) and its newest
+# suite is the one it sealed.
+SUITE_HOLDING_STAGES: Tuple[LaneStage, ...] = STARTED_IMPLEMENTATION_STAGES + (
+    LaneStage.MERGED,
+)
 LANE_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.LANE_PLAN,
     ArtifactKind.TEST_DRAFT,

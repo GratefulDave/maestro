@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -781,6 +782,11 @@ class LaunchHandle:
     child_workspace_id: str = ""
     pane_role: str = ""
     lane_label: str = ""
+    #: Records of the offer this handle is waiting on, counted from just
+    #: before it was sent (`marks_since_offer`). `None` before any offer.
+    offer_marks: Optional[Callable[[], int]] = field(
+        default=None, compare=False, repr=False
+    )
 
 
     def __post_init__(self) -> None:
@@ -920,6 +926,18 @@ SESSION_ROLE_MISMATCH = "SESSION_ROLE_MISMATCH"
 SESSION_SPEC_DIGEST_CHANGED = "SESSION_SPEC_DIGEST_CHANGED"
 #: Nothing records whose session it is, so nothing proves it is this one.
 SESSION_UNRECORDED = "SESSION_UNRECORDED"
+#: A restart-adopted agent is still `working` on a turn its dead scheduler
+#: dispatched. Nothing in this process will read that turn, and a prompt
+#: resubmitted into it waits on, or interrupts, work nobody owns.
+SESSION_TURN_ORPHANED = "SESSION_TURN_ORPHANED"
+#: A retained agent whose dispatched turn already declared is still not
+#: interactive at the next dispatch's bounded readiness wait -- it started a
+#: turn of its own (a background-task notification wakes Claude Code into
+#: one). Nothing will read that turn either.
+SESSION_BUSY = "SESSION_BUSY"
+#: A retained agent never received the prompt resubmitted into it, after
+#: every bounded send. A fresh session is the one remaining delivery.
+SESSION_NOT_CONSUMED = "SESSION_NOT_CONSUMED"
 #: The file in an omp `session_dir` recording whose session it holds.
 SESSION_IDENTITY_FILE = "maestro-session.json"
 
@@ -1364,7 +1382,17 @@ def session_rename_confirmed(text: str, session_name: str) -> bool:
     rename had worked; the sentence was on screen for the whole 60s wait.
     Punctuation is the composer's, so `_unchromed` drops it too.
     """
-    return _unchromed(session_rename_confirmation(session_name)) in _unchromed(text)
+    sentence = _unchromed(session_rename_confirmation(session_name))
+    anchor = _unchromed("Session renamed to")
+    name = sentence[len(anchor):]
+    haystack = _unchromed(text)
+    start = haystack.find(anchor)
+    while start != -1:
+        after = start + len(anchor)
+        if name in haystack[after : after + len(name) + SESSION_RENAME_DECORATION_MAX]:
+            return True
+        start = haystack.find(anchor, start + 1)
+    return False
 
 
 def git_primary_workdir(repo: Path) -> Path:
@@ -1822,6 +1850,43 @@ def composer_holds_offer(
         return None
     marker = str(Path(prompt_path).resolve())
     return any(marker in line for line in lines[-COMPOSER_TAIL_LINES:])
+
+
+#: What `turn_activity` reports for an `idle` agent whose pane footer still
+#: lists a background shell or monitor it started. Herdr says `idle` the moment
+#: the turn ends, but Claude Code re-invokes the agent when that job fires, so
+#: the agent is working and the dispatch idle bound must not count the time.
+BACKGROUND_TASK_STATUS = "background"
+
+_BACKGROUND_TASK_FOOTER = re.compile(
+    r"\b[1-9]\d* (?:shells?|monitors?|background (?:tasks?|jobs?))\b"
+)
+
+
+def pane_background_tasks(
+    herdr_call: Callable[..., dict], pane_id: str
+) -> Optional[bool]:
+    """Whether the pane footer lists a live background shell or monitor.
+
+    Reads the tail of the pane the way `pane_lacks_offer` does. `None` means
+    the pane could not be read, which is a missing observation and never a
+    "no".
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        return None
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return any(
+        _BACKGROUND_TASK_FOOTER.search(line)
+        for line in lines[-COMPOSER_TAIL_LINES:]
+    )
 
 
 def pane_revision(
@@ -2563,23 +2628,11 @@ def prompt_submission_marks(
     transcript = handle.transcript_path
     if transcript is None:
         return 0
-    marker = ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
-    if chunk_size < len(marker):
-        chunk_size = len(marker)
+    marker = _prompt_marker(prompt_path)
     total = 0
     try:
         for path in transcript_family(Path(transcript)):
-            overlap = b""
-            with path.open("rb") as source:
-                while True:
-                    chunk = source.read(chunk_size)
-                    if not chunk:
-                        break
-                    window = overlap + chunk
-                    total += window.count(marker)
-                    overlap = (
-                        window[-(len(marker) - 1) :] if len(marker) > 1 else b""
-                    )
+            total += _file_marks(path, marker, chunk_size)
         return total
     except OSError as exc:
         # The count so far is a floor, not the count. Callers comparing counts
@@ -2589,6 +2642,88 @@ def prompt_submission_marks(
         if on_error is not None:
             on_error(exc)
         return total
+
+
+def _prompt_marker(prompt_path: Path) -> bytes:
+    return ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
+
+
+def _file_marks(path: Path, marker: bytes, chunk_size: int = 64 * 1024) -> int:
+    chunk_size = max(chunk_size, len(marker))
+    total = 0
+    overlap = b""
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            window = overlap + chunk
+            total += window.count(marker)
+            overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+    return total
+
+
+#: A family file last written this close before the offer may still be the
+#: one the offer is recorded in, on a filesystem with coarse mtimes.
+OFFER_MTIME_SLACK_S = 2.0
+
+
+def _family_marks(
+    handle: LaunchHandle, marker: bytes
+) -> Dict[Path, Tuple[int, float]]:
+    if handle.transcript_path is None:
+        return {}
+    marks: Dict[Path, Tuple[int, float]] = {}
+    for path in transcript_family(Path(handle.transcript_path)):
+        try:
+            mtime = path.stat().st_mtime
+            marks[path] = (_file_marks(path, marker), mtime)
+        except FileNotFoundError:
+            continue
+    return marks
+
+
+def marks_since_offer(handle: LaunchHandle, prompt_path: Path) -> Callable[[], int]:
+    """Count the records of THIS offer of `prompt_path`, taken from now.
+
+    `prompt_submission_marks` is a total, and a prompt path is reused: a
+    scheduler restart resets the turn counter, so a fresh session is handed
+    `prompt-1.json` again, and Claude leaves the replaced session's
+    transcript beside the new one in the checkout's project directory. Run
+    646181870aef, lane-wp3-reproduce-tests: the dead session named
+    `prompt-1.json` 33 times, so a prompt that never reached the fresh
+    session read as delivered, nothing re-sent it, and the lane parked
+    `DISPATCH_NOT_CONSUMED` for the operator 629s later.
+
+    Snapshot per file before the offer and count only what rises. A file
+    first seen later (a transcript bound after the offer, a rotated session
+    file) counts in full only when it was written since the offer; one last
+    written before it cannot hold this offer's record.
+    """
+    marker = _prompt_marker(prompt_path)
+    offered_at = time.time()
+    try:
+        baseline = _family_marks(handle, marker)
+    except OSError:
+        baseline = {}
+
+    def since() -> int:
+        total = 0
+        for path, (count, mtime) in _family_marks(handle, marker).items():
+            if path in baseline:
+                total += max(0, count - baseline[path][0])
+            elif mtime >= offered_at - OFFER_MTIME_SLACK_S:
+                total += count
+        return total
+
+    return since
+
+
+def _offer_marks_now(handle: LaunchHandle, prompt_path: Path) -> int:
+    """This offer's records when the handle carries an offer, else the total."""
+    if handle.offer_marks is not None:
+        return handle.offer_marks()
+    return prompt_submission_marks(handle, prompt_path)
 
 
 def transcript_family(transcript: Path) -> List[Path]:
@@ -2735,6 +2870,65 @@ def wait_for_interactive_agent(
 
 
 
+#: How long a started agent may take to draw over its own launch line before
+#: the first prompt is sent anyway. Measured 2026-10-21: Claude Code with
+#: `--remote-control` drew its TUI 34-47s after start, while `herdr agent
+#: start` had returned ready, `idle`, `interactive_ready: true`, at 6s.
+AGENT_DRAW_TIMEOUT_S = 180.0
+
+
+def pane_shows_launch_line(
+    herdr_call: Callable[..., dict], pane_id: str, route: str, last_arg: str
+) -> bool:
+    """Whether the pane's last line is still the shell line that started the agent.
+
+    True only on a legible screen whose last non-blank line names the route
+    and its final argument: nothing has drawn over the command yet, so a
+    prompt sent now lands on no composer. An unreadable or empty screen is
+    never a True.
+    """
+    try:
+        payload = herdr_call(
+            "pane", "read", pane_id, "--source", "recent-unwrapped", timeout=15.0
+        )
+    except Exception:
+        return False
+    result = payload.get("result", payload) if isinstance(payload, dict) else None
+    text = str(result.get("text") or "") if isinstance(result, dict) else ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return route in lines[-1] and last_arg in lines[-1]
+
+
+def wait_for_agent_drawn(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    route: str,
+    last_arg: str,
+    timeout_s: float = AGENT_DRAW_TIMEOUT_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Hold the first prompt until the agent has drawn over its launch line.
+
+    Herdr's readiness is not this. Run 646181870aef: a code reviewer's pane
+    still showed only `claude … --remote-control` when its prompt was sent
+    three times and refused `DISPATCH_NOT_CONSUMED`, and a tester's sends were
+    swallowed by the TUI that drew after them, leaving an empty composer.
+    Refuses `AgentNotInteractive` when the agent never draws.
+    """
+    deadline = monotonic() + max(0.0, timeout_s)
+    while pane_shows_launch_line(herdr_call, pane_id, route, last_arg):
+        if monotonic() >= deadline:
+            raise AgentNotInteractive(
+                "AGENT_NEVER_DRAWN:{0} still shows its launch line after {1}s".format(
+                    pane_id, int(timeout_s)
+                )
+            )
+        sleep(0.5)
+
+
 def wait_for_agent_transcript(
     herdr_call: Callable[..., dict],
     name: str,
@@ -2859,6 +3053,14 @@ AGENT_START_BUSY_POLL_S = 0.5
 #: How often COMPLETE cleanup re-reads a pane while waiting for the composer
 #: to print its rename confirmation. The window is the caller's `timeout_s`.
 SESSION_RENAME_POLL_S = 0.5
+
+#: Most characters, once whitespace and punctuation are removed, a composer may
+#: print between `Session renamed to` and the name it was given. omp prefixes
+#: the title with a role badge -- `Session renamed to "\U0001f9ea TESTS:` and
+#: then the name -- so the name is not adjacent to the sentence. The name embeds
+#: a 64-hex repository fingerprint, so finding it right after the anchor is not
+#: ambiguous.
+SESSION_RENAME_DECORATION_MAX = 32
 
 
 def _start_agent_when_free(
@@ -3919,8 +4121,14 @@ class HerdrLauncher:
         spec: LaunchSpec,
         handle: LaunchHandle,
         pane: Mapping[str, object],
+        *,
+        orphaned: bool = False,
     ) -> bool:
         """Close `handle`'s session if it may not serve `spec`; say if it did.
+
+        `orphaned` is the restart-adoption path's statement that the proven
+        session is mid-turn for a scheduler that no longer exists; it is
+        closed as `SESSION_TURN_ORPHANED` exactly as a superseded one is.
 
         Both reuse paths -- the in-process role handle and an agent adopted
         by its stable name after a restart -- call this once the pane is
@@ -3937,6 +4145,8 @@ class HerdrLauncher:
         """
         recorded = _pane_session_record(pane)
         reason = session_reuse_refusal(spec, recorded)
+        if reason is None and orphaned:
+            reason = SESSION_TURN_ORPHANED
         if reason is None:
             return False
         detail = "pane {0}: recorded {1}, wanted {2}".format(
@@ -3946,6 +4156,35 @@ class HerdrLauncher:
         )
         if reason in (SESSION_LANE_MISMATCH, SESSION_ROLE_MISMATCH):
             self._refuse_live_pane("{0}:{1}".format(reason, detail))
+        self._replace_session(spec, handle, reason, detail)
+        return True
+
+    def _busy_session_replaced(self, spec: LaunchSpec, handle: LaunchHandle) -> bool:
+        """Close an adopted session that stays busy past the readiness wait.
+
+        Every adopted session's dispatched turn has already declared, so a
+        turn still running at the end of the bounded wait is one nobody will
+        read. Refusing here parked the lane `LANE_FAULT` on a healthy agent;
+        the session is replaced exactly as a superseded one is, and the
+        caller starts the role fresh.
+        """
+        try:
+            wait_for_interactive_agent(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=handle.environment, **kwargs
+                ),
+                handle.agent_name,
+            )
+        except AgentNotInteractive as exc:
+            self._replace_session(
+                spec, handle, SESSION_BUSY, "pane {0}: {1}".format(handle.pane_id, exc)
+            )
+            return True
+        return False
+
+    def _replace_session(
+        self, spec: LaunchSpec, handle: LaunchHandle, reason: str, detail: str
+    ) -> None:
         try:
             self.cancel(handle, time.monotonic() + 5.0)
         except Exception as exc:
@@ -3959,7 +4198,6 @@ class HerdrLauncher:
         self._discard_role_handle(spec, handle)
         if spec.on_session_replaced is not None:
             spec.on_session_replaced(reason, detail)
-        return True
 
     def _validated_existing_role_handle(
         self, spec: LaunchSpec, environment: Mapping[str, str]
@@ -4115,11 +4353,14 @@ class HerdrLauncher:
             )
             name = _agent_name(spec.correlation_token)
             agent = self._fetch_agent(name, environment)
-            # A session recorded for another spec digest is left for the
-            # next launch, whose reconnect closes and replaces it.
-            if agent is not None and session_reuse_refusal(
-                spec, _pane_session_record(pane)
-            ) is None:
+            # A session recorded for another spec digest, or one still
+            # `working` on a turn the dead scheduler dispatched, is left for
+            # the next launch, whose reconnect closes and replaces it.
+            if (
+                agent is not None
+                and _agent_status_of(agent) != "working"
+                and session_reuse_refusal(spec, _pane_session_record(pane)) is None
+            ):
                 if str(agent.get("pane_id") or "") != pane_id:
                     self._refuse_live_pane("RESTORED_AGENT_PANE_MISMATCH")
                 self._handle_from_live_agent(spec, name, agent, pane, environment)
@@ -4555,6 +4796,13 @@ class HerdrLauncher:
             != METADATA_SCRATCH_REDIRECT
         ):
             return None
+        # No handle in this process means the agent was started by a
+        # scheduler that has since died. If it is still `working`, that turn
+        # has no reader: resubmitting waits on it until the readiness wait
+        # refuses and the lane parks, or interrupts it into a composer that
+        # still holds whatever it held. Replace the session instead.
+        with self._handles_lock:
+            owned = spec.correlation_token in self._handles
         if self._refused_session_replaced(
             spec,
             LaunchHandle(
@@ -4565,6 +4813,7 @@ class HerdrLauncher:
                 environment=environment,
             ),
             pane,
+            orphaned=status == "working" and not owned,
         ):
             return None
         return self._handle_from_live_agent(spec, stable_name, agent, pane, environment)
@@ -5225,6 +5474,15 @@ class HerdrLauncher:
         turn's answer, so the prompt reached the agent. A re-sent prompt the
         agent answers by pointing at the result it already wrote is consumed,
         and the waiter harvests that result.
+
+        A transcript that does not exist yet is a missing observation, not a
+        transcript without the record. A fresh omp session accepts its first
+        prompt, runs a pre-turn memory recall, and only then writes its session
+        file and renders the prompt; measured on omp 18.12.5 that was 62s after
+        Enter, with Herdr reporting `idle` and the path on no pane line the
+        whole time. Run 646181870aef's code reviewer was sent its prompt three
+        times in that window, refused `DISPATCH_NOT_CONSUMED`, and cancelled
+        holding the prompt it had accepted.
         """
         envelope = handle.envelope_path
         if envelope is not None and Path(envelope).is_file():
@@ -5232,7 +5490,12 @@ class HerdrLauncher:
         try:
             if self._agent_transcript_bound(handle) != "idle":
                 return False
-            if prompt_submission_marks(handle, prompt_path) > 0:
+            transcript = handle.transcript_path
+            if transcript is None or not any(
+                path.is_file() for path in transcript_family(Path(transcript))
+            ):
+                return False
+            if _offer_marks_now(handle, prompt_path) > 0:
                 return False
             return (
                 pane_lacks_offer(
@@ -5260,6 +5523,18 @@ class HerdrLauncher:
             return None
         if status is None:
             return None
+        if status == "idle":
+            try:
+                background = pane_background_tasks(
+                    lambda *args, **kwargs: self._herdr(
+                        *args, env=handle.environment, **kwargs
+                    ),
+                    handle.pane_id,
+                )
+            except Exception:
+                background = None
+            if background:
+                status = BACKGROUND_TASK_STATUS
         size = -1
         if handle.transcript_path is not None:
             try:
@@ -5304,7 +5579,7 @@ class HerdrLauncher:
                     self._bind_handle_transcript(handle, found)
             if handle.transcript_path is None:
                 return False
-            return prompt_submission_marks(handle, prompt_path) > 0
+            return _offer_marks_now(handle, prompt_path) > 0
 
         return recorded
 
@@ -5354,25 +5629,48 @@ class HerdrLauncher:
         # raised before herdr is called *at all*. Resolving the parent first
         # would make one herdr call before that refusal and falsify it.
         pane_env_flags(environment)
-        def resubmit_adopted(adopted: LaunchHandle) -> LaunchHandle:
+        def resubmit_adopted(adopted: LaunchHandle) -> Optional[LaunchHandle]:
+            # `None`: the adopted session stayed busy, or never received the
+            # prompt, and was closed; the caller starts the role fresh.
+            # Binding first: only a session proven to be this one may be
+            # closed.
+            self._verified_handle_binding(adopted)
+            if self._busy_session_replaced(spec, adopted):
+                return None
             if spec.prepare_adopted_cwd is not None:
-                self._verified_handle_binding(adopted)
                 spec.prepare_adopted_cwd(adopted.launched_cwd)
                 # The callback may rewrite the prompt with the adopted CWD.
                 prepare_route_prompt(spec)
                 preflight_launch_prompt(spec)
-            return self.resubmit(
-                adopted,
-                spec.prompt_path,
-                route=spec.route,
-                envelope_path=spec.envelope_path,
-            )
+            try:
+                return self.resubmit(
+                    adopted,
+                    spec.prompt_path,
+                    route=spec.route,
+                    envelope_path=spec.envelope_path,
+                )
+            except LaunchRefused as exc:
+                # The retained session never received the prompt after every
+                # bounded send. Replaced exactly as a busy one is (#369): the
+                # caller starts the role fresh, which is one more delivery,
+                # not a lane fault.
+                if exc.refusal is not LaunchRefusal.DISPATCH_NOT_CONSUMED:
+                    raise
+                self._replace_session(
+                    spec,
+                    adopted,
+                    SESSION_NOT_CONSUMED,
+                    "pane {0}: {1}".format(adopted.pane_id, exc.detail),
+                )
+                return None
 
         existing = self._validated_existing_role_handle(spec, environment)
         if existing is None:
             existing = self._reconnect_live_agent(spec, environment)
         if existing is not None:
-            return resubmit_adopted(existing)
+            adopted = resubmit_adopted(existing)
+            if adopted is not None:
+                return adopted
         # Placement: the operator's (or Maestro-created) parent Space, a
         # linked lane child under it, a lazy role pane inside the child.
         pane_id, layout, reused_role_pane = self._acquire_pane(
@@ -5386,7 +5684,13 @@ class HerdrLauncher:
             # be refused `agent_pane_busy` and reap the live pane.
             existing = self._reconnect_live_agent(spec, environment)
             if existing is not None:
-                return resubmit_adopted(existing)
+                adopted = resubmit_adopted(existing)
+                if adopted is not None:
+                    return adopted
+                # The busy session's pane is closed; place a fresh one.
+                pane_id, layout, reused_role_pane = self._acquire_pane(
+                    spec, worktree, environment
+                )
         with layout.lock:
             pane_is_in_layout = pane_id in layout.panes
             placement_tab_id = layout.tab_id
@@ -5577,6 +5881,12 @@ class HerdrLauncher:
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 name,
             )
+            wait_for_agent_drawn(
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id,
+                spec.route,
+                route_argv[-1],
+            )
             # The trailing space is load-bearing, not cosmetic. `@` opens the
             # composer's file-path completion popup in both omp and Claude
             # Code, and while that popup is open it consumes Enter to accept a
@@ -5595,6 +5905,9 @@ class HerdrLauncher:
             # before or after offering is a circular refusal. Discover it
             # through the proof predicate while the submission loop runs;
             # missing stays unproven False.
+            object.__setattr__(
+                handle, "offer_marks", marks_since_offer(handle, spec.prompt_path)
+            )
             submission_recorded = self._runtime_submission_recorded(
                 handle, spec.prompt_path
             )
@@ -5815,6 +6128,7 @@ class HerdrLauncher:
     def _submit_resubmission(
         self, handle: LaunchHandle, prompt: Path, timeout_s: float
     ) -> None:
+        object.__setattr__(handle, "offer_marks", marks_since_offer(handle, prompt))
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
@@ -6324,9 +6638,11 @@ class HerdrLauncher:
 
         The parent Space is never closed: it is the operator's own Space when
         one was open on the repository, and even a Maestro-created one is
-        shared by every run on that repository. Cancel is not this path. A
-        rename that is not confirmed leaves every affected pane and lane
-        workspace open.
+        shared by every run on that repository. Cancel is not this path. The
+        rename is cosmetic: a pane that is not idle, is not interactive, or
+        does not confirm it never keeps its lane workspace open, because this
+        runs only after the run published. Only a handle that is not this
+        launcher's own (`BINDING_MISMATCH`) stops the cleanup.
         """
         ordered: List[LaunchHandle] = []
         seen: set[str] = set()
@@ -6342,28 +6658,17 @@ class HerdrLauncher:
                 continue
             try:
                 self.wait_for_idle(handle, timeout_s=timeout_s)
+                name = self._session_name(handle, project_identity)
+                self._confirm_session_rename(handle, name, timeout_s)
             except HerdrCallError as exc:
                 if exc.code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND, AGENT_NOT_FOUND):
                     self._cleaned_absent.add(handle.pane_id)
                     continue
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                    pane_created=True,
-                ) from exc
-            except LaunchRefused:
-                raise
-            except AgentNotInteractive as exc:
-                # Same outcome as any other unconfirmed rename, said in the
-                # type this path already declares. Untyped, it escaped every
-                # caller and ended the run at cleanup.
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                    pane_created=True,
-                ) from exc
-            name = self._session_name(handle, project_identity)
-            self._confirm_session_rename(handle, name, timeout_s)
+            except LaunchRefused as exc:
+                if exc.refusal is LaunchRefusal.BINDING_MISMATCH:
+                    raise
+            except Exception:
+                pass
             confirmed.append(handle)
         children: List[str] = []
         environments: Dict[str, Mapping[str, str]] = {}
@@ -6532,12 +6837,6 @@ class FakeLauncher:
             if self._handles.get(handle.correlation_token) is not handle:
                 raise LaunchRefused(
                     LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
-                )
-            if self.agent_status(handle) not in (None, "idle"):
-                raise LaunchRefused(
-                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
-                    handle.correlation_token,
-                    pane_created=True,
                 )
             self._states[handle.correlation_token] = PollResult(
                 PollState.GONE, detail="RUN_COMPLETE"

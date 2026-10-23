@@ -318,7 +318,7 @@ class InvokingWorkspaceTest(unittest.TestCase):
                 launcher.resubmit(tester, tester_spec.prompt_path)
             self.assert_selected(herdr, tester)
 
-    def test_restored_agent_requires_confirmed_rename_before_child_cleanup(self) -> None:
+    def test_restored_agent_unconfirmed_rename_does_not_block_child_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = _RunFixture(tmp)
             spec = run.spec(TESTS_LANE, "tester")
@@ -338,11 +338,7 @@ class InvokingWorkspaceTest(unittest.TestCase):
                 "unconfirmed", pane_created=True,
             )
             with mock.patch.object(fresh, "_confirm_session_rename", side_effect=refusal):
-                with self.assertRaises(lch.LaunchRefused):
-                    fresh.complete_run([], timeout_s=1.0)
-            self.assertNotIn(original.child_workspace_id, run.herdr.closed_workspaces)
-            self.assertNotIn(original.pane_id, run.herdr.closed_panes)
-            fresh.complete_run([], timeout_s=1.0)
+                fresh.complete_run([], timeout_s=1.0)
             self.assertIn(original.child_workspace_id, run.herdr.closed_workspaces)
             self.assertNotIn(original.parent_workspace_id, run.herdr.closed_workspaces)
 
@@ -466,7 +462,7 @@ class InvokingWorkspaceTest(unittest.TestCase):
                 cwd = _checkout(Path(tmp), "tester")
                 envelopes = []
 
-                def reply(handle, envelope, role, lane):
+                def reply(handle, envelope, role, lane, prompt=None):
                     envelopes.append(envelope)
                     envelope.write_text("{}", encoding="utf-8")
                     return {}
@@ -1184,10 +1180,10 @@ class RenameCloseTest(unittest.TestCase):
                 any(call[:2] == ("workspace", "close") for call in herdr.calls[again:])
             )
 
-    def test_rename_failure_leaves_workspaces_and_cwds(self) -> None:
+    def test_rename_failure_still_closes_workspaces(self) -> None:
         herdr = FakeHerdr()
-        # The composer never prints its confirmation, which is the only way
-        # the rename can now fail: the wait is a poll of the pane's own text.
+        # The composer never prints its confirmation. The rename is cosmetic,
+        # so the published run's workspaces close anyway.
         herdr.rename_confirms = False
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
@@ -1196,21 +1192,53 @@ class RenameCloseTest(unittest.TestCase):
             tester, reviewer, tester_handle, reviewer_handle = self._two_roles(
                 herdr, launcher, Path(tmp)
             )
-            with self.assertRaises(lch.LaunchRefused) as raised:
-                launcher.complete_run(
-                    [tester_handle, reviewer_handle],
-                    project_identity=PROJECT,
-                    timeout_s=1.0,
-                )
-            self.assertEqual(
-                raised.exception.refusal, lch.LaunchRefusal.SESSION_RENAME_UNCONFIRMED
+            launcher.complete_run(
+                [tester_handle, reviewer_handle],
+                project_identity=PROJECT,
+                timeout_s=1.0,
             )
-            self.assertFalse(
-                any(call[:2] == ("workspace", "close") for call in herdr.calls)
-            )
-            self.assertNotIn(tester_handle.child_workspace_id, herdr.closed_workspaces)
+            self.assertIn(tester_handle.child_workspace_id, herdr.closed_workspaces)
+            self.assertNotIn(tester_handle.parent_workspace_id, herdr.closed_workspaces)
             self.assertTrue(tester.is_dir())
             self.assertTrue(reviewer.is_dir())
+
+    def test_complete_run_spaces_closes_when_the_rename_never_confirms(self) -> None:
+        import maestro
+        from types import SimpleNamespace
+
+        herdr = FakeHerdr()
+        herdr.rename_confirms = False
+        launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
+        launcher._herdr = herdr  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
+            _, _, tester_handle, reviewer_handle = self._two_roles(
+                herdr, launcher, Path(tmp)
+            )
+            roles = {
+                name: SimpleNamespace(
+                    handle=handle, attempt=None, checkout=Path(tmp) / name
+                )
+                for name, handle in (
+                    ("tester", tester_handle),
+                    ("reviewer", reviewer_handle),
+                )
+            }
+            actor = SimpleNamespace(
+                launcher=launcher,
+                project_identity=PROJECT,
+                state_root=Path(tmp) / "state",
+                _roles=roles,
+                _session_run_id=lambda stored: RUN_HASH,
+                _handle_space_absent=lambda handle: False,
+                _safe_remove_attempt=lambda attempt, checkout: None,
+            )
+            with mock.patch.object(lch.time, "sleep"), mock.patch.object(
+                lch.time, "monotonic", side_effect=iter(range(0, 10_000, 100))
+            ):
+                maestro.HerdrStageActor.complete_run_spaces(actor, RUN_HASH)
+            self.assertIn(tester_handle.child_workspace_id, herdr.closed_workspaces)
+            self.assertEqual(actor._roles, {})
 
     def test_close_failure_leaves_cwd(self) -> None:
         herdr = FakeHerdr()
@@ -2346,8 +2374,22 @@ class OwnershipMatrixTest(unittest.TestCase):
 
     # -- stable agent ------------------------------------------------------------
 
-    def test_idle_and_working_agents_are_adopted_blocked_and_unknown_refuse(self) -> None:
-        for status, adopted in (("idle", True), ("working", True), ("done", True), ("blocked", False), ("unknown", False)):
+    def test_working_agent_from_a_dead_launcher_is_replaced_not_adopted(self) -> None:
+        # Its turn belongs to a scheduler that no longer exists; resubmitting
+        # into it waits on, or interrupts, work nothing will read.
+        with tempfile.TemporaryDirectory() as tmp:
+            run = _RunFixture(tmp)
+            tester = run.spec(TESTS_LANE, "tester")
+            first = _launch(run.launcher(), run.herdr, tester)
+            run.herdr.set_agent_status(first.agent_name, "working")
+            mark = len(run.herdr.calls)
+            again = _launch(run.launcher(), run.herdr, tester)
+            self.assertNotEqual(again.pane_id, first.pane_id)
+            self.assertIn(first.pane_id, run.herdr.closed_panes)
+            self.assertEqual(len(_calls_after(run.herdr, mark, START)), 1)
+
+    def test_idle_and_done_agents_are_adopted_blocked_and_unknown_refuse(self) -> None:
+        for status, adopted in (("idle", True), ("done", True), ("blocked", False), ("unknown", False)):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 run = _RunFixture(tmp)
                 tester = run.spec(TESTS_LANE, "tester")

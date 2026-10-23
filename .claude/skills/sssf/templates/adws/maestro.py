@@ -205,9 +205,14 @@ DEFAULT_ROLE_SESSION_MAX_TOKENS = 1_000_000
 
 
 #: Seconds a dispatched agent may sit `idle` with no envelope and a transcript
-#: that does not grow before the dispatch is refused `DISPATCH_NOT_CONSUMED`.
+#: that does not grow, and no background shell or monitor of its own, before
+#: the dispatch is refused `DISPATCH_NOT_CONSUMED`.
 #: `0` turns the bound off.
 DEFAULT_DISPATCH_IDLE_TIMEOUT_S = 600
+
+#: How many times a dispatch whose prompt provably never reached the agent is
+#: delivered again when the idle bound expires, before it is refused.
+DISPATCH_REDELIVERIES = 1
 
 
 def _config_dispatch_idle_timeout_s(value: object, label: str) -> int:
@@ -568,6 +573,14 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["provision_timeout_s"] = _config_timeout(
         loaded.get("provision_timeout_s"), "provision_timeout_s"
     )
+    try:
+        loaded["suite_requirements"] = provisioning.parse_suite_requirements(
+            loaded.get("suite_requirements")
+        )
+    except ValueError as exc:
+        raise _MaestroConfigurationError(str(exc)) from exc
+    # Every remote suite job this process dispatches carries them.
+    provisioning.set_suite_requirements(loaded["suite_requirements"])
     loaded["suite_timeout_s"] = _config_timeout(
         loaded.get("suite_timeout_s"), "suite_timeout_s", None
     )
@@ -884,6 +897,12 @@ TEST_CRAFT_REVIEWER_QUESTION = (
     "must quote the public contract verbatim; a finding that does not quote "
     "it is sent back once, and a second miss parks the lane.\n"
 )
+
+
+#: The agents' test command (`tools/remote_tests.py`): it runs a checkout's
+#: tests on the GitHub Actions spot fleet. Agents are told to use it and never
+#: to start a test runner on this machine.
+REMOTE_TESTS_TOOL = Path(__file__).resolve().parent / "tools" / "remote_tests.py"
 
 
 def _clear_precreated_role_cwd(dest: Path) -> bool:
@@ -1276,13 +1295,13 @@ class HerdrStageActor:
 
     _TESTER_COLLECT_RULE = (
         "Before you return the envelope, enumerate your own draft with the "
-        "gate's own runner and see the listing. vitest: "
-        "`<vitest binary> list --run [--config <gate config>] <your files>`; "
-        "pytest: `<pytest binary> --collect-only -q -o addopts= <your files>`. "
-        "The harness runs exactly that and will not accept a draft it cannot "
+        "gate's own runner and see the listing: run the remote test command "
+        "your turn instructions name, with `--collect`, over your files. It "
+        "runs the gate's runner on the spot fleet, never on this machine. The "
+        "harness runs exactly that and will not accept a draft it cannot "
         "enumerate. A listing that appears and then does not exit is fine -- "
         "some configs hold the runner open, and the harness reads what was "
-        "printed; kill it once you have seen your case ids. Nothing printed at "
+        "printed. Nothing printed at "
         "all means no module finished loading, which is your defect to fix, "
         "not the harness's. Counting `it(`, `test(`, or `def test_` with grep, "
         "or any other static scan of the file, is NOT this measurement and "
@@ -1456,6 +1475,12 @@ class HerdrStageActor:
                 "the suite asserts, as a contract clause in your own words, is "
                 "exactly what you are here to do; pasting the test file into "
                 "the contract is not.\n"
+                "Every lane a parked lane builds on is already merged, and its "
+                "declared outputs, as the integration head the builder starts "
+                "from holds them, are under `merged/<lane_id>/` "
+                "(`merged_source_dir`, at `integration_head`). When a review "
+                "demands the contract name a merged callable, module or "
+                "report schema, read it there and name it exactly as it is.\n"
                 "Write the revision IR at the path the per-turn JSON names, "
                 "and nowhere else. Do not edit the current IR in place. Do not "
                 "run any `maestro` verb, any git command, or `planctl` -- an "
@@ -1465,7 +1490,8 @@ class HerdrStageActor:
                 "any lane outside allowed_lane_ids is refused whole, and no "
                 "lane gets anything.\n"
                 "When `reviewer_findings_path` is given, the reviewer said "
-                "REVISE to your previous revision (`previous_revision_path`): "
+                "REVISE to your previous revision (`previous_revision_path`), "
+                "or planctl refused it and its error is the finding: "
                 "fix every located finding in it.\n"
                 "When `envelope_error` is given, your previous envelope was "
                 "refused with exactly that error: return a corrected envelope "
@@ -1482,7 +1508,13 @@ class HerdrStageActor:
                 "and you do not edit it. Read the revision against the "
                 "current IR it revises, the planctl question surface of the "
                 "revision, the author's rationales, and each parked lane's "
-                "evidence under `lanes/<lane_id>/` and `suite/<lane_id>/`.\n"
+                "evidence under `lanes/<lane_id>/` and `suite/<lane_id>/`, "
+                "and the merged source it builds on under "
+                "`merged/<lane_id>/`: the integration head's bytes for every "
+                "lane it depends on, the same the builder starts from. That "
+                "merged source is a permitted review input; check every "
+                "merged callable, module or schema the revision names "
+                "against it and cite it in your findings.\n"
                 "Return REVISE when the revision does not close each parked "
                 "lane's gap, weakens a check, verdict or error path, reaches "
                 "a lane outside allowed_lane_ids, or leaves a two-"
@@ -1534,6 +1566,7 @@ class HerdrStageActor:
             "- Use enabled profile and repository capabilities only for this role's task.\n"
             "- Native Read, Write, Edit, Bash, skills, and MCP remain available.\n"
             "- Delegation is allowed: split disjoint work across subagents to save context (Claude: `/team`; omp: its own subagents). Subagents obey this contract; you own the envelope.\n"
+            "- Run tests and waits in the foreground. Never end a turn while a background shell or monitor you started is still running: the harness reads an ended turn as finished work, and an idle agent with no envelope is refused.\n"
             "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
             "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
             "- Write only what this role permits, then write the requested UTF-8 JSON envelope to its `.part` sibling and rename it into place, and stop.\n\n"
@@ -1714,6 +1747,19 @@ class HerdrStageActor:
             spec.pop("gate", None)
         return spec
 
+    @staticmethod
+    def _remote_tests_instruction(cwd: Path) -> str:
+        """Every role's rule: no test process starts on this machine."""
+        return (
+            " Never run pytest, vitest, or any other test runner or test "
+            "collection on this machine -- not the suite, not one case, not "
+            "`--collect-only`, not `vitest list`: test processes run only on "
+            "the GitHub Actions spot fleet. To run or list tests, run "
+            "`uv run --script {0} --tree {1} [--collect] -- <test files>`. It "
+            "tests this checkout as it stands, uncommitted files included, and "
+            "prints the runner's output; its exit status is the runner's."
+        ).format(REMOTE_TESTS_TOOL, cwd.resolve())
+
     def _prompt(
         self,
         ctx: LaneContext,
@@ -1740,6 +1786,7 @@ class HerdrStageActor:
             "finished; never write into {0} directly, because a reader polling "
             "it reads a partial file as a failed turn. Schema: {1}. CWD: {2}."
         ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
+        instructions += self._remote_tests_instruction(cwd)
 
         if acceptance:
             instructions += self._acceptance_instruction(str(mode))
@@ -1933,8 +1980,9 @@ class HerdrStageActor:
         elif role == "operator":
             instructions += (
                 " Read current_ir_path and, for every lane in parked_lanes, "
-                "its accepted suite under suite/<lane_id>/ and its gate "
-                "table, reviews and final review under lanes/<lane_id>/. "
+                "its accepted suite under suite/<lane_id>/, its gate "
+                "table, reviews and final review under lanes/<lane_id>/, "
+                "and the merged source it builds on under merged/<lane_id>/. "
                 "Write one revised IR answering every parked lane at "
                 "revision_out_path and return that exact path plus one "
                 "rationale per parked lane, except a LANE_FAULT lane you "
@@ -1952,7 +2000,9 @@ class HerdrStageActor:
             instructions += (
                 " Read current_ir_path, revision_ir_path, question_surface_path, "
                 "rationales_path, and for every lane in parked_lanes its "
-                "evidence under lanes/<lane_id>/ and suite/<lane_id>/. "
+                "evidence under lanes/<lane_id>/ and suite/<lane_id>/ and "
+                "the merged source under merged/<lane_id>/, which you may "
+                "cite. "
                 + att.TWO_IMPLEMENTATIONS_QUESTION
                 + " Then return verdict PASS or REVISE; REVISE carries at "
                 "least one finding with location, defect and required_change."
@@ -2173,6 +2223,7 @@ class HerdrStageActor:
 
         The index stays at the refreshed head, so the restored files read as
         the role's uncommitted output exactly as if it had just written them.
+        A path absent at `draft_sha` was deleted there, and is deleted here.
         """
         present = tuple(
             line
@@ -2181,6 +2232,10 @@ class HerdrStageActor:
             ).splitlines()
             if line
         )
+        for rel in set(files) - set(present):
+            target = _resolved_under(checkout, str(Path(rel).parent)) / Path(rel).name
+            if target.is_file() or target.is_symlink():
+                target.unlink()
         if not present:
             return
         self._git(checkout, "checkout", draft_sha, "--", *present)
@@ -2397,14 +2452,56 @@ class HerdrStageActor:
             pass
 
     def _await_envelope(
-        self, handle: object, envelope: Path, role: str, lane_id: str = ""
+        self,
+        handle: object,
+        envelope: Path,
+        role: str,
+        lane_id: str = "",
+        prompt: Optional[Path] = None,
     ) -> Mapping[str, Any]:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
+        started = time.monotonic()
         waited = 0.0
+        next_beat = 30.0
         activity = getattr(self.launcher, "turn_activity", None)
         limit = int(getattr(self, "dispatch_idle_timeout_s", 0) or 0)
         last_seen: object = None
         quiet_since = 0.0
+        redeliveries = 0
+
+        def delivery_lost() -> bool:
+            lost = getattr(self.launcher, "prompt_delivery_lost", None)
+            if prompt is None or lost is None:
+                return False
+            try:
+                return bool(lost(handle, prompt))
+            except Exception:
+                return False
+
+        def transcript_bytes() -> object:
+            if activity is None:
+                return None
+            try:
+                seen = activity(handle)
+            except Exception:
+                return None
+            return seen[1] if seen is not None else None
+
+        def background_live() -> bool:
+            if activity is None:
+                return False
+            try:
+                seen = activity(handle)
+            except Exception:
+                return False
+            return seen is not None and seen[0] == lch.BACKGROUND_TASK_STATUS
+
+        def envelope_text() -> object:
+            try:
+                return _read_regular_text_under(bound, envelope)
+            except (OSError, UnicodeError, ValueError):
+                return None
+
         while True:
             try:
                 raw = _read_regular_text_under(bound, envelope)
@@ -2419,10 +2516,36 @@ class HerdrStageActor:
             if isinstance(payload, dict) and self._payload_ok(role, payload):
                 wait = getattr(self.launcher, "wait_for_idle", None)
                 if wait is not None:
+                    before = transcript_bytes()
                     try:
                         wait(handle)
+                    except lch.AgentNotInteractive as exc:
+                        # An envelope is not the end of a turn. On run
+                        # 2acd2f5f the tester declared, kept editing for a
+                        # minute, and rewrote its envelope six seconds after
+                        # this wait gave up, so the recorded draft missed its
+                        # last edit. A transcript that grew, or an envelope
+                        # that changed, during the wait is an agent still
+                        # working: wait again. One that did neither is a slow
+                        # composer over finished work, and the declaration
+                        # stands.
+                        if (
+                            transcript_bytes() != before
+                            or envelope_text() != raw
+                            or background_live()
+                        ):
+                            self._say(
+                                lane_id or "-",
+                                "{0} still working after declaring".format(role),
+                                str(exc),
+                            )
+                            continue
+                        self._say(
+                            lane_id or "-",
+                            "{0} completion could not be confirmed".format(role),
+                            str(exc),
+                        )
                     except (
-                        lch.AgentNotInteractive,
                         lch.HerdrCallError,
                         lch.LaunchRefused,
                     ) as exc:
@@ -2435,6 +2558,12 @@ class HerdrStageActor:
                             "{0} completion could not be confirmed".format(role),
                             str(exc),
                         )
+                    else:
+                        # Idle now, and the envelope read above predates the
+                        # wait: a turn that rewrote it while finishing is
+                        # declared by the rewrite. Read it again.
+                        if envelope_text() != raw:
+                            continue
                 return payload
             # ── nothing but the envelope ends this wait ─────────────────────
             #
@@ -2473,10 +2602,14 @@ class HerdrStageActor:
             # it. The refusal is the typed launch failure every caller already
             # contains (a lane parks LANE_FAULT; attend retries once).
             time.sleep(0.1)
-            waited += 0.1
+            # Wall time, not a count of sleeps: each pass also reads the
+            # envelope and calls herdr, so summing 0.1s ticks ran 2.7x slow
+            # on run 2acd2f5f and a 600s bound took 2030s.
+            waited = time.monotonic() - started
             # A silent minute is indistinguishable from a hung agent. Say the
             # wait is still a wait, at a cadence that does not flood a terminal.
-            if waited % 30 < 0.1:
+            if waited >= next_beat:
+                next_beat = waited - waited % 30 + 30
                 self._say(
                     lane_id or "-",
                     "waiting on {0}".format(role),
@@ -2493,6 +2626,30 @@ class HerdrStageActor:
                     quiet_since = waited
                     continue
                 if waited - quiet_since >= limit:
+                    # Run 646181870aef: a fresh tester sat at an empty
+                    # composer for 629s and the lane parked for the operator.
+                    # A dispatch that provably never reached the agent is
+                    # delivered again, a bounded number of times, first.
+                    if redeliveries < DISPATCH_REDELIVERIES and delivery_lost():
+                        redeliveries += 1
+                        self._say(
+                            lane_id or "-",
+                            "{0} never received its prompt, delivering again".format(
+                                role
+                            ),
+                            "redelivery {0} of {1}".format(
+                                redeliveries, DISPATCH_REDELIVERIES
+                            ),
+                        )
+                        try:
+                            self.launcher.resubmit(
+                                handle, prompt, envelope_path=envelope
+                            )
+                        except lch.LaunchRefused as exc:
+                            raise self._launch_failed(exc) from exc
+                        last_seen = None
+                        quiet_since = waited
+                        continue
                     raise LaunchFailed(
                         "DISPATCH_NOT_CONSUMED:{0} idle {1}s with no envelope "
                         "and no transcript activity".format(
@@ -2877,7 +3034,7 @@ class HerdrStageActor:
             "dispatched {0}".format(role),
             "{0} {1}".format(route["route"], route.get("model") or route.get("profile") or ""),
         )
-        payload = self._await_envelope(handle, envelope, role, lane_id)
+        payload = self._await_envelope(handle, envelope, role, lane_id, prompt=prompt)
         self._say(lane_id, "{0} replied".format(role), "turn {0}".format(turn))
         bound = _RoleSession(handle, cwd_used, attempt, None, ctx.run_id)
         bound.turns = turn
@@ -3237,14 +3394,34 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
+        # A CODE_REVISE or BASE_INVALIDATION turn edits the prior candidate.
+        # A checkout that survived holds it committed on the base; a fresh one
+        # is the bare base, so lay the candidate's delta back down, uncommitted.
+        prior = getattr(ctx.artifacts.get("BUILDER_OUTPUT"), "payload", None) or {}
+        prior_sha = str(prior.get("candidate_sha") or "")
+        prior_files = tuple(sorted({
+            path
+            for entry in prior.get("tree_delta") or ()
+            if isinstance(entry, Mapping)
+            for path in (entry.get("old_path"), entry.get("new_path"))
+            if path
+        }))
+
+        def refresh(path: Path) -> None:
+            self._refresh_builder_checkout(path, ctx.lane.declared_outputs, sha)
+            if (
+                prior_sha
+                and prior_files
+                and self._git(path, "rev-parse", "HEAD") == sha
+            ):
+                self._restore_draft(path, prior_sha, prior_files)
+
         payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
             cwd,
             extra,
-            prepare_cwd=self._with_fixtures(ctx, lambda path: self._refresh_builder_checkout(
-                path, ctx.lane.declared_outputs, sha
-            )),
+            prepare_cwd=self._with_fixtures(ctx, refresh),
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         candidate_sha, changed = self._commit_declared(
@@ -3453,6 +3630,8 @@ class HerdrStageActor:
     #: to their CWD.
     _OPERATOR_INPUTS = "inputs"
     _OPERATOR_SUITE = "suite"
+    #: The integration head's bytes for every lane a parked lane builds on.
+    _OPERATOR_MERGED = "merged"
     _OPERATOR_OUT = "revisions"
     _ATTEND_REVIEWER = _ATTEND_REVIEWER_ROLE
 
@@ -3504,7 +3683,8 @@ class HerdrStageActor:
         """
         inputs = cwd / self._OPERATOR_INPUTS
         suite = cwd / self._OPERATOR_SUITE
-        for directory in (inputs, suite):
+        merged = cwd / self._OPERATOR_MERGED
+        for directory in (inputs, suite, merged):
             if directory.exists():
                 shutil.rmtree(directory)
             directory.mkdir(parents=True, exist_ok=True)
@@ -3539,11 +3719,15 @@ class HerdrStageActor:
                 json.dumps(st.json_ready(lane.final_review), indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            lane_suite = _resolved_under(suite, lane.lane_id)
-            for relative, text in sorted(lane.suite_files.items()):
-                destination = _resolved_under(lane_suite, relative)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text(text, encoding="utf-8")
+            for root, files_of in (
+                (suite, lane.suite_files),
+                (merged, lane.merged_source),
+            ):
+                lane_root = _resolved_under(root, lane.lane_id)
+                for relative, text in sorted(files_of.items()):
+                    destination = _resolved_under(lane_root, relative)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(text, encoding="utf-8")
         lch.scratch_environment(cwd)
 
     def _attend_lanes_extra(
@@ -3558,6 +3742,12 @@ class HerdrStageActor:
                 ),
                 "suite_dir": str((cwd / self._OPERATOR_SUITE / lane.lane_id).resolve()),
                 "suite_files": sorted(lane.suite_files),
+                "integration_head": lane.integration_head,
+                "merged_source_dir": str(
+                    (cwd / self._OPERATOR_MERGED / lane.lane_id).resolve()
+                ),
+                "merged_source_files": sorted(lane.merged_source),
+                "merged_source_sha256": lane.merged_source_sha256,
             }
             for lane in lanes
         ]
@@ -4258,8 +4448,12 @@ class _RunPreflight:
         Supplied when absent: an IR attend did not write (`attend.plan_ir`,
         or a hand amendment's, which may sit in `/tmp`) is copied with its
         sources into the revision's root under `runtime_state_root`.
+        The IR is the one the revision's plan names (`_attend_plan_ir`).
         """
-        remedy = "set attend.plan_ir to the Plan IR this revision was projected from"
+        remedy = (
+            "project the plan with plan_author_cli.py so it names its IR, or set "
+            "attend.plan_ir to the IR whose sha256 the plan's receipt names"
+        )
         check = rp.readable_file_check("attend:plan-ir", self.plan_ir, remedy, parse=json.loads)
         if self.plan_ir_current is None:
             return check
@@ -4299,7 +4493,7 @@ class _RunPreflight:
                     rp.Check(
                         "runners",
                         lambda: (scheduler._assert_runners_usable() or True, "every runner the plan names resolves"),
-                        "fix provision_argv so the runner loads; the runner tree is kept for inspection",
+                        "fix provision_argv so the runner loads, or the named suite_requirements entry so it installs on the spot fleet",
                     )
                 ],
                 self.say,
@@ -5238,7 +5432,11 @@ _PLANCTL_VERDICT_EXIT = 1
 
 
 def _run_planctl(
-    binary: Path, argv: Sequence[str], *, key: Optional[str] = None
+    binary: Path,
+    argv: Sequence[str],
+    *,
+    key: Optional[str] = None,
+    log: Optional[Path] = None,
 ) -> str:
     """One planctl subcommand, refused by exit status and nothing else.
 
@@ -5271,11 +5469,25 @@ def _run_planctl(
                 argv[0], type(exc).__name__, exc
             ),
         ) from exc
+    if log is not None:
+        # planctl prints its phase timings on stderr; success used to drop
+        # them, so a 15-32 minute review could not be broken into phases.
+        try:
+            log.write_text(result.stderr or "", encoding="utf-8")
+        except OSError:
+            pass
     if result.returncode == 0:
         return result.stdout or ""
     detail = (result.stdout or "") + (result.stderr or "")
+    # planctl prints every warning before its error, and the detail is
+    # bounded, so in planctl's order 18 warnings truncated the one line that
+    # said why the revision was refused. Non-warning lines come first.
+    lines = detail.strip().splitlines()
+    ordered = [line for line in lines if not line.startswith("warning:")] + [
+        line for line in lines if line.startswith("warning:")
+    ]
     message = "planctl {0} exited {1}: {2}".format(
-        argv[0], result.returncode, detail.strip()[:2000]
+        argv[0], result.returncode, "\n".join(ordered)[:2000]
     )
     if "review.remote_runner" in detail:
         # planctl runs its mutation pass on EC2 by default. Maestro never
@@ -5350,27 +5562,136 @@ def _attend_suite_files(
     )
 
 
+def _attend_merged_source(
+    repo: Path, head: str, paths: Sequence[str]
+) -> dict[str, str]:
+    """`paths` as the integration head `head` holds them, file by file.
+
+    A declared output may be a directory; every blob under it is read. Read
+    from the run repository's object database, never a working tree, so the
+    bytes are the head's and nothing else's. A blob that is not UTF-8 text is
+    left out: the agents read source, and the digest binds what they read.
+    """
+    if not head or not paths:
+        return {}
+    listing = tm._git(
+        Path(repo), "ls-tree", "-r", "-z", head, "--", *paths, text=False
+    ).stdout
+    files: dict[str, str] = {}
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        meta, _tab, raw_path = entry.partition(b"\t")
+        _mode, kind, blob = meta.decode("ascii").split()
+        if kind != "blob":
+            continue
+        try:
+            files[raw_path.decode("utf-8")] = tm.cat_blob(Path(repo), blob).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return dict(sorted(files.items()))
+
+
+def _plan_source_ir(pinned: Path) -> tuple[Optional[str], Optional[str]]:
+    """The IR a pinned plan was projected from: `(sha256, recorded path)`.
+
+    The sha256 is the signed receipt's `ir_sha256`; the path is
+    `approval.source_ir.path`, which plans projected before it existed lack.
+    Both are None for a plan with no approval (a scripted `run amend`).
+    """
+    try:
+        document = json.loads(Path(pinned).read_bytes())
+    except (OSError, ValueError):
+        return None, None
+    approval = document.get("approval") if isinstance(document, dict) else None
+    if not isinstance(approval, Mapping):
+        return None, None
+    receipt = approval.get("receipt")
+    expected = receipt.get("ir_sha256") if isinstance(receipt, Mapping) else None
+    source = approval.get("source_ir")
+    recorded = source.get("path") if isinstance(source, Mapping) else None
+    return (
+        expected if isinstance(expected, str) else None,
+        recorded if isinstance(recorded, str) and recorded else None,
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _attend_configured_ir_conflict(
+    policy: att.AttendPolicy, pinned: Path, revision: int
+) -> str:
+    """Why `attend.plan_ir` names another IR than this revision's, else "".
+
+    The pinned plan's receipt names its IR by sha256; a configured path to
+    different bytes is a run-scoped input read from deployment config.
+    """
+    expected, _ = _plan_source_ir(pinned)
+    configured = policy.plan_ir
+    if expected is None or configured is None or not configured.is_file():
+        return ""
+    found = _file_sha256(configured)
+    if found == expected:
+        return ""
+    return (
+        "attend.plan_ir {0} has sha256 {1}; revision {2} was projected from "
+        "the IR with sha256 {3}".format(configured, found, revision, expected)
+    )
+
+
 def _attend_plan_ir(
-    policy: att.AttendPolicy, plans_dir: Path, run_id: str, revision: int
+    policy: att.AttendPolicy,
+    plans_dir: Path,
+    run_id: str,
+    revision: int,
+    pinned: Optional[Path] = None,
+    repo: Optional[Path] = None,
 ) -> Path:
     """The Plan IR the live revision was projected from.
 
-    Two places, in order: the copy `run attend` itself wrote for a revision it
-    applied, and the deployment's configured `attend.plan_ir` for the revision
-    a human authored. Neither present is a refusal rather than a fallback --
-    the pinned plan artifact is a *projection* of an IR, and handing it to an
-    agent asked to edit an IR would produce a revision the ingress cannot read
-    and a refusal three steps later that names none of this.
+    An approved plan names its IR by the receipt's sha256, and a plan the
+    projection authored also names its path (`approval.source_ir`). Places,
+    in order: the copy `run attend` itself wrote for a revision it applied,
+    the plan's recorded path under the run repository, then `attend.plan_ir`
+    -- each taken only when its bytes are that sha256. `attend.plan_ir`
+    naming other bytes refuses `ATTEND_PLAN_IR_MISMATCH`: it never stands in
+    for the run's own IR. A plan with no receipt keeps the unverified order.
+    None found is a refusal rather than a fallback -- the pinned plan
+    artifact is a *projection* of an IR, and handing it to an agent asked to
+    edit an IR would produce a revision the ingress cannot read.
     """
     written = plans_dir / "{0}.r{1}.ir.json".format(run_id, revision)
-    if written.is_file():
-        return written
-    if policy.plan_ir is not None and policy.plan_ir.is_file():
-        return policy.plan_ir
+    expected, recorded = _plan_source_ir(pinned) if pinned is not None else (None, None)
+    if expected is None:
+        if written.is_file():
+            return written
+        if policy.plan_ir is not None and policy.plan_ir.is_file():
+            return policy.plan_ir
+        raise att.AttendRefused(
+            att.PLAN_IR_UNRESOLVED,
+            "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
+            "({2})".format(revision, written, policy.plan_ir or "unset"),
+        )
+    conflict = _attend_configured_ir_conflict(policy, pinned, revision)
+    if conflict:
+        raise att.AttendRefused(att.PLAN_IR_MISMATCH, conflict)
+    candidates = [written]
+    if recorded is not None:
+        candidates.append(Path(repo or ".") / recorded)
+    if policy.plan_ir is not None:
+        candidates.append(policy.plan_ir)
+    for candidate in candidates:
+        if candidate.is_file() and _file_sha256(candidate) == expected:
+            return candidate
     raise att.AttendRefused(
         att.PLAN_IR_UNRESOLVED,
-        "no Plan IR for revision {0}: looked at {1} and attend.plan_ir "
-        "({2})".format(revision, written, policy.plan_ir or "unset"),
+        "no Plan IR with sha256 {0} (revision {1}'s receipt): looked at {2}; "
+        "re-project the plan with plan_author_cli.py so it records its IR, "
+        "or set attend.plan_ir to that IR".format(
+            expected, revision, ", ".join(str(c) for c in candidates)
+        ),
     )
 
 
@@ -5507,7 +5828,11 @@ def _attend_record_root(runtime: Any, base: Path, run_id: str, revision: int) ->
 
 
 def _attend_root_current(
-    runtime: Any, base: Path, run_id: str, revision: int
+    runtime: Any,
+    base: Path,
+    run_id: str,
+    revision: int,
+    policy: Optional[att.AttendPolicy] = None,
 ) -> tuple[bool, str]:
     """The owned IR exists and its record names the revision's pinned plan."""
     ir = _attend_owned_ir(base, run_id, revision)
@@ -5522,6 +5847,15 @@ def _attend_root_current(
         return False, "{0} records another plan than {1}".format(record_path, pinned)
     if record.get("ir_sha256") != hashlib.sha256(ir.read_bytes()).hexdigest():
         return False, "{0} changed after it was recorded".format(ir)
+    expected, _ = _plan_source_ir(pinned)
+    if expected is not None and record.get("ir_sha256") != expected:
+        return False, "{0} holds the IR with sha256 {1}; {2} was projected from {3}".format(
+            ir, record.get("ir_sha256"), pinned, expected
+        )
+    if policy is not None:
+        conflict = _attend_configured_ir_conflict(policy, pinned, revision)
+        if conflict:
+            return False, conflict
     json.loads(ir.read_bytes())
     return True, str(ir)
 
@@ -5627,6 +5961,26 @@ def _attend_copy_sources(
     return missing
 
 
+def _attend_clear_foreign_root(
+    base: Path, run_id: str, revision: int, ir_sha256: str
+) -> None:
+    """Empty a revision's root recorded for another IR before re-laying it.
+
+    A root an earlier release supplied from a deployment-wide `attend.plan_ir`
+    holds that IR's sources too; laying the run's own IR over it would leave
+    them beside it, for planctl to upload and an agent to read.
+    """
+    record_path = _attend_root_record(base, run_id, revision)
+    if not record_path.is_file():
+        return
+    try:
+        recorded = json.loads(record_path.read_text(encoding="utf-8")).get("ir_sha256")
+    except ValueError:
+        recorded = None
+    if recorded != ir_sha256:
+        shutil.rmtree(_attend_root(base, run_id, revision))
+
+
 def _attend_supply_root(
     policy: att.AttendPolicy,
     runtime: Any,
@@ -5649,17 +6003,21 @@ def _attend_supply_root(
     """
     moved = _attend_migrate_roots(runtime, base, run_id)
     if moved:
-        if _attend_root_current(runtime, base, run_id, revision)[0]:
+        if _attend_root_current(runtime, base, run_id, revision, policy)[0]:
             return "moved {0} files from runtime_state_root into {1}".format(
                 len(moved), _attend_root(base, run_id, revision)
             )
     legacy = Path(plan_artifact_ref_for(store, run_id, revision)).resolve().parent
-    found = _attend_plan_ir(policy, legacy, run_id, revision)
+    found = _attend_plan_ir(
+        policy, legacy, run_id, revision,
+        pinned=_pinned_plan_artifact(runtime, run_id, revision), repo=repo,
+    )
     data = found.read_bytes()
     document = json.loads(data)
     if not isinstance(document, dict):
         raise att.AttendRefused(att.PLAN_IR_UNRESOLVED, "{0} is not an object".format(found))
     owned = _attend_owned_ir(base, run_id, revision)
+    _attend_clear_foreign_root(base, run_id, revision, _file_sha256(found))
     owned.parent.mkdir(parents=True, exist_ok=True)
     bases = [found.resolve().parent, *found.resolve().parent.parents, repo]
     missing = _attend_copy_sources(document, owned.parent, bases)
@@ -5730,6 +6088,16 @@ def _attend_lane_evidence(
     wait = store.latest_lane_artifact_payload(
         run_id, lane_id, st.ArtifactKind.USER_WAIT
     )
+    # The head the scheduler builds on, so the bytes are the builder's.
+    head = durable_integration_tip(store, run_id)
+    by_id = {item.lane_id: item for item in compiled.lanes}
+    paths = sorted(
+        {
+            path
+            for need in att.merged_source_lane_ids(compiled.lanes, lane_id)
+            for path in by_id[need].declared_outputs
+        }
+    )
     return att.LaneEvidence(
         lane_id=lane_id,
         wait_reason=wait_reason,
@@ -5747,6 +6115,8 @@ def _attend_lane_evidence(
         suite_files=_attend_suite_files(store, repo, run_id, lane),
         final_review=_attend_final_review(store, run_id, wait),
         fault=dict((wait or {}).get("fault") or {}),
+        integration_head=head,
+        merged_source=_attend_merged_source(repo, head, paths),
     )
 
 
@@ -5933,6 +6303,74 @@ def _write_review_findings(
     )
 
 
+def _attend_render(
+    policy: att.AttendPolicy,
+    repo: Path,
+    plans_dir: Path,
+    run_id: str,
+    revision_bytes: bytes,
+    revision: int,
+    bases: Optional[Sequence[Path]] = None,
+) -> tuple[Path, Path]:
+    """Lay one revision out in `plans_dir` and render it: `(ir, rendered)`.
+
+    planctl's mechanical validation of the revision, and the first step of
+    `_attend_project`. Attend also runs it on every authored revision before
+    its reviewer is dispatched (`_attend_check_revision`), so a revision
+    planctl refuses goes back to its author as that round's finding instead
+    of reaching a reviewer whose PASS the projection would then refuse.
+    """
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    stem = "{0}.r{1}".format(run_id, revision)
+    ir = plans_dir / (stem + ".ir.json")
+    rendered = plans_dir / (stem + ".html")
+    receipt = plans_dir / (stem + ".receipt.json")
+    if rendered.exists():
+        rendered.unlink()
+    try:
+        document = json.loads(revision_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise att.AttendRefused(
+            att.REVISION_REFUSED, "revision IR is not JSON: {0}".format(exc)
+        ) from exc
+    if not isinstance(document, dict):
+        raise att.AttendRefused(att.REVISION_REFUSED, "revision IR is not an object")
+    approval = document.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+    document["approval"] = {**approval, "receipt_path": receipt.name}
+    _attend_copy_sources(document, plans_dir, (repo,) if bases is None else bases)
+    ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _run_planctl(
+        _planctl_binary(policy),
+        ["render", str(ir), "--out", str(rendered), "--repo-root", str(plans_dir)],
+    )
+    return ir, rendered
+
+
+def _attend_check_revision(
+    policy: att.AttendPolicy,
+    repo: Path,
+    base: Path,
+    run_id: str,
+    revision_bytes: bytes,
+    revision: int,
+) -> None:
+    """`_attend_render` in a scratch root, before the reviewer reads a revision.
+
+    The scratch root is emptied first, so no source an earlier round laid out
+    is read for this one, and it is never the revision's own root. Sources
+    come from where `_attend_project` takes them.
+    """
+    scratch = Path(base) / run_id / "r{0}.check".format(int(revision))
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    _attend_render(
+        policy, repo, scratch, run_id, revision_bytes, revision,
+        bases=(_attend_root(base, run_id, revision - 1), repo),
+    )
+
+
 def _attend_project(
     policy: att.AttendPolicy,
     layout: Mapping[str, Any],
@@ -5975,33 +6413,18 @@ def _attend_project(
         )
     binary = _planctl_binary(policy)
     key = _reviewer_hmac_key(layout)
-    plans_dir.mkdir(parents=True, exist_ok=True)
     stem = "{0}.r{1}".format(run_id, revision)
-    ir = plans_dir / (stem + ".ir.json")
-    rendered = plans_dir / (stem + ".html")
     receipt = plans_dir / (stem + ".receipt.json")
     plan_out = plans_dir / (stem + ".plan.json")
     findings = plans_dir / (stem + ".review-findings.json")
-    for stale in (rendered, receipt, plan_out, findings):
+    for stale in (receipt, plan_out, findings):
         if stale.exists():
             stale.unlink()
-    try:
-        document = json.loads(revision_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise att.AttendRefused(
-            att.REVISION_REFUSED, "revision IR is not JSON: {0}".format(exc)
-        ) from exc
-    if not isinstance(document, dict):
-        raise att.AttendRefused(att.REVISION_REFUSED, "revision IR is not an object")
-    approval = document.get("approval")
-    if not isinstance(approval, dict):
-        approval = {}
-    document["approval"] = {**approval, "receipt_path": receipt.name}
-    _attend_copy_sources(document, plans_dir, (repo,) if bases is None else bases)
-    ir.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    ir, rendered = _attend_render(
+        policy, repo, plans_dir, run_id, revision_bytes, revision, bases
+    )
     root = ["--repo-root", str(plans_dir)]
     _write_review_findings(binary, ir, findings, policy, review_findings)
-    _run_planctl(binary, ["render", str(ir), "--out", str(rendered), *root])
     _run_planctl(
         binary,
         [
@@ -6021,6 +6444,7 @@ def _attend_project(
             *(["--local"] if local else []),
         ],
         key=key,
+        log=plans_dir / (stem + ".planctl-review.log"),
     )
     _run_planctl(
         binary,
@@ -6111,7 +6535,7 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
                 plan_ir=_attend_owned_ir(plan_base(), run_id, revision),
                 plan_ir_current=lambda: _attend_root_current(
                     runtime, _attend_planroot_base(policy, runtime, layout),
-                    run_id, revision,
+                    run_id, revision, policy,
                 ),
                 plan_ir_supply=lambda: _attend_supply_root(
                     policy, runtime, _attend_planroot_base(policy, runtime, layout),
@@ -6193,6 +6617,13 @@ def _run_attend(args: argparse.Namespace, verb: str = "attend") -> int:
         review_round: int,
         revision_sha256: str,
     ) -> att.ReviewRequest:
+        # A revision planctl refuses never reaches the reviewer: the refusal
+        # goes back to the author as this round's finding.
+        _attend_check_revision(
+            policy, repo, _attend_planroot_base(policy, runtime, layout), run_id,
+            att.reviewed_bytes(revision, revision_sha256),
+            request.next_plan_revision,
+        )
         return _attend_review_request(
             policy,
             request,

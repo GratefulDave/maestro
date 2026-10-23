@@ -876,9 +876,10 @@ class AttendLoop(unittest.TestCase):
         self.assertEqual(len(harness.projected), 2)
         self.assertEqual([item.lane_id for item in outcome.escalated], ["lane-a-build"])
 
-    def test_a_planctl_verdict_about_the_revision_is_not_retried_or_contained(
+    def test_a_planctl_verdict_after_pass_goes_back_to_the_author_each_round(
         self,
     ) -> None:
+        """Not retried, not contained: the author fixes it until rounds run out."""
         harness = _Harness(
             self.tmp,
             parked={"lane-a-build": NO_PROGRESS},
@@ -890,7 +891,71 @@ class AttendLoop(unittest.TestCase):
         with self.assertRaises(att.AttendRefused) as caught:
             harness.attend()
         self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
-        self.assertEqual(len(harness.projected), 1)
+        self.assertEqual(len(harness.projected), 3)
+        self.assertEqual(len(harness.dispatched), 3)
+        self.assertEqual(
+            harness.dispatched[1].reviewer_findings[0]["defect"],
+            "planctl validate exited 1: schema",
+        )
+
+    def test_a_planctl_verdict_after_pass_with_rounds_left_lands_next_round(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            project_refusal=att.AttendRefused(
+                att.REVISION_REFUSED, "planctl render exited 1: verifier.source_coverage"
+            ),
+            crash_times=1,
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.projected), 2)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.stop_reason, att.STOP_RUN_SETTLED)
+
+    def test_a_revision_planctl_refuses_before_review_goes_back_to_the_author(
+        self,
+    ) -> None:
+        """The refusal is the round's finding; no reviewer reads that revision."""
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            review_request_refusal=att.AttendRefused(
+                att.REVISION_REFUSED,
+                "planctl render exited 1: verifier.source_coverage: verifier "
+                "sources do not exactly cover its fixtures, seams, and claims",
+            ),
+            crash_times=1,
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.dispatched), 2)
+        self.assertEqual(len(harness.reviewed), 1)
+        self.assertEqual(harness.reviewed[0].review_round, 2)
+        (finding,) = harness.dispatched[1].reviewer_findings
+        self.assertIn("verifier.source_coverage", finding["defect"])
+        self.assertTrue(harness.dispatched[1].previous_revision_path)
+        self.assertEqual(len(harness.applied), 1)
+        self.assertEqual(outcome.stop_reason, att.STOP_RUN_SETTLED)
+
+    def test_a_revision_planctl_refuses_every_round_leaves_the_review_unresolved(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self.tmp,
+            parked={"lane-a-build": NO_PROGRESS},
+            policy=_policy(),
+            review_request_refusal=att.AttendRefused(
+                att.REVISION_REFUSED, "planctl render exited 1: schema"
+            ),
+        )
+        outcome = harness.attend()
+        self.assertEqual(len(harness.dispatched), 3)
+        self.assertEqual(harness.reviewed, [])
+        self.assertEqual(harness.applied, [])
+        self.assertEqual(outcome.stop_reason, att.STOP_REVIEW_UNRESOLVED)
 
     def test_an_untyped_projection_error_is_not_contained_as_planctl(self) -> None:
         harness = _Harness(

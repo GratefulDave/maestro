@@ -6,6 +6,110 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed — contract change (new path): a revision planctl refuses goes back to the attend author instead of ending the session
+
+- An attend reviewer passed a revision in round 3; `planctl render` then exited
+  1 on `verifier.source_coverage` and the session ended
+  `ATTEND_REVISION_REFUSED`. Render ran only after review, and its refusal
+  ended the verb, so the author never saw the error. The logged detail was
+  cut at 2000 characters after 18 warnings and never reached the error line.
+- Each authored revision is rendered in a scratch root
+  (`_attend_check_revision`) before the reviewer is dispatched. An exit-1
+  refusal there, or in the projection after a `PASS`, is that round's located
+  finding for the author, and the next round proceeds. A projection refused
+  in the last round still refuses; other planctl exits stay
+  `ATTEND_PLANCTL_FAILED`.
+- `_run_planctl` puts non-`warning:` lines before warnings in its refusal
+  detail.
+
+### Changed — contract change (strengthening, new path): the attend author and reviewer read the merged source the parked lane builds on
+
+- A tests lane parked `NO_PROGRESS` because its review demanded the contract
+  name the merged producer callables and their report schemas. The builder's
+  checkout held them; the attend author and reviewer were handed only the
+  lane's contract, reviews, gate table and suite. Three review rounds ended
+  `REVIEW_UNRESOLVED`, the reviewer naming the author's missing merged source
+  each time.
+- `_attend_lane_evidence` now reads, from the run's durable integration head,
+  the declared outputs of every lane the parked lane and its pair transitively
+  need (`attend.merged_source_lane_ids`). Both attend trees carry them under
+  `merged/<lane_id>/`; `parked_lanes` names `integration_head`,
+  `merged_source_dir`, `merged_source_files` and `merged_source_sha256`.
+- Both role contracts name the directory; the attend reviewer's names it a
+  permitted review input it may cite.
+- Each `ATTEND_REVIEW` lane entry records `merged_source_sha256`, binding the
+  head and every merged byte the round read.
+
+### Changed — contract change (new path): a transient GitHub failure on the spot fleet is retried, and a spot-fleet refusal parks its lane instead of ending the run
+
+- One `gh run view` poll answered `net/http: TLS handshake timeout`; `_gh`
+  refused `REMOTE_SUITE_REFUSED:RUN_UNREADABLE` on that first answer, the
+  refusal left the lane worker, and `_advance_ready` re-raised it, so every
+  lane in the run stopped.
+- `remote_suite` retries a `gh` call or `git push` whose output reads as a
+  transit failure (TLS or i/o timeout, reset or refused connection, HTTP 5xx,
+  429 or rate limit) after 5, 10, 20, 40 and 80 seconds. Any other failure,
+  and a transient one past the last retry, refuses exactly as before.
+- `_advance` parks a `RemoteSuiteRefused` as that lane's `LANE_FAULT`, the
+  same lane-scoped treatment as `LaunchFailed`; independent lanes keep
+  advancing. Git, harness, runtime and ledger-integrity errors stay run-level.
+
+### Changed — contract change (strengthening, new path): a suite's host tools and devices are declared, installed and proven on the spot fleet before any lane runs
+
+- The run preflight proved only that the runner loads. Suites that call
+  `ffmpeg`, `ffprobe` or `just` by subprocess, or that need an Apple MPS
+  device, reached the spot runner without them, and the missing tool was
+  scored as errored cases against the builder and sent to the tester as
+  findings.
+- `maestro.config.yaml` gains `suite_requirements: [{name, probe, install?}]`.
+  Every remote suite job, the run start/resume preflight included, runs each
+  probe in the provisioned tree on the runner, runs `install` once on failure,
+  and probes again. Still failing refuses `SUITE_REQUIREMENT_MISSING` naming
+  the entry, which the preflight reports as `RUNNER_PREFLIGHT_REFUSED`.
+- A device the runner cannot have is declared with no `install`, so the run is
+  refused until the plan stops needing it. Nothing is skipped and nothing runs
+  locally. `tools/remote_tests.py` carries the same requirements.
+
+### Changed — contract change (strengthening, new path): a dispatch that never reached its agent is delivered again, not parked for the operator
+
+- Run 646181870aef parked two lanes `DISPATCH_NOT_CONSUMED` on prompts a
+  fresh agent never received.
+- `prompt_delivery_lost` and the unbound-transcript submission proof counted
+  every record of the prompt path over the transcript family. After a
+  scheduler restart the path is `prompt-1.json` again, and Claude keeps the
+  replaced session's transcript (33 records of it) beside the new one, so the
+  lost offer read as delivered and was never re-sent. Both now count from a
+  per-file snapshot taken just before the offer (`marks_since_offer`,
+  `LaunchHandle.offer_marks`).
+- Herdr reports Claude `--remote-control` ready about 30s before its TUI
+  draws (measured: ready at 6s, drawn at 34-47s). A fresh launch now holds
+  the first prompt while the pane still ends at the agent's launch line
+  (`wait_for_agent_drawn`, 180s, `AGENT_NEVER_DRAWN`).
+- The envelope wait's idle bound resubmits a provably lost prompt once
+  (`DISPATCH_REDELIVERIES`) before refusing.
+- A retained session refused `DISPATCH_NOT_CONSUMED` on resubmission is
+  replaced (`SESSION_NOT_CONSUMED`) and the role starts fresh.
+
+### Changed — contract change (new path, weakening): a retained session still busy at the next dispatch is replaced, not refused
+
+- A Claude tester declared its draft; a background-task notification later
+  woke it into a turn of its own (10m17s). The next dispatch adopted the
+  in-process role handle, `resubmit`'s bounded readiness wait
+  (`wait_for_interactive_agent`, 180s) timed out on `working`, and the lane
+  parked `LANE_FAULT` as
+  `PROMPT_SUBMISSION_REFUSED:AGENT_INTERACTIVE_READY_TIMEOUT:<agent>:pane_retained`.
+  The agent was healthy and became idle minutes later.
+- `HerdrLauncher.launch` now runs the readiness wait on an adopted session
+  before re-materializing its tree (`_busy_session_replaced`). If the wait
+  times out, the session is closed as `SESSION_BUSY` through the same
+  close/refuse/steps-line path a superseded or orphaned session uses
+  (`_replace_session`), and the role starts fresh. A settled session is reused
+  as before. Binding is verified before the wait, so a mismatched pane still
+  refuses `BINDING_MISMATCH` and is never closed.
+- Removed: the `PROMPT_SUBMISSION_REFUSED` refusal for this case on both
+  adoption call sites in `launch`. `resubmit` called directly keeps its
+  refusal.
+
 ### Changed — contract change (weakening): an amendment keeps every MERGED lane it does not affect, not only the integration-order prefix
 
 - After #347 only the MERGED lanes ahead of the first changed lane in

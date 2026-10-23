@@ -245,14 +245,88 @@ class AnsweredDispatchTests(unittest.TestCase):
         self.assertEqual(pane.herdr.sends, lch.PROMPT_RESENDS + 1)
 
 
+class _FreshOmp(_Herdr):
+    """A fresh omp session between accepting its first prompt and recording it.
+
+    Measured on omp 18.12.5: Enter clears the composer, a pre-turn memory
+    recall runs for about a minute, and only then is the session file written
+    and the prompt rendered. Herdr names the session path the whole time and
+    reports `idle`.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> dict:
+        verb = tuple(args[:2])
+        if verb == ("pane", "send-text"):
+            self.sends += 1
+            self.screen = "> " + str(args[3]) + "\n"
+            return {}
+        if verb in (("pane", "send-keys"), ("agent", "send-keys")):
+            if args[3] == "enter":
+                self.screen = "> \n"
+            return {}
+        if verb == ("agent", "get"):
+            return {
+                "result": {
+                    "agent": {
+                        "agent_status": self.status,
+                        "agent_session": {
+                            "kind": "path",
+                            "source": "herdr:omp",
+                            "value": str(self.transcript),
+                        },
+                    }
+                }
+            }
+        return super().__call__(*args, **kwargs)
+
+
+class UnwrittenTranscriptTests(unittest.TestCase):
+    """Run 646181870aef, lane-wp3-report-build code reviewer (omp).
+
+    A fresh code-reviewer session was sent its prompt three times while it ran
+    its pre-turn recall, refused `DISPATCH_NOT_CONSUMED ... after 3 sends`, and
+    cancelled. Its session directory held no transcript at all.
+    """
+
+    def test_a_first_prompt_omp_has_not_recorded_yet_is_sent_once(self) -> None:
+        pane = _Pane(drop=0)
+        self.addCleanup(pane.close)
+        session_dir = Path(pane.handle.launched_cwd) / "code-reviewer-session"
+        session_dir.mkdir()
+        session = session_dir / "2026-10-21T07-06-30-000Z_omp.jsonl"
+        pane.herdr = _FreshOmp(pane.prompt, session, drop=0)
+        pane.launcher = _launcher(pane.herdr)
+        object.__setattr__(pane.handle, "transcript_path", None)
+        pane.submit()
+        self.assertEqual(pane.herdr.sends, 1)
+        # The launcher bound the path Herdr names; omp has not written it.
+        self.assertEqual(pane.handle.transcript_path, session)
+        self.assertFalse(session.exists())
+
+    def test_an_unbound_transcript_is_never_called_lost(self) -> None:
+        pane = _Pane(drop=0)
+        self.addCleanup(pane.close)
+        object.__setattr__(pane.handle, "transcript_path", None)
+        self.assertFalse(pane.launcher.prompt_delivery_lost(pane.handle, pane.prompt))
+
+
 class IdleWaitBoundTests(unittest.TestCase):
-    def _wait(self, pane: _Pane, limit: int) -> Any:
+    def _wait(self, pane: _Pane, limit: int, tick: float = 0.1) -> Any:
+        self.clock = 1000.0
+
+        def sleep(_s: float) -> None:
+            # What a pass really costs: the sleep plus the envelope read and
+            # the herdr calls around it. `tick` > 0.1 is a slow pass.
+            self.clock += tick
+
         actor = maestro.HerdrStageActor.__new__(maestro.HerdrStageActor)
         actor.launcher = pane.launcher
         actor.step = None
         actor.dispatch_idle_timeout_s = limit
         envelope = Path(pane.handle.launched_cwd) / "results" / "envelope-1.json"
-        with mock.patch.object(maestro.time, "sleep", lambda _s: None):
+        with mock.patch.object(maestro.time, "sleep", sleep), mock.patch.object(
+            maestro.time, "monotonic", lambda: self.clock
+        ):
             return actor._await_envelope(pane.handle, envelope, "operator", "lane-a")
 
     def test_an_idle_agent_with_no_envelope_ends_the_wait_typed(self) -> None:
@@ -262,6 +336,17 @@ class IdleWaitBoundTests(unittest.TestCase):
             self._wait(pane, 120)
         self.assertTrue(ctx.exception.detail.startswith("DISPATCH_NOT_CONSUMED:operator"))
         self.assertTrue(ctx.exception.pane_created)
+
+    def test_the_bound_is_wall_time_when_each_pass_is_slower_than_its_sleep(self) -> None:
+        # Run 2acd2f5f: a 600s bound took 2030s because the loop summed its
+        # 0.1s sleeps. Here every pass costs 0.3s of wall time; a 120s bound
+        # must end within one extra 30s sample of 120s after the first quiet sample,
+        # not at 3x that.
+        pane = _Pane(drop=99)
+        self.addCleanup(pane.close)
+        with self.assertRaises(LaunchFailed):
+            self._wait(pane, 120, tick=0.3)
+        self.assertLessEqual(self.clock - 1000.0, 30 + 120 + 30 + 1)
 
     def test_transcript_growth_restarts_the_bound(self) -> None:
         pane = _Pane(drop=99)
@@ -306,6 +391,89 @@ class IdleWaitBoundTests(unittest.TestCase):
         ):
             self.assertEqual(self._wait(pane, 120), {"ok": True})
         self.assertGreaterEqual(len(samples), 40)
+
+    def test_an_idle_agent_waiting_on_its_own_background_job_is_never_bounded(
+        self,
+    ) -> None:
+        # WP3 run 646181870aef: the tester started the suite in a background
+        # shell plus a monitor and ended its turn. Herdr said `idle`, the
+        # transcript was still, and the lane was refused after 629s. The
+        # footer "1 shell, 1 monitor" is the agent's own pending work.
+        pane = _Pane(drop=99)
+        self.addCleanup(pane.close)
+        pane.herdr.screen = "> \n  auto mode on \u00b7 1 shell, 1 monitor \u00b7 \u2190 6 agents\n"
+        samples: list[int] = []
+        real = pane.launcher.turn_activity
+
+        def activity(handle: Any) -> Any:
+            samples.append(1)
+            if len(samples) == 60:
+                envelope = Path(handle.launched_cwd) / "results" / "envelope-1.json"
+                envelope.parent.mkdir(parents=True, exist_ok=True)
+                envelope.write_text(json.dumps({"ok": True}), encoding="utf-8")
+            return real(handle)
+
+        pane.launcher.turn_activity = activity  # type: ignore[method-assign]
+        pane.launcher.wait_for_idle = lambda _h: None  # type: ignore[method-assign]
+        with mock.patch.object(
+            maestro.HerdrStageActor, "_payload_ok", lambda *_a: True
+        ):
+            self.assertEqual(self._wait(pane, 120), {"ok": True})
+        self.assertGreaterEqual(len(samples), 60)
+
+    def test_the_bound_resumes_once_the_background_job_is_gone(self) -> None:
+        pane = _Pane(drop=99)
+        self.addCleanup(pane.close)
+        pane.herdr.screen = "> \n  auto mode on \u00b7 1 shell\n"
+        samples: list[int] = []
+        real = pane.launcher.turn_activity
+
+        def activity(handle: Any) -> Any:
+            samples.append(1)
+            if len(samples) == 10:
+                pane.herdr.screen = "> \n  auto mode on\n"
+            return real(handle)
+
+        pane.launcher.turn_activity = activity  # type: ignore[method-assign]
+        with self.assertRaises(LaunchFailed) as ctx:
+            self._wait(pane, 120)
+        self.assertTrue(ctx.exception.detail.startswith("DISPATCH_NOT_CONSUMED:"))
+        self.assertGreaterEqual(len(samples), 14)
+
+    def test_a_declared_agent_with_a_background_job_is_still_working(self) -> None:
+        pane = _Pane(drop=99)
+        self.addCleanup(pane.close)
+        pane.herdr.screen = "> \n  auto mode on \u00b7 1 monitor\n"
+        envelope = Path(pane.handle.launched_cwd) / "results" / "envelope-1.json"
+        envelope.parent.mkdir(parents=True, exist_ok=True)
+        envelope.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        waits: list[int] = []
+
+        def wait_for_idle(_h: Any) -> None:
+            waits.append(1)
+            if len(waits) == 3:
+                pane.herdr.screen = "> \n"
+                return
+            raise lch.AgentNotInteractive("AGENT_INTERACTIVE_READY_TIMEOUT:x")
+
+        pane.launcher.wait_for_idle = wait_for_idle  # type: ignore[method-assign]
+        with mock.patch.object(
+            maestro.HerdrStageActor, "_payload_ok", lambda *_a: True
+        ):
+            self.assertEqual(self._wait(pane, 120), {"ok": True})
+        self.assertEqual(len(waits), 3)
+
+    def test_the_footer_pattern_reads_job_counts_and_nothing_else(self) -> None:
+        def read(text: str) -> Any:
+            return lch.pane_background_tasks(
+                lambda *a, **k: {"result": {"text": text}}, PANE
+            )
+
+        self.assertTrue(read("x\n \u23f5\u23f5 auto mode on \u00b7 2 shells\n"))
+        self.assertTrue(read("x\n 1 shell, 1 monitor\n"))
+        self.assertFalse(read("x\n auto mode on \u00b7 \u2190 6 agents\n"))
+        self.assertFalse(read("x\n 0 shells\n"))
+        self.assertIsNone(read(""))
 
 
 if __name__ == "__main__":

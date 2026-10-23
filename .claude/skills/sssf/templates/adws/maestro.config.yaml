@@ -6,6 +6,21 @@ runtime_state_root: /nonexistent/maestro-runtime-state
 # Worker threads for independent ready lanes (author/review/build stages).
 # Merges are serialized at any value. 1 keeps every stage inline.
 concurrency: 1
+# Host tools and devices the accepted suites reach outside the project's
+# manifest (a binary run by subprocess, an accelerator). Every remote suite
+# job -- the run start/resume preflight included -- runs each `probe` in the
+# provisioned tree on the spot runner; a failing probe runs `install` once and
+# probes again. Still failing, or failing with no `install`, refuses
+# SUITE_REQUIREMENT_MISSING naming the entry, so the preflight refuses the run
+# before any lane is dispatched. A device the runner cannot have (no install)
+# refuses every run until the plan stops needing it. Absent means none.
+suite_requirements: []
+# suite_requirements:
+#   - name: ffmpeg
+#     probe: [ffmpeg, -version]
+#     install: [sh, -c, "sudo apt-get update -q && sudo apt-get install -yq ffmpeg"]
+#   - name: mps
+#     probe: [uv, run, python, -c, "import sys, torch; sys.exit(not torch.backends.mps.is_available())"]
 # A tests round is measured by its review's findings count. Plateau and
 # repeated content park a lane at any setting; true also parks it on one
 # worse round. Absent means false.
@@ -44,11 +59,13 @@ attend:
   # Absolute path to the plan-contract validator. Absent refuses
   # ATTEND_PLANCTL_UNRESOLVED rather than approving an unvalidated revision.
   # planctl: /absolute/path/to/planctl.py
-  # Absolute path to the Plan IR the run's current revision was projected
-  # from. Preflight copies it, with its sources, into the revision's planctl
-  # root under planctl_root_dir/<run>/r<N>/, where every attended
-  # amendment writes its own. Absent refuses ATTEND_PLAN_IR_UNRESOLVED
-  # rather than handing an agent a projected plan to edit as an IR.
+  # Legacy. A plan projected by plan_author_cli.py names its own IR (path
+  # and sha256), and preflight copies that IR, with its sources, into the
+  # revision's planctl root under planctl_root_dir/<run>/r<N>/, where every
+  # attended amendment writes its own. plan_ir is read only for a plan that
+  # records no path, and only when its sha256 is the plan receipt's
+  # ir_sha256; naming any other IR refuses ATTEND_PLAN_IR_MISMATCH, and no
+  # IR found refuses ATTEND_PLAN_IR_UNRESOLVED.
   # plan_ir: /absolute/path/to/plan.ir.json
   # Where attend keeps each revision's planctl root: durable, and uploaded by
   # planctl, which refuses a root that is the home directory, contains it, or

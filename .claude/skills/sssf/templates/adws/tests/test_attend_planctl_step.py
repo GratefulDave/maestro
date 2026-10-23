@@ -101,6 +101,16 @@ class PlanctlExitStatus(unittest.TestCase):
         path.write_text("import os, signal, sys\n" + body + "\n", encoding="utf-8")
         return path
 
+    def test_stderr_is_persisted_on_success_and_on_failure(self) -> None:
+        log = self.tmp / "x.planctl-review.log"
+        ok = self._binary("sys.stderr.write('phase ami 4s\\n')")
+        maestro._run_planctl(ok, ["review", "x.ir.json"], log=log)
+        self.assertEqual(log.read_text(encoding="utf-8"), "phase ami 4s\n")
+        bad = self._binary("sys.stderr.write('phase mutate 9s\\n'); sys.exit(1)")
+        with self.assertRaises(att.AttendRefused):
+            maestro._run_planctl(bad, ["review", "x.ir.json"], log=log)
+        self.assertEqual(log.read_text(encoding="utf-8"), "phase mutate 9s\n")
+
     def _code(self, binary: Path) -> str:
         with self.assertRaises(att.AttendRefused) as caught:
             maestro._run_planctl(binary, ["review", "x.ir.json"])
@@ -112,6 +122,46 @@ class PlanctlExitStatus(unittest.TestCase):
             maestro._run_planctl(binary, ["validate", "x.ir.json"])
         self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
         self.assertIn("schema.version: wrong", caught.exception.detail)
+
+    def test_the_error_survives_many_warnings_printed_before_it(self) -> None:
+        """planctl prints warnings first; the bounded detail keeps the error."""
+        warning = "warning: verifier.claim_source_disjoint: " + "x" * 300
+        binary = self._binary(
+            "for _ in range(18): print({0!r})\n"
+            "print('verifier.source_coverage: verifier sources do not exactly "
+            "cover its fixtures, seams, and claims: verify-wp5-run-build')\n"
+            "sys.exit(1)".format(warning)
+        )
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._run_planctl(binary, ["render", "x.ir.json"])
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertTrue(
+            caught.exception.detail.startswith(
+                "planctl render exited 1: verifier.source_coverage:"
+            ),
+            caught.exception.detail[:200],
+        )
+        self.assertIn("verify-wp5-run-build", caught.exception.detail)
+
+    def test_a_revision_is_rendered_in_a_scratch_root_before_review(self) -> None:
+        binary = self._binary(
+            "out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "open(sys.argv[0] + '.args', 'w').write(repr(sys.argv[1:]))\n"
+            "print('warning: noise'); print('schema.version: wrong'); sys.exit(1)"
+        )
+        policy = att.AttendPolicy(max_amendments_per_lane=1, planctl=binary)
+        base = self.tmp / "planroots"
+        with self.assertRaises(att.AttendRefused) as caught:
+            maestro._attend_check_revision(
+                policy, self.tmp, base, "run", b'{"plan": 1}', 2
+            )
+        self.assertEqual(caught.exception.code, att.REVISION_REFUSED)
+        self.assertIn("schema.version: wrong", caught.exception.detail.splitlines()[0])
+        argv = eval(Path(str(binary) + ".args").read_text(encoding="utf-8"))
+        scratch = argv[argv.index("--repo-root") + 1]
+        self.assertEqual(argv[0], "render")
+        self.assertNotEqual(Path(scratch), maestro._attend_root(base, "run", 2))
+        self.assertFalse(maestro._attend_root(base, "run", 2).exists())
 
     def test_a_harness_exit_is_a_planctl_failure_not_a_refusal(self) -> None:
         binary = self._binary('print("review.remote_runner: spot capacity"); sys.exit(3)')

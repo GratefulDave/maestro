@@ -1,0 +1,77 @@
+# Maestro remote suite runner. Every test process a maestro run starts -- the
+# runner preflight, a draft's collection, the accepted suite, a reviewer's probe,
+# an agent's own test run -- is dispatched here by `adw_modules/remote_suite.py`
+# and runs on the AWS EC2 spot fleet (`orbstack` -> arm64_spot), never on the
+# operator's machine.
+#
+# Install: copy to `.github/workflows/maestro-suite.yml` on the target
+# repository's default branch. `gh workflow run` only dispatches a workflow
+# that exists there.
+name: maestro-suite
+run-name: maestro-suite ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: maestro request id (names the run and its artifact)
+        required: true
+      subject_ref:
+        description: ref holding the commit under test
+        required: true
+      job_ref:
+        description: ref holding the maestro runtime, job.json and the overlay
+        required: true
+      timeout_minutes:
+        description: job bound
+        required: true
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: orbstack
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    steps:
+      - name: Check out the subject
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.subject_ref }}
+          path: subject
+          persist-credentials: false
+
+      - name: Check out the job
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.job_ref }}
+          path: _maestro_job
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run the job
+        working-directory: _maestro_job/runtime
+        run: >
+          uv run --no-project --python 3.12
+          --with pydantic --with python-dotenv --with pyyaml --with rich
+          python -m adw_modules.remote_job
+          "$GITHUB_WORKSPACE/_maestro_job/job.json"
+          "$GITHUB_WORKSPACE/subject"
+          "$GITHUB_WORKSPACE/_maestro_result/result.json"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-suite-${{ inputs.request_id }}
+          path: _maestro_result/result.json
+          if-no-files-found: ignore
+          retention-days: 3

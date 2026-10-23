@@ -27,6 +27,7 @@ from . import git_publication as gitpub
 from . import plan_model
 from . import probes
 from . import provisioning as prov
+from . import remote_suite as rs
 from . import review_contract as rc
 from . import suite_increment as inc
 from . import runner_resolution as rr
@@ -288,6 +289,37 @@ def _base_invalidation_priors(
         _lane_artifact_by_id(store, run_id, lane_id, builder_id),
         _lane_artifact_by_id(store, run_id, lane_id, review_id),
     )
+
+
+def _revise_prior(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    revise: Optional[ArtifactRecord],
+    kind: st.ArtifactKind = st.ArtifactKind.BUILDER_OUTPUT,
+) -> Optional[ArtifactRecord]:
+    """The BUILDER_OUTPUT a CODE_REVIEW REVISE judged, read off the review.
+
+    Or, with `kind=TEST_DRAFT`, the draft a TEST_REVIEW REVISE judged: the
+    same question about the other producing stage.
+
+    The review names its candidate in `input_artifact_ids`. A lane carried
+    across an amendment in a resumable wait re-reviews the candidate it built
+    under the previous plan revision, so its REVISE is stamped with the new
+    revision and its BUILDER_OUTPUT with the old one; the newest BUILDER_OUTPUT
+    at the review's revision is nothing, and the lane refused CODE_REVISE
+    missing prior artifacts with both artifacts present.
+    """
+    if revise is None:
+        return None
+    named = [
+        artifact
+        for artifact_id in revise.payload.get("input_artifact_ids") or ()
+        if (artifact := _lane_artifact_by_id(store, run_id, lane_id, artifact_id))
+        is not None
+        and artifact.kind is kind
+    ]
+    return named[0] if len(named) == 1 else None
 
 
 def _substantive_blob(repo: Path, path: str, oid: str) -> str:
@@ -871,14 +903,20 @@ def _merge_producers(
     """
     if lane.lane_kind == st.LANE_KIND_TESTS:
         revision = run_row(store, run_id)["plan_revision"]
+        suite = _latest(
+            store,
+            run_id,
+            lane.lane_id,
+            st.ArtifactKind.ACCEPTED_TEST_SUITE,
+            plan_revision=revision,
+        )
+        if suite is None and store.lane_stage(run_id, lane.lane_id) in st.SUITE_HOLDING_STAGES:
+            # Carried across an amendment, not reset: the suite it sealed.
+            suite = _latest(
+                store, run_id, lane.lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
+            )
         return (
-            _latest(
-                store,
-                run_id,
-                lane.lane_id,
-                st.ArtifactKind.ACCEPTED_TEST_SUITE,
-                plan_revision=revision,
-            ),
+            suite,
             _latest(
                 store,
                 run_id,
@@ -1558,18 +1596,7 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     )
 
 
-def _collect_gate(
-    gate: SimpleNamespace, files: Mapping[str, str], tree: Path
-) -> SimpleNamespace:
-    argv, _selectors = rc.substituted_gate_argv(gate.argv, files, tree)
-    return SimpleNamespace(
-        runner=gate.runner,
-        argv=argv,
-        cwd=gate.cwd,
-        min_cases=gate.min_cases,
-        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
-        declared_cases=tuple(getattr(gate, "declared_cases", ()) or ()),
-    )
+_collect_gate = tc.collect_gate
 
 
 def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
@@ -2619,13 +2646,7 @@ class FactoryScheduler:
             code_review = st.NO_CODE_REVIEW
             base_invalidation = st.NO_BASE_INVALIDATION
             if entry is st.BuildingEntryKind.CODE_REVISE:
-                prior = _latest(
-                    self.store,
-                    self.run_id,
-                    lane_id,
-                    st.ArtifactKind.BUILDER_OUTPUT,
-                    plan_revision=revision,
-                )
+                prior = _revise_prior(self.store, self.run_id, lane_id, revise)
                 if prior is None or revise is None:
                     raise FactoryRefused("CODE_REVISE missing prior artifacts")
                 prior_builder = prior.artifact_id
@@ -2717,9 +2738,10 @@ class FactoryScheduler:
         try:
             return call(*args)
         # `HerdrStageActor._launch` translates an agent-launch refusal to this
-        # boundary type.  It is the entire lane-scoped transport allowlist:
-        # harness, git, preparation, and generic runtime errors remain fatal
-        # even if they arise while a role method is executing.
+        # boundary type.  With `_advance`'s `RemoteSuiteRefused` it is the
+        # entire lane-scoped transport allowlist: harness, git, preparation,
+        # and generic runtime errors remain fatal even if they arise while a
+        # role method is executing.
         except LaunchFailed as exc:
             detail = exc.detail + (":pane_retained" if exc.pane_created else "")
             self._park_lane_fault(ctx, type(exc).__name__, detail, exc)
@@ -2728,27 +2750,32 @@ class FactoryScheduler:
         self, ctx: LaneContext, fault_type: str, detail: str, cause: BaseException
     ) -> NoReturn:
         """Park one lane as LANE_FAULT for the operator; the run keeps going."""
+        self._pause_lane_fault(ctx.lane.lane_id, ctx.stage, fault_type, detail)
+        raise _ActorFaultParked from cause
+
+    def _pause_lane_fault(
+        self, lane_id: str, stage: st.LaneStage, fault_type: str, detail: str
+    ) -> None:
         with self._inflight_lock:
-            inflight = self._inflight.get(ctx.lane.lane_id)
-        if inflight is not None and inflight[1] is ctx.stage:
+            inflight = self._inflight.get(lane_id)
+        if inflight is not None and inflight[1] is stage:
             _, _, digest, observed = inflight
         else:
-            digest, observed = self._pause_input(ctx.lane.lane_id, ctx.stage)
+            digest, observed = self._pause_input(lane_id, stage)
         self.store.pause_lane(
             self.run_id,
-            ctx.lane.lane_id,
-            ctx.stage,
+            lane_id,
+            stage,
             digest,
             observed=observed,
             reason=st.WaitReason.LANE_FAULT,
             fault=st.LaneFault(fault_type, detail),
         )
         self._say(
-            ctx.lane.lane_id,
+            lane_id,
             "lane fault, blocking for the operator",
             detail,
         )
-        raise _ActorFaultParked from cause
 
 
     def _advance(self, lane_id: str) -> None:
@@ -2788,6 +2815,13 @@ class FactoryScheduler:
                 )
         except _ActorFaultParked:
             return
+        except rs.RemoteSuiteRefused as exc:
+            # The spot fleet could not run or report this lane's suite, after
+            # `remote_suite` already retried any transient failure. Like
+            # `LaunchFailed` it is transport for one lane: that lane parks and
+            # every independent lane keeps advancing. It used to leave the
+            # worker and end the run.
+            self._pause_lane_fault(lane_id, stage, type(exc).__name__, str(exc))
         finally:
             with self._inflight_lock:
                 self._inflight.pop(lane_id, None)
@@ -2830,8 +2864,9 @@ class FactoryScheduler:
             st.ArtifactKind.ACCEPTED_TEST_SUITE,
             plan_revision=revision,
         )
-        if suite is None and self.store.lane_stage(self.run_id, lane_id) is st.LaneStage.MERGED:
-            # A merged lane an amendment retained keeps the suite it merged.
+        if suite is None and self.store.lane_stage(self.run_id, lane_id) in st.SUITE_HOLDING_STAGES:
+            # A lane an amendment carried rather than reset keeps the suite
+            # it sealed (`st.SUITE_HOLDING_STAGES`).
             suite = _latest(
                 self.store, self.run_id, lane_id, st.ArtifactKind.ACCEPTED_TEST_SUITE
             )
@@ -3007,6 +3042,15 @@ class FactoryScheduler:
         artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
         if review is not None:
             artifacts["TEST_REVIEW"] = review
+            # The draft under revision. Without it the tester's checkout is
+            # the integration head and nothing else, so every revise turn
+            # rebuilt the draft from scratch and dropped the last round's
+            # fixes (run 2acd2f5f, lane-device-tests, turns 13 and 14).
+            draft = _revise_prior(
+                self.store, self.run_id, lane_id, review, st.ArtifactKind.TEST_DRAFT
+            )
+            if draft is not None:
+                artifacts["TEST_DRAFT"] = draft
         contract = rc.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
@@ -3334,53 +3378,34 @@ class FactoryScheduler:
                 self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
             )
             tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
-            keep = False
             try:
-                self._say("", "checking {0} is usable in {1}".format(runner, cwd))
-                # The one provisioner every actor and measurement tree crosses,
-                # with nothing bridged in afterwards: this probe speaks for the
-                # tester, reviewer and builder trees only if it runs in exactly
-                # what `provision_argv` installs.
-                prov.provision_tree(
-                    dest, self._provision_argv, self._provision_timeout_s
-                )
-                rr.resolve(
-                    runner,
+                self._say("", "checking {0} is usable in {1} on the spot fleet".format(runner, cwd))
+                # Provisioned and probed where every lane's suite will run: the
+                # remote job runs `provision_argv`, then the whole-tree probe.
+                # Empty paths on purpose: this preflight runs before any
+                # candidate exists, so the whole tree genuinely is its question.
+                rs.call(
+                    "resolve",
                     dest,
-                    cwd,
-                    # Empty on purpose, and now stated rather than defaulted:
-                    # this preflight runs before any candidate exists, so the
-                    # whole tree genuinely is its question.
-                    (),
+                    {"runner": runner, "cwd": cwd, "paths": []},
+                    provision_argv=self._provision_argv,
+                    provision_timeout_s=self._provision_timeout_s,
+                    timeout_s=rr.PROBE_TIMEOUT_S,
                 )
             except (rr.RunnerUnusable, prov.ReviewProvisioningError) as extra:
                 # Provisioning belongs to this refusal, not above it. The
                 # preflight's own sentence is "the environment every lane will
                 # run in is usable", and a `provision_argv` that fails is that
                 # sentence coming out false -- one whose answer is the
-                # deployment's command, which no agent can act on either. It
-                # escaped here as an untyped crash, so the one run verb both
-                # paths cross reported a stack trace for the case it exists to
-                # name.
-                #
-                # The tree stays. A refusal about an environment is answered by
-                # opening that environment, and this one used to be deleted on
-                # the way out -- so the cheapest possible diagnosis, running the
-                # probe by hand where it failed, cost a full rebuild of the
-                # environment from the deployment's own `provision_argv` before
-                # it could start. `scratch_worktree_path` randomizes the name,
-                # so a kept tree can never be one a later call is refused for
-                # adopting.
-                keep = True
+                # deployment's command, which no agent can act on either.
                 detail = getattr(extra, "detail", None) or str(extra)
                 unusable.append(
-                    "{0} in {1}: {2}; measured in {3}, which is kept".format(
-                        runner, cwd, detail, dest
+                    "{0} in {1}: {2}; measured on the spot fleet at {3}".format(
+                        runner, cwd, detail, base
                     )
                 )
             finally:
-                if not keep:
-                    _remove_collect_tree(dest)
+                _remove_collect_tree(dest)
         if unusable:
             raise RunnerPreflightRefused("; ".join(unusable))
 
@@ -3399,57 +3424,29 @@ class FactoryScheduler:
             "draft-collect-{0}".format(ctx.lane.lane_id),
         )
         tm.materialize_commit(run_repo, base, dest, state_root=self.runtime.path)
-        keep = False
         try:
-            # Provision before probing, with nothing bridged in from the
-            # product checkout, so a dependency the deployment's
-            # `provision_argv` does not install is missing here exactly as it
-            # is missing in the tester's tree.
-            prov.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
-            # Resolve BEFORE the draft is written, because `resolve`'s probe is
-            # a whole-tree `--collect-only` and would otherwise be measuring the
-            # draft it is supposed to be measuring the environment for. FDAdb
-            # run 2489c772 paid for that ordering: `lane-wp4-release-tests`
-            # drafted `services/device-substrates/tests/release/
-            # test_release_artifact.py`, the repository already carried
-            # `services/label-batch/tests/observations/test_release_artifact.py`
-            # from a merged lane, neither directory has an `__init__.py`, so
-            # pytest derived the same module name twice and interrupted
-            # collection with `import file mismatch` at exit 2. That is a name
-            # the tester chose and can change in one line -- and it was
-            # reported as `RUNNER_PREFLIGHT_REFUSED`, which ends the whole run,
-            # because a probe run after `write_files` cannot tell an unusable
-            # interpreter from a draft that will not collect.
-            resolved = rr.resolve(
-                gate.runner,
+            # One remote job, on the spot fleet: provision, resolve the runner
+            # BEFORE the draft is written, write it, collect, run the parent
+            # outcomes and the harness probe -- all in the one tree, which IS
+            # the parent commit. Resolution precedes the write because the
+            # probe is a whole-tree collect and would otherwise measure the
+            # draft (FDAdb run 2489c772, `import file mismatch` at exit 2,
+            # reported as `RUNNER_PREFLIGHT_REFUSED`). See `remote_job._op_draft`.
+            measured = rs.call(
+                "draft",
                 dest,
-                gate.cwd,
-                # Empty on purpose. This probe deliberately runs BEFORE
-                # `write_files`, so the draft's paths do not exist yet and
-                # naming them makes pytest exit 4, `file or directory not
-                # found` -- an unusable-interpreter refusal for a draft that
-                # was never written. The question here is only whether the
-                # environment is usable.
-                (),
+                {"gate": gate, "files": dict(files)},
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
+                timeout_s=rr.PROBE_TIMEOUT_S
+                + rr.COLLECT_TIMEOUT_S
+                + 2 * rr.EXECUTE_TIMEOUT_S,
             )
-            rc.write_files(dest, files)
-            measured = _collect_gate(gate, files, Path(dest))
-            ids = rr.collect_cases(resolved, measured, dest)
-            # The tree this collected in IS the parent commit -- `base` is the
-            # integration head with only the draft's files written on top --
-            # so the red-at-parent measurement belongs here and nowhere else. A second tree would provision twice and, worse, would let
-            # the two measurements disagree about which commit they were made
-            # against.
-            outcomes: Mapping[str, bool] = {}
-            if getattr(gate, "declared_cases", ()):
-                outcomes = rr.execute_case_outcomes(resolved, measured, dest)
-            # Same tree, same reason: the harness probe asks which of the
-            # draft's failures at the parent were raised by the draft itself,
-            # and the parent is this tree.
-            harness = rr.execute_harness_probe(
-                resolved, measured, dest, tuple(files), self.runtime.path
+            return (
+                tuple(measured["ids"]),
+                measured["outcomes"],
+                measured["harness"],
             )
-            return tuple(ids), outcomes, harness
         except (
             rr.CollectFailed,
             rr.RunnerUnusable,
@@ -3467,19 +3464,14 @@ class FactoryScheduler:
                 # the answer changed mid-run, which is the same fault
                 # discovered later.
                 #
-                # And the same fault keeps the same evidence: this refusal ends
-                # the run and is read by an operator, so the tree it was
-                # measured in stays, named beside the detail.
-                keep = True
                 raise RunnerPreflightRefused(
-                    "{0}; measured in {1}, which is kept".format(detail, dest)
+                    "{0}; measured on the spot fleet at {1}".format(detail, base)
                 ) from extra
             if isinstance(extra, rr.CaseOutcomesUnreadable):
                 raise ParentOutcomesRefused(detail) from extra
             raise DraftCollectionRefused(detail) from extra
         finally:
-            if not keep:
-                _remove_collect_tree(dest)
+            _remove_collect_tree(dest)
 
 
 
@@ -3745,13 +3737,7 @@ class FactoryScheduler:
         code_review = st.NO_CODE_REVIEW
         base_invalidation = st.NO_BASE_INVALIDATION
         if entry is st.BuildingEntryKind.CODE_REVISE:
-            prior = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.BUILDER_OUTPUT,
-                plan_revision=revision,
-            )
+            prior = _revise_prior(self.store, self.run_id, lane_id, revise)
             if prior is None or revise is None:
                 raise FactoryRefused("CODE_REVISE missing prior artifacts")
             prior_builder = prior.artifact_id
@@ -3787,6 +3773,11 @@ class FactoryScheduler:
         }
         if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
             artifacts["CODE_REVIEW"] = revise
+        if entry is not st.BuildingEntryKind.INITIAL:
+            # The candidate under revision, for a builder whose checkout no
+            # longer holds it (an amendment closes the run's panes and
+            # removes their trees).
+            artifacts["BUILDER_OUTPUT"] = prior
         records, retired, _receipts, probe_commit = self._accumulated_probes(lane_id)
         active_probes = probes.active_records(records, retired)
         ctx = LaneContext(
@@ -4470,9 +4461,20 @@ class FactoryScheduler:
                     survivors.append(sub)
             if not survivors:
                 return rejected
+            paths = [sub.path for sub in survivors]
             try:
-                resolved = rr.resolve(
-                    runner, tree, ".", paths=[sub.path for sub in survivors]
+                executions = rs.call(
+                    "probes",
+                    tree,
+                    {
+                        "runner": runner,
+                        "peers": paths,
+                        "paths": paths,
+                        "timeout_s": rr.EXECUTE_TIMEOUT_S,
+                    },
+                    provision_argv=self._provision_argv,
+                    provision_timeout_s=self._provision_timeout_s,
+                    timeout_s=rr.PROBE_TIMEOUT_S + rr.EXECUTE_TIMEOUT_S * len(paths),
                 )
             except rr.RunnerUnusable as exc:
                 for sub in survivors:
@@ -4481,7 +4483,7 @@ class FactoryScheduler:
                 return rejected
             pending: list[dict[str, Any]] = []
             for sub in survivors:
-                execution = probes.run_probe(resolved, tree, sub.path, scratch)
+                execution = executions[sub.path]
                 kind = probes.classify_admission(execution)
                 lines = tuple(cr.failure_lines(execution.output))
                 if kind == probes.ADMISSION_FAILING:
@@ -4598,6 +4600,8 @@ class FactoryScheduler:
                 retired=retired,
                 receipts=receipts,
                 scratch_root=scratch,
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
             )
             items = []
             for challenge in challenges:
@@ -4671,6 +4675,8 @@ class FactoryScheduler:
             receipts=receipts,
             submissions=tuple(outcomes[key] for key in sorted(outcomes)),
             scratch_root=scratch,
+            provision_argv=self._provision_argv,
+            provision_timeout_s=self._provision_timeout_s,
         )
         if active:
             commit, ref = probes.pin_sources(

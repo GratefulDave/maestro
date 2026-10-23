@@ -20,6 +20,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from types import SimpleNamespace
+from unittest import mock
 
 import maestro
 from adw_modules import launcher as lch
@@ -29,7 +30,11 @@ from tests.test_herdr_workspace_topology import (
     PROJECT,
     RUN_HASH,
     TESTS_LANE,
+    _RunFixture,
     _checkout,
+    _drive,
+    _launch,
+    _launch_patches,
     _launcher,
     _place,
     _spec,
@@ -37,6 +42,9 @@ from tests.test_herdr_workspace_topology import (
 
 OLD = "a" * 64
 NEW = "b" * 64
+
+#: Captured before any test patches it: `_launch_patches` stubs the wait.
+_REAL_READINESS_WAIT = lch.wait_for_interactive_agent
 
 
 def _role_spec(
@@ -233,6 +241,198 @@ class LiveSessionReuseTest(unittest.TestCase):
             "{0}:CLOSE_UNCONFIRMED".format(lch.SESSION_SPEC_DIGEST_CHANGED),
             raised.exception.detail,
         )
+        self.assertEqual(self.replaced, [])
+
+
+class OrphanedTurnTest(unittest.TestCase):
+    """A dead scheduler's still-running turn is never dispatched into.
+
+    A resume adopted a code reviewer whose previous scheduler had been killed
+    mid-turn and resubmitted into it. A turn still `working` either holds the
+    readiness wait until it refuses and parks the lane, or is interrupted by
+    the offer with whatever its composer held. Either way a killed scheduler
+    stranded a lane; the adopted session is replaced instead.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.herdr = FakeHerdr()
+        self.herdr.add_workspace(PROJECT, self.root)
+        self.label = lch.workspace_label_for(PROJECT, RUN_HASH)
+        self.replaced: list = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def launcher(self) -> lch.HerdrLauncher:
+        launcher = _launcher(self.label)
+        launcher._herdr = self.herdr  # type: ignore[method-assign]
+        return launcher
+
+    def test_restart_reconnect_replaces_a_working_session(self) -> None:
+        for role, lane in (
+            ("tester", TESTS_LANE),
+            ("builder", BUILD_LANE),
+            ("code-reviewer", BUILD_LANE),
+            ("operator", BUILD_LANE),
+            ("attend-reviewer", BUILD_LANE),
+        ):
+            with self.subTest(role):
+                self.replaced.clear()
+                tree = _checkout(self.root, role)
+                spec = _role_spec(
+                    tree, lane=lane, role=role, digest=OLD, replaced=self.replaced
+                )
+                old, _, _ = _place(self.launcher(), self.herdr, spec, status="working")
+                second = self.launcher()
+                second._bind_run_identity(spec)
+                self.assertIsNone(
+                    second._reconnect_live_agent(spec, dict(spec.environment))
+                )
+                self.assertIn(old.pane_id, self.herdr.closed_panes)
+                self.assertEqual(self.replaced, [lch.SESSION_TURN_ORPHANED])
+
+    def test_restart_reconnect_reuses_a_settled_session(self) -> None:
+        for status in ("idle", "done"):
+            with self.subTest(status):
+                self.replaced.clear()
+                self.herdr = FakeHerdr()
+                self.herdr.add_workspace(PROJECT, self.root)
+                tree = _checkout(self.root, "tester-" + status)
+                spec = _role_spec(
+                    tree, lane=TESTS_LANE, role="tester", digest=OLD,
+                    replaced=self.replaced,
+                )
+                old, _, _ = _place(self.launcher(), self.herdr, spec, status=status)
+                second = self.launcher()
+                second._bind_run_identity(spec)
+                adopted = second._reconnect_live_agent(spec, dict(spec.environment))
+                self.assertIsNotNone(adopted)
+                assert adopted is not None
+                self.assertEqual(adopted.pane_id, old.pane_id)
+                self.assertNotIn(old.pane_id, self.herdr.closed_panes)
+                self.assertEqual(self.replaced, [])
+
+    def test_this_process_own_working_turn_is_not_orphaned(self) -> None:
+        tree = _checkout(self.root, "tester")
+        spec = _role_spec(
+            tree, lane=TESTS_LANE, role="tester", digest=OLD, replaced=self.replaced
+        )
+        launcher = self.launcher()
+        old, _, _ = _place(launcher, self.herdr, spec, status="working")
+        adopted = launcher._reconnect_live_agent(spec, dict(spec.environment))
+        self.assertIsNotNone(adopted)
+        self.assertNotIn(old.pane_id, self.herdr.closed_panes)
+        self.assertEqual(self.replaced, [])
+
+    def test_restore_leaves_a_working_session_for_the_launch_to_replace(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        spec = replace(
+            run.spec(TESTS_LANE, "tester"),
+            spec_digest=OLD,
+            on_session_replaced=lambda reason, detail: self.replaced.append(reason),
+        )
+        original = _launch(run.launcher(), run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "working")
+        fresh = run.launcher()
+        fresh.restore_layout(spec)
+        self.assertNotIn(spec.correlation_token, fresh._handles)
+        relaunched = _launch(fresh, run.herdr, spec)
+        self.assertIn(original.pane_id, run.herdr.closed_panes)
+        self.assertNotEqual(relaunched.pane_id, original.pane_id)
+        self.assertEqual(self.replaced, [lch.SESSION_TURN_ORPHANED])
+
+
+class BusyRetainedSessionTest(unittest.TestCase):
+    """A retained session still busy at the next dispatch is replaced.
+
+    A Claude tester declared its draft; minutes later a background-task
+    notification woke it into a turn of its own, and the next dispatch's
+    readiness wait refused PROMPT_SUBMISSION_REFUSED:AGENT_INTERACTIVE_READY_
+    TIMEOUT, parking a healthy lane LANE_FAULT. That turn has no reader.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.replaced: list = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def relaunch(self, launcher: lch.HerdrLauncher, spec: lch.LaunchSpec) -> lch.LaunchHandle:
+        """The next dispatch, under the real readiness wait."""
+        with _launch_patches(), mock.patch.object(
+            lch, "wait_for_interactive_agent", _REAL_READINESS_WAIT
+        ):
+            return _drive(launcher, spec)
+
+    def run_spec(self, run: _RunFixture, role: str) -> lch.LaunchSpec:
+        lane = TESTS_LANE if role in ("tester", "test-reviewer") else BUILD_LANE
+        return replace(
+            run.spec(lane, role),
+            on_session_replaced=lambda reason, detail: self.replaced.append(reason),
+        )
+
+    def test_a_busy_retained_session_is_replaced_not_refused(self) -> None:
+        for role in ("tester", "test-reviewer", "builder", "code-reviewer", "operator"):
+            with self.subTest(role):
+                self.replaced.clear()
+                run = _RunFixture(tempfile.mkdtemp(dir=self.tmp.name))
+                launcher = run.launcher()
+                spec = self.run_spec(run, role)
+                original = _launch(launcher, run.herdr, spec)
+                run.herdr.set_agent_status(original.agent_name, "working")
+                relaunched = self.relaunch(launcher, spec)
+                self.assertIn(original.pane_id, run.herdr.closed_panes)
+                self.assertNotEqual(relaunched.pane_id, original.pane_id)
+                self.assertEqual(self.replaced, [lch.SESSION_BUSY])
+
+    def test_a_settled_retained_session_is_reused(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        launcher = run.launcher()
+        spec = self.run_spec(run, "tester")
+        original = _launch(launcher, run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "idle")
+        again = self.relaunch(launcher, spec)
+        self.assertEqual(again.pane_id, original.pane_id)
+        self.assertNotIn(original.pane_id, run.herdr.closed_panes)
+        self.assertEqual(self.replaced, [])
+
+    def test_a_retained_session_that_never_took_the_prompt_is_replaced(self) -> None:
+        # Run 646181870aef: a resubmission into a retained session that never
+        # receives the prompt was refused DISPATCH_NOT_CONSUMED and parked the
+        # lane LANE_FAULT. A fresh session is one more delivery.
+        refused = lch.LaunchRefused(
+            lch.LaunchRefusal.DISPATCH_NOT_CONSUMED, "never landed", pane_created=True
+        )
+        for role in ("tester", "test-reviewer", "builder", "code-reviewer", "operator"):
+            with self.subTest(role):
+                self.replaced.clear()
+                run = _RunFixture(tempfile.mkdtemp(dir=self.tmp.name))
+                launcher = run.launcher()
+                spec = self.run_spec(run, role)
+                original = _launch(launcher, run.herdr, spec)
+                run.herdr.set_agent_status(original.agent_name, "idle")
+                with mock.patch.object(launcher, "resubmit", side_effect=refused):
+                    relaunched = self.relaunch(launcher, spec)
+                self.assertIn(original.pane_id, run.herdr.closed_panes)
+                self.assertNotEqual(relaunched.pane_id, original.pane_id)
+                self.assertEqual(self.replaced, [lch.SESSION_NOT_CONSUMED])
+
+    def test_a_retained_session_refused_otherwise_still_refuses(self) -> None:
+        run = _RunFixture(self.tmp.name)
+        launcher = run.launcher()
+        spec = self.run_spec(run, "tester")
+        original = _launch(launcher, run.herdr, spec)
+        run.herdr.set_agent_status(original.agent_name, "idle")
+        refused = lch.LaunchRefused(
+            lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED, "x", pane_created=True
+        )
+        with mock.patch.object(launcher, "resubmit", side_effect=refused):
+            with self.assertRaises(lch.LaunchRefused):
+                self.relaunch(launcher, spec)
+        self.assertNotIn(original.pane_id, run.herdr.closed_panes)
         self.assertEqual(self.replaced, [])
 
 
